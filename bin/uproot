@@ -1,0 +1,37 @@
+#!/bin/bash
+# update-filesystem.squashfs - Update filesystem.squashfs from overlay filesystem
+
+set -e
+
+echo "Updating filesystem.squashfs..."
+
+# Remount /cdrom as read-write
+mount /cdrom -o remount,rw
+
+# Create overlay filesystem directories
+mkdir -p /tmp/squashfs/upper/ /tmp/squashfs/work/ /tmp/squashfs/root/
+
+# Mount overlay filesystem (unmount first if already mounted)
+if mountpoint -q /tmp/squashfs/root/ 2>/dev/null; then
+    echo "Unmounting existing overlay..."
+    umount /tmp/squashfs/root/ || true
+fi
+
+mount -t overlay overlay -o upperdir=/tmp/squashfs/upper/,lowerdir=/rofs,workdir=/tmp/squashfs/work/ /tmp/squashfs/root/
+
+# Bind mount apt cache for package installations
+mount --bind /var/cache/apt/archives/ /tmp/squashfs/root/var/cache/apt/archives/ || true
+
+# Copy resolv.conf for network access
+cp /etc/resolv.conf /tmp/squashfs/root/etc/resolv.conf || true
+
+# Backup existing filesystem.squashfs
+if [ -f /cdrom/casper/filesystem.squashfs ]; then
+    mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_$(date +%Y%m%d%H%M%S).squashfs
+fi
+
+# Create new filesystem.squashfs
+mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem.squashfs -comp zstd -Xcompression-level 22
+
+echo "filesystem.squashfs updated successfully!"
+

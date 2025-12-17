@@ -1,0 +1,203 @@
+#!/bin/bash
+# lsl-gui - GUI launcher for Linux Services for Linux - WSL emulator
+# Provides a graphical interface to select and run WSL distributions
+
+WSL_REPORT="/tmp/wsl"
+LSL_SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+LSL_SCRIPT="$LSL_SCRIPT_DIR/lsl"
+
+# Function to parse WSL report and extract VHDX/distro mappings
+parse_wsl_report() {
+    local vhdx_file=""
+    local rootfs_path=""
+    local distro_name=""
+    
+    if [ ! -f "$WSL_REPORT" ]; then
+        return 1
+    fi
+    
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Found\ ext4\.vhdx:\ (.+)$ ]]; then
+            vhdx_file="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^Found\ vhdx:\ (.+)$ ]]; then
+            vhdx_file="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^WSL\ (Distro|Custom|LXSS)\ rootfs:\ (.+)$ ]]; then
+            rootfs_path="${BASH_REMATCH[2]}"
+            # Extract distro name from path
+            if [[ "$rootfs_path" =~ Packages/([^/]+)/LocalState/rootfs ]]; then
+                distro_name="${BASH_REMATCH[1]}"
+            elif [[ "$rootfs_path" =~ /([^/]+)/rootfs$ ]]; then
+                distro_name="${BASH_REMATCH[1]}"
+            elif [[ "$rootfs_path" =~ distros/([^/]+) ]]; then
+                distro_name="${BASH_REMATCH[1]}"
+            else
+                distro_name=$(basename "$(dirname "$rootfs_path")")
+            fi
+            
+            # Output entry if we have either VHDX or rootfs
+            if [ -n "$vhdx_file" ] && [ -f "$vhdx_file" ]; then
+                echo "$distro_name|$vhdx_file|$rootfs_path"
+            elif [ -n "$rootfs_path" ] && [ -d "$rootfs_path" ]; then
+                # Fallback: use rootfs directly if VHDX not available
+                echo "$distro_name||$rootfs_path"
+            fi
+            vhdx_file=""
+            rootfs_path=""
+            distro_name=""
+        elif [[ "$line" == "---" ]]; then
+            vhdx_file=""
+            rootfs_path=""
+            distro_name=""
+        fi
+    done < "$WSL_REPORT"
+}
+
+# Check for GUI tools
+GUI_TOOL=""
+if command -v zenity >/dev/null 2>&1; then
+    GUI_TOOL="zenity"
+elif command -v dialog >/dev/null 2>&1; then
+    GUI_TOOL="dialog"
+elif command -v whiptail >/dev/null 2>&1; then
+    GUI_TOOL="whiptail"
+fi
+
+# Function to show error dialog
+show_error() {
+    local message="$1"
+    if [ "$GUI_TOOL" = "zenity" ]; then
+        zenity --error --text="$message" --title="lsl-gui Error" 2>/dev/null
+    else
+        echo "Error: $message" >&2
+    fi
+}
+
+# Main GUI selection
+main() {
+    # Check if WSL report exists
+    if [ ! -f "$WSL_REPORT" ]; then
+        show_error "WSL report not found at $WSL_REPORT
+
+Please run onboot.sh first to detect WSL distributions."
+        exit 1
+    fi
+    
+    # Build arrays for selection
+    local distro_names=()
+    local distro_paths=()
+    local menu_items=()
+    
+    while IFS='|' read -r name vhdx rootfs; do
+        if [ -n "$name" ]; then
+            local status=""
+            if [ -n "$vhdx" ] && [ -f "$vhdx" ]; then
+                status="(VHDX)"
+            elif [ -n "$rootfs" ] && [ -d "$rootfs" ]; then
+                status="(rootfs)"
+            else
+                status="(unavailable)"
+            fi
+            distro_names+=("$name")
+            distro_paths+=("$vhdx|$rootfs")
+            menu_items+=("${#distro_names[@]}" "$name $status")
+        fi
+    done < <(parse_wsl_report 2>/dev/null)
+    
+    if [ ${#distro_names[@]} -eq 0 ]; then
+        show_error "No WSL distributions found.
+
+Please run onboot.sh first to detect WSL distributions."
+        exit 1
+    fi
+    
+    # Show selection dialog
+    local selected=""
+    local selected_name=""
+    
+    if [ "$GUI_TOOL" = "zenity" ]; then
+        # Build list for zenity
+        local list_items=""
+        for i in "${!distro_names[@]}"; do
+            local num=$((i + 1))
+            local item="${distro_names[$i]}"
+            local path_info="${distro_paths[$i]}"
+            IFS='|' read -r vhdx rootfs <<< "$path_info"
+            local status=""
+            if [ -n "$vhdx" ] && [ -f "$vhdx" ]; then
+                status="VHDX"
+            elif [ -n "$rootfs" ] && [ -d "$rootfs" ]; then
+                status="rootfs"
+            else
+                status="unavailable"
+            fi
+            list_items+="$num|$item|$status\n"
+        done
+        
+        selected=$(echo -e "$list_items" | zenity --list \
+            --title="Select WSL Distribution" \
+            --text="Choose a WSL distribution to run:" \
+            --column="ID" --column="Distribution" --column="Type" \
+            --width=600 --height=400 \
+            --print-column=1 2>/dev/null)
+        
+        if [ -z "$selected" ]; then
+            exit 0
+        fi
+        
+        selected_name="${distro_names[$((selected - 1))]}"
+        
+    elif [ "$GUI_TOOL" = "dialog" ]; then
+        # Use dialog menu
+        selected=$(dialog --menu "Select WSL Distribution" 20 60 10 "${menu_items[@]}" 2>&1 >/dev/tty)
+        
+        if [ -z "$selected" ] || [ "$selected" -lt 1 ] || [ "$selected" -gt "${#distro_names[@]}" ]; then
+            exit 0
+        fi
+        
+        selected_name="${distro_names[$((selected - 1))]}"
+        
+    elif [ "$GUI_TOOL" = "whiptail" ]; then
+        # Use whiptail menu
+        selected=$(whiptail --menu "Select WSL Distribution" 20 60 10 "${menu_items[@]}" 3>&1 1>&2 2>&3)
+        
+        if [ -z "$selected" ] || [ "$selected" -lt 1 ] || [ "$selected" -gt "${#distro_names[@]}" ]; then
+            exit 0
+        fi
+        
+        selected_name="${distro_names[$((selected - 1))]}"
+        
+    else
+        # Fallback to text menu
+        echo "Available WSL distributions:"
+        echo ""
+        for i in "${!distro_names[@]}"; do
+            echo "$((i + 1)). ${distro_names[$i]}"
+        done
+        echo ""
+        read -p "Select distribution (1-${#distro_names[@]}): " selected
+        
+        if [ -z "$selected" ] || [ "$selected" -lt 1 ] || [ "$selected" -gt "${#distro_names[@]}" ]; then
+            echo "Invalid selection"
+            exit 1
+        fi
+        
+        selected_name="${distro_names[$((selected - 1))]}"
+    fi
+    
+    if [ -z "$selected_name" ]; then
+        show_error "No distribution selected"
+        exit 1
+    fi
+    
+    # Launch lsl with the selected distribution
+    if [ -f "$LSL_SCRIPT" ]; then
+        # Use the lsl script with the selected distribution
+        exec "$LSL_SCRIPT" -d "$selected_name" "$@"
+    else
+        show_error "lsl script not found at $LSL_SCRIPT"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"

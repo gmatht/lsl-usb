@@ -1,0 +1,20 @@
+#!/bin/bash
+# update-home.sfs - Update home.sfs from current /home/ directory
+
+set -e
+
+echo "Updating home.sfs..."
+
+# Remount /cdrom as read-write
+mount /cdrom -o remount,rw
+
+# Create home.sfs from current /home/ directory
+cd /home/ && mksquashfs . /cdrom/home_new.sfs -comp zstd
+if [ -f /cdrom/home_orig.sfs ]; then
+    mv /cdrom/home.sfs /cdrom/home_`date +%Y%m%d%H%M%S`.sfs
+else
+    mv /cdrom/home_new.sfs /cdrom/home_orig.sfs
+fi
+mv /cdrom/home_new.sfs /cdrom/home.sfs
+
+echo "home.sfs updated successfully!"

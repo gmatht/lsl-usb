@@ -1,0 +1,289 @@
+#!/bin/bash
+# lsl - Linux Services for Linux - WSL emulator
+# Mounts VHDX files and chroots into WSL distributions
+
+WSL_REPORT="/tmp/wsl"
+LSL_MOUNT_BASE="/tmp/lsl_mounts"
+
+# Parse command line arguments
+DISTRO=""
+LIST_ONLY=false
+COMMAND=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -d|--distribution)
+            DISTRO="$2"
+            shift 2
+            ;;
+        -l|--list)
+            LIST_ONLY=true
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: lsl [OPTIONS] [COMMAND]"
+            echo ""
+            echo "Options:"
+            echo "  -d, --distribution NAME  Specify WSL distribution name"
+            echo "  -l, --list               List available WSL distributions"
+            echo "  -h, --help               Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  lsl                      Enter default WSL distribution"
+            echo "  lsl -d Ubuntu            Enter Ubuntu distribution"
+            echo "  lsl -l                   List all available distributions"
+            echo "  lsl bash                 Run bash in default distribution"
+            exit 0
+            ;;
+        *)
+            if [ -z "$COMMAND" ]; then
+                COMMAND="$*"
+            fi
+            break
+            ;;
+    esac
+done
+
+# Function to parse WSL report and extract VHDX/distro mappings
+parse_wsl_report() {
+    local vhdx_file=""
+    local rootfs_path=""
+    local distro_name=""
+    
+    if [ ! -f "$WSL_REPORT" ]; then
+        echo "Error: WSL report not found at $WSL_REPORT" >&2
+        echo "Run onboot.sh first to detect WSL distributions" >&2
+        return 1
+    fi
+    
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Found\ ext4\.vhdx:\ (.+)$ ]]; then
+            vhdx_file="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^Found\ vhdx:\ (.+)$ ]]; then
+            vhdx_file="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^WSL\ (Distro|Custom|LXSS)\ rootfs:\ (.+)$ ]]; then
+            rootfs_path="${BASH_REMATCH[2]}"
+            # Extract distro name from path
+            if [[ "$rootfs_path" =~ Packages/([^/]+)/LocalState/rootfs ]]; then
+                distro_name="${BASH_REMATCH[1]}"
+            elif [[ "$rootfs_path" =~ /([^/]+)/rootfs$ ]]; then
+                distro_name="${BASH_REMATCH[1]}"
+            elif [[ "$rootfs_path" =~ distros/([^/]+) ]]; then
+                distro_name="${BASH_REMATCH[1]}"
+            else
+                distro_name=$(basename "$(dirname "$rootfs_path")")
+            fi
+            
+            # Output entry if we have either VHDX or rootfs
+            if [ -n "$vhdx_file" ] && [ -f "$vhdx_file" ]; then
+                echo "$distro_name|$vhdx_file|$rootfs_path"
+            elif [ -n "$rootfs_path" ] && [ -d "$rootfs_path" ]; then
+                # Fallback: use rootfs directly if VHDX not available
+                echo "$distro_name||$rootfs_path"
+            fi
+            vhdx_file=""
+            rootfs_path=""
+            distro_name=""
+        elif [[ "$line" == "---" ]]; then
+            vhdx_file=""
+            rootfs_path=""
+            distro_name=""
+        fi
+    done < "$WSL_REPORT"
+}
+
+# Function to list available distributions
+list_distros() {
+    echo "Available WSL distributions:"
+    echo ""
+    local count=0
+    while IFS='|' read -r name vhdx rootfs; do
+        count=$((count + 1))
+        echo "  $count. $name"
+        if [ -n "$vhdx" ] && [ -f "$vhdx" ]; then
+            echo "     VHDX: $vhdx"
+        else
+            echo "     VHDX: (not available)"
+        fi
+        if [ -n "$rootfs" ] && [ -d "$rootfs" ]; then
+            echo "     Rootfs: $rootfs"
+        else
+            echo "     Rootfs: (not available)"
+        fi
+        echo ""
+    done < <(parse_wsl_report)
+    
+    if [ $count -eq 0 ]; then
+        echo "No WSL distributions found."
+        return 1
+    fi
+    return 0
+}
+
+# Function to find VHDX by distro name
+find_vhdx_by_distro() {
+    local search_name="$1"
+    while IFS='|' read -r name vhdx rootfs; do
+        if [[ "$name" == "$search_name" ]] || [[ "$name" =~ $search_name ]]; then
+            echo "$vhdx|$rootfs"
+            return 0
+        fi
+    done < <(parse_wsl_report)
+    return 1
+}
+
+# Function to get first available VHDX
+get_first_vhdx() {
+    local first=$(parse_wsl_report | head -n 1)
+    if [ -n "$first" ]; then
+        IFS='|' read -r name vhdx rootfs <<< "$first"
+        echo "$vhdx|$rootfs"
+        return 0
+    fi
+    return 1
+}
+
+# Function to mount VHDX and chroot
+mount_and_chroot() {
+    local vhdx_file="$1"
+    local rootfs_path="$2"
+    local root_fs=""
+    
+    # If VHDX file is provided, mount it
+    if [ -n "$vhdx_file" ] && [ -f "$vhdx_file" ]; then
+        local mount_point="$LSL_MOUNT_BASE/$(basename "$vhdx_file" .vhdx)"
+        
+        # Create mount point
+        mkdir -p "$mount_point"
+        
+        # Check if already mounted
+        if mountpoint -q "$mount_point" 2>/dev/null; then
+            echo "VHDX already mounted at $mount_point"
+            root_fs="$mount_point"
+        else
+            # Mount VHDX using guestmount
+            echo "Mounting VHDX: $vhdx_file"
+            
+            # Try to auto-detect and mount filesystem
+            if guestmount -a "$vhdx_file" -i "$mount_point" 2>/dev/null; then
+                echo "Successfully mounted at $mount_point (auto-detected)"
+                root_fs="$mount_point"
+            elif guestmount -a "$vhdx_file" -m /dev/sda1 "$mount_point" 2>/dev/null; then
+                echo "Successfully mounted at $mount_point (/dev/sda1)"
+                root_fs="$mount_point"
+            elif guestmount -a "$vhdx_file" -m /dev/sda2 "$mount_point" 2>/dev/null; then
+                echo "Successfully mounted at $mount_point (/dev/sda2)"
+                root_fs="$mount_point"
+            else
+                echo "Error: Failed to mount VHDX file" >&2
+                echo "Inspecting partitions..." >&2
+                guestfish -a "$vhdx_file" -i list-filesystems 2>&1 | head -20 || true
+                echo ""
+                echo "Falling back to rootfs path if available..." >&2
+                # Fall through to try rootfs_path
+            fi
+        fi
+        
+        # Find the root filesystem in the mounted VHDX
+        if [ -n "$root_fs" ]; then
+            if [ -d "$root_fs/rootfs" ]; then
+                root_fs="$root_fs/rootfs"
+            elif [ -d "$root_fs/root" ]; then
+                root_fs="$root_fs/root"
+            fi
+        fi
+    fi
+    
+    # Fallback to rootfs_path if VHDX mounting failed or not available
+    if [ -z "$root_fs" ] && [ -n "$rootfs_path" ] && [ -d "$rootfs_path" ]; then
+        echo "Using rootfs path directly: $rootfs_path"
+        root_fs="$rootfs_path"
+    fi
+    
+    if [ -z "$root_fs" ] || [ ! -d "$root_fs" ]; then
+        echo "Error: Could not determine root filesystem location" >&2
+        return 1
+    fi
+    
+    # Verify it's a Linux filesystem
+    if [ ! -d "$root_fs/etc" ] && [ ! -d "$root_fs/usr" ] && [ ! -d "$root_fs/bin" ]; then
+        echo "Warning: Filesystem doesn't appear to be a Linux rootfs" >&2
+    fi
+    
+    # Setup bind mounts for chroot
+    mount --bind /proc "$root_fs/proc" 2>/dev/null
+    mount --bind /dev "$root_fs/dev" 2>/dev/null
+    mount --bind /sys "$root_fs/sys" 2>/dev/null
+    mount --bind /dev/pts "$root_fs/dev/pts" 2>/dev/null
+    
+    # Copy resolv.conf for network
+    if [ -f /etc/resolv.conf ]; then
+        cp /etc/resolv.conf "$root_fs/etc/resolv.conf" 2>/dev/null || true
+    fi
+    
+    # Chroot and execute command
+    if [ -n "$COMMAND" ]; then
+        chroot "$root_fs" $COMMAND
+    else
+        # Interactive shell
+        echo "Entering WSL distribution..."
+        echo "Type 'exit' to leave"
+        chroot "$root_fs" /bin/bash -l || chroot "$root_fs" /bin/sh -l
+    fi
+    
+    local exit_code=$?
+    
+    # Cleanup bind mounts
+    umount "$root_fs/proc" 2>/dev/null || true
+    umount "$root_fs/dev/pts" 2>/dev/null || true
+    umount "$root_fs/dev" 2>/dev/null || true
+    umount "$root_fs/sys" 2>/dev/null || true
+    
+    # Optionally unmount VHDX (comment out to keep mounted)
+    # guestunmount "$mount_point" 2>/dev/null || umount "$mount_point" 2>/dev/null || true
+    
+    return $exit_code
+}
+
+# Main execution
+if [ "$LIST_ONLY" = true ]; then
+    list_distros
+    exit $?
+fi
+
+# Find VHDX file
+VHDX_INFO=""
+if [ -n "$DISTRO" ]; then
+    VHDX_INFO=$(find_vhdx_by_distro "$DISTRO")
+    if [ -z "$VHDX_INFO" ]; then
+        echo "Error: Distribution '$DISTRO' not found" >&2
+        echo ""
+        list_distros
+        exit 1
+    fi
+else
+    VHDX_INFO=$(get_first_vhdx)
+    if [ -z "$VHDX_INFO" ]; then
+        echo "Error: No WSL distributions found" >&2
+        echo "Run onboot.sh first to detect WSL distributions" >&2
+        exit 1
+    fi
+fi
+
+IFS='|' read -r VHDX_FILE ROOTFS_PATH <<< "$VHDX_INFO"
+
+# Validate that we have either VHDX or rootfs
+if [ -z "$VHDX_FILE" ] && [ -z "$ROOTFS_PATH" ]; then
+    echo "Error: No valid VHDX or rootfs found" >&2
+    exit 1
+fi
+
+if [ -n "$VHDX_FILE" ] && [ ! -f "$VHDX_FILE" ]; then
+    echo "Warning: VHDX file not found: $VHDX_FILE" >&2
+    echo "Will try to use rootfs path instead" >&2
+    VHDX_FILE=""
+fi
+
+# Mount and chroot
+mount_and_chroot "$VHDX_FILE" "$ROOTFS_PATH"
+
