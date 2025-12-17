@@ -26,12 +26,21 @@ mount --bind /var/cache/apt/archives/ /tmp/squashfs/root/var/cache/apt/archives/
 cp /etc/resolv.conf /tmp/squashfs/root/etc/resolv.conf || true
 
 # Backup existing filesystem.squashfs
-if [ -f /cdrom/casper/filesystem.squashfs ]; then
-    mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_$(date +%Y%m%d%H%M%S).squashfs
+#if [ -f /cdrom/casper/filesystem.squashfs ]; then
+#    mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_$(date +%Y%m%d%H%M%S).squashfs
+#fi
+
+#is empty /tmp/squashfs/upper/
+if [ -z "$(ls -A /tmp/squashfs/upper/)" ]; then
+    echo "Upper directory is empty, skipping filesystem.squashfs update"
+    exit 0
 fi
 
 # Create new filesystem.squashfs
-mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem.squashfs -comp zstd -Xcompression-level 22
+mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem_new.squashfs -comp zstd -Xcompression-level 22
+
+mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_`date +%Y%m%d%H%M%S`.squashfs
+mv /cdrom/casper/filesystem_new.squashfs /cdrom/casper/filesystem.squashfs
+
 
 echo "filesystem.squashfs updated successfully!"
-

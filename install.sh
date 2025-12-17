@@ -69,6 +69,16 @@ mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem.squashfs -comp zstd -Xco
 mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_orig.squashfs
 mv /cdrom/casper/filesystem_new.squashfs /cdrom/casper/filesystem.squashfs
 
+#save SSID from nmcli
+SSID=$(nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2)
+PASSWORD=$(nmcli -s -g 802-11-wireless-security.psk connection show "$SSID" 2>/dev/null)
+
+echo "SSID: $SSID"
+echo "PASSWORD: $PASSWORD"
+
+echo "nmcli device wifi connect '$SSID' password '$PASSWORD'" > /cdrom/casper/wifi.sh
+chmod +x /cdrom/casper/wifi.sh
+
 #mount | grep tmp/squash | cut -f3 -d\  | while read d; do umount $d; done
 
 #if [ -e /cdrom/casper/filesystem_new.squashfs
