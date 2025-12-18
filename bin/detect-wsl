@@ -1,0 +1,111 @@
+#!/bin/bash
+# detect-wsl - Detect WSL distributions and VHDX files on Windows partitions
+# Creates /tmp/wsl report file for use by lsl and lsl-gui
+
+WSL_REPORT="/tmp/wsl"
+
+# Clear existing report
+> "$WSL_REPORT"
+
+# Function to find and report WSL distributions
+detect_wsl_on_partition() {
+    local base_path="$1"
+    local users_dir="$base_path/Users"
+    
+    if [ ! -d "$users_dir" ]; then
+        return 0
+    fi
+    
+    # Find all user directories
+    find "$users_dir" -maxdepth 1 -type d -name "*" 2>/dev/null | while read -r user_dir; do
+        [ "$user_dir" = "$users_dir" ] && continue
+        
+        local appdata="$user_dir/AppData/Local"
+        if [ ! -d "$appdata" ]; then
+            continue
+        fi
+        
+        # Modern WSL2: Packages/*/LocalState/rootfs and ext4.vhdx
+        find "$appdata/Packages" -type d -path "*/LocalState/rootfs" 2>/dev/null | while read -r rootfs_path; do
+            local localstate_dir=$(dirname "$rootfs_path")
+            local vhdx_file=""
+            local distro_type="Distro"
+            
+            # Look for ext4.vhdx in LocalState directory
+            if [ -f "$localstate_dir/ext4.vhdx" ]; then
+                vhdx_file="$localstate_dir/ext4.vhdx"
+                echo "Found ext4.vhdx: $vhdx_file" >> "$WSL_REPORT"
+            elif [ -f "$localstate_dir/rootfs.vhdx" ]; then
+                vhdx_file="$localstate_dir/rootfs.vhdx"
+                echo "Found vhdx: $vhdx_file" >> "$WSL_REPORT"
+            fi
+            
+            # Determine distro type from package name
+            if [[ "$localstate_dir" =~ Packages/([^/]+)/LocalState ]]; then
+                local package_name="${BASH_REMATCH[1]}"
+                if [[ "$package_name" =~ ^CanonicalGroupLimited ]]; then
+                    distro_type="Distro"
+                elif [[ "$package_name" =~ ^Microsoft\.WindowsSubsystemLinux ]]; then
+                    distro_type="Distro"
+                else
+                    distro_type="Custom"
+                fi
+            fi
+            
+            echo "WSL $distro_type rootfs: $rootfs_path" >> "$WSL_REPORT"
+            echo "---" >> "$WSL_REPORT"
+        done
+        
+        # Older WSL1: lxss/rootfs
+        if [ -d "$appdata/lxss/rootfs" ]; then
+            echo "WSL LXSS rootfs: $appdata/lxss/rootfs" >> "$WSL_REPORT"
+            echo "---" >> "$WSL_REPORT"
+        fi
+        
+        # Check for WSL distributions in other locations
+        # Some distributions might be in distros/ subdirectories
+        find "$appdata" -type d -path "*/distros/*/rootfs" 2>/dev/null | while read -r distro_rootfs; do
+            local distro_dir=$(dirname "$distro_rootfs")
+            local vhdx_file=""
+            
+            # Look for VHDX in the distro directory
+            if [ -f "$distro_dir/ext4.vhdx" ]; then
+                vhdx_file="$distro_dir/ext4.vhdx"
+                echo "Found ext4.vhdx: $vhdx_file" >> "$WSL_REPORT"
+            elif [ -f "$distro_dir/rootfs.vhdx" ]; then
+                vhdx_file="$distro_dir/rootfs.vhdx"
+                echo "Found vhdx: $vhdx_file" >> "$WSL_REPORT"
+            fi
+            
+            echo "WSL Custom rootfs: $distro_rootfs" >> "$WSL_REPORT"
+            echo "---" >> "$WSL_REPORT"
+        done
+    done
+}
+
+# Scan common Windows partition mount points
+echo "Detecting WSL distributions..."
+
+# Check /media/mint/Windows (from onboot.sh)
+if [ -d "/media/mint/Windows" ]; then
+    echo "Scanning /media/mint/Windows..."
+    detect_wsl_on_partition "/media/mint/Windows"
+fi
+
+# Also check other common Windows mount points
+for mount_point in /media/*/Windows /mnt/*/Windows /media/*/C /mnt/*/C; do
+    if [ -d "$mount_point" ] && [ "$mount_point" != "/media/mint/Windows" ]; then
+        echo "Scanning $mount_point..."
+        detect_wsl_on_partition "$mount_point"
+    fi
+done
+
+# Check if we found anything
+if [ ! -s "$WSL_REPORT" ]; then
+    echo "No WSL distributions found." > "$WSL_REPORT"
+    echo "No WSL distributions detected."
+else
+    count=$(grep -c "WSL.*rootfs:" "$WSL_REPORT" 2>/dev/null || echo "0")
+    echo "Found $count WSL distribution(s). Report written to $WSL_REPORT"
+fi
+

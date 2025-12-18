@@ -29,6 +29,11 @@ mount -t overlay overlay -olowerdir='/media/mint/Windows/Program Files (x86)/Ste
 chown mint /tmp/steam/root
 chown mint /tmp/steam2/root
 
+# Detect WSL distributions and create report
+if [ -f /cdrom/bin/detect-wsl ]; then
+    /cdrom/bin/detect-wsl
+fi
+
 until bash /cdrom/wifi.sh
 do
 	sleep 1
