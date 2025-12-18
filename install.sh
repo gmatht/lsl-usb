@@ -5,6 +5,8 @@ mount /cdrom -o remount,rw
 
 mkdir -p /cdrom/bin
 cp bin/* /cdrom/bin/
+cp onboot.sh /cdrom/
+
 #cp ./lsl /cdrom/bin/lsl
 
 # Create desktop shortcut for lsl-gui
