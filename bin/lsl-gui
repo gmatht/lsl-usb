@@ -6,13 +6,28 @@ WSL_REPORT="/tmp/wsl"
 LSL_SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 LSL_SCRIPT="$LSL_SCRIPT_DIR/lsl"
 
+# Function to ensure WSL report exists by running detect-wsl if needed
+ensure_wsl_report() {
+    if [ ! -f "$WSL_REPORT" ] || [ ! -s "$WSL_REPORT" ] || grep -q "No WSL distributions found" "$WSL_REPORT" 2>/dev/null; then
+        # Try to run detect-wsl if available
+        if command -v detect-wsl >/dev/null 2>&1; then
+            detect-wsl >/dev/null 2>&1
+        elif [ -f "/cdrom/bin/detect-wsl" ]; then
+            /cdrom/bin/detect-wsl >/dev/null 2>&1
+        fi
+    fi
+}
+
 # Function to parse WSL report and extract VHDX/distro mappings
 parse_wsl_report() {
     local vhdx_file=""
     local rootfs_path=""
     local distro_name=""
     
-    if [ ! -f "$WSL_REPORT" ]; then
+    # Ensure report exists (will try to run detect-wsl if needed)
+    ensure_wsl_report
+    
+    if [ ! -f "$WSL_REPORT" ] || [ ! -s "$WSL_REPORT" ]; then
         return 1
     fi
     
@@ -74,11 +89,14 @@ show_error() {
 
 # Main GUI selection
 main() {
+    # Ensure WSL report exists (will try to run detect-wsl if needed)
+    ensure_wsl_report
+    
     # Check if WSL report exists
-    if [ ! -f "$WSL_REPORT" ]; then
+    if [ ! -f "$WSL_REPORT" ] || [ ! -s "$WSL_REPORT" ]; then
         show_error "WSL report not found at $WSL_REPORT
 
-Please run onboot.sh first to detect WSL distributions."
+Could not detect WSL distributions. Please ensure Windows partitions are mounted."
         exit 1
     fi
     

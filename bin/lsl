@@ -5,6 +5,20 @@
 WSL_REPORT="/tmp/wsl"
 LSL_MOUNT_BASE="/tmp/lsl_mounts"
 
+# Function to ensure WSL report exists by running detect-wsl if needed
+ensure_wsl_report() {
+    if [ ! -f "$WSL_REPORT" ] || [ ! -s "$WSL_REPORT" ] || grep -q "No WSL distributions found" "$WSL_REPORT" 2>/dev/null; then
+        # Try to run detect-wsl if available
+        if command -v detect-wsl >/dev/null 2>&1; then
+            echo "WSL report not found or empty. Running detect-wsl..." >&2
+            detect-wsl >/dev/null 2>&1
+        elif [ -f "/cdrom/bin/detect-wsl" ]; then
+            echo "WSL report not found or empty. Running detect-wsl..." >&2
+            /cdrom/bin/detect-wsl >/dev/null 2>&1
+        fi
+    fi
+}
+
 # Parse command line arguments
 DISTRO=""
 LIST_ONLY=false
@@ -50,9 +64,12 @@ parse_wsl_report() {
     local rootfs_path=""
     local distro_name=""
     
-    if [ ! -f "$WSL_REPORT" ]; then
+    # Ensure report exists (will try to run detect-wsl if needed)
+    ensure_wsl_report
+    
+    if [ ! -f "$WSL_REPORT" ] || [ ! -s "$WSL_REPORT" ]; then
         echo "Error: WSL report not found at $WSL_REPORT" >&2
-        echo "Run onboot.sh first to detect WSL distributions" >&2
+        echo "Could not detect WSL distributions. Please ensure Windows partitions are mounted." >&2
         return 1
     fi
     
