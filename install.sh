@@ -72,7 +72,8 @@ mv /cdrom/casper/filesystem_new.squashfs /cdrom/casper/filesystem.squashfs
 
 #save SSID from nmcli
 SSID=$(nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2)
-PASSWORD=$(nmcli -s -g 802-11-wireless-security.psk connection show "$SSID" 2>/dev/null)
+#PASSWORD=$(nmcli -s -g 802-11-wireless-security.psk connection show "$SSID" 2>/dev/null)
+PASSWORD=$(nmcli device wifi show-password | grep ^Password: | sed s/^Password:\ //)
 
 echo "SSID: $SSID"
 echo "PASSWORD: $PASSWORD"
