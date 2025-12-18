@@ -76,8 +76,8 @@ PASSWORD=$(nmcli -s -g 802-11-wireless-security.psk connection show "$SSID" 2>/d
 echo "SSID: $SSID"
 echo "PASSWORD: $PASSWORD"
 
-echo "nmcli device wifi connect '$SSID' password '$PASSWORD'" > /cdrom/casper/wifi.sh
-chmod +x /cdrom/casper/wifi.sh
+echo "nmcli device wifi connect '$SSID' password '$PASSWORD'" > /cdrom/wifi.sh
+chmod +x /cdrom/wifi.sh
 
 #mount | grep tmp/squash | cut -f3 -d\  | while read d; do umount $d; done
 
