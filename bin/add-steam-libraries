@@ -1,0 +1,159 @@
+#!/bin/bash
+# add-steam-libraries - Automatically add mounted Steam libraries to Steam configuration
+
+STEAM_USER="${STEAM_USER:-mint}"
+STEAM_HOME="/home/$STEAM_USER"
+STEAM_CONFIG_DIR="$STEAM_HOME/.steam/steam"
+STEAM_CONFIG_DIR_ALT="$STEAM_HOME/.local/share/Steam"
+LIBRARYFOLDERS_VDF=""
+
+# Find Steam config directory
+if [ -d "$STEAM_CONFIG_DIR" ]; then
+    STEAM_CONFIG_DIR="$STEAM_CONFIG_DIR"
+elif [ -d "$STEAM_CONFIG_DIR_ALT" ]; then
+    STEAM_CONFIG_DIR="$STEAM_CONFIG_DIR_ALT"
+else
+    echo "Steam config directory not found. Steam may not be installed or configured yet." >&2
+    exit 1
+fi
+
+LIBRARYFOLDERS_VDF="$STEAM_CONFIG_DIR/steamapps/libraryfolders.vdf"
+
+# Function to check if a path is a valid Steam library
+is_valid_steam_library() {
+    local path="$1"
+    # Check if it has steamapps directory
+    [ -d "$path/steamapps" ] || [ -d "$path/SteamLibrary/steamapps" ] || [ -d "$path/steam/steamapps" ]
+}
+
+# Function to normalize library path
+normalize_library_path() {
+    local path="$1"
+    # If it's a SteamLibrary directory, use it directly
+    if [ -d "$path/steamapps" ]; then
+        echo "$path"
+    elif [ -d "$path/SteamLibrary/steamapps" ]; then
+        echo "$path/SteamLibrary"
+    elif [ -d "$path/steam/steamapps" ]; then
+        echo "$path/steam"
+    else
+        echo ""
+    fi
+}
+
+# Function to add library using Steam console (if Steam is running)
+add_library_via_console() {
+    local library_path="$1"
+    if pgrep -x steam >/dev/null 2>&1; then
+        echo "Steam is running. Adding library via console: $library_path"
+        # Use Steam's console command
+        # Note: This requires Steam to be running and may need user interaction
+        echo "library_folder_add \"$library_path\"" | socat - "EXEC:steam -console" 2>/dev/null || {
+            echo "Could not add via console. Will add to config file instead." >&2
+            return 1
+        }
+        return 0
+    fi
+    return 1
+}
+
+# Function to add library to libraryfolders.vdf
+add_library_to_config() {
+    local library_path="$1"
+    
+    # Create directory if it doesn't exist
+    mkdir -p "$(dirname "$LIBRARYFOLDERS_VDF")"
+    
+    # Check if library already exists in config
+    if [ -f "$LIBRARYFOLDERS_VDF" ] && grep -q "\"$library_path\"" "$LIBRARYFOLDERS_VDF" 2>/dev/null; then
+        echo "Library already configured: $library_path"
+        return 0
+    fi
+    
+    # Get next library number
+    local next_num=1
+    if [ -f "$LIBRARYFOLDERS_VDF" ]; then
+        # Find highest number
+        while grep -q "\"$next_num\"" "$LIBRARYFOLDERS_VDF" 2>/dev/null; do
+            next_num=$((next_num + 1))
+        done
+    fi
+    
+    # Create or update libraryfolders.vdf
+    if [ ! -f "$LIBRARYFOLDERS_VDF" ]; then
+        cat > "$LIBRARYFOLDERS_VDF" <<EOF
+"LibraryFolders"
+{
+	"TimeNextStatsReport"		"$(date +%s)"
+	"ContentStatsID"		"$(date +%s)"
+	"$next_num"		"$library_path"
+}
+EOF
+    else
+        # Add new library entry before closing brace
+        # This is a simple approach - may need more robust parsing for complex files
+        sed -i "/^}$/i\\\t\"$next_num\"\t\t\"$library_path\"" "$LIBRARYFOLDERS_VDF"
+    fi
+    
+    # Fix ownership
+    chown -R "$STEAM_USER:$STEAM_USER" "$(dirname "$LIBRARYFOLDERS_VDF")" 2>/dev/null || true
+    
+    echo "Added library to config: $library_path"
+}
+
+# Main function
+main() {
+    echo "Detecting Steam libraries..."
+    
+    local libraries_added=0
+    
+    # Check mounted overlay directories from onboot.sh
+    # /tmp/steam/root is mounted from /media/mint/Games/SteamLibrary/
+    if [ -d "/tmp/steam/root" ] && mountpoint -q "/tmp/steam/root" 2>/dev/null; then
+        normalized=$(normalize_library_path "/tmp/steam/root")
+        if [ -n "$normalized" ] && is_valid_steam_library "$normalized"; then
+            echo "Found Steam library: $normalized"
+            if ! add_library_via_console "$normalized"; then
+                add_library_to_config "$normalized"
+            fi
+            libraries_added=$((libraries_added + 1))
+        fi
+    fi
+    
+    # /tmp/steam2/root is mounted from Windows Steam installation (not a library folder)
+    # Check if it has steamapps/common which indicates it might be usable
+    if [ -d "/tmp/steam2/root/steamapps/common" ] && mountpoint -q "/tmp/steam2/root" 2>/dev/null; then
+        # This is the Windows Steam installation, add the parent directory
+        normalized="/tmp/steam2/root"
+        echo "Found Windows Steam installation: $normalized"
+        if ! add_library_via_console "$normalized"; then
+            add_library_to_config "$normalized"
+        fi
+        libraries_added=$((libraries_added + 1))
+    fi
+    
+    # Also check source locations (before overlay mounts)
+    for lib_path in "/media/mint/Games/SteamLibrary"; do
+        if [ -d "$lib_path" ] && is_valid_steam_library "$lib_path"; then
+            normalized=$(normalize_library_path "$lib_path")
+            if [ -n "$normalized" ]; then
+                echo "Found Steam library: $normalized"
+                if ! add_library_via_console "$normalized"; then
+                    add_library_to_config "$normalized"
+                fi
+                libraries_added=$((libraries_added + 1))
+            fi
+        fi
+    done
+    
+    if [ $libraries_added -eq 0 ]; then
+        echo "No Steam libraries found to add."
+        exit 1
+    else
+        echo "Successfully added $libraries_added Steam library/libraries."
+        echo "Restart Steam for changes to take effect."
+    fi
+}
+
+main "$@"
+
