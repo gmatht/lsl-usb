@@ -28,6 +28,7 @@ cd /home/ && mksquashfs . /cdrom/home.sfs -comp zstd
 
 mkdir -p /tmp/squashfs/upper/ /tmp/squashfs/work/ /tmp/squashfs/root/
 mount -t overlay overlay -o upperdir=/tmp/squashfs/upper/,lowerdir=/rofs,workdir=/tmp/squashfs/work/ /tmp/squashfs/root/
+#apt complains if proc is not mounted... but it complains worse if it is. Why?
 #mount --bind /proc/ /tmp/squashfs/root/proc
 #mount --bind /dev /tmp/squashfs/root/dev
 #mount --bind /sys /tmp/squashfs/root/sys
