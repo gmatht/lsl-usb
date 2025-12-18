@@ -65,7 +65,7 @@ fi
 EOF
 
 #Create new filesystem.squashfs and move old one to filesystem_<date>.squashfs
-mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem.squashfs -comp zstd -Xcompression-level 22
+mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem_new.squashfs -comp zstd -Xcompression-level 22
 #mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_`date +%Y%m%d%H%M%S`.squashfs
 mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_orig.squashfs
 mv /cdrom/casper/filesystem_new.squashfs /cdrom/casper/filesystem.squashfs
