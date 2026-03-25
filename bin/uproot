@@ -39,8 +39,14 @@ if [ -z "$(ls -A /tmp/squashfs/upper/)" ]; then
     exit 0
 fi
 
+umount /tmp/squashfs/root/var/cache/apt/archives
+umount /tmp/squashfs/root/home # Does not work, says not mounted?
+umount /tmp/squashfs/root/proc
+
+
 # Create new filesystem.squashfs
-mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem_new.squashfs -comp zstd -Xcompression-level 22
+#mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem_new.squashfs -comp zstd -Xcompression-level 22 -one-file-system
+(cd /tmp/squashfs/root && mksquashfs . /cdrom/casper/filesystem_new.squashfs -comp zstd -Xcompression-level 22 -e home/mint/ )
 
 mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_`date +%Y%m%d%H%M%S`.squashfs
 mv /cdrom/casper/filesystem_new.squashfs /cdrom/casper/filesystem.squashfs
