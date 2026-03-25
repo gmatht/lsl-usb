@@ -12,10 +12,10 @@ mount / -o remount
 #Stop remove boot installation hardware prompt.
 sudo touch /run/casper-no-prompt
 
-mkdir -p /media/mint/Games
-mkdir -p /media/mint/Windows
-mount -o ro /dev/nvme1n1p2 /media/mint/Games
-mount -o ro /dev/nvme0n1p3 /media/mint/Windows
+# Mount Windows partitions WSL-style (/mnt/c, /mnt/d) and detect WSL distros
+if [ -x /cdrom/bin/wsl-boot-setup ]; then
+    /cdrom/bin/wsl-boot-setup
+fi
 
 mkdir -p /tmp/steam ; cd /tmp/steam/ && mkdir upper && mkdir work && mkdir root
 mkdir -p /tmp/steam2 ; cd /tmp/steam2/ && mkdir upper && mkdir work && mkdir root
@@ -23,16 +23,11 @@ mkdir -p /tmp/home/lower ; cd /tmp/home && mkdir upper && mkdir work && mkdir ro
 
 mount /cdrom/home.sfs /tmp/home/lower
 mount -t overlay overlay -olowerdir=/tmp/home/lower/,upperdir=/tmp/home/upper,workdir=/tmp/home/work /home
-mount -t overlay overlay -olowerdir=/media/mint/Games/SteamLibrary/,upperdir=/tmp/steam/upper,workdir=/tmp/steam/work /tmp/steam/root
-mount -t overlay overlay -olowerdir='/media/mint/Windows/Program Files (x86)/Steam',upperdir=/tmp/steam2/upper,workdir=/tmp/steam2/work /tmp/steam2/root
+mount -t overlay overlay -olowerdir=/mnt/d/SteamLibrary/,upperdir=/tmp/steam/upper,workdir=/tmp/steam/work /tmp/steam/root
+mount -t overlay overlay -olowerdir='/mnt/c/Program Files (x86)/Steam',upperdir=/tmp/steam2/upper,workdir=/tmp/steam2/work /tmp/steam2/root
 
 chown mint /tmp/steam/root
 chown mint /tmp/steam2/root
-
-# Detect WSL distributions and create report
-if [ -f /cdrom/bin/detect-wsl ]; then
-    /cdrom/bin/detect-wsl
-fi
 
 until bash /cdrom/wifi.sh
 do

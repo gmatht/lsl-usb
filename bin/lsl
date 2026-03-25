@@ -2,19 +2,42 @@
 # lsl - Linux Services for Linux - WSL emulator
 # Mounts VHDX files and chroots into WSL distributions
 
-WSL_REPORT="/tmp/wsl"
+WSL_REPORT="${WSL_REPORT:-/tmp/wsl}"
 LSL_MOUNT_BASE="/tmp/lsl_mounts"
+
+run_privileged() {
+    if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+        "$@"
+        return $?
+    fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+        return $?
+    fi
+
+    return 1
+}
 
 # Function to ensure WSL report exists by running detect-wsl if needed
 ensure_wsl_report() {
     if [ ! -f "$WSL_REPORT" ] || [ ! -s "$WSL_REPORT" ] || grep -q "No WSL distributions found" "$WSL_REPORT" 2>/dev/null; then
-        # Try to run detect-wsl if available
+        # Prefer mounting Windows volumes (C:, D:) and then detecting.
+        if command -v wsl-boot-setup >/dev/null 2>&1; then
+            echo "WSL report missing/empty. Running wsl-boot-setup..." >&2
+            run_privileged wsl-boot-setup >/dev/null 2>&1 || true
+        elif [ -x "/cdrom/bin/wsl-boot-setup" ]; then
+            echo "WSL report missing/empty. Running wsl-boot-setup..." >&2
+            run_privileged /cdrom/bin/wsl-boot-setup >/dev/null 2>&1 || true
+        fi
+
+        # Fallback: just run detect-wsl if available
         if command -v detect-wsl >/dev/null 2>&1; then
-            echo "WSL report not found or empty. Running detect-wsl..." >&2
-            detect-wsl >/dev/null 2>&1
-        elif [ -f "/cdrom/bin/detect-wsl" ]; then
-            echo "WSL report not found or empty. Running detect-wsl..." >&2
-            /cdrom/bin/detect-wsl >/dev/null 2>&1
+            echo "WSL report missing/empty. Running detect-wsl..." >&2
+            run_privileged detect-wsl >/dev/null 2>&1 || true
+        elif [ -x "/cdrom/bin/detect-wsl" ]; then
+            echo "WSL report missing/empty. Running detect-wsl..." >&2
+            run_privileged /cdrom/bin/detect-wsl >/dev/null 2>&1 || true
         fi
     fi
 }
@@ -23,11 +46,16 @@ ensure_wsl_report() {
 DISTRO=""
 LIST_ONLY=false
 COMMAND=""
+VHDX_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         -d|--distribution)
             DISTRO="$2"
+            shift 2
+            ;;
+        -v|--vhdx)
+            VHDX_OVERRIDE="$2"
             shift 2
             ;;
         -l|--list)
@@ -39,12 +67,14 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  -d, --distribution NAME  Specify WSL distribution name"
+            echo "  -v, --vhdx FILE          Specify a VHDX file to mount (bypasses detection)"
             echo "  -l, --list               List available WSL distributions"
             echo "  -h, --help               Show this help message"
             echo ""
             echo "Examples:"
             echo "  lsl                      Enter default WSL distribution"
             echo "  lsl -d Ubuntu            Enter Ubuntu distribution"
+            echo "  lsl --vhdx /path/to/ext4.vhdx   Enter a VHDX directly"
             echo "  lsl -l                   List all available distributions"
             echo "  lsl bash                 Run bash in default distribution"
             exit 0
@@ -63,6 +93,8 @@ parse_wsl_report() {
     local vhdx_file=""
     local rootfs_path=""
     local distro_name=""
+    local have_entry=false
+    local registry_name=""
     
     # Ensure report exists (will try to run detect-wsl if needed)
     ensure_wsl_report
@@ -73,40 +105,73 @@ parse_wsl_report() {
         return 1
     fi
     
+    flush_entry() {
+        local name=""
+
+        if [ -n "$registry_name" ]; then
+            name="$registry_name"
+        fi
+
+        if [ -n "$rootfs_path" ]; then
+            if [[ "$rootfs_path" =~ Packages/([^/]+)/LocalState/rootfs$ ]]; then
+                name="${BASH_REMATCH[1]}"
+            elif [[ "$rootfs_path" =~ /([^/]+)/rootfs$ ]]; then
+                name="${BASH_REMATCH[1]}"
+            elif [[ "$rootfs_path" =~ distros/([^/]+) ]]; then
+                name="${BASH_REMATCH[1]}"
+            else
+                name="$(basename "$(dirname "$rootfs_path")")"
+            fi
+        elif [ -n "$vhdx_file" ]; then
+            if [[ "$vhdx_file" =~ Packages/([^/]+)/LocalState/ ]]; then
+                name="${BASH_REMATCH[1]}"
+            else
+                name="$(basename "$vhdx_file")"
+            fi
+        fi
+
+        if [ -z "$name" ]; then
+            return 0
+        fi
+
+        if [ -n "$vhdx_file" ] && [ -f "$vhdx_file" ]; then
+            echo "$name|$vhdx_file|$rootfs_path"
+            return 0
+        fi
+
+        if [ -n "$rootfs_path" ] && [ -d "$rootfs_path" ]; then
+            echo "$name||$rootfs_path"
+            return 0
+        fi
+
+        return 0
+    }
+
     while IFS= read -r line; do
         if [[ "$line" =~ ^Found\ ext4\.vhdx:\ (.+)$ ]]; then
             vhdx_file="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ ^Found\ vhdx:\ (.+)$ ]]; then
             vhdx_file="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^WSL\ (Distro|Custom|LXSS)\ vhdx:\ (.+)$ ]]; then
+            vhdx_file="${BASH_REMATCH[2]}"
+        elif [[ "$line" =~ ^WSL\ Registry\ vhdx:\ (.+)$ ]]; then
+            vhdx_file="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^WSL\ Registry\ name:\ (.+)$ ]]; then
+            registry_name="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ ^WSL\ (Distro|Custom|LXSS)\ rootfs:\ (.+)$ ]]; then
             rootfs_path="${BASH_REMATCH[2]}"
-            # Extract distro name from path
-            if [[ "$rootfs_path" =~ Packages/([^/]+)/LocalState/rootfs ]]; then
-                distro_name="${BASH_REMATCH[1]}"
-            elif [[ "$rootfs_path" =~ /([^/]+)/rootfs$ ]]; then
-                distro_name="${BASH_REMATCH[1]}"
-            elif [[ "$rootfs_path" =~ distros/([^/]+) ]]; then
-                distro_name="${BASH_REMATCH[1]}"
-            else
-                distro_name=$(basename "$(dirname "$rootfs_path")")
-            fi
-            
-            # Output entry if we have either VHDX or rootfs
-            if [ -n "$vhdx_file" ] && [ -f "$vhdx_file" ]; then
-                echo "$distro_name|$vhdx_file|$rootfs_path"
-            elif [ -n "$rootfs_path" ] && [ -d "$rootfs_path" ]; then
-                # Fallback: use rootfs directly if VHDX not available
-                echo "$distro_name||$rootfs_path"
-            fi
-            vhdx_file=""
-            rootfs_path=""
-            distro_name=""
         elif [[ "$line" == "---" ]]; then
+            flush_entry
             vhdx_file=""
             rootfs_path=""
             distro_name=""
+            have_entry=false
+            registry_name=""
         fi
     done < "$WSL_REPORT"
+
+    # Flush last entry if file doesn't end with '---'
+    flush_entry
 }
 
 # Function to list available distributions
@@ -131,8 +196,30 @@ list_distros() {
     done < <(parse_wsl_report)
     
     if [ $count -eq 0 ]; then
-        echo "No WSL distributions found."
-        return 1
+        # Try to refresh the report and retry once.
+        ensure_wsl_report
+        while IFS='|' read -r name vhdx rootfs; do
+            count=$((count + 1))
+            echo "  $count. $name"
+            if [ -n "$vhdx" ] && [ -f "$vhdx" ]; then
+                echo "     VHDX: $vhdx"
+            else
+                echo "     VHDX: (not available)"
+            fi
+            if [ -n "$rootfs" ] && [ -d "$rootfs" ]; then
+                echo "     Rootfs: $rootfs"
+            else
+                echo "     Rootfs: (not available)"
+            fi
+            echo ""
+        done < <(parse_wsl_report)
+
+        if [ $count -eq 0 ]; then
+            echo "No WSL distributions found."
+            echo "Tried mounting Windows partitions automatically and rerunning detection." >&2
+            echo "If this still fails, set LSL_WIN_C_DEV (and optionally LSL_WIN_D_DEV) and run: wsl-boot-setup" >&2
+            return 1
+        fi
     fi
     return 0
 }
@@ -265,6 +352,16 @@ mount_and_chroot() {
 # Main execution
 if [ "$LIST_ONLY" = true ]; then
     list_distros
+    exit $?
+fi
+
+# Direct VHDX mount mode (bypass detection/report)
+if [ -n "$VHDX_OVERRIDE" ]; then
+    if [ ! -f "$VHDX_OVERRIDE" ]; then
+        echo "Error: VHDX file not found: $VHDX_OVERRIDE" >&2
+        exit 1
+    fi
+    mount_and_chroot "$VHDX_OVERRIDE" ""
     exit $?
 fi
 

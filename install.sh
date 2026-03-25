@@ -58,7 +58,7 @@ systemctl enable onboot
 
 apt update
 apt upgrade -y
-apt install -y guestmount neovim nix-bin git steam-installer zenity
+apt install -y guestmount neovim nix-bin git steam-installer zenity libhivex-bin chntpw
 #curl -fsS https://dl.brave.com/install.sh | sh
 
 if ! grep -q '/cdrom/bin' /etc/bash.bashrc; then

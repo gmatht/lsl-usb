@@ -1,6 +1,10 @@
 # lsl-usb
 Linux Services for Linux
 
+## A quick note about WSL
+
+WSL (Windows Subsystem for Linux) is a Windows 11 feature. This project is a lovingly unserious reimplementation of WSL for Linux—so Linux can finally run Linux—and will undoubtedly usher in the **Year of the Linux Desktop**.
+
 ## Quickstart
 
 ### Installation
