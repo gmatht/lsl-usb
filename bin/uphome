@@ -14,3 +14,4 @@ mv /cdrom/home.sfs /cdrom/home_`date +%Y%m%d%H%M%S`.sfs
 mv /cdrom/home_new.sfs /cdrom/home.sfs
 
 echo "home.sfs updated successfully!"
+df -h /cdrom || true

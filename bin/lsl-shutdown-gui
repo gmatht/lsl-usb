@@ -1,0 +1,197 @@
+#!/bin/bash
+# lsl-shutdown-gui - Prompt to save home.sfs then shut down
+
+set -u
+
+# TODO: Add an option to also persist system changes ("save root") via `uproot`,
+# but be careful to avoid baking transient hardware-detection / live-boot changes
+# under `/` into the squashfs image.
+
+run_privileged() {
+    if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+        "$@"
+        return $?
+    fi
+
+    if command -v pkexec >/dev/null 2>&1; then
+        pkexec "$@"
+        return $?
+    fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+        return $?
+    fi
+
+    return 1
+}
+
+GUI_TOOL=""
+if command -v zenity >/dev/null 2>&1; then
+    GUI_TOOL="zenity"
+elif command -v dialog >/dev/null 2>&1; then
+    GUI_TOOL="dialog"
+elif command -v whiptail >/dev/null 2>&1; then
+    GUI_TOOL="whiptail"
+fi
+
+show_error() {
+    local message="$1"
+    if [ "$GUI_TOOL" = "zenity" ]; then
+        zenity --error --text="$message" --title="Shutdown" 2>/dev/null || true
+    else
+        echo "Error: $message" >&2
+    fi
+}
+
+upper_summary() {
+    local upper_dir="/tmp/squashfs/upper"
+    local out=""
+
+    if [ ! -d "$upper_dir" ]; then
+        return 0
+    fi
+
+    if [ -z "$(ls -A "$upper_dir" 2>/dev/null || true)" ]; then
+        return 0
+    fi
+
+    local size=""
+    size="$(du -sh "$upper_dir" 2>/dev/null | awk '{print $1}' || true)"
+
+    local count=""
+    count="$(find "$upper_dir" -mindepth 1 -print 2>/dev/null | wc -l | tr -d ' ' || true)"
+
+    local examples=""
+    examples="$(cd "$upper_dir" 2>/dev/null && find . -mindepth 1 -maxdepth 3 -print 2>/dev/null | head -n 20 || true)"
+
+    out+="Unsaved system changes detected in $upper_dir\n"
+    if [ -n "$size" ] || [ -n "$count" ]; then
+        out+="(approx size: ${size:-?}, paths: ${count:-?})\n"
+    fi
+    out+="These may be lost on reboot unless you save root.\n"
+    out+="\nExamples:\n"
+    out+="${examples:-  (could not list examples)}"
+
+    printf "%b" "$out"
+}
+
+confirm_and_run() {
+    local action="$1" # "save" or "shutdown"
+    local uphome_cmd=""
+
+    if command -v uphome >/dev/null 2>&1; then
+        uphome_cmd="$(command -v uphome)"
+    elif [ -x "/cdrom/bin/uphome" ]; then
+        uphome_cmd="/cdrom/bin/uphome"
+    fi
+
+    if [ "$action" = "save" ]; then
+        if [ -z "$uphome_cmd" ]; then
+            show_error "Could not find 'uphome' (needed to save home.sfs)."
+            return 1
+        fi
+
+        if [ "$GUI_TOOL" = "zenity" ]; then
+            (
+                echo "10"
+                echo "# Saving home snapshot to /cdrom/home.sfs…"
+                if ! run_privileged "$uphome_cmd" >/tmp/uphome.log 2>&1; then
+                    echo "100"
+                    exit 1
+                fi
+                echo "100"
+            ) | zenity --progress --title="Shutdown" --text="Saving home…" --auto-close --no-cancel 2>/dev/null
+
+            if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+                show_error "Saving home failed.\n\nDetails:\n$(tail -n 50 /tmp/uphome.log 2>/dev/null)"
+                return 1
+            fi
+        else
+            if ! run_privileged "$uphome_cmd"; then
+                show_error "Saving home failed (uphome exited non-zero)."
+                return 1
+            fi
+        fi
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        run_privileged systemctl poweroff
+        return $?
+    fi
+
+    if command -v shutdown >/dev/null 2>&1; then
+        run_privileged shutdown -h now
+        return $?
+    fi
+
+    show_error "No shutdown command found (systemctl/shutdown)."
+    return 1
+}
+
+main() {
+    local selected=""
+    local upper_msg=""
+    upper_msg="$(upper_summary || true)"
+
+    if [ "$GUI_TOOL" = "zenity" ]; then
+        if [ -n "$upper_msg" ]; then
+            zenity --info --title="Shutdown" --width=700 --height=420 --text="$upper_msg" 2>/dev/null || true
+        fi
+        selected="$(zenity --list --radiolist \
+            --title="Shutdown" \
+            --text="Before shutting down, do you want to save your home snapshot to /cdrom/home.sfs?" \
+            --column="" --column="Action" \
+            TRUE "Save home and shut down" \
+            FALSE "Shut down now (don’t save)" \
+            FALSE "Cancel" \
+            --width=520 --height=260 2>/dev/null || true)"
+    elif [ "$GUI_TOOL" = "dialog" ]; then
+        if [ -n "$upper_msg" ]; then
+            dialog --msgbox "$upper_msg" 22 80 2>&1 >/dev/tty || true
+        fi
+        selected="$(dialog --menu "Shutdown" 12 60 5 \
+            1 "Save home and shut down" \
+            2 "Shut down now (don’t save)" \
+            3 "Cancel" 2>&1 >/dev/tty || true)"
+    elif [ "$GUI_TOOL" = "whiptail" ]; then
+        if [ -n "$upper_msg" ]; then
+            whiptail --msgbox "$upper_msg" 22 80 3>&1 1>&2 2>&3 || true
+        fi
+        selected="$(whiptail --menu "Shutdown" 12 60 5 \
+            1 "Save home and shut down" \
+            2 "Shut down now (don’t save)" \
+            3 "Cancel" 3>&1 1>&2 2>&3 || true)"
+    else
+        if [ -n "$upper_msg" ]; then
+            echo ""
+            printf "%b\n" "$upper_msg"
+            echo ""
+        fi
+        echo "Shutdown options:"
+        echo "1) Save home and shut down"
+        echo "2) Shut down now (don’t save)"
+        echo "3) Cancel"
+        read -r -p "Choose (1-3): " selected || true
+    fi
+
+    selected="${selected//$'\r'/}"
+
+    case "$selected" in
+        "Save home and shut down"|"1")
+            confirm_and_run "save"
+            ;;
+        "Shut down now (don’t save)"|"2")
+            confirm_and_run "shutdown"
+            ;;
+        ""|"Cancel"|"3")
+            exit 0
+            ;;
+        *)
+            # Closing the dialog returns empty; anything else treat as cancel.
+            exit 0
+            ;;
+    esac
+}
+
+main "$@"

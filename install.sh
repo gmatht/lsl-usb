@@ -26,6 +26,21 @@ EOF
 chmod +x /home/mint/Desktop/lsl-gui.desktop
 chown mint:mint /home/mint/Desktop/lsl-gui.desktop
 
+# Create desktop shortcut for shutdown GUI (save home optional)
+cat <<EOF > /home/mint/Desktop/lsl-shutdown.desktop
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=lsl-shutdown
+Comment=Save home snapshot and shut down
+Exec=/cdrom/bin/lsl-shutdown-gui
+Icon=system-shutdown
+Terminal=false
+Categories=System;Utility;
+EOF
+chmod +x /home/mint/Desktop/lsl-shutdown.desktop
+chown mint:mint /home/mint/Desktop/lsl-shutdown.desktop
+
 cd /home/ && mksquashfs . /cdrom/home.sfs -comp zstd
 
 mkdir -p /tmp/squashfs/upper/ /tmp/squashfs/work/ /tmp/squashfs/root/

@@ -248,22 +248,26 @@ If this still fails, set LSL_WIN_C_DEV (and optionally LSL_WIN_D_DEV) and run: s
             local path_info="${distro_paths[$i]}"
             IFS='|' read -r vhdx rootfs <<< "$path_info"
             local status=""
+            local location=""
             if [ -n "$vhdx" ] && [ -f "$vhdx" ]; then
                 status="VHDX"
+                location="$vhdx"
             elif [ -n "$rootfs" ] && [ -d "$rootfs" ]; then
                 status="rootfs"
+                location="$rootfs"
             else
                 status="unavailable"
+                location=""
             fi
-            list_items+="$num|$item|$status\n"
+            list_items+="$num|$item|$status|$location\n"
         done
         
         selected=$(echo -e "$list_items" | zenity --list \
             --title="Select WSL Distribution" \
             --text="Choose a WSL distribution to run:" \
-            --column="ID" --column="Distribution" --column="Type" \
-            --width=600 --height=400 \
-            --print-column=1 \
+            --column="ID" --column="Distribution" --column="Type" --column="Location" \
+            --hide-column=1 \
+            --width=900 --height=450 \
             --extra-button="Browse VHDX…" 2>/dev/null) || true
 
         if [ "$selected" = "Browse VHDX…" ]; then
@@ -281,8 +285,22 @@ If this still fails, set LSL_WIN_C_DEV (and optionally LSL_WIN_D_DEV) and run: s
         if [ -z "$selected" ]; then
             exit 0
         fi
-        
-        selected_name="${distro_names[$((selected - 1))]}"
+
+        # Zenity may return a full row like "1|Ubuntu|VHDX|/path" (even when hide/print
+        # options vary between versions). Only the first field is the numeric index.
+        local selected_id="${selected%%|*}"
+        selected_id="${selected_id//$'\r'/}"
+        if ! [[ "$selected_id" =~ ^[0-9]+$ ]]; then
+            show_error "Unexpected selection value from picker:\n$selected"
+            exit 1
+        fi
+
+        if [ "$selected_id" -lt 1 ] || [ "$selected_id" -gt "${#distro_names[@]}" ]; then
+            show_error "Invalid selection index:\n$selected_id"
+            exit 1
+        fi
+
+        selected_name="${distro_names[$((selected_id - 1))]}"
         
     elif [ "$GUI_TOOL" = "dialog" ]; then
         # Use dialog menu
