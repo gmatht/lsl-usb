@@ -1,0 +1,5 @@
+#!/bin/bash
+# FUSE passthrough: Linux metadata in a sidecar JSON file over a FAT (or any) backing tree.
+set -e
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec python3 "$ROOT/fuse/fat_linux_meta_fs.py" "$@"
