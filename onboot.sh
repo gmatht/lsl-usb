@@ -1,5 +1,6 @@
 #!/bin/bash
-mount /cdrom/ -o remount,rw
+# Keep /cdrom read-only by default; only remount rw when explicitly persisting images.
+mount /cdrom/ -o remount,ro 2>/dev/null || true
 #mount /cdrom/home.btrfs /home/ -t btrfs -o relatime,compress=zstd:3
 #mount -t btrfs -o loop,relatime,compress=zstd:3 /cdrom/home.btrfs /rofs/home
 
@@ -11,6 +12,25 @@ mount / -o remount
 
 #Stop remove boot installation hardware prompt.
 sudo touch /run/casper-no-prompt
+
+# Mount persistence image only if it already exists.
+if [ -f /cdrom/persist.btrfs ]; then
+    mkdir -p /persist
+    if ! mountpoint -q /persist 2>/dev/null; then
+        mount -t btrfs -o loop,compress=zstd:3 /cdrom/persist.btrfs /persist || true
+    fi
+fi
+
+# If persistence is mounted, redirect high-churn logs off VFAT.
+if mountpoint -q /persist 2>/dev/null; then
+    mkdir -p /persist/var-log
+    mkdir -p /persist/casper/uproot-logs
+
+    # Persist system logs (reduces VFAT writes).
+    if [ -d /var/log ] && ! mountpoint -q /var/log 2>/dev/null; then
+        mount --bind /persist/var-log /var/log || true
+    fi
+fi
 
 # Mount Windows partitions WSL-style (/mnt/c, /mnt/d) and detect WSL distros
 if [ -x /cdrom/bin/wsl-boot-setup ]; then

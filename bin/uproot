@@ -6,7 +6,11 @@ set -e
 echo "Updating filesystem.squashfs..."
 
 ts="$(date +%Y%m%d%H%M%S)"
-usb_log_dir="/cdrom/casper/uproot-logs"
+if mountpoint -q /persist 2>/dev/null; then
+    usb_log_dir="/persist/casper/uproot-logs"
+else
+    usb_log_dir="/cdrom/casper/uproot-logs"
+fi
 mkdir -p "$usb_log_dir"
 build_log="${usb_log_dir}/uproot-${ts}.log"
 
@@ -93,6 +97,10 @@ mount --bind /var/cache/apt/archives/ /tmp/squashfs/root/var/cache/apt/archives/
 mount --bind /home/ /tmp/squashfs/root/home || true
 mkdir -p /tmp/squashfs/root/cdrom
 mount --bind /cdrom /tmp/squashfs/root/cdrom || true
+mkdir -p /tmp/squashfs/root/persist
+if mountpoint -q /persist 2>/dev/null; then
+    mount --bind /persist /tmp/squashfs/root/persist || true
+fi
 
 # Copy resolv.conf for network access
 cp /etc/resolv.conf /tmp/squashfs/root/etc/resolv.conf || true
@@ -111,24 +119,24 @@ if chroot /tmp/squashfs/root /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin 
     # Prefer asciinema if available (cleaner, searchable playback).
     log "Recording chroot session to $(basename "$chroot_cast") (asciinema)"
     chroot /tmp/squashfs/root /usr/bin/env \
-        HISTFILE="/cdrom/casper/uproot-logs/chroot-${ts}.history" \
+        HISTFILE="${chroot_history}" \
         HISTSIZE=200000 \
         HISTFILESIZE=200000 \
         ASCIINEMA_REC=1 \
-        asciinema rec -q "/cdrom/casper/uproot-logs/chroot-${ts}.cast" -c "/bin/bash -i"
+        asciinema rec -q "${chroot_cast}" -c "/bin/bash -i"
 elif chroot /tmp/squashfs/root /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -lc 'command -v script >/dev/null 2>&1'; then
     # Fallback: util-linux script(1) transcript.
     log "Recording chroot transcript to $(basename "$chroot_typescript") (script)"
     chroot /tmp/squashfs/root /usr/bin/env \
-        HISTFILE="/cdrom/casper/uproot-logs/chroot-${ts}.history" \
+        HISTFILE="${chroot_history}" \
         HISTSIZE=200000 \
         HISTFILESIZE=200000 \
-        /usr/bin/script -q -f "/cdrom/casper/uproot-logs/chroot-${ts}.typescript" -c "/bin/bash -i"
+        /usr/bin/script -q -f "${chroot_typescript}" -c "/bin/bash -i"
 else
     # Fallback: no transcript tool, but still persist bash history to USB.
     log "No asciinema/script found in chroot; recording history only to $(basename "$chroot_history")"
     chroot /tmp/squashfs/root /usr/bin/env \
-        HISTFILE="/cdrom/casper/uproot-logs/chroot-${ts}.history" \
+        HISTFILE="${chroot_history}" \
         HISTSIZE=200000 \
         HISTFILESIZE=200000 \
         /bin/bash -i

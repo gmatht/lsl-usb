@@ -26,6 +26,48 @@ run_privileged() {
     return 1
 }
 
+pre_shutdown_cleanup() {
+    # Best-effort: reduce risk of VFAT (/cdrom) corruption.
+    # VFAT is fragile; leaving it rw + dirty buffers at poweroff is a common cause of fsck errors.
+    sync || true
+
+    # Unmount persist image if mounted
+    if mountpoint -q /persist 2>/dev/null; then
+        run_privileged umount /persist || true
+    fi
+
+    # Unmount any uproot staging mounts if present
+    if mountpoint -q /tmp/squashfs/root/var/cache/apt/archives 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/var/cache/apt/archives || true
+    fi
+    if mountpoint -q /tmp/squashfs/root/home 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/home || true
+    fi
+    if mountpoint -q /tmp/squashfs/root/proc 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/proc || true
+    fi
+    if mountpoint -q /tmp/squashfs/root/dev 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/dev || true
+    fi
+    if mountpoint -q /tmp/squashfs/root/sys 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/sys || true
+    fi
+    if mountpoint -q /tmp/squashfs/root/cdrom 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/cdrom || true
+    fi
+    if mountpoint -q /tmp/squashfs/root/ 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/ || true
+    fi
+
+    sync || true
+
+    # Try to leave /cdrom cleanly mounted read-only.
+    if mountpoint -q /cdrom 2>/dev/null; then
+        run_privileged mount /cdrom -o remount,ro 2>/dev/null || true
+    fi
+    sync || true
+}
+
 GUI_TOOL=""
 if command -v zenity >/dev/null 2>&1; then
     GUI_TOOL="zenity"
@@ -116,11 +158,13 @@ confirm_and_run() {
     fi
 
     if command -v systemctl >/dev/null 2>&1; then
+        pre_shutdown_cleanup
         run_privileged systemctl poweroff
         return $?
     fi
 
     if command -v shutdown >/dev/null 2>&1; then
+        pre_shutdown_cleanup
         run_privileged shutdown -h now
         return $?
     fi
