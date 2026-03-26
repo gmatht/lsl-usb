@@ -9,7 +9,7 @@ echo "Updating home.sfs..."
 mount /cdrom -o remount,rw
 
 # Create home.sfs from current /home/ directory
-cd /home/ && mksquashfs . /cdrom/home_new.sfs -comp zstd
+cd /home/ && mksquashfs . /cdrom/home_new.sfs -comp zstd -b 512K
 mv /cdrom/home.sfs /cdrom/home_`date +%Y%m%d%H%M%S`.sfs
 mv /cdrom/home_new.sfs /cdrom/home.sfs
 
