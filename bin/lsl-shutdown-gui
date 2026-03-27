@@ -119,7 +119,8 @@ upper_summary() {
 }
 
 confirm_and_run() {
-    local action="$1" # "save" or "shutdown"
+    local save_mode="$1"    # "save" or "nosave"
+    local power_mode="$2"   # "reboot_usb" | "reboot" | "shutdown"
     local uphome_cmd=""
 
     if command -v uphome >/dev/null 2>&1; then
@@ -128,7 +129,7 @@ confirm_and_run() {
         uphome_cmd="/cdrom/bin/uphome"
     fi
 
-    if [ "$action" = "save" ]; then
+    if [ "$save_mode" = "save" ]; then
         if [ -z "$uphome_cmd" ]; then
             show_error "Could not find 'uphome' (needed to save home.sfs)."
             return 1
@@ -157,24 +158,64 @@ confirm_and_run() {
         fi
     fi
 
-    if command -v systemctl >/dev/null 2>&1; then
-        pre_shutdown_cleanup
-        run_privileged systemctl poweroff
-        return $?
-    fi
+    pre_shutdown_cleanup
 
-    if command -v shutdown >/dev/null 2>&1; then
-        pre_shutdown_cleanup
-        run_privileged shutdown -h now
-        return $?
-    fi
-
-    show_error "No shutdown command found (systemctl/shutdown)."
-    return 1
+    case "$power_mode" in
+        reboot_usb)
+            # If booted via UEFI, use current boot entry as BootNext to bypass boot menu.
+            if command -v efibootmgr >/dev/null 2>&1; then
+                local current_entry=""
+                current_entry="$(efibootmgr 2>/dev/null | awk '/^BootCurrent:/ {print $2; exit}' || true)"
+                if [ -n "$current_entry" ]; then
+                    run_privileged efibootmgr -n "$current_entry" >/dev/null 2>&1 || true
+                fi
+            fi
+            if command -v systemctl >/dev/null 2>&1; then
+                run_privileged systemctl reboot
+                return $?
+            fi
+            if command -v shutdown >/dev/null 2>&1; then
+                run_privileged shutdown -r now
+                return $?
+            fi
+            show_error "No reboot command found (systemctl/shutdown)."
+            return 1
+            ;;
+        reboot)
+            if command -v systemctl >/dev/null 2>&1; then
+                run_privileged systemctl reboot
+                return $?
+            fi
+            if command -v shutdown >/dev/null 2>&1; then
+                run_privileged shutdown -r now
+                return $?
+            fi
+            show_error "No reboot command found (systemctl/shutdown)."
+            return 1
+            ;;
+        shutdown)
+            if command -v systemctl >/dev/null 2>&1; then
+                run_privileged systemctl poweroff
+                return $?
+            fi
+            if command -v shutdown >/dev/null 2>&1; then
+                run_privileged shutdown -h now
+                return $?
+            fi
+            show_error "No shutdown command found (systemctl/shutdown)."
+            return 1
+            ;;
+        *)
+            show_error "Invalid power action: $power_mode"
+            return 1
+            ;;
+    esac
 }
 
 main() {
     local selected=""
+    local save_mode=""
+    local power_mode=""
     local upper_msg=""
     upper_msg="$(upper_summary || true)"
 
@@ -184,28 +225,40 @@ main() {
         fi
         selected="$(zenity --list --radiolist \
             --title="Shutdown" \
-            --text="Before shutting down, do you want to save your home snapshot to /cdrom/home.sfs?" \
+            --text="Choose action:" \
             --column="" --column="Action" \
-            TRUE "Save home and shut down" \
-            FALSE "Shut down now (don’t save)" \
+            TRUE "Save home + Reboot to USB" \
+            FALSE "Save home + Normal reboot" \
+            FALSE "Save home + Shutdown" \
+            FALSE "Reboot to USB (no save)" \
+            FALSE "Normal reboot (no save)" \
+            FALSE "Shutdown (no save)" \
             FALSE "Cancel" \
-            --width=520 --height=260 2>/dev/null || true)"
+            --width=620 --height=360 2>/dev/null || true)"
     elif [ "$GUI_TOOL" = "dialog" ]; then
         if [ -n "$upper_msg" ]; then
             dialog --msgbox "$upper_msg" 22 80 2>&1 >/dev/tty || true
         fi
-        selected="$(dialog --menu "Shutdown" 12 60 5 \
-            1 "Save home and shut down" \
-            2 "Shut down now (don’t save)" \
-            3 "Cancel" 2>&1 >/dev/tty || true)"
+        selected="$(dialog --menu "Shutdown options" 16 72 8 \
+            1 "Save home + Reboot to USB" \
+            2 "Save home + Normal reboot" \
+            3 "Save home + Shutdown" \
+            4 "Reboot to USB (no save)" \
+            5 "Normal reboot (no save)" \
+            6 "Shutdown (no save)" \
+            7 "Cancel" 2>&1 >/dev/tty || true)"
     elif [ "$GUI_TOOL" = "whiptail" ]; then
         if [ -n "$upper_msg" ]; then
             whiptail --msgbox "$upper_msg" 22 80 3>&1 1>&2 2>&3 || true
         fi
-        selected="$(whiptail --menu "Shutdown" 12 60 5 \
-            1 "Save home and shut down" \
-            2 "Shut down now (don’t save)" \
-            3 "Cancel" 3>&1 1>&2 2>&3 || true)"
+        selected="$(whiptail --menu "Shutdown options" 16 72 8 \
+            1 "Save home + Reboot to USB" \
+            2 "Save home + Normal reboot" \
+            3 "Save home + Shutdown" \
+            4 "Reboot to USB (no save)" \
+            5 "Normal reboot (no save)" \
+            6 "Shutdown (no save)" \
+            7 "Cancel" 3>&1 1>&2 2>&3 || true)"
     else
         if [ -n "$upper_msg" ]; then
             echo ""
@@ -213,29 +266,52 @@ main() {
             echo ""
         fi
         echo "Shutdown options:"
-        echo "1) Save home and shut down"
-        echo "2) Shut down now (don’t save)"
-        echo "3) Cancel"
-        read -r -p "Choose (1-3): " selected || true
+        echo "1) Save home + Reboot to USB"
+        echo "2) Save home + Normal reboot"
+        echo "3) Save home + Shutdown"
+        echo "4) Reboot to USB (no save)"
+        echo "5) Normal reboot (no save)"
+        echo "6) Shutdown (no save)"
+        echo "7) Cancel"
+        read -r -p "Choose (1-7): " selected || true
     fi
 
     selected="${selected//$'\r'/}"
 
     case "$selected" in
-        "Save home and shut down"|"1")
-            confirm_and_run "save"
+        "Save home + Reboot to USB"|"1")
+            save_mode="save"
+            power_mode="reboot_usb"
             ;;
-        "Shut down now (don’t save)"|"2")
-            confirm_and_run "shutdown"
+        "Save home + Normal reboot"|"2")
+            save_mode="save"
+            power_mode="reboot"
             ;;
-        ""|"Cancel"|"3")
+        "Save home + Shutdown"|"3")
+            save_mode="save"
+            power_mode="shutdown"
+            ;;
+        "Reboot to USB (no save)"|"4")
+            save_mode="nosave"
+            power_mode="reboot_usb"
+            ;;
+        "Normal reboot (no save)"|"5")
+            save_mode="nosave"
+            power_mode="reboot"
+            ;;
+        "Shutdown (no save)"|"6")
+            save_mode="nosave"
+            power_mode="shutdown"
+            ;;
+        ""|"Cancel"|"7")
             exit 0
             ;;
         *)
-            # Closing the dialog returns empty; anything else treat as cancel.
             exit 0
             ;;
     esac
+
+    confirm_and_run "$save_mode" "$power_mode"
 }
 
 main "$@"

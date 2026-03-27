@@ -13,6 +13,24 @@ mount / -o remount
 #Stop remove boot installation hardware prompt.
 sudo touch /run/casper-no-prompt
 
+# Enable global command logging to /cdrom/bash.log once.
+if ! grep -q "LSL_BASH_LOG_HOOK" /etc/bash.bashrc 2>/dev/null; then
+cat >> /etc/bash.bashrc <<'EOF'
+# LSL_BASH_LOG_HOOK
+__lsl_log_cmd() {
+    local ec="$?"
+    local cmd
+    cmd="$(history 1 | sed 's/^ *[0-9]\+ *//')"
+    printf '%s\t%s\t%s\t%s\n' "$BASHPID" "$USER" "$PWD" "$cmd" >> /cdrom/bash.log 2>/dev/null || true
+    return "$ec"
+}
+case ";${PROMPT_COMMAND:-};" in
+    *";__lsl_log_cmd;"*) ;;
+    *) PROMPT_COMMAND="__lsl_log_cmd${PROMPT_COMMAND:+;${PROMPT_COMMAND}}";;
+esac
+EOF
+fi
+
 # Mount persistence image only if it already exists.
 if [ -f /cdrom/persist.btrfs ]; then
     mkdir -p /persist
@@ -33,6 +51,12 @@ if mountpoint -q /persist 2>/dev/null; then
 fi
 
 # Mount Windows partitions WSL-style (/mnt/c, /mnt/d) and detect WSL distros
+modprobe ntfs3 2>/dev/null || true
+mkdir -p /mnt/c
+if ! mountpoint -q /mnt/c 2>/dev/null; then
+    mount -t ntfs3 /dev/nvme0n1p3 /mnt/c 2>/dev/null || true
+fi
+
 if [ -x /cdrom/bin/wsl-boot-setup ]; then
     /cdrom/bin/wsl-boot-setup
 fi
