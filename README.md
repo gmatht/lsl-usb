@@ -79,6 +79,7 @@ git -C E:\path\to\lsl-usb restore README.md bin\lsl-gui bin\uproot
 The `onboot.sh` script runs automatically on boot and:
 - Sets up overlay filesystems for home directory and Steam libraries
 - Mounts external drives (Games, Windows partitions)
+- Mounts `/cdrom/posix` to `/x` via the custom FUSE filesystem (`fat-linux-meta-fs`) in quick permissive mode so `mint` can write
 - Configures network connections
 
 ### Manual Installation

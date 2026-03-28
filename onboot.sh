@@ -73,6 +73,16 @@ mount -t overlay overlay -olowerdir='/mnt/c/Program Files (x86)/Steam',upperdir=
 chown mint /tmp/steam/root
 chown mint /tmp/steam2/root
 
+# Expose writable POSIX metadata view of /cdrom/posix at /x.
+# Quick permissive mode: allow_other + broad permissions for mint write access.
+mount /cdrom/ -o remount,rw 2>/dev/null || true
+mkdir -p /cdrom/posix /x
+umount /x 2>/dev/null || true
+if [ -x /cdrom/bin/fat-linux-meta-fs ]; then
+    /cdrom/bin/fat-linux-meta-fs /cdrom/posix /x --allow-other || true
+fi
+chmod 0777 /cdrom/posix /x 2>/dev/null || true
+
 until bash /cdrom/wifi.sh
 do
 	sleep 1
