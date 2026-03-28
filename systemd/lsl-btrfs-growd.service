@@ -1,0 +1,12 @@
+[Unit]
+Description=LSL HDD home.btrfs auto-grow
+After=onboot.service
+
+[Service]
+Type=simple
+ExecStart=/cdrom/bin/lsl-btrfs-growd
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

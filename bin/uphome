@@ -1,17 +1,22 @@
 #!/bin/bash
-# update-home.sfs - Update home.sfs from current /home/ directory
+# Persist home: USB — flush overlay to home.sfs; HDD — btrfs sync.
+set -euo pipefail
 
-set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/lsl-common.sh"
 
-echo "Updating home.sfs..."
+lsl_load_config
 
-# Remount /cdrom as read-write
-mount /cdrom -o remount,rw
+if lsl_is_usb_mode; then
+    echo "USB mode: flushing merged /home to /cdrom/home.sfs…"
+    exec "$SCRIPT_DIR/lsl-flush-home.sh"
+fi
 
-# Create home.sfs from current /home/ directory
-cd /home/ && mksquashfs . /cdrom/home_new.sfs -comp zstd -b 512K
-mv /cdrom/home.sfs /cdrom/home_`date +%Y%m%d%H%M%S`.sfs
-mv /cdrom/home_new.sfs /cdrom/home.sfs
-
-echo "home.sfs updated successfully!"
-df -h /cdrom || true
+echo "HDD mode: syncing btrfs…"
+btrfs filesystem sync /home 2>/dev/null || true
+if mountpoint -q /mnt/lsl-cache 2>/dev/null; then
+    btrfs filesystem sync /mnt/lsl-cache 2>/dev/null || true
+fi
+sync
+echo "home/cache btrfs sync complete."

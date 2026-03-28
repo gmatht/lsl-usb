@@ -1,0 +1,60 @@
+#!/bin/bash
+# Periodically grow loop-backed home.btrfs on HDD when free space is low.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/lsl-common.sh"
+
+lsl_load_config
+
+if lsl_is_usb_mode; then
+    exit 0
+fi
+
+IMG="$(lsl_home_btrfs_path)"
+MIN_PCT="${LSL_BTRFS_MIN_FREE_PCT:-10}"
+CHUNK_MIB="${LSL_BTRFS_GROW_CHUNK_MIB:-1024}"
+
+free_pct_home() {
+    if ! mountpoint -q /home 2>/dev/null; then
+        echo ""
+        return 1
+    fi
+    # Column 5 is Use%; free percent = 100 - used
+    df -P /home 2>/dev/null | awk 'NR==2 { gsub(/%/,"",$5); print 100 - $5 }'
+}
+
+while sleep 120; do
+    lsl_load_config
+    if lsl_is_usb_mode; then
+        exit 0
+    fi
+    if [ ! -f "$IMG" ]; then
+        continue
+    fi
+    if ! mountpoint -q /home 2>/dev/null; then
+        continue
+    fi
+
+    fp="$(free_pct_home)" || continue
+    case "$fp" in
+        ''|*[!0-9]*) continue ;;
+    esac
+
+    # Grow when free space percent on /home is at or below threshold
+    if [ "$fp" -gt "$MIN_PCT" ]; then
+        continue
+    fi
+
+    echo "lsl-btrfs-growd: low free space on /home (${fp}% ≤ ${MIN_PCT}%), growing ${IMG} by ${CHUNK_MIB}MiB…"
+    btrfs filesystem sync /home 2>/dev/null || true
+    if ! truncate -s "+${CHUNK_MIB}M" "$IMG"; then
+        echo "lsl-btrfs-growd: truncate failed" >&2
+        continue
+    fi
+    if ! btrfs filesystem resize max /home; then
+        echo "lsl-btrfs-growd: btrfs resize failed" >&2
+    fi
+    df -h /home 2>/dev/null || true
+done

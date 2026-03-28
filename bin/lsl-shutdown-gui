@@ -1,5 +1,5 @@
 #!/bin/bash
-# lsl-shutdown-gui - Prompt to save home.sfs then shut down
+# lsl-shutdown-gui - Prompt to save home then shut down
 
 set -u
 
@@ -57,6 +57,26 @@ pre_shutdown_cleanup() {
     fi
     if mountpoint -q /tmp/squashfs/root/ 2>/dev/null; then
         run_privileged umount /tmp/squashfs/root/ || true
+    fi
+
+    if [ -f /cdrom/bin/lsl-common.sh ]; then
+        # shellcheck source=/dev/null
+        . /cdrom/bin/lsl-common.sh
+        lsl_load_config
+        if ! lsl_is_usb_mode; then
+            if mountpoint -q /home/mint/.cache 2>/dev/null; then
+                run_privileged umount /home/mint/.cache || true
+            fi
+            if mountpoint -q /var/cache 2>/dev/null; then
+                run_privileged umount /var/cache || true
+            fi
+            if mountpoint -q /mnt/lsl-cache 2>/dev/null; then
+                run_privileged umount /mnt/lsl-cache || true
+            fi
+            if mountpoint -q /home 2>/dev/null; then
+                run_privileged umount /home || true
+            fi
+        fi
     fi
 
     sync || true
@@ -119,9 +139,19 @@ upper_summary() {
 }
 
 confirm_and_run() {
-    local save_mode="$1"    # "save" or "nosave"
-    local power_mode="$2"   # "reboot_usb" | "reboot" | "shutdown"
+    local save_mode="$1"
+    local power_mode="$2"
     local uphome_cmd=""
+    local save_msg="Saving home snapshot to /cdrom/home.sfs…"
+
+    if [ -f /cdrom/bin/lsl-common.sh ]; then
+        # shellcheck source=/dev/null
+        . /cdrom/bin/lsl-common.sh
+        lsl_load_config
+        if ! lsl_is_usb_mode; then
+            save_msg="Syncing btrfs home and cache…"
+        fi
+    fi
 
     if command -v uphome >/dev/null 2>&1; then
         uphome_cmd="$(command -v uphome)"
@@ -131,14 +161,14 @@ confirm_and_run() {
 
     if [ "$save_mode" = "save" ]; then
         if [ -z "$uphome_cmd" ]; then
-            show_error "Could not find 'uphome' (needed to save home.sfs)."
+            show_error "Could not find 'uphome' (needed to save home)."
             return 1
         fi
 
         if [ "$GUI_TOOL" = "zenity" ]; then
             (
                 echo "10"
-                echo "# Saving home snapshot to /cdrom/home.sfs…"
+                echo "# $save_msg"
                 if ! run_privileged "$uphome_cmd" >/tmp/uphome.log 2>&1; then
                     echo "100"
                     exit 1

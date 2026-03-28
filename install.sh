@@ -6,6 +6,7 @@ mount /cdrom -o remount,rw
 mkdir -p /cdrom/bin
 cp bin/* /cdrom/bin/
 cp onboot.sh /cdrom/
+cp lsl-usb.env /cdrom/lsl-usb.env
 
 #cp ./lsl /cdrom/bin/lsl
 
@@ -68,12 +69,44 @@ ExecStart=/cdrom/onboot.sh
 WantedBy=multi-user.target
 ONBOOT
 
+cat <<'FLUSH' > /etc/systemd/system/lsl-home-flushd.service
+[Unit]
+Description=LSL USB idle home.sfs flush
+After=onboot.service
+
+[Service]
+Type=simple
+ExecStart=/cdrom/bin/lsl-home-flushd
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+FLUSH
+
+cat <<'GROW' > /etc/systemd/system/lsl-btrfs-growd.service
+[Unit]
+Description=LSL HDD home.btrfs auto-grow
+After=onboot.service
+
+[Service]
+Type=simple
+ExecStart=/cdrom/bin/lsl-btrfs-growd
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+GROW
+
 systemctl daemon-reload
 systemctl enable onboot
+systemctl enable lsl-home-flushd
+systemctl enable lsl-btrfs-growd
 
 apt update
 apt upgrade -y
-apt install -y guestmount neovim nix-bin git steam-installer zenity libhivex-bin chntpw
+apt install -y btrfs-progs guestmount neovim nix-bin git steam-installer zenity libhivex-bin chntpw
 #curl -fsS https://dl.brave.com/install.sh | sh
 
 if ! grep -q '/cdrom/bin' /etc/bash.bashrc; then

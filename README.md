@@ -18,19 +18,35 @@ curl -fsSL https://raw.githubusercontent.com/gmatht/lsl-usb/main/fetch.sh | sudo
 The installation script (`install.sh`) will:
 
 1. **Create a systemd service** (`onboot.service`) that runs on boot
-2. **Set up the `lsl` and `lsl-gui` binaries** in `/cdrom/bin` and add them to PATH
-3. **Create desktop shortcuts** for `lsl-gui` and `lsl-shutdown` on the Mint user's desktop
-4. **Create a home filesystem** (`home.sfs`) from your current home directory
-5. **Create an overlay filesystem** and install additional packages (guestmount, neovim, nix-bin, git, steam-installer, zenity)
-6. **Generate a new filesystem.squashfs** with your customizations
+2. **Install `lsl-usb.env` on `/cdrom`** — edit this file on the FAT partition to set where data lives (`LSL_DATA_DIR`, default `/mnt/c/Users/lsl-usb`)
+3. **Set up the `lsl` and `lsl-gui` binaries** in `/cdrom/bin` and add them to PATH
+4. **Create desktop shortcuts** for `lsl-gui` and `lsl-shutdown-gui`
+5. **Create a home filesystem** (`home.sfs`) from your current home directory
+6. **Create an overlay filesystem** and install additional packages (including `btrfs-progs`, guestmount, neovim, nix-bin, git, steam-installer, zenity)
+7. **Generate a new filesystem.squashfs** with your customizations
+8. **Enable `lsl-home-flushd` and `lsl-btrfs-growd`** — see persistence modes below
 
-### Usage
+### Persistence modes
 
-- **`lsl-gui`**: Launch the GUI to select and run a WSL distribution (double-click the desktop shortcut)
-- **`lsl-shutdown-gui`**: GUI prompt to (optionally) run `uphome` and then shut down
-- **`lsl`**: Command-line tool to launch WSL distributions
-- **`uphome`**: Update the home.sfs filesystem snapshot
-- **`uproot`**: Update the filesystem.squashfs with changes from the overlay
+Configuration is read from `/cdrom/lsl-usb.env`. The resolved **`LSL_DATA_DIR`** path selects the mode:
+
+| Mode | When | Home | Caches | Background |
+|------|------|------|--------|------------|
+| **HDD** | `LSL_DATA_DIR` is **not** under `/cdrom` or `/persist` (e.g. NTFS under `/mnt/c/...`) | Loop **`home.btrfs`** with `compress=zstd` | **`cache.btrfs`**: bind-mounts over `/var/cache` and `/home/mint/.cache` | **`lsl-btrfs-growd`** extends `home.btrfs` when free space is low |
+| **USB** | Path is under **`/cdrom`** or **`/persist`** | **`home.sfs`** lower + **tmpfs** overlay upper at `/run/lsl-home-overlay` | (unchanged; use `persist.btrfs` for logs if configured) | **`lsl-home-flushd`** flushes merged `/home` to **`/cdrom/home.sfs`** after **`LSL_HOME_IDLE_SEC`** (default 300) seconds of inactivity |
+
+- **`uphome`**: On **USB**, runs a full **mksquashfs** flush to the stick (same as the idle daemon, but immediate). On **HDD**, runs **`btrfs filesystem sync`** on `/home` and the cache volume (no squashfs).
+- **`lsl-shutdown-gui`**: On save, uses the same `uphome` behavior, then unmounts (HDD: cache + home btrfs; USB: existing VFAT cleanup).
+
+### Manual migration (HDD, first boot)
+
+If `home.btrfs` is new and empty but you still have **`/cdrom/home.sfs`**, you can one-time seed your profile (example):
+
+```bash
+sudo mkdir -p /mnt/seed && sudo mount /cdrom/home.sfs /mnt/seed
+sudo rsync -a /mnt/seed/mint/ /home/mint/
+sudo umount /mnt/seed
+```
 
 ### Persisting changes (and reverting them)
 
@@ -77,14 +93,14 @@ git -C E:\path\to\lsl-usb restore README.md bin\lsl-gui bin\uproot
 ### Boot Configuration
 
 The `onboot.sh` script runs automatically on boot and:
-- Sets up overlay filesystems for home directory and Steam libraries
-- Mounts external drives (Games, Windows partitions)
-- Mounts `/cdrom/posix` to `/x` via the custom FUSE filesystem (`fat-linux-meta-fs`) in quick permissive mode so `mint` can write
-- Configures network connections
+
+- Sources **`/cdrom/lsl-usb.env`** and mounts **`/mnt/c`** / **`/mnt/d`** when possible
+- Sets up **Steam library overlays** (best-effort if drives exist)
+- Applies **HDD** or **USB** home layout as above
+- Optionally mounts **`/cdrom/posix`** at **`/x`** via **`fat-linux-meta-fs`** (permissive mode) when that helper exists
+- Configures network connections (Wi‑Fi via `/cdrom/wifi.sh`)
 
 ### Manual Installation
-
-If you prefer to install manually:
 
 ```bash
 git clone https://github.com/gmatht/lsl-usb.git
