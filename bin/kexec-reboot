@@ -1,0 +1,108 @@
+#!/bin/bash
+# Reboot the running system via kexec (fast reload of kernel + initrd, no firmware POST).
+# Intended for this project's Casper live USB; falls back to /boot when casper paths are absent.
+set -euo pipefail
+
+ORIGINAL_ARGS=("$@")
+
+usage() {
+    cat >&2 <<EOF
+Usage: ${0##*/} [-n|--dry-run] [--no-sync]
+
+  Load the same kernel and initramfs as this boot and jump to it with kexec.
+  Writes current Wi-Fi to /cdrom/wifi.sh when persist-wifi.sh is available.
+  Requires root (will re-run with sudo) and the kexec-tools package.
+
+  -n, --dry-run   Print kernel, initrd, and cmdline; do not call kexec
+  --no-sync       Skip sync(1) before kexec -e
+EOF
+}
+
+dry_run=0
+no_sync=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n | --dry-run) dry_run=1 ;;
+        --no-sync) no_sync=1 ;;
+        -h | --help) usage; exit 0 ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+kernel=""
+for p in /cdrom/casper/vmlinuz "/boot/vmlinuz-$(uname -r)" /boot/vmlinuz; do
+    if [ -r "$p" ]; then
+        kernel="$p"
+        break
+    fi
+done
+if [ -z "$kernel" ]; then
+    echo "Could not find a readable kernel (tried /cdrom/casper/vmlinuz and /boot)." >&2
+    exit 1
+fi
+
+initrd=""
+for p in /cdrom/casper/initrd.lz /cdrom/casper/initrd "/boot/initrd.img-$(uname -r)" /boot/initrd.img; do
+    if [ -r "$p" ]; then
+        initrd="$p"
+        break
+    fi
+done
+if [ -z "$initrd" ]; then
+    echo "Could not find a readable initramfs (tried /cdrom/casper/initrd* and /boot)." >&2
+    exit 1
+fi
+
+cmdline="$(tr '\0' ' ' </proc/cmdline | sed 's/[[:space:]]*$//')"
+
+if [ "$dry_run" -eq 1 ]; then
+    echo "Kernel:  $kernel"
+    echo "Initrd:  $initrd"
+    echo "Cmdline: $cmdline"
+    exit 0
+fi
+
+if [ "${EUID:-0}" -ne 0 ]; then
+    exec sudo -- "$0" "${ORIGINAL_ARGS[@]}"
+fi
+
+lsl_persist_wifi_script() {
+    if [ -x /cdrom/bin/persist-wifi.sh ]; then
+        echo /cdrom/bin/persist-wifi.sh
+    elif [ -x "$(dirname -- "${BASH_SOURCE[0]}")/persist-wifi.sh" ]; then
+        echo "$(dirname -- "${BASH_SOURCE[0]}")/persist-wifi.sh"
+    fi
+}
+pw_script="$(lsl_persist_wifi_script)"
+if [ -n "$pw_script" ]; then
+    "$pw_script" || true
+fi
+
+if ! command -v kexec >/dev/null 2>&1; then
+    echo "kexec not found. Install: apt install kexec-tools" >&2
+    exit 1
+fi
+
+kdisabled="$(sysctl -n kernel.kexec_load_disabled 2>/dev/null || echo 0)"
+if [ "$kdisabled" != "0" ]; then
+    echo "kernel.kexec_load_disabled is $kdisabled; set to 0 to use kexec." >&2
+    exit 1
+fi
+
+# Prefer --reuse-cmdline when available (matches bootloader line exactly).
+if kexec --help 2>&1 | grep -qF -- '--reuse-cmdline'; then
+    kexec -l "$kernel" --initrd="$initrd" --reuse-cmdline
+else
+    kexec -l "$kernel" --initrd="$initrd" --append="$cmdline"
+fi
+
+if [ "$no_sync" -eq 0 ]; then
+    sync
+fi
+
+kexec -e

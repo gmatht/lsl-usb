@@ -3,44 +3,10 @@
 
 mount /cdrom -o remount,rw
 
-mkdir -p /cdrom/bin
-cp bin/* /cdrom/bin/
-cp onboot.sh /cdrom/
-cp lsl-usb.env /cdrom/lsl-usb.env
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+"$REPO_ROOT/bin/config.sh" --sync-only
 
 #cp ./lsl /cdrom/bin/lsl
-
-# Create desktop shortcut for lsl-gui
-mkdir -p /home/mint/Desktop
-chown mint:mint /home/mint/Desktop
-cat <<EOF > /home/mint/Desktop/lsl-gui.desktop
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=lsl-gui
-Comment=Launch WSL Distribution (GUI)
-Exec=/cdrom/bin/lsl-gui
-Icon=terminal
-Terminal=false
-Categories=System;Utility;
-EOF
-chmod +x /home/mint/Desktop/lsl-gui.desktop
-chown mint:mint /home/mint/Desktop/lsl-gui.desktop
-
-# Create desktop shortcut for shutdown GUI (save home optional)
-cat <<EOF > /home/mint/Desktop/lsl-shutdown.desktop
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=lsl-shutdown
-Comment=Save home snapshot and shut down
-Exec=/cdrom/bin/lsl-shutdown-gui
-Icon=system-shutdown
-Terminal=false
-Categories=System;Utility;
-EOF
-chmod +x /home/mint/Desktop/lsl-shutdown.desktop
-chown mint:mint /home/mint/Desktop/lsl-shutdown.desktop
 
 cd /home/ && mksquashfs . /cdrom/home.sfs -comp zstd
 
@@ -53,65 +19,15 @@ mount -t overlay overlay -o upperdir=/tmp/squashfs/upper/,lowerdir=/rofs,workdir
 mount --bind /var/cache/apt/archives/ /tmp/squashfs/root/var/cache/apt/archives/
 cp /etc/resolv.conf /tmp/squashfs/root/etc/resolv.conf
 
-
+LSL_CONFIG_ROOT=/tmp/squashfs/root "$REPO_ROOT/bin/config.sh" --systemd-only
 
 cat <<EOF | chroot /tmp/squashfs/root/
 
-cat <<ONBOOT > /etc/systemd/system/onboot.service
-[Unit]
-Description=On Boot
-After=network-online.target
-
-[Service]
-ExecStart=/cdrom/onboot.sh
-
-[Install]
-WantedBy=multi-user.target
-ONBOOT
-
-cat <<'FLUSH' > /etc/systemd/system/lsl-home-flushd.service
-[Unit]
-Description=LSL USB idle home.sfs flush
-After=onboot.service
-
-[Service]
-Type=simple
-ExecStart=/cdrom/bin/lsl-home-flushd
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-FLUSH
-
-cat <<'GROW' > /etc/systemd/system/lsl-btrfs-growd.service
-[Unit]
-Description=LSL HDD home.btrfs auto-grow
-After=onboot.service
-
-[Service]
-Type=simple
-ExecStart=/cdrom/bin/lsl-btrfs-growd
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-GROW
-
-systemctl daemon-reload
-systemctl enable onboot
-systemctl enable lsl-home-flushd
-systemctl enable lsl-btrfs-growd
-
 apt update
 apt upgrade -y
-apt install -y btrfs-progs guestmount neovim nix-bin git steam-installer zenity libhivex-bin chntpw
+apt install -y btrfs-progs guestmount neovim nix-bin git steam-installer zenity libhivex-bin chntpw guestfish kexec-tools
 #curl -fsS https://dl.brave.com/install.sh | sh
 
-if ! grep -q '/cdrom/bin' /etc/bash.bashrc; then
-    echo 'export PATH="/cdrom/bin:$PATH"' >> /etc/bash.bashrc
-fi
 EOF
 
 #Create new filesystem.squashfs and move old one to filesystem_<date>.squashfs

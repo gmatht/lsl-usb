@@ -12,49 +12,49 @@ if lsl_is_usb_mode; then
     exit 0
 fi
 
-IMG="$(lsl_home_btrfs_path)"
 MIN_PCT="${LSL_BTRFS_MIN_FREE_PCT:-10}"
 CHUNK_MIB="${LSL_BTRFS_GROW_CHUNK_MIB:-1024}"
 
-free_pct_home() {
-    if ! mountpoint -q /home 2>/dev/null; then
+# Args: mountpoint image_path label
+free_pct() {
+    if ! mountpoint -q "$1" 2>/dev/null; then
         echo ""
         return 1
     fi
-    # Column 5 is Use%; free percent = 100 - used
-    df -P /home 2>/dev/null | awk 'NR==2 { gsub(/%/,"",$5); print 100 - $5 }'
+    df -P "$1" 2>/dev/null | awk 'NR==2 { gsub(/%/,"",$5); print 100 - $5 }'
 }
 
-while sleep 120; do
+try_grow() {
+    local mp="$1" img="$2" label="$3"
+    local fp
+    [ -f "$img" ] || return 0
+    mountpoint -q "$mp" 2>/dev/null || return 0
+    fp="$(free_pct "$mp")" || return 0
+    case "$fp" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    if [ "$fp" -gt "$MIN_PCT" ]; then
+        return 0
+    fi
+
+    echo "lsl-btrfs-growd: low free space on ${label} (${fp}% ≤ ${MIN_PCT}%), growing ${img} by ${CHUNK_MIB}MiB…"
+    btrfs filesystem sync "$mp" 2>/dev/null || true
+    if ! truncate -s "+${CHUNK_MIB}M" "$img"; then
+        echo "lsl-btrfs-growd: truncate failed (${label})" >&2
+        return 0
+    fi
+    if ! btrfs filesystem resize max "$mp"; then
+        echo "lsl-btrfs-growd: btrfs resize failed (${label})" >&2
+    fi
+    df -h "$mp" 2>/dev/null || true
+}
+
+while true; do
     lsl_load_config
     if lsl_is_usb_mode; then
         exit 0
     fi
-    if [ ! -f "$IMG" ]; then
-        continue
-    fi
-    if ! mountpoint -q /home 2>/dev/null; then
-        continue
-    fi
-
-    fp="$(free_pct_home)" || continue
-    case "$fp" in
-        ''|*[!0-9]*) continue ;;
-    esac
-
-    # Grow when free space percent on /home is at or below threshold
-    if [ "$fp" -gt "$MIN_PCT" ]; then
-        continue
-    fi
-
-    echo "lsl-btrfs-growd: low free space on /home (${fp}% ≤ ${MIN_PCT}%), growing ${IMG} by ${CHUNK_MIB}MiB…"
-    btrfs filesystem sync /home 2>/dev/null || true
-    if ! truncate -s "+${CHUNK_MIB}M" "$IMG"; then
-        echo "lsl-btrfs-growd: truncate failed" >&2
-        continue
-    fi
-    if ! btrfs filesystem resize max /home; then
-        echo "lsl-btrfs-growd: btrfs resize failed" >&2
-    fi
-    df -h /home 2>/dev/null || true
+    try_grow /home "$(lsl_home_btrfs_path)" home
+    try_grow "${LSL_CACHE_MOUNT:-/mnt/lsl-cache}" "$(lsl_cache_btrfs_path)" cache
+    sleep 60
 done

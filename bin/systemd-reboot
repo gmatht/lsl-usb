@@ -1,0 +1,114 @@
+#!/bin/bash
+# Userspace-only "reboot": systemd tears down services and restarts userspace on the
+# same kernel. No BIOS/firmware, no new kernel (unlike systemctl reboot or kexec).
+# Requires systemd with soft-reboot support (e.g. systemd >= 250).
+set -euo pipefail
+
+ORIGINAL_ARGS=("$@")
+
+CDROM="${LSL_CDROM:-/cdrom}"
+CASPER="$CDROM/casper"
+
+usage() {
+    cat >&2 <<EOF
+Usage: ${0##*/} [-n|--dry-run] [--no-sync] [--no-persist-wifi] [--casper]
+
+  Run \`systemctl soft-reboot\`: systemd stops units and brings the default target
+  back up without resetting the machine. Same kernel, no firmware POST — unlike
+  \`systemctl reboot\`, \`kexec-reboot\`, or \`systemctl kexec\`.
+
+  --casper            Require $CASPER/filesystem.squashfs, then sync and remount
+                      $CDROM read-only before soft-reboot (live USB hygiene).
+                      Does not reload squashfs into the running root (soft-reboot
+                      keeps the current mounts/kernel).
+  --no-persist-wifi   Do not write ${CDROM}/wifi.sh (see persist-wifi.sh).
+  --no-sync           Skip sync(1) before soft-reboot.
+  -n, --dry-run       Print actions only.
+
+  Re-runs with sudo when root is needed (--casper, default persist-wifi).
+EOF
+}
+
+dry_run=0
+no_sync=0
+no_persist_wifi=0
+casper=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n | --dry-run) dry_run=1 ;;
+        --no-sync) no_sync=1 ;;
+        --no-persist-wifi) no_persist_wifi=1 ;;
+        --casper) casper=1 ;;
+        -h | --help) usage; exit 0 ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+need_sudo=0
+[ "$no_persist_wifi" -eq 0 ] && need_sudo=1
+[ "$casper" -eq 1 ] && need_sudo=1
+
+lsl_persist_wifi_script() {
+    if [ -x /cdrom/bin/persist-wifi.sh ]; then
+        echo /cdrom/bin/persist-wifi.sh
+    elif [ -x "$(dirname -- "${BASH_SOURCE[0]}")/persist-wifi.sh" ]; then
+        echo "$(dirname -- "${BASH_SOURCE[0]}")/persist-wifi.sh"
+    fi
+}
+
+verify_casper_squashfs() {
+    if ! mountpoint -q "$CDROM" 2>/dev/null; then
+        echo "${0##*/}: $CDROM is not mounted; cannot use --casper." >&2
+        return 1
+    fi
+    if [ ! -f "$CASPER/filesystem.squashfs" ]; then
+        echo "${0##*/}: missing $CASPER/filesystem.squashfs (required for --casper)." >&2
+        return 1
+    fi
+}
+
+if [ "$dry_run" -eq 1 ]; then
+    echo "Dry-run: would run systemctl soft-reboot (userspace only; same kernel)."
+    [ "$no_persist_wifi" -eq 0 ] && echo "Dry-run: would run persist-wifi if available."
+    [ "$casper" -eq 1 ] && echo "Dry-run: would verify $CASPER/filesystem.squashfs, sync, remount $CDROM ro."
+    [ "$no_sync" -eq 0 ] && [ "$casper" -eq 0 ] && echo "Dry-run: would sync(1)."
+    exit 0
+fi
+
+if [ "$need_sudo" -eq 1 ] && [ "${EUID:-0}" -ne 0 ]; then
+    exec sudo -- "$0" "${ORIGINAL_ARGS[@]}"
+fi
+
+pw_script=""
+if [ "$no_persist_wifi" -eq 0 ]; then
+    pw_script="$(lsl_persist_wifi_script || true)"
+    if [ -n "$pw_script" ]; then
+        "$pw_script" || true
+    fi
+fi
+
+if [ "$casper" -eq 1 ]; then
+    verify_casper_squashfs
+    if [ "$no_sync" -eq 0 ]; then
+        sync
+    fi
+    if mountpoint -q "$CDROM" 2>/dev/null; then
+        mount "$CDROM" -o remount,ro 2>/dev/null || true
+    fi
+    sync || true
+elif [ "$no_sync" -eq 0 ]; then
+    sync
+fi
+
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo "${0##*/}: systemctl not found." >&2
+    exit 1
+fi
+
+exec systemctl soft-reboot

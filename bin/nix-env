@@ -1,0 +1,24 @@
+#!/bin/bash
+# LSL-USB: delegate to real nix-env; log invocations under ~/.local/state/lsl/ (home.btrfs on HDD).
+set -euo pipefail
+
+REAL="${REAL_NIX_ENV:-/usr/bin/nix-env}"
+if [ ! -x "$REAL" ]; then
+    REAL="$(command -v nix-env 2>/dev/null || true)"
+fi
+if [ -z "$REAL" ] || [ ! -x "$REAL" ]; then
+    echo "lsl-usb nix-env wrapper: real nix-env not found (set REAL_NIX_ENV)" >&2
+    exit 127
+fi
+
+lsl_nix_env_log_line() {
+    local logdir="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/lsl"
+    mkdir -p "$logdir" 2>/dev/null || true
+    local logf="$logdir/nix-imperative.log"
+    printf '%s\t%s\t%s\t%s\n' "$(date -Iseconds 2>/dev/null || date)" "${USER:-?}" "${PWD:-?}" "$1" >>"$logf" 2>/dev/null || true
+}
+
+# nix-env is legacy imperative; log every invocation for recovery hints.
+lsl_nix_env_log_line "nix-env $(printf '%q ' "$@")"
+
+exec "$REAL" "$@"

@@ -17,14 +17,15 @@ curl -fsSL https://raw.githubusercontent.com/gmatht/lsl-usb/main/fetch.sh | sudo
 
 The installation script (`install.sh`) will:
 
-1. **Create a systemd service** (`onboot.service`) that runs on boot
-2. **Install `lsl-usb.env` on `/cdrom`** — edit this file on the FAT partition to set where data lives (`LSL_DATA_DIR`, default `/mnt/c/Users/lsl-usb`)
-3. **Set up the `lsl` and `lsl-gui` binaries** in `/cdrom/bin` and add them to PATH
-4. **Create desktop shortcuts** for `lsl-gui` and `lsl-shutdown-gui`
-5. **Create a home filesystem** (`home.sfs`) from your current home directory
-6. **Create an overlay filesystem** and install additional packages (including `btrfs-progs`, guestmount, neovim, nix-bin, git, steam-installer, zenity)
-7. **Generate a new filesystem.squashfs** with your customizations
-8. **Enable `lsl-home-flushd` and `lsl-btrfs-growd`** — see persistence modes below
+1. **Run `bin/config.sh`** to copy scripts, `onboot.sh`, `lsl-usb.env`, and `systemd/*.service` onto `/cdrom`, add desktop shortcuts, and install/enable systemd units (you can re-run `sudo ./bin/config.sh` later to refresh the stick and re-enable services)
+2. **Create a systemd service** (`onboot.service`) that runs on boot — `onboot.sh` also runs `config.sh --from-onboot` so units stay aligned with `/cdrom` even if the live image was not rebuilt
+3. **Install `lsl-usb.env` on `/cdrom`** — edit this file on the FAT partition to set where data lives (`LSL_DATA_DIR`, default `/mnt/c/Users/lsl-usb`)
+4. **Set up the `lsl` and `lsl-gui` binaries** in `/cdrom/bin` and add them to PATH (via `config.sh`)
+5. **Create desktop shortcuts** for `lsl-gui` and `lsl-shutdown-gui`
+6. **Create a home filesystem** (`home.sfs`) from your current home directory
+7. **Create an overlay filesystem** and install additional packages (including `btrfs-progs`, guestmount, neovim, nix-bin, git, steam-installer, zenity)
+8. **Generate a new filesystem.squashfs** with your customizations
+9. **Enable `lsl-home-flushd` and `lsl-btrfs-growd`** (via `config.sh`) — see persistence modes below
 
 ### Persistence modes
 
@@ -32,11 +33,12 @@ Configuration is read from `/cdrom/lsl-usb.env`. The resolved **`LSL_DATA_DIR`**
 
 | Mode | When | Home | Caches | Background |
 |------|------|------|--------|------------|
-| **HDD** | `LSL_DATA_DIR` is **not** under `/cdrom` or `/persist` (e.g. NTFS under `/mnt/c/...`) | Loop **`home.btrfs`** with `compress=zstd` | **`cache.btrfs`**: bind-mounts over `/var/cache` and `/home/mint/.cache` | **`lsl-btrfs-growd`** extends `home.btrfs` when free space is low |
+| **HDD** | `LSL_DATA_DIR` is **not** under `/cdrom` or `/persist` (e.g. NTFS under `/mnt/c/...`) | Loop **`home.btrfs`** with `compress=zstd` | **`cache.btrfs`**: bind-mounts over `/var/cache`, `/home/mint/.cache`, **`/nix/store`**, and **`/nix/var`** (Nix config: **`~/.config/nix/nix.conf`** on `home.btrfs`) | **`lsl-btrfs-growd`** extends **`home.btrfs`** and **`cache.btrfs`** when free space is low |
 | **USB** | Path is under **`/cdrom`** or **`/persist`** | **`home.sfs`** lower + **tmpfs** overlay upper at `/run/lsl-home-overlay` | (unchanged; use `persist.btrfs` for logs if configured) | **`lsl-home-flushd`** flushes merged `/home` to **`/cdrom/home.sfs`** after **`LSL_HOME_IDLE_SEC`** (default 300) seconds of inactivity |
 
 - **`uphome`**: On **USB**, runs a full **mksquashfs** flush to the stick (same as the idle daemon, but immediate). On **HDD**, runs **`btrfs filesystem sync`** on `/home` and the cache volume (no squashfs).
 - **`lsl-shutdown-gui`**: On save, uses the same `uphome` behavior, then unmounts (HDD: cache + home btrfs; USB: existing VFAT cleanup).
+- **Nix wrappers**: `/cdrom/bin` ships **`nix`** and **`nix-env`** scripts that run ahead of `/usr/bin` (see `export PATH="/cdrom/bin:$PATH"` in `/etc/bash.bashrc`). They append imperative commands to **`~/.local/state/lsl/nix-imperative.log`** (on **`home.btrfs`** in HDD mode): `nix profile` / `channel` / `registry` state changes, and every **`nix-env`** invocation. Calling **`/usr/bin/nix`** directly bypasses logging.
 
 ### Manual migration (HDD, first boot)
 
@@ -107,3 +109,6 @@ git clone https://github.com/gmatht/lsl-usb.git
 cd lsl-usb
 sudo ./install.sh
 ```
+### Notes
+
+- Writing to the USB can leave it dirty and unbootable until a fsck. Not sure why it isn't being cleaned on shutdown. But for the moment storing dynamic data on the HDD, which may not be a bad idea anyway.

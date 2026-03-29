@@ -1,0 +1,9 @@
+[Unit]
+Description=On Boot
+After=network-online.target
+
+[Service]
+ExecStart=/cdrom/onboot.sh
+
+[Install]
+WantedBy=multi-user.target

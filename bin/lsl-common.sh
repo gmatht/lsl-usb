@@ -67,3 +67,54 @@ lsl_source_state() {
         . "$f"
     fi
 }
+
+# Persisted VHDX paths (from lsl-gui browse); not auto-scanned.
+lsl_vhdx_state_file() {
+    if [ -n "${LSL_VHDX_LIST_FILE:-}" ]; then
+        printf '%s\n' "$LSL_VHDX_LIST_FILE"
+        return
+    fi
+    local base=""
+    lsl_load_config 2>/dev/null || true
+    base="$(lsl_resolve_data_dir 2>/dev/null || true)"
+    if [ -n "$base" ]; then
+        printf '%s/vhdx.list\n' "$base"
+        return
+    fi
+    base="${XDG_STATE_HOME:-${HOME:-.}/.local/state}/lsl"
+    mkdir -p "$base" 2>/dev/null || base="/tmp"
+    printf '%s/vhdx.list\n' "$base"
+}
+
+lsl_vhdx_paths_stdout() {
+    local f
+    f="$(lsl_vhdx_state_file)"
+    [ -f "$f" ] || return 0
+    grep -v '^[[:space:]]*$' "$f" 2>/dev/null | sort -u
+}
+
+lsl_vhdx_append() {
+    local path="$1" f canon
+    [ -n "$path" ] && [ -f "$path" ] || return 1
+    canon="$(readlink -f "$path" 2>/dev/null || echo "$path")"
+    f="$(lsl_vhdx_state_file)"
+    mkdir -p "$(dirname "$f")" 2>/dev/null || true
+    touch "$f" 2>/dev/null || true
+    if grep -qxF "$canon" "$f" 2>/dev/null; then
+        return 0
+    fi
+    printf '%s\n' "$canon" >> "$f"
+}
+
+# Lines: name|vhdx_path| (third field empty) for merge with parse_wsl_report.
+lsl_vhdx_saved_distro_lines() {
+    local p
+    while IFS= read -r p; do
+        [ -z "$p" ] && continue
+        printf '%s|%s|\n' "$(basename "$p" .vhdx)" "$p"
+    done < <(lsl_vhdx_paths_stdout)
+}
+
+lsl_dedupe_distro_lines() {
+    awk -F'|' 'NF>=2 { key=($2 != "" ? $2 : $3); if (key != "" && !seen[key]++) print }'
+}

@@ -3,8 +3,10 @@
 # Provides a graphical interface to select and run WSL distributions
 
 WSL_REPORT="${WSL_REPORT:-/tmp/wsl}"
-LSL_SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+LSL_SCRIPT_DIR="$(cd -- "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
 LSL_SCRIPT="$LSL_SCRIPT_DIR/lsl"
+# shellcheck source=/dev/null
+. "$LSL_SCRIPT_DIR/lsl-common.sh"
 
 run_privileged() {
     # Run a command with privileges if possible.
@@ -33,6 +35,8 @@ ensure_wsl_report() {
         # Prefer mounting Windows volumes (C:, D:) and then detecting.
         if command -v wsl-boot-setup >/dev/null 2>&1; then
             run_privileged wsl-boot-setup >/dev/null 2>&1 || true
+        elif [ -n "${LSL_SCRIPT_DIR:-}" ] && [ -x "$LSL_SCRIPT_DIR/wsl-boot-setup" ]; then
+            run_privileged "$LSL_SCRIPT_DIR/wsl-boot-setup" >/dev/null 2>&1 || true
         elif [ -x "/cdrom/bin/wsl-boot-setup" ]; then
             run_privileged /cdrom/bin/wsl-boot-setup >/dev/null 2>&1 || true
         fi
@@ -40,26 +44,28 @@ ensure_wsl_report() {
         # Fallback: just run detect-wsl if available
         if command -v detect-wsl >/dev/null 2>&1; then
             run_privileged detect-wsl >/dev/null 2>&1 || true
+        elif [ -n "${LSL_SCRIPT_DIR:-}" ] && [ -x "$LSL_SCRIPT_DIR/detect-wsl" ]; then
+            run_privileged "$LSL_SCRIPT_DIR/detect-wsl" >/dev/null 2>&1 || true
         elif [ -x "/cdrom/bin/detect-wsl" ]; then
             run_privileged /cdrom/bin/detect-wsl >/dev/null 2>&1 || true
         fi
     fi
 }
 
-# Function to parse WSL report and extract VHDX/distro mappings
+# Parse WSL report and merge VHDX paths saved from Browse (see lsl_vhdx_state_file).
 parse_wsl_report() {
     local vhdx_file=""
     local rootfs_path=""
     local distro_name=""
     local registry_name=""
-    
-    # Ensure report exists (will try to run detect-wsl if needed)
+
     ensure_wsl_report
-    
-    if [ ! -f "$WSL_REPORT" ] || [ ! -s "$WSL_REPORT" ]; then
-        return 1
+
+    local report_ok=0
+    if [ -f "$WSL_REPORT" ] && [ -s "$WSL_REPORT" ] && ! grep -q "No WSL distributions found" "$WSL_REPORT" 2>/dev/null; then
+        report_ok=1
     fi
-    
+
     flush_entry() {
         local name=""
 
@@ -89,41 +95,49 @@ parse_wsl_report() {
             return 0
         fi
 
-        if [ -n "$vhdx_file" ] && [ -f "$vhdx_file" ]; then
+        # Emit even when paths are missing on disk so the GUI can show (unavailable)
+        # and users can mount Windows or fix paths without an empty list.
+        if [ -n "$vhdx_file" ]; then
             echo "$name|$vhdx_file|$rootfs_path"
             return 0
         fi
 
-        if [ -n "$rootfs_path" ] && [ -d "$rootfs_path" ]; then
+        if [ -n "$rootfs_path" ]; then
             echo "$name||$rootfs_path"
             return 0
         fi
         return 0
     }
 
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^Found\ ext4\.vhdx:\ (.+)$ ]]; then
-            vhdx_file="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^Found\ vhdx:\ (.+)$ ]]; then
-            vhdx_file="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^WSL\ (Distro|Custom|LXSS)\ vhdx:\ (.+)$ ]]; then
-            vhdx_file="${BASH_REMATCH[2]}"
-        elif [[ "$line" =~ ^WSL\ Registry\ vhdx:\ (.+)$ ]]; then
-            vhdx_file="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^WSL\ Registry\ name:\ (.+)$ ]]; then
-            registry_name="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^WSL\ (Distro|Custom|LXSS)\ rootfs:\ (.+)$ ]]; then
-            rootfs_path="${BASH_REMATCH[2]}"
-        elif [[ "$line" == "---" ]]; then
+    {
+        if [ "$report_ok" -eq 1 ]; then
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^Found\ ext4\.vhdx:\ (.+)$ ]]; then
+                    vhdx_file="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ ^Found\ vhdx:\ (.+)$ ]]; then
+                    vhdx_file="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ ^WSL\ (Distro|Custom|LXSS)\ vhdx:\ (.+)$ ]]; then
+                    vhdx_file="${BASH_REMATCH[2]}"
+                elif [[ "$line" =~ ^WSL\ Registry\ vhdx:\ (.+)$ ]]; then
+                    vhdx_file="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ ^WSL\ Registry\ name:\ (.+)$ ]]; then
+                    registry_name="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ ^WSL\ Registry\ rootfs:\ (.+)$ ]]; then
+                    rootfs_path="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ ^WSL\ (Distro|Custom|LXSS)\ rootfs:\ (.+)$ ]]; then
+                    rootfs_path="${BASH_REMATCH[2]}"
+                elif [[ "$line" == "---" ]]; then
+                    flush_entry
+                    vhdx_file=""
+                    rootfs_path=""
+                    distro_name=""
+                    registry_name=""
+                fi
+            done <"$WSL_REPORT"
             flush_entry
-            vhdx_file=""
-            rootfs_path=""
-            distro_name=""
-            registry_name=""
         fi
-    done < "$WSL_REPORT"
-
-    flush_entry
+        lsl_vhdx_saved_distro_lines
+    } | lsl_dedupe_distro_lines
 }
 
 # Check for GUI tools
@@ -173,23 +187,18 @@ browse_vhdx() {
         return 1
     fi
 
+    lsl_load_config 2>/dev/null || true
+    lsl_vhdx_append "$picked" || true
+
     echo "$picked"
     return 0
 }
 
 # Main GUI selection
 main() {
-    # Ensure WSL report exists (will try to run detect-wsl if needed)
+    lsl_load_config 2>/dev/null || true
     ensure_wsl_report
-    
-    # Check if WSL report exists
-    if [ ! -f "$WSL_REPORT" ] || [ ! -s "$WSL_REPORT" ]; then
-        show_error "WSL report not found at $WSL_REPORT
 
-Could not detect WSL distributions. Please ensure Windows partitions are mounted."
-        exit 1
-    fi
-    
     # Build arrays for selection
     local distro_names=()
     local distro_paths=()
@@ -227,9 +236,9 @@ Could not detect WSL distributions. Please ensure Windows partitions are mounted
         if [ ${#distro_names[@]} -eq 0 ]; then
             show_error "No WSL distributions found.
 
-Tried mounting Windows partitions automatically and rerunning detection.
+Tried mounting Windows partitions and rerunning detection. Use Browse VHDX… to pick a .vhdx once; paths are saved for next time (see: lsl --list-vhdx).
 
-If this still fails, set LSL_WIN_C_DEV (and optionally LSL_WIN_D_DEV) and run: sudo wsl-boot-setup"
+If needed, set LSL_WIN_C_DEV / LSL_WIN_D_DEV and run: sudo wsl-boot-setup"
             exit 1
         fi
     fi
@@ -274,7 +283,7 @@ If this still fails, set LSL_WIN_C_DEV (and optionally LSL_WIN_D_DEV) and run: s
             selected_vhdx="$(browse_vhdx || true)"
             if [ -n "$selected_vhdx" ]; then
                 if [ -f "$LSL_SCRIPT" ]; then
-                    exec "$LSL_SCRIPT" --vhdx "$selected_vhdx" "$@"
+                    exec bash "$LSL_SCRIPT" --vhdx "$selected_vhdx" "$@"
                 fi
                 show_error "lsl script not found at $LSL_SCRIPT"
                 exit 1

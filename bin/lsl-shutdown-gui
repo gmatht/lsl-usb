@@ -70,6 +70,12 @@ pre_shutdown_cleanup() {
             if mountpoint -q /var/cache 2>/dev/null; then
                 run_privileged umount /var/cache || true
             fi
+            if mountpoint -q /nix/store 2>/dev/null; then
+                run_privileged umount /nix/store || true
+            fi
+            if mountpoint -q /nix/var 2>/dev/null; then
+                run_privileged umount /nix/var || true
+            fi
             if mountpoint -q /mnt/lsl-cache 2>/dev/null; then
                 run_privileged umount /mnt/lsl-cache || true
             fi
@@ -86,6 +92,18 @@ pre_shutdown_cleanup() {
         run_privileged mount /cdrom -o remount,ro 2>/dev/null || true
     fi
     sync || true
+}
+
+# Update /cdrom/wifi.sh so the next boot uses the currently connected Wi‑Fi (same idea as install.sh).
+run_persist_wifi() {
+    local script=""
+    if [ -x /cdrom/bin/persist-wifi.sh ]; then
+        script=/cdrom/bin/persist-wifi.sh
+    elif [ -x "$(dirname -- "${BASH_SOURCE[0]}")/persist-wifi.sh" ]; then
+        script="$(dirname -- "${BASH_SOURCE[0]}")/persist-wifi.sh"
+    fi
+    [ -n "$script" ] || return 0
+    run_privileged "$script" || true
 }
 
 GUI_TOOL=""
@@ -188,6 +206,7 @@ confirm_and_run() {
         fi
     fi
 
+    run_persist_wifi
     pre_shutdown_cleanup
 
     case "$power_mode" in

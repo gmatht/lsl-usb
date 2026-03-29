@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Warn at graphical login if /home is read-only (e.g. NTFS dirty bit blocking home.btrfs).
+# Does not attempt repair — unsafe if Windows is hibernated.
+set -euo pipefail
+
+lsl_home_is_readonly() {
+    local opts
+    opts="$(findmnt -n -o OPTIONS /home 2>/dev/null)" || return 1
+    case ",$opts," in
+        *,ro,*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+wait_for_gui_env() {
+    local i
+    for ((i = 0; i < 120; i++)); do
+        if [[ -n "${DISPLAY:-}" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+main() {
+    lsl_home_is_readonly || exit 0
+
+    local stamp
+    stamp="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/lsl-home-readonly-warning.shown"
+    mkdir -p "$(dirname "$stamp")" 2>/dev/null || true
+    if [[ -f "$stamp" ]]; then
+        exit 0
+    fi
+
+    wait_for_gui_env || exit 0
+
+    local text
+    text="Your home directory (/home) is mounted read-only.
+
+This often happens when the Windows volume that stores your home disk image (home.btrfs) still has the NTFS \"dirty\" flag — for example after Fast Startup or an unclean shutdown. Linux will not mount that image read-write until Windows clears the flag.
+
+What to do:
+• Reboot and start Windows normally (not resume from hibernation or sleep).
+• From Windows, shut down fully (Start → Power → Shut down) so the volume is clean.
+• Boot back into LSL-USB.
+
+Do not run disk repair or force-write the Windows drive from Linux while Windows might be hibernated — that risks filesystem corruption."
+
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --warning --title="Home is read-only" --width=560 --text="$text" 2>/dev/null || true
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send -u critical --expire-time=0 "Home is read-only" "$text" 2>/dev/null || true
+    else
+        echo "lsl-home-readonly-warning: $text" >&2
+    fi
+
+    : >"$stamp" 2>/dev/null || true
+}
+
+main "$@"

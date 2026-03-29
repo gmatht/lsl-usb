@@ -1,5 +1,5 @@
 [Unit]
-Description=LSL HDD home.btrfs auto-grow
+Description=LSL HDD home.btrfs and cache.btrfs auto-grow
 After=onboot.service
 
 [Service]

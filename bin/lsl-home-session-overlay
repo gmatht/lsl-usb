@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Stack overlayfs (tmpfs upper) on read-only /home, then bind the merged tree on /home.
+# Changes exist only in RAM until reboot; nothing is written to the underlying disk image.
+# Must run as root (e.g. pkexec). Safe w.r.t. Windows hibernation — does not touch NTFS.
+set -euo pipefail
+
+STATE_DIR=/run/lsl-usb-home-session-overlay
+SIZE_MIB="${LSL_HOME_SESSION_OVERLAY_MIB:-2048}"
+
+opts=$(findmnt -n -o OPTIONS /home 2>/dev/null) || {
+    echo "lsl-home-session-overlay: cannot query /home mount" >&2
+    exit 1
+}
+case ",$opts," in
+    *,ro,*) ;;
+    *)
+        # Idempotent: normal rw home — nothing to do.
+        exit 0
+        ;;
+esac
+
+if [[ -f "$STATE_DIR/active" ]]; then
+    opts2=$(findmnt -n -o OPTIONS /home 2>/dev/null) || true
+    case ",$opts2," in
+        *,ro,*) ;;
+        *) exit 0 ;;
+    esac
+fi
+
+mkdir -p "$STATE_DIR/fs"
+if mountpoint -q "$STATE_DIR/fs" 2>/dev/null; then
+    echo "lsl-home-session-overlay: $STATE_DIR/fs already mounted" >&2
+    exit 1
+fi
+
+mount -t tmpfs -o "size=${SIZE_MIB}M" tmpfs "$STATE_DIR/fs"
+mkdir -p "$STATE_DIR/fs"/{upper,work,merged}
+mount -t overlay overlay -o "lowerdir=/home,upperdir=$STATE_DIR/fs/upper,workdir=$STATE_DIR/fs/work" "$STATE_DIR/fs/merged"
+mount --bind "$STATE_DIR/fs/merged" /home
+touch "$STATE_DIR/active"
+echo "lsl-home-session-overlay: session overlay active (RAM only; changes lost at shutdown)" >&2
