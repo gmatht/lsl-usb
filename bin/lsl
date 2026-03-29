@@ -57,7 +57,7 @@ LIST_ONLY=false
 LIST_VHDX=false
 COMMAND=""
 VHDX_OVERRIDE=""
-LSL_TMPFS_OVERLAY=false
+LSL_OVERLAY_DISK=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -69,8 +69,8 @@ while [[ $# -gt 0 ]]; do
             VHDX_OVERRIDE="$2"
             shift 2
             ;;
-        --tmpfs-overlay)
-            LSL_TMPFS_OVERLAY=true
+        --overlay-disk|--tmpfs-overlay)
+            LSL_OVERLAY_DISK=true
             shift
             ;;
         -l|--list)
@@ -87,7 +87,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  -d, --distribution NAME  Specify WSL distribution name"
             echo "  -v, --vhdx FILE          Specify a VHDX file to mount (bypasses detection)"
-            echo "      --tmpfs-overlay      RAM-backed overlay on VHDX root (session writes; optional on ro images)"
+            echo "      --overlay-disk       qcow2 copy-on-write layer on the VHDX (session writes; parent image unchanged)"
             echo "  -l, --list               List available WSL distributions"
             echo "      --list-vhdx          List VHDX paths saved from lsl-gui (one path per line)"
             echo "  -h, --help               Show this help message"
@@ -96,7 +96,7 @@ while [[ $# -gt 0 ]]; do
             echo "  lsl                      Enter default WSL distribution"
             echo "  lsl -d Ubuntu            Enter Ubuntu distribution"
             echo "  lsl --vhdx /path/to/ext4.vhdx   Enter a VHDX directly"
-            echo "  sudo lsl --tmpfs-overlay --vhdx /path/disk.vhdx   Session in RAM over VHDX (no writes to image)"
+            echo "  sudo lsl --overlay-disk --vhdx /path/disk.vhdx   Writable session over VHDX (no writes to image)"
             echo "  lsl /path/to/disk.vhdx   Same if the path exists (convenience)"
             echo "  lsl -l                   List all available distributions"
             echo "  lsl --list-vhdx          Print saved VHDX paths"
@@ -377,18 +377,28 @@ lsl_mount_vhdx() {
     return 1
 }
 
-# Mount VHDX via qemu-nbd (no libguestfs). Requires qemu-utils, nbd module, and root/sudo.
+# qemu-img cannot create a child VHDX with a backing file; qcow2-on-VHDX is the usual QEMU COW equivalent.
+lsl_qemu_disk_format() {
+    case "$1" in
+        *.qcow2|*.qcow) printf '%s\n' qcow2 ;;
+        *.vhdx) printf '%s\n' vhdx ;;
+        *) printf '%s\n' vhdx ;;
+    esac
+}
+
+# Mount disk image via qemu-nbd (no libguestfs). Requires qemu-utils, nbd module, and root/sudo.
 lsl_mount_vhdx_qemu_nbd() {
-    local vhdx_file="$1"
+    local disk_file="$1"
     local mount_point="$2"
-    local nbd part
+    local nbd part fmt
 
     command -v qemu-nbd >/dev/null 2>&1 || return 1
     run_privileged modprobe nbd max_part=16 2>/dev/null || true
+    fmt="$(lsl_qemu_disk_format "$disk_file")"
 
     for nbd in /dev/nbd{0..15}; do
         [ -b "$nbd" ] || continue
-        if run_privileged qemu-nbd --connect="$nbd" -f vhdx "$vhdx_file" 2>/dev/null; then
+        if run_privileged qemu-nbd --connect="$nbd" -f "$fmt" "$disk_file" 2>/dev/null; then
             run_privileged partprobe "$nbd" 2>/dev/null || true
             sleep 0.3
             local try_parts
@@ -422,75 +432,76 @@ lsl_path_is_readonly() {
     esac
 }
 
-# RAM-backed overlay on read-only root. Sets LSL_VHDX_OVL_BASE for cleanup; prints merged path.
-lsl_vhdx_tmpfs_overlay_mount() {
-    local lower="$1"
-    local size_mib="${2:-4096}"
-    local merged
-    LSL_VHDX_OVL_BASE=""
-    LSL_VHDX_OVL_BASE="$LSL_MOUNT_BASE/ovl_${RANDOM}_$$"
-    merged="$LSL_VHDX_OVL_BASE/merged"
-    mkdir -p "$LSL_VHDX_OVL_BASE" || return 1
-    if ! run_privileged mount -t tmpfs -o "size=${size_mib}M" tmpfs "$LSL_VHDX_OVL_BASE"; then
-        rmdir "$LSL_VHDX_OVL_BASE" 2>/dev/null || true
-        LSL_VHDX_OVL_BASE=""
-        return 1
-    fi
-    mkdir -p "$LSL_VHDX_OVL_BASE/upper" "$LSL_VHDX_OVL_BASE/work" "$merged" || {
-        run_privileged umount "$LSL_VHDX_OVL_BASE" 2>/dev/null || true
-        LSL_VHDX_OVL_BASE=""
-        return 1
-    }
-    if ! run_privileged mount -t overlay overlay -o "lowerdir=$lower,upperdir=$LSL_VHDX_OVL_BASE/upper,workdir=$LSL_VHDX_OVL_BASE/work" "$merged"; then
-        run_privileged umount "$LSL_VHDX_OVL_BASE" 2>/dev/null || true
-        LSL_VHDX_OVL_BASE=""
-        return 1
-    fi
-    printf '%s\n' "$merged"
-}
-
 # Function to mount VHDX and chroot
 mount_and_chroot() {
     local vhdx_file="$1"
     local rootfs_path="$2"
     local root_fs=""
     local vhdx_mounted=""
-    
-    # If VHDX file is provided, mount it
+    local image_to_mount=""
+    local mount_point=""
+
+    LSL_COW_SESSION_IMG=""
+    LSL_VHDX_SESSION_MOUNT=""
+
+    # If VHDX file is provided, mount it (--overlay-disk: qcow2 COW on parent; qemu-img cannot create child VHDX with -b)
     if [ -n "$vhdx_file" ] && [ -f "$vhdx_file" ]; then
-        local mount_point="$LSL_MOUNT_BASE/$(basename "$vhdx_file" .vhdx)"
-        
-        # Create mount point
+        if [ "${LSL_OVERLAY_DISK:-false}" = true ]; then
+            mkdir -p "$LSL_MOUNT_BASE" || return 1
+            local parent_abs
+            parent_abs="$(readlink -f "$vhdx_file")" || parent_abs="$vhdx_file"
+            if ! command -v qemu-img >/dev/null 2>&1; then
+                echo "Error: qemu-img required for --overlay-disk (qemu-utils)." >&2
+                return 1
+            fi
+            LSL_COW_SESSION_IMG="$LSL_MOUNT_BASE/lsl_cow_${RANDOM}_$$.qcow2"
+            if ! run_privileged qemu-img create -f qcow2 -F vhdx -b "$parent_abs" "$LSL_COW_SESSION_IMG"; then
+                echo "Error: qemu-img create failed (qcow2 overlay on VHDX)." >&2
+                rm -f "$LSL_COW_SESSION_IMG" 2>/dev/null || true
+                LSL_COW_SESSION_IMG=""
+                return 1
+            fi
+            image_to_mount="$LSL_COW_SESSION_IMG"
+            mount_point="$LSL_MOUNT_BASE/lsl_sess_${RANDOM}_$$"
+        else
+            image_to_mount="$vhdx_file"
+            mount_point="$LSL_MOUNT_BASE/$(basename "$vhdx_file" .vhdx)"
+        fi
+
         mkdir -p "$mount_point"
-        
-        # Check if already mounted
-        if mountpoint -q "$mount_point" 2>/dev/null; then
+
+        if [ "${LSL_OVERLAY_DISK:-false}" != true ] && mountpoint -q "$mount_point" 2>/dev/null; then
             echo "VHDX already mounted at $mount_point"
             root_fs="$mount_point"
             vhdx_mounted="$mount_point"
         else
-            # Mount VHDX using guestmount
-            echo "Mounting VHDX: $vhdx_file"
-            
-            if lsl_mount_vhdx "$vhdx_file" "$mount_point"; then
+            echo "Mounting: $image_to_mount"
+            if lsl_mount_vhdx "$image_to_mount" "$mount_point"; then
                 echo "Successfully mounted at $mount_point"
                 root_fs="$mount_point"
                 vhdx_mounted="$mount_point"
+                if [ -n "$LSL_COW_SESSION_IMG" ]; then
+                    LSL_VHDX_SESSION_MOUNT="$mount_point"
+                    echo "overlay-disk: qcow2 copy-on-write on $(basename "$vhdx_file"); parent VHDX unchanged; session layer removed on exit." >&2
+                fi
             else
-                echo "Error: Failed to mount VHDX file (libguestfs and qemu-nbd)" >&2
+                echo "Error: Failed to mount disk image (libguestfs and qemu-nbd)" >&2
                 echo "Image info (no libguestfs):" >&2
                 if command -v qemu-img >/dev/null 2>&1; then
-                    run_privileged qemu-img info "$vhdx_file" 2>&1 | head -35 || true
+                    run_privileged qemu-img info "$image_to_mount" 2>&1 | head -35 || true
                 fi
-                file "$vhdx_file" 2>/dev/null || true
+                file "$image_to_mount" 2>/dev/null || true
                 echo "" >&2
                 echo "Ensure: sudo modprobe nbd; qemu-nbd and qemu-img (qemu-utils); disk not in use by WSL/Hyper-V." >&2
                 echo "If libguestfs alone fails (supermin), lsl now tries qemu-nbd automatically — use: sudo lsl -v \"$vhdx_file\"" >&2
+                if [ -n "$LSL_COW_SESSION_IMG" ]; then
+                    rm -f "$LSL_COW_SESSION_IMG" 2>/dev/null || true
+                    LSL_COW_SESSION_IMG=""
+                fi
                 echo "Falling back to rootfs path if available..." >&2
-                # Fall through to try rootfs_path
             fi
         fi
-        
+
         # Resolve WSL layout (./rootfs) and ensure we have a real Linux root
         if [ -n "$root_fs" ]; then
             local resolved=""
@@ -498,6 +509,13 @@ mount_and_chroot() {
                 root_fs="$resolved"
             else
                 echo "Error: Mounted image has no usable Linux root (need /etc/os-release and bash; try another partition or WSL layout under rootfs/)." >&2
+                if [ -n "$LSL_COW_SESSION_IMG" ]; then
+                    command -v guestunmount >/dev/null 2>&1 && guestunmount "$mount_point" 2>/dev/null || true
+                    run_privileged umount "$mount_point" 2>/dev/null || true
+                    rm -f "$LSL_COW_SESSION_IMG" 2>/dev/null || true
+                    LSL_COW_SESSION_IMG=""
+                    LSL_VHDX_SESSION_MOUNT=""
+                fi
                 return 1
             fi
         fi
@@ -518,28 +536,14 @@ mount_and_chroot() {
         return 1
     fi
 
-    # VHDX: honor --tmpfs-overlay always; if ro and no overlay, suggest the flag
-    LSL_VHDX_OVL_BASE=""
-    if [ -n "$vhdx_mounted" ]; then
-        if [ "${LSL_TMPFS_OVERLAY:-false}" = true ]; then
-            local mib="${LSL_VHDX_OVERLAY_MIB:-4096}"
-            local merged
-            merged="$(lsl_vhdx_tmpfs_overlay_mount "$root_fs" "$mib")" || {
-                echo "Error: tmpfs overlay failed (need overlay filesystem support and root/sudo)." >&2
-                return 1
-            }
-            root_fs="$merged"
-            echo "tmpfs overlay active (upper layer up to ${mib}MiB; changes are discarded when you exit)." >&2
-        elif lsl_path_is_readonly "$root_fs"; then
-            echo "" >&2
-            echo "Note: This VHDX is mounted read-only — the disk image will not be written." >&2
-            echo "For a writable session using RAM only (nothing persisted to the VHDX), run:" >&2
-            echo "  sudo lsl --tmpfs-overlay --vhdx \"$vhdx_file\"" >&2
-            echo "Optional: LSL_VHDX_OVERLAY_MIB=8192 caps the writable overlay size (mebibytes)." >&2
-            echo "" >&2
-        fi
+    if [ -n "$vhdx_mounted" ] && [ "${LSL_OVERLAY_DISK:-false}" != true ] && lsl_path_is_readonly "$root_fs"; then
+        echo "" >&2
+        echo "Note: This VHDX is mounted read-only — the disk image will not be written." >&2
+        echo "For a writable copy-on-write session (parent VHDX unchanged), run:" >&2
+        echo "  sudo lsl --overlay-disk --vhdx \"$vhdx_file\"" >&2
+        echo "" >&2
     fi
-    
+
     if ! lsl_is_linux_root "$root_fs"; then
         echo "Warning: Root may be incomplete (missing etc/os-release or bash)" >&2
     fi
@@ -580,15 +584,19 @@ mount_and_chroot() {
     umount "$root_fs/dev" 2>/dev/null || true
     umount "$root_fs/sys" 2>/dev/null || true
 
-    if [ -n "${LSL_VHDX_OVL_BASE:-}" ]; then
-        run_privileged umount "$root_fs" 2>/dev/null || true
-        run_privileged umount "$LSL_VHDX_OVL_BASE" 2>/dev/null || true
-        LSL_VHDX_OVL_BASE=""
+    if [ -n "${LSL_VHDX_SESSION_MOUNT:-}" ]; then
+        if command -v guestunmount >/dev/null 2>&1; then
+            guestunmount "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || run_privileged guestunmount "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || true
+        fi
+        run_privileged umount "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || true
+        rmdir "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || true
+        LSL_VHDX_SESSION_MOUNT=""
     fi
-    
-    # Optionally unmount VHDX (comment out to keep mounted)
-    # guestunmount "$mount_point" 2>/dev/null || umount "$mount_point" 2>/dev/null || true
-    
+    if [ -n "${LSL_COW_SESSION_IMG:-}" ]; then
+        run_privileged rm -f "$LSL_COW_SESSION_IMG" 2>/dev/null || true
+        LSL_COW_SESSION_IMG=""
+    fi
+
     return $exit_code
 }
 
