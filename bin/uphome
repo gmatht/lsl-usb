@@ -18,5 +18,8 @@ btrfs filesystem sync /home 2>/dev/null || true
 if mountpoint -q /mnt/lsl-cache 2>/dev/null; then
     btrfs filesystem sync /mnt/lsl-cache 2>/dev/null || true
 fi
+if [ -x "$SCRIPT_DIR/persist-wifi.sh" ]; then
+    "$SCRIPT_DIR/persist-wifi.sh" || true
+fi
 sync
 echo "home/cache btrfs sync complete."

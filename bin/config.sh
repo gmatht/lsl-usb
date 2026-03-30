@@ -10,6 +10,8 @@
 #   LSL_CONFIG_ROOT  Prefix for etc (e.g. chroot); empty = real /
 set -euo pipefail
 
+mount /cdrom -o rw,remount
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 CDROM="${LSL_CDROM:-/cdrom}"
@@ -50,13 +52,20 @@ sync_cdrom() {
         echo "config.sh: $CDROM not found; skip sync" >&2
         return 0
     fi
-    mkdir -p "$CDROM/bin" "$CDROM/systemd"
+    mkdir -p "$CDROM/bin" "$CDROM/systemd" "$CDROM/misc"
     cp_to_cdrom "$REPO_ROOT/bin/"* "$CDROM/bin/"
     cp_to_cdrom "$REPO_ROOT/onboot.sh" "$CDROM/"
     cp_to_cdrom "$REPO_ROOT/lsl-usb.env" "$CDROM/lsl-usb.env"
+    if [[ -f "$REPO_ROOT/misc/.wezterm.lua" ]]; then
+        cp_to_cdrom "$REPO_ROOT/misc/.wezterm.lua" "$CDROM/misc/.wezterm.lua"
+    fi
     shopt -s nullglob
     cp_to_cdrom "$REPO_ROOT/systemd/"*.service "$CDROM/systemd/"
     shopt -u nullglob
+
+    if [[ -x "$REPO_ROOT/bin/persist-wifi.sh" ]]; then
+        "$REPO_ROOT/bin/persist-wifi.sh" || true
+    fi
 }
 
 install_desktop_shortcuts() {
@@ -126,6 +135,33 @@ EOF
     chown mint:mint "$mint_home/.config/autostart/lsl-home-readonly-warning.desktop"
 }
 
+install_lsl_wezterm_autostart() {
+    local mint_home
+    if [[ -n "$CFG_ROOT" ]]; then
+        mint_home="${CFG_ROOT}/home/mint"
+    else
+        mint_home="/home/mint"
+    fi
+    if [[ ! -d "$mint_home" ]]; then
+        return 0
+    fi
+    mkdir -p "$mint_home/.config/autostart"
+    chown mint:mint "$mint_home/.config" "$mint_home/.config/autostart" 2>/dev/null || true
+
+    cat <<'EOF' >"$mint_home/.config/autostart/lsl-wezterm-autostart.desktop"
+[Desktop Entry]
+Type=Application
+Name=LSL WezTerm chooser
+Comment=Start WezTerm and select a VHDX from find catalogs
+Exec=/cdrom/bin/lsl-wezterm-autostart
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+EOF
+    chmod +x "$mint_home/.config/autostart/lsl-wezterm-autostart.desktop"
+    chown mint:mint "$mint_home/.config/autostart/lsl-wezterm-autostart.desktop"
+}
+
 ensure_cdrom_path_in_bashrc() {
     local bashrc
     if [[ -n "$CFG_ROOT" ]]; then
@@ -181,6 +217,7 @@ install_systemd_units() {
 
 if [[ "$AUTOSTART_WARN_ONLY" -eq 1 ]]; then
     install_lsl_autostart_warning
+    install_lsl_wezterm_autostart
     exit 0
 fi
 
@@ -188,5 +225,6 @@ sync_cdrom
 install_desktop_shortcuts
 if [[ "$SKIP_AUTOSTART_WARN" -eq 0 ]]; then
     install_lsl_autostart_warning
+    install_lsl_wezterm_autostart
 fi
 install_systemd_units

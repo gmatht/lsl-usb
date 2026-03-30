@@ -55,6 +55,7 @@ ensure_wsl_report() {
 DISTRO=""
 LIST_ONLY=false
 LIST_VHDX=false
+CHOOSE_VHDX=false
 COMMAND=""
 VHDX_OVERRIDE=""
 LSL_OVERLAY_DISK=false
@@ -81,6 +82,10 @@ while [[ $# -gt 0 ]]; do
             LIST_VHDX=true
             shift
             ;;
+        --choose)
+            CHOOSE_VHDX=true
+            shift
+            ;;
         -h|--help)
             echo "Usage: lsl [OPTIONS] [COMMAND]"
             echo ""
@@ -90,6 +95,7 @@ while [[ $# -gt 0 ]]; do
             echo "      --overlay-disk       qcow2 copy-on-write layer on the VHDX (session writes; parent image unchanged)"
             echo "  -l, --list               List available WSL distributions"
             echo "      --list-vhdx          List VHDX paths saved from lsl-gui (one path per line)"
+            echo "      --choose             Choose a VHDX from find_*.zstd catalogs and mount it"
             echo "  -h, --help               Show this help message"
             echo ""
             echo "Examples:"
@@ -100,6 +106,7 @@ while [[ $# -gt 0 ]]; do
             echo "  lsl /path/to/disk.vhdx   Same if the path exists (convenience)"
             echo "  lsl -l                   List all available distributions"
             echo "  lsl --list-vhdx          Print saved VHDX paths"
+            echo "  lsl --choose             Pick a VHDX from find_*.zstd indexes"
             echo "  lsl bash                 Run bash in default distribution"
             exit 0
             ;;
@@ -278,6 +285,134 @@ get_first_vhdx() {
         return 0
     fi
     return 1
+}
+
+lsl_normalize_catalog_vhdx_path() {
+    local input="$1"
+    input="${input//$'\r'/}"
+    [ -n "$input" ] || return 1
+
+    if [[ "$input" == /mnt/* ]]; then
+        printf '%s\n' "$input"
+        return 0
+    fi
+
+    if [[ "$input" =~ ^([A-Za-z]):\\(.+)$ ]]; then
+        local drive="${BASH_REMATCH[1],,}"
+        local rest="${BASH_REMATCH[2]}"
+        rest="${rest//\\//}"
+        printf '/mnt/%s/%s\n' "$drive" "$rest"
+        return 0
+    fi
+
+    return 1
+}
+
+lsl_catalog_vhdx_paths() {
+    if ! command -v zstd >/dev/null 2>&1; then
+        echo "Error: zstd is required for --choose (install package: zstd)." >&2
+        return 2
+    fi
+
+    local data_dir zst raw norm
+    local -a catalogs=()
+    data_dir="$(lsl_resolve_data_dir)"
+
+    shopt -s nullglob
+    for zst in "$data_dir"/find_*.zstd /mnt/d/Users/lsl-usb/find_*.zstd; do
+        catalogs+=("$zst")
+    done
+    shopt -u nullglob
+
+    if [ "${#catalogs[@]}" -eq 0 ]; then
+        echo "Error: no find_*.zstd catalogs found in $data_dir or /mnt/d/Users/lsl-usb." >&2
+        return 1
+    fi
+
+    for zst in "${catalogs[@]}"; do
+        while IFS= read -r raw; do
+            norm="$(lsl_normalize_catalog_vhdx_path "$raw" || true)"
+            [ -n "$norm" ] || continue
+            [ -f "$norm" ] || continue
+            printf '%s\n' "$norm"
+        done < <(zstd -d -c -- "$zst" 2>/dev/null | strings | grep -i '\.vhdx$' | grep -vi '/[Tt]emp/')
+    done | sort -u
+}
+
+lsl_choose_vhdx_from_catalog() {
+    local -a paths=()
+    local rc=0 selected selected_id
+    mapfile -t paths < <(lsl_catalog_vhdx_paths) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        return "$rc"
+    fi
+    if [ "${#paths[@]}" -eq 0 ]; then
+        echo "Error: no existing .vhdx files found in find catalogs." >&2
+        return 1
+    fi
+
+    if command -v zenity >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
+        local i
+        local list_rows=""
+        for i in "${!paths[@]}"; do
+            list_rows+="$((i + 1))|$(basename "${paths[$i]}")|${paths[$i]}"$'\n'
+        done
+        selected="$(printf '%s' "$list_rows" | zenity --list \
+            --title="Choose VHDX" \
+            --text="Select a VHDX from find catalogs" \
+            --column="ID" --column="File" --column="Path" \
+            --hide-column=1 \
+            --width=1000 --height=450 2>/dev/null || true)"
+        [ -n "$selected" ] || return 10
+        selected_id="${selected%%|*}"
+        if [[ "$selected_id" =~ ^[0-9]+$ ]] && [ "$selected_id" -ge 1 ] && [ "$selected_id" -le "${#paths[@]}" ]; then
+            printf '%s\n' "${paths[$((selected_id - 1))]}"
+            return 0
+        fi
+        return 10
+    fi
+
+    if command -v dialog >/dev/null 2>&1; then
+        local -a items=()
+        local i
+        for i in "${!paths[@]}"; do
+            items+=("$((i + 1))" "${paths[$i]}")
+        done
+        selected="$(dialog --menu "Select a VHDX from find catalogs" 22 110 14 "${items[@]}" 2>&1 >/dev/tty)" || return 10
+        if [[ "$selected" =~ ^[0-9]+$ ]] && [ "$selected" -ge 1 ] && [ "$selected" -le "${#paths[@]}" ]; then
+            printf '%s\n' "${paths[$((selected - 1))]}"
+            return 0
+        fi
+        return 10
+    fi
+
+    if command -v whiptail >/dev/null 2>&1; then
+        local -a items=()
+        local i
+        for i in "${!paths[@]}"; do
+            items+=("$((i + 1))" "${paths[$i]}")
+        done
+        selected="$(whiptail --menu "Select a VHDX from find catalogs" 22 110 14 "${items[@]}" 3>&1 1>&2 2>&3)" || return 10
+        if [[ "$selected" =~ ^[0-9]+$ ]] && [ "$selected" -ge 1 ] && [ "$selected" -le "${#paths[@]}" ]; then
+            printf '%s\n' "${paths[$((selected - 1))]}"
+            return 0
+        fi
+        return 10
+    fi
+
+    if [ -t 0 ] && [ -t 1 ]; then
+        local pick
+        echo "Choose a VHDX from find catalogs:"
+        select pick in "${paths[@]}"; do
+            [ -n "$pick" ] || return 10
+            printf '%s\n' "$pick"
+            return 0
+        done
+        return 10
+    fi
+
+    printf '%s\n' "${paths[0]}"
+    return 0
 }
 
 # True if path looks like a Linux root (WSL often uses ./rootfs/).
@@ -610,6 +745,21 @@ fi
 if [ "$LIST_ONLY" = true ]; then
     list_distros
     exit $?
+fi
+
+if [ "$CHOOSE_VHDX" = true ]; then
+    choose_rc=0
+    CHOSEN_VHDX="$(lsl_choose_vhdx_from_catalog)" || choose_rc=$?
+    if [ "$choose_rc" -eq 10 ]; then
+        exit 0
+    fi
+    if [ "$choose_rc" -ne 0 ]; then
+        exit "$choose_rc"
+    fi
+    if [ -z "$CHOSEN_VHDX" ]; then
+        exit 0
+    fi
+    VHDX_OVERRIDE="$CHOSEN_VHDX"
 fi
 
 # Direct VHDX mount mode (bypass detection/report)

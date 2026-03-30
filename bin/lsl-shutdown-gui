@@ -156,6 +156,15 @@ upper_summary() {
     printf "%b" "$out"
 }
 
+remount_ro() {
+	for f in /home /cdrom /mnt/*
+	do
+		sudo mount -o ro,remount
+	done
+	sync
+}
+
+
 confirm_and_run() {
     local save_mode="$1"
     local power_mode="$2"
@@ -220,10 +229,12 @@ confirm_and_run() {
                 fi
             fi
             if command -v systemctl >/dev/null 2>&1; then
+		remount_ro
                 run_privileged systemctl reboot
                 return $?
             fi
             if command -v shutdown >/dev/null 2>&1; then
+		remount_ro
                 run_privileged shutdown -r now
                 return $?
             fi
@@ -232,10 +243,12 @@ confirm_and_run() {
             ;;
         reboot)
             if command -v systemctl >/dev/null 2>&1; then
+		remount_ro
                 run_privileged systemctl reboot
                 return $?
             fi
             if command -v shutdown >/dev/null 2>&1; then
+		remount_ro
                 run_privileged shutdown -r now
                 return $?
             fi
@@ -244,10 +257,12 @@ confirm_and_run() {
             ;;
         shutdown)
             if command -v systemctl >/dev/null 2>&1; then
+		remount_ro
                 run_privileged systemctl poweroff
                 return $?
             fi
             if command -v shutdown >/dev/null 2>&1; then
+		remount_ro
                 run_privileged shutdown -h now
                 return $?
             fi
