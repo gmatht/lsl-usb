@@ -1,5 +1,34 @@
 #!/bin/bash
 
+# Ensure the desktop user can use multi-user Nix.
+# On first boot, the "mint" account can appear after this script starts, so retry.
+lsl_ensure_nix_users_group_membership() {
+    if ! getent group nix-users >/dev/null 2>&1; then
+        groupadd --system nix-users 2>/dev/null || true
+    fi
+
+    if id -u mint >/dev/null 2>&1; then
+        usermod -aG nix-users mint 2>/dev/null || true
+        return 0
+    fi
+    if id -u ubuntu >/dev/null 2>&1; then
+        usermod -aG nix-users ubuntu 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+if ! lsl_ensure_nix_users_group_membership; then
+    (
+        i=0
+        while [ "$i" -lt 180 ]; do # up to ~15 minutes
+            sleep 5
+            lsl_ensure_nix_users_group_membership && exit 0
+            i=$((i + 1))
+        done
+    ) &
+fi
+
 # Compressed swap in RAM (zram). Uses LSL_ZRAM_MIB from lsl-usb.env (see lsl_load_config).
 # 0 = off; unset = 80% of MemTotal (minimum 128 MiB).
 lsl_setup_zram() {
@@ -30,6 +59,118 @@ lsl_setup_zram() {
 
     mkswap "$zdev" >/dev/null 2>&1 || return 0
     swapon -p 100 "$zdev" 2>/dev/null || true
+}
+
+# /nix/var can be bind-mounted at runtime; refresh daemon/socket afterwards.
+lsl_ensure_nix_daemon() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+
+    # Prefer socket activation; start service too for distros without it.
+    systemctl enable nix-daemon.socket >/dev/null 2>&1 || true
+    systemctl restart nix-daemon.socket >/dev/null 2>&1 || true
+    systemctl enable nix-daemon.service >/dev/null 2>&1 || true
+    systemctl restart nix-daemon.service >/dev/null 2>&1 || true
+}
+
+# Replace the # BEGIN lsl-usb fstab ... # END lsl-usb fstab block in /etc/fstab so
+# installers, disk tools, and "mount -a" see stable UUID/path lines for /cdrom,
+# Windows drive letters, persist, and (HDD mode) loop-backed /home and cache.
+lsl_merge_fstab() {
+    local fstab=/etc/fstab
+    [ -e "$fstab" ] || touch "$fstab"
+    local tmp block
+    tmp=$(mktemp)
+    block=$(mktemp)
+    awk '
+        /^# BEGIN lsl-usb fstab$/ { skip=1; next }
+        /^# END lsl-usb fstab$/ { skip=0; next }
+        !skip { print }
+    ' "$fstab" > "$tmp"
+
+    lsl_fstab_loop_backing() {
+        local src="$1"
+        case "$src" in
+            /dev/loop*)
+                losetup -n -O BACK-FILE "$src" 2>/dev/null || echo ""
+                ;;
+            *)
+                echo ""
+                ;;
+        esac
+    }
+
+    {
+        echo "# BEGIN lsl-usb fstab"
+        echo "# Maintained by onboot.sh (lsl_merge_fstab); edit only outside this block."
+
+        local src fst uuid mp letter back _lsl_cm
+        if mountpoint -q /cdrom 2>/dev/null; then
+            src=$(findmnt -n -o SOURCE /cdrom 2>/dev/null)
+            fst=$(findmnt -n -o FSTYPE /cdrom 2>/dev/null)
+            if [ -n "$src" ] && [ -n "$fst" ]; then
+                uuid=$(blkid -s UUID -o value "$src" 2>/dev/null || true)
+                if [ -n "$uuid" ]; then
+                    echo "UUID=$uuid /cdrom $fst defaults,ro,nofail 0 0"
+                else
+                    echo "$src /cdrom $fst defaults,ro,nofail 0 0"
+                fi
+            fi
+        fi
+
+        if [ -f /cdrom/persist.btrfs ]; then
+            echo "/cdrom/persist.btrfs /persist btrfs loop,compress=zstd:3,nofail 0 0"
+        fi
+
+        for letter in {c..z}; do
+            mp="/mnt/$letter"
+            if mountpoint -q "$mp" 2>/dev/null; then
+                src=$(findmnt -n -o SOURCE "$mp" 2>/dev/null)
+                fst=$(findmnt -n -o FSTYPE "$mp" 2>/dev/null)
+                case "$fst" in
+                    ntfs|ntfs3|fuseblk)
+                        uuid=$(blkid -s UUID -o value "$src" 2>/dev/null || true)
+                        if [ -n "$uuid" ]; then
+                            echo "UUID=$uuid $mp ntfs3 defaults,nofail 0 0"
+                        else
+                            echo "$src $mp ntfs3 defaults,nofail 0 0"
+                        fi
+                        ;;
+                esac
+            fi
+        done
+
+        if mountpoint -q /home 2>/dev/null; then
+            fst=$(findmnt -n -o FSTYPE /home 2>/dev/null)
+            src=$(findmnt -n -o SOURCE /home 2>/dev/null)
+            if [ "$fst" = "btrfs" ] && [ -n "$src" ]; then
+                back=$(lsl_fstab_loop_backing "$src")
+                if [ -n "$back" ]; then
+                    echo "$back /home btrfs loop,compress=zstd:3,relatime,nofail 0 0"
+                fi
+            elif [ "$fst" = "overlay" ]; then
+                echo "# /home is overlay (LSL USB mode); not expressible as one fstab line."
+            fi
+        fi
+
+        _lsl_cm="${LSL_CACHE_MOUNT:-/mnt/lsl-cache}"
+        if mountpoint -q "$_lsl_cm" 2>/dev/null; then
+            fst=$(findmnt -n -o FSTYPE "$_lsl_cm" 2>/dev/null)
+            src=$(findmnt -n -o SOURCE "$_lsl_cm" 2>/dev/null)
+            if [ "$fst" = "btrfs" ] && [ -n "$src" ]; then
+                back=$(lsl_fstab_loop_backing "$src")
+                if [ -n "$back" ]; then
+                    echo "$back $_lsl_cm btrfs loop,compress=zstd:3,relatime,nofail 0 0"
+                fi
+            fi
+        fi
+
+        echo "# END lsl-usb fstab"
+    } > "$block"
+
+    cat "$block" >> "$tmp"
+    chmod --reference="$fstab" "$tmp" 2>/dev/null || chmod 644 "$tmp"
+    mv -f "$tmp" "$fstab"
+    rm -f "$block"
 }
 
 # Keep /cdrom read-only by default; only remount rw when explicitly persisting images.
@@ -66,6 +207,10 @@ fi
 
 modprobe ntfs3 2>/dev/null || true
 mkdir -p /mnt/c /mnt/d
+if true; then # I hope this new code works...
+	bash /cdrom/bin/mount_all.sh
+else # begin stubbed out code.
+
 #TODO: Should automatically detect which device has C: and D:
 if ! mountpoint -q /mnt/c 2>/dev/null; then
     bash /cdrom/bin/safe_ntfsfix.sh /dev/nvme0n1p3 
@@ -76,6 +221,8 @@ if ! mountpoint -q /mnt/d 2>/dev/null; then
     #bash /cdrom/bin/safe_ntfsfix.sh /dev/nvme1n1p2 
     mount -t ntfs3 /dev/nvme1n1p2 /mnt/d 2>/dev/null || true
 fi
+
+fi #End Stubbed Out Code.
 
 if [ -x /cdrom/bin/wsl-boot-setup ]; then
     /cdrom/bin/wsl-boot-setup
@@ -164,8 +311,6 @@ else
         mkfs.btrfs -f "$CACHE_IMG" >/dev/null
     fi
     mount -o loop,compress=zstd:3,relatime "$HOME_IMG" /home
-    sudo usermod -aG nix-users mint ||
-	sudo usermod -aG nix-users ubuntu
 
     lsl_prepare_bash_log "$LSL_BASH_LOG"
     mkdir -p "$LSL_CACHE_MOUNT"
@@ -214,6 +359,9 @@ EOF
         echo "LSL_CACHE_MOUNT=$LSL_CACHE_MOUNT"
     } > /run/lsl-usb.state
 fi
+
+lsl_merge_fstab || true
+lsl_ensure_nix_daemon || true
 
 # After /home is mounted (config.sh --from-onboot runs earlier, before home setup).
 if [ -x /cdrom/bin/config.sh ]; then

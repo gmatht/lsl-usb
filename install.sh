@@ -21,14 +21,16 @@ cp /etc/resolv.conf /tmp/squashfs/root/etc/resolv.conf
 
 LSL_CONFIG_ROOT=/tmp/squashfs/root "$REPO_ROOT/bin/config.sh" --systemd-only
 
-cat <<EOF | chroot /tmp/squashfs/root/
+"$REPO_ROOT/bin/mount_all.sh" &&
+	mkdir -p /mnt/c/Users/lsl-usb &&
+	for f in /mnt/*; do ( time find $f | zstd -19 > /mnt/c/Users/lsl-usb/find_$f.zstd) & done
 
-apt update
-apt upgrade -y
-apt install -y btrfs-progs guestmount neovim nix-bin git steam-installer zenity libhivex-bin chntpw guestfish kexec-tools
-#curl -fsS https://dl.brave.com/install.sh | sh
 
-EOF
+
+# mount_all.sh expects hivexregedit, fdisk, xxd (packages: libhivex-bin or hivex-tools, fdisk, xxd).
+#"$REPO_ROOT/bin/mount_all.sh" &&
+#cat <<EOF | chroot /tmp/squashfs/root/
+cat bin/squashfs_config.sh | chroot /tmp/squashfs/root/
 
 #Create new filesystem.squashfs and move old one to filesystem_<date>.squashfs
 mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem_new.squashfs -comp zstd -Xcompression-level 22
