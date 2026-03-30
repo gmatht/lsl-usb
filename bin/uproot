@@ -3,7 +3,22 @@
 
 set -e
 
+on_error() {
+    local ec="$?"
+    local line="$1"
+    echo "uproot failed at line ${line} (exit ${ec})."
+    if [ -n "${build_log:-}" ] && [ -f "${build_log:-}" ]; then
+        echo "See log: ${build_log}"
+    fi
+}
+trap 'on_error $LINENO' ERR
+
 echo "Updating filesystem.squashfs..."
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root (e.g. sudo bin/uproot)"
+    exit 1
+fi
 
 ts="$(date +%Y%m%d%H%M%S)"
 if mountpoint -q /persist 2>/dev/null; then
@@ -37,15 +52,86 @@ get_live_root_lowerdir() {
     printf "%s" "$opts" | tr ',' '\n' | sed -n 's/^lowerdir=//p' | head -n 1
 }
 
+MOUNTED_LOWER_TARGETS=()
+
+check_overlay_support() {
+    if ! awk '$1=="nodev" && $2=="overlay" {found=1} END{exit(found?0:1)}' /proc/filesystems 2>/dev/null; then
+        echo "Error: overlayfs is not available in this kernel namespace."
+        return 1
+    fi
+}
+
+validate_lowerdirs() {
+    local lower_csv="$1"
+    local d
+    IFS=':' read -r -a _lowerdirs <<< "$lower_csv"
+    for d in "${_lowerdirs[@]}"; do
+        if [ ! -d "$d" ]; then
+            echo "Error: lowerdir entry is not a directory: $d"
+            return 1
+        fi
+    done
+}
+
+resolve_live_lowerdirs() {
+    local lower_csv="$1"
+    local entry base squashfs_file mnt
+    local warned_missing=0
+    local -a resolved=()
+
+    mkdir -p /tmp/squashfs/lower
+    IFS=':' read -r -a _lowerdirs <<< "$lower_csv"
+    for entry in "${_lowerdirs[@]}"; do
+        [ -n "$entry" ] || continue
+        if [ -d "$entry" ]; then
+            resolved+=("$entry")
+            continue
+        fi
+
+        base="$(basename "$entry")"
+        if [ "$base" = "filesystem.squashfs" ] && mountpoint -q /rofs 2>/dev/null; then
+            resolved+=("/rofs")
+            continue
+        fi
+
+        squashfs_file="/cdrom/casper/$base"
+        if [ -f "$squashfs_file" ]; then
+            mnt="/tmp/squashfs/lower/$base"
+            mkdir -p "$mnt"
+            if ! mountpoint -q "$mnt" 2>/dev/null; then
+                mount -t squashfs -o loop,ro "$squashfs_file" "$mnt"
+                MOUNTED_LOWER_TARGETS+=("$mnt")
+            fi
+            resolved+=("$mnt")
+            continue
+        fi
+
+        # Non-live/degraded environments may not expose every casper layer path.
+        # Keep going with what we can resolve (typically /rofs).
+        echo "Warning: could not resolve lowerdir entry: $entry" >&2
+        echo "         looked for: $squashfs_file" >&2
+        warned_missing=1
+    done
+
+    if [ "${#resolved[@]}" -eq 0 ]; then
+        echo "Error: could not resolve any usable lowerdir from: $lower_csv" >&2
+        return 1
+    fi
+    if [ "$warned_missing" -eq 1 ]; then
+        echo "Warning: proceeding with partial lowerdir stack: $(IFS=':'; echo "${resolved[*]}")" >&2
+    fi
+    (IFS=':'; echo "${resolved[*]}")
+}
+
 prompt_choice() {
     local ans=""
-    echo ""
+    echo "" >&2
     #I Don't see anyof this.
-    echo "Persist these root changes to the USB image?"
-    echo "1) Append new squashfs layer (stacking; fast; may confuse dpkg if you keep many layers)"
-    echo "2) Merge into a single filesystem.squashfs (slower; keeps dpkg consistent)"
-    echo "3) Skip (do nothing)"
-    echo "... actually I THINK we order the squashfs such that appending won't confuse dpkg, but it WILL add overhead as we have to walk more squashfs"
+    echo "Persist these root changes to the USB image?" >&2
+    echo "1) Append new squashfs layer (stacking; fast; may confuse dpkg if you keep many layers)" >&2
+    echo "2) Merge into a single filesystem.squashfs (slower; keeps dpkg consistent)" >&2
+    echo "3) Skip (do nothing)" >&2
+    echo "... actually I THINK we order the squashfs such that appending won't confuse dpkg, but it WILL add overhead as we have to walk more squashfs" >&2
     read -r -p "Choose (1-3): " ans || true
     case "$ans" in
         1) echo "append" ;;
@@ -55,17 +141,29 @@ prompt_choice() {
 }
 
 write_append_layer() {
-    local ts layer
+    local ts layer meta
     ts="$(date +%Y%m%d%H%M%S)"
     # Naming: make it sort LAST in /cdrom/casper/*.squashfs so casper's reverse-order logic
     # gives it HIGHEST precedence (first in lowerdir=...).
     layer="/cdrom/casper/filesystem_z${ts}.squashfs"
+    meta="/cdrom/casper/filesystem_z${ts}.sh"
     echo "Writing new layer squashfs: $layer"
     mksquashfs /tmp/squashfs/upper "$layer" -comp zstd -Xcompression-level 22
+    if [ -n "${squashfs_config_used_host:-}" ] && [ -f "$squashfs_config_used_host" ]; then
+        cp -a "$squashfs_config_used_host" "$meta"
+        echo "Saved config script snapshot: $meta"
+        log "Companion config copy: $meta (from $squashfs_config_used_host)"
+    else
+        echo "No squashfs_config.sh path recorded; skipping ${meta##*/}"
+    fi
     echo "Layer written. Reboot to have casper include it."
 }
 
 cleanup_mounts() {
+    local i
+    for (( i=${#MOUNTED_LOWER_TARGETS[@]}-1; i>=0; i-- )); do
+        umount "${MOUNTED_LOWER_TARGETS[$i]}" 2>/dev/null || true
+    done
     umount /tmp/squashfs/root/var/cache/apt/archives 2>/dev/null || true
     umount /tmp/squashfs/root/home 2>/dev/null || true
     umount /tmp/squashfs/root/proc 2>/dev/null || true
@@ -76,16 +174,68 @@ cleanup_mounts() {
 }
 trap cleanup_mounts EXIT
 
-# Remount /cdrom as read-write
-mount /cdrom -o remount,rw
+clear_mount_tree() {
+    local target="$1"
+    [ -n "$target" ] || return 0
+    if ! mountpoint -q "$target" 2>/dev/null; then
+        return 0
+    fi
+    echo "Cleaning stale mount tree at $target ..."
+    # Prefer recursive unmount to avoid stale bind mounts from prior runs.
+    if ! umount -R "$target" 2>/dev/null; then
+        # Fallback for systems where -R is unavailable or partially fails.
+        umount "$target/var/cache/apt/archives" 2>/dev/null || true
+        umount "$target/home" 2>/dev/null || true
+        umount "$target/proc" 2>/dev/null || true
+        umount "$target/dev" 2>/dev/null || true
+        umount "$target/sys" 2>/dev/null || true
+        umount "$target/cdrom" 2>/dev/null || true
+        umount "$target" 2>/dev/null || true
+    fi
+    if mountpoint -q "$target" 2>/dev/null; then
+        echo "Error: failed to unmount stale mount tree at $target"
+        return 1
+    fi
+}
+
+prompt_unmount_existing_overlay() {
+    local ans=""
+    if ! mountpoint -q /tmp/squashfs/root/ 2>/dev/null; then
+        return 1
+    fi
+    echo ""
+    echo "An existing overlay is already mounted at /tmp/squashfs/root."
+    read -r -p "Unmount it and start fresh? (y/N): " ans || true
+    case "${ans:-}" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Remount /cdrom as read-write when available.
+if mountpoint -q /cdrom 2>/dev/null; then
+    mount /cdrom -o remount,rw || echo "Warning: could not remount /cdrom read-write; continuing."
+else
+    echo "Warning: /cdrom is not mounted; writing output/logs may fail."
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -x "$SCRIPT_DIR/persist-wifi.sh" ]; then
+    "$SCRIPT_DIR/persist-wifi.sh" || true
+fi
 
 # Create overlay filesystem directories
 mkdir -p /tmp/squashfs/upper/ /tmp/squashfs/work/ /tmp/squashfs/root/
 
-# Mount overlay filesystem (unmount first if already mounted)
+# Mount overlay filesystem (or continue with existing mounted one).
+reuse_existing_overlay=0
 if mountpoint -q /tmp/squashfs/root/ 2>/dev/null; then
-    echo "Unmounting existing overlay..."
-    umount /tmp/squashfs/root/ || true
+    if prompt_unmount_existing_overlay; then
+        clear_mount_tree /tmp/squashfs/root/
+    else
+        echo "Keeping existing mounted overlay at /tmp/squashfs/root."
+        reuse_existing_overlay=1
+    fi
 fi
 
 # Use the same lowerdir stack as the live / overlay, not just /rofs.
@@ -94,17 +244,18 @@ if [ -z "${lowerdir:-}" ]; then
     echo "Warning: could not determine live lowerdir stack; falling back to /rofs only."
     lowerdir="/rofs"
 fi
-
-#lowerdir is "/filesystem.squashfs" ... how does that work
-#just ALWAYS fall back to /rofs
-#
-
-echo FALLING BACK TO /rofs. YOU MAY HAVE TO REDO CHANGES!
-lowerdir=/rofs
+lowerdir="$(resolve_live_lowerdirs "$lowerdir")"
 
 log "lowerdir=${lowerdir}"
-echo -- mount -t overlay overlay -o "upperdir=/tmp/squashfs/upper/,lowerdir=${lowerdir},workdir=/tmp/squashfs/work/" /tmp/squashfs/root/
-mount -t overlay overlay -o "upperdir=/tmp/squashfs/upper/,lowerdir=${lowerdir},workdir=/tmp/squashfs/work/" /tmp/squashfs/root/
+if [ "$reuse_existing_overlay" -eq 0 ]; then
+    check_overlay_support
+    validate_lowerdirs "$lowerdir"
+    overlay_opts="upperdir=/tmp/squashfs/upper/,lowerdir=${lowerdir},workdir=/tmp/squashfs/work/"
+    echo -- mount -t overlay none /tmp/squashfs/root/ -o "$overlay_opts"
+    mount -t overlay none /tmp/squashfs/root/ -o "$overlay_opts"
+else
+    echo "Reusing currently mounted overlay at /tmp/squashfs/root."
+fi
 
 # Bind mount apt cache for package installations
 mount --bind /var/cache/apt/archives/ /tmp/squashfs/root/var/cache/apt/archives/ || true
@@ -128,36 +279,79 @@ log "Entering chroot. Session logs under: ${usb_log_dir}"
 chroot_typescript="${usb_log_dir}/chroot-${ts}.typescript"
 chroot_history="${usb_log_dir}/chroot-${ts}.history"
 chroot_cast="${usb_log_dir}/chroot-${ts}.cast"
+auto_log="${usb_log_dir}/squashfs-config-${ts}.log"
+interactive="${UPROOT_INTERACTIVE:-0}"
 
-if chroot /tmp/squashfs/root /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -lc 'command -v asciinema >/dev/null 2>&1'; then
-    # Prefer asciinema if available (cleaner, searchable playback).
-    log "Recording chroot session to $(basename "$chroot_cast") (asciinema)"
+# Config script path inside chroot: only /cdrom/... exists there if the USB image has bin/.
+# Repo checkout lives on the host FS — copy into chroot /tmp for that case.
+config_host=""
+if [ -n "${UPROOT_SQUASHFS_CONFIG:-}" ] && [ -f "$UPROOT_SQUASHFS_CONFIG" ]; then
+    config_host="$UPROOT_SQUASHFS_CONFIG"
+elif [ -f "/tmp/squashfs/root/cdrom/bin/squashfs_config.sh" ]; then
+    config_host="/cdrom/bin/squashfs_config.sh"
+elif [ -f "$SCRIPT_DIR/squashfs_config.sh" ]; then
+    config_host="$SCRIPT_DIR/squashfs_config.sh"
+fi
+# Snapshot source for companion .sh next to append layers (same basename as .squashfs).
+squashfs_config_used_host="${config_host:-}"
+
+config_in_chroot=""
+if [ -n "$config_host" ]; then
+    if [[ "$config_host" == /cdrom/* ]] && [ -f "/tmp/squashfs/root$config_host" ]; then
+        config_in_chroot="$config_host"
+    else
+        mkdir -p /tmp/squashfs/root/tmp
+        install -m 755 "$config_host" /tmp/squashfs/root/tmp/run-squashfs_config.sh
+        config_in_chroot="/tmp/run-squashfs_config.sh"
+        log "Using host script (not on USB): $config_host -> $config_in_chroot"
+    fi
+fi
+
+if [ -n "$config_in_chroot" ]; then
+    log "Running ${config_in_chroot} non-interactively (log: $(basename "$auto_log"))."
+    echo ""
+    echo "=== squashfs_config.sh (live output; also: $auto_log) ==="
     chroot /tmp/squashfs/root /usr/bin/env \
-        HISTFILE="${chroot_history}" \
-        HISTSIZE=200000 \
-        HISTFILESIZE=200000 \
-        ASCIINEMA_REC=1 \
-        asciinema rec -q "${chroot_cast}" -c "/bin/bash -i"
-elif chroot /tmp/squashfs/root /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -lc 'command -v script >/dev/null 2>&1'; then
-# script says no pty
-#elif chroot /tmp/squashfs/root /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash'; then
-#elif false
-    # Fallback: util-linux script(1) transcript.
-    log "Recording chroot transcript to $(basename "$chroot_typescript") (script)"
-    script -c "chroot /tmp/squashfs/root /bin/bash"
-        #HISTFILE="${chroot_history}" \
-        #HISTSIZE=200000 \
-        #HISTFILESIZE=200000 \
-        #/bin/bash -i
-        #/usr/bin/script -q -f "${chroot_typescript}" -c "/bin/bash -i"
+        DEBIAN_FRONTEND=noninteractive \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        /bin/bash -lc "set -e; /bin/bash '${config_in_chroot}'" 2>&1 | tee "$auto_log"
+    squashfs_config_rc="${PIPESTATUS[0]}"
+    echo "=== squashfs_config.sh finished (exit $squashfs_config_rc) ==="
+    echo ""
+    if [ "$squashfs_config_rc" -ne 0 ]; then
+        echo "Non-interactive run failed: ${config_in_chroot}"
+        echo "See log: $auto_log"
+        log "Non-interactive run failed. Falling back to interactive chroot."
+        interactive=1
+    fi
 else
-    # Fallback: no transcript tool, but still persist bash history to USB.
-    log "No asciinema/script found in chroot; recording history only to $(basename "$chroot_history")"
-    chroot /tmp/squashfs/root /usr/bin/env \
-        HISTFILE="${chroot_history}" \
-        HISTSIZE=200000 \
-        HISTFILESIZE=200000 \
-        /bin/bash -i
+    log "No squashfs_config.sh found (UPROOT_SQUASHFS_CONFIG, /cdrom/bin/, or $SCRIPT_DIR/squashfs_config.sh)."
+fi
+
+if [ "$interactive" = "1" ]; then
+    if chroot /tmp/squashfs/root /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -lc 'command -v asciinema >/dev/null 2>&1'; then
+        # Prefer asciinema if available (cleaner, searchable playback).
+        log "Recording chroot session to $(basename "$chroot_cast") (asciinema)"
+        chroot /tmp/squashfs/root /usr/bin/env \
+            HISTFILE="${chroot_history}" \
+            HISTSIZE=200000 \
+            HISTFILESIZE=200000 \
+            ASCIINEMA_REC=1 \
+            asciinema rec -q "${chroot_cast}" -c "/bin/bash -i"
+    elif chroot /tmp/squashfs/root /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -lc 'command -v script >/dev/null 2>&1'; then
+        # Fallback: util-linux script(1) transcript.
+        log "Recording chroot transcript to $(basename "$chroot_typescript") (script)"
+        echo "Entering interactive chroot shell now. Type 'exit' when done to continue."
+        script -q -f "$chroot_typescript" -c "chroot /tmp/squashfs/root /usr/bin/env HISTFILE='${chroot_history}' HISTSIZE=200000 HISTFILESIZE=200000 /bin/bash -i"
+    else
+        # Fallback: no transcript tool, but still persist bash history to USB.
+        log "No asciinema/script found in chroot; recording history only to $(basename "$chroot_history")"
+        chroot /tmp/squashfs/root /usr/bin/env \
+            HISTFILE="${chroot_history}" \
+            HISTSIZE=200000 \
+            HISTFILESIZE=200000 \
+            /bin/bash -i
+    fi
 fi
 
 upper_bytes="$(du -sb /tmp/squashfs/upper 2>/dev/null | awk '{print $1}' || echo 0)"
