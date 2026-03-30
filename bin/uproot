@@ -11,7 +11,10 @@ if mountpoint -q /persist 2>/dev/null; then
 else
     usb_log_dir="/cdrom/casper/uproot-logs"
 fi
-mkdir -p "$usb_log_dir"
+if ! mkdir -p "$usb_log_dir" 
+then 
+	usb_log_dir=/tmp
+fi
 build_log="${usb_log_dir}/uproot-${ts}.log"
 
 log() {
@@ -37,10 +40,12 @@ get_live_root_lowerdir() {
 prompt_choice() {
     local ans=""
     echo ""
+    #I Don't see anyof this.
     echo "Persist these root changes to the USB image?"
     echo "1) Append new squashfs layer (stacking; fast; may confuse dpkg if you keep many layers)"
     echo "2) Merge into a single filesystem.squashfs (slower; keeps dpkg consistent)"
     echo "3) Skip (do nothing)"
+    echo "... actually I THINK we order the squashfs such that appending won't confuse dpkg, but it WILL add overhead as we have to walk more squashfs"
     read -r -p "Choose (1-3): " ans || true
     case "$ans" in
         1) echo "append" ;;
@@ -89,7 +94,16 @@ if [ -z "${lowerdir:-}" ]; then
     echo "Warning: could not determine live lowerdir stack; falling back to /rofs only."
     lowerdir="/rofs"
 fi
+
+#lowerdir is "/filesystem.squashfs" ... how does that work
+#just ALWAYS fall back to /rofs
+#
+
+echo FALLING BACK TO /rofs. YOU MAY HAVE TO REDO CHANGES!
+lowerdir=/rofs
+
 log "lowerdir=${lowerdir}"
+echo -- mount -t overlay overlay -o "upperdir=/tmp/squashfs/upper/,lowerdir=${lowerdir},workdir=/tmp/squashfs/work/" /tmp/squashfs/root/
 mount -t overlay overlay -o "upperdir=/tmp/squashfs/upper/,lowerdir=${lowerdir},workdir=/tmp/squashfs/work/" /tmp/squashfs/root/
 
 # Bind mount apt cache for package installations
@@ -97,13 +111,13 @@ mount --bind /var/cache/apt/archives/ /tmp/squashfs/root/var/cache/apt/archives/
 mount --bind /home/ /tmp/squashfs/root/home || true
 mkdir -p /tmp/squashfs/root/cdrom
 mount --bind /cdrom /tmp/squashfs/root/cdrom || true
-mkdir -p /tmp/squashfs/root/persist
-if mountpoint -q /persist 2>/dev/null; then
-    mount --bind /persist /tmp/squashfs/root/persist || true
-fi
+#mkdir -p /tmp/squashfs/root/persist
+#if mountpoint -q /persist 2>/dev/null; then
+#    mount --bind /persist /tmp/squashfs/root/persist || true
+#fi
 
 # Copy resolv.conf for network access
-cp /etc/resolv.conf /tmp/squashfs/root/etc/resolv.conf || true
+#cp /etc/resolv.conf /tmp/squashfs/root/etc/resolv.conf || true
 
 # Make chroot usable for apt/dpkg tooling.
 mount --bind /proc /tmp/squashfs/root/proc 2>/dev/null || true
@@ -125,13 +139,17 @@ if chroot /tmp/squashfs/root /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin 
         ASCIINEMA_REC=1 \
         asciinema rec -q "${chroot_cast}" -c "/bin/bash -i"
 elif chroot /tmp/squashfs/root /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -lc 'command -v script >/dev/null 2>&1'; then
+# script says no pty
+#elif chroot /tmp/squashfs/root /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash'; then
+#elif false
     # Fallback: util-linux script(1) transcript.
     log "Recording chroot transcript to $(basename "$chroot_typescript") (script)"
-    chroot /tmp/squashfs/root /usr/bin/env \
-        HISTFILE="${chroot_history}" \
-        HISTSIZE=200000 \
-        HISTFILESIZE=200000 \
-        /usr/bin/script -q -f "${chroot_typescript}" -c "/bin/bash -i"
+    script -c "chroot /tmp/squashfs/root /bin/bash"
+        #HISTFILE="${chroot_history}" \
+        #HISTSIZE=200000 \
+        #HISTFILESIZE=200000 \
+        #/bin/bash -i
+        #/usr/bin/script -q -f "${chroot_typescript}" -c "/bin/bash -i"
 else
     # Fallback: no transcript tool, but still persist bash history to USB.
     log "No asciinema/script found in chroot; recording history only to $(basename "$chroot_history")"
