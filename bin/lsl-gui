@@ -8,6 +8,10 @@ LSL_SCRIPT="$LSL_SCRIPT_DIR/lsl"
 # shellcheck source=/dev/null
 . "$LSL_SCRIPT_DIR/lsl-common.sh"
 
+#STUB, GUI seems to be broken just run the CLI chooser for now.
+wezterm start -- sudo bash -c "bash $LSL_SCRIPT --choose --pause-on-quit; read"
+exit
+
 run_privileged() {
     # Run a command with privileges if possible.
     # Prefer pkexec for GUI prompts; fall back to sudo.
