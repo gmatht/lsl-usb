@@ -59,6 +59,26 @@ lsl_state_file() {
     echo /run/lsl-usb.state
 }
 
+lsl_runtime_dir() {
+    local d fallback
+    d="${LSL_RUNTIME_DIR:-/run/lsl-usb}"
+    mkdir -p "$d" 2>/dev/null || true
+    if [ ! -d "$d" ]; then
+        fallback="/tmp/lsl-usb"
+        mkdir -p "$fallback" 2>/dev/null || true
+        d="$fallback"
+    fi
+    if [ -d "$d" ]; then
+        readlink -f "$d" 2>/dev/null || echo "$d"
+    else
+        echo "$d"
+    fi
+}
+
+lsl_mount_state_base() {
+    printf '%s/mounts\n' "$(lsl_runtime_dir)"
+}
+
 lsl_source_state() {
     local f
     f="$(lsl_state_file)"
