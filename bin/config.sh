@@ -162,6 +162,33 @@ EOF
     chown mint:mint "$mint_home/.config/autostart/lsl-wezterm-autostart.desktop"
 }
 
+install_lsl_pin_favorites_autostart() {
+    local mint_home
+    if [[ -n "$CFG_ROOT" ]]; then
+        mint_home="${CFG_ROOT}/home/mint"
+    else
+        mint_home="/home/mint"
+    fi
+    if [[ ! -d "$mint_home" ]]; then
+        return 0
+    fi
+    mkdir -p "$mint_home/.config/autostart"
+    chown mint:mint "$mint_home/.config" "$mint_home/.config/autostart" 2>/dev/null || true
+
+    cat <<'EOF' >"$mint_home/.config/autostart/lsl-pin-favorites.desktop"
+[Desktop Entry]
+Type=Application
+Name=LSL pin favorites
+Comment=Pin WezTerm and Brave to Cinnamon favorites/panel
+Exec=/cdrom/bin/lsl-pin-favorites
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+EOF
+    chmod +x "$mint_home/.config/autostart/lsl-pin-favorites.desktop"
+    chown mint:mint "$mint_home/.config/autostart/lsl-pin-favorites.desktop"
+}
+
 ensure_cdrom_path_in_bashrc() {
     local bashrc
     if [[ -n "$CFG_ROOT" ]]; then
@@ -226,5 +253,6 @@ install_desktop_shortcuts
 if [[ "$SKIP_AUTOSTART_WARN" -eq 0 ]]; then
     install_lsl_autostart_warning
     install_lsl_wezterm_autostart
+    install_lsl_pin_favorites_autostart
 fi
 install_systemd_units
