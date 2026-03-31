@@ -22,6 +22,102 @@ run_privileged() {
     return 1
 }
 
+LSL_SHARED_MOUNT_DIR=""
+LSL_SHARED_MOUNT_PIN=""
+LSL_SHARED_SESSION_ATTACHED=false
+
+lsl_mount_state_id() {
+    local mount_point="$1"
+    local abs hash
+    abs="$(readlink -f "$mount_point" 2>/dev/null || echo "$mount_point")"
+    if command -v md5sum >/dev/null 2>&1; then
+        hash="$(printf '%s' "$abs" | md5sum | awk '{print $1}')"
+    else
+        hash="$(printf '%s' "$abs" | cksum | awk '{print $1}')"
+    fi
+    printf '%s\n' "$hash"
+}
+
+lsl_shared_mount_state_dir() {
+    local mount_point="$1"
+    printf '%s/%s\n' "$(lsl_mount_state_base)" "$(lsl_mount_state_id "$mount_point")"
+}
+
+lsl_shared_mount_prune_stale_pins() {
+    local state_dir="$1"
+    local pin base pid
+    shopt -s nullglob
+    for pin in "$state_dir"/pins/*.pin; do
+        base="$(basename "$pin")"
+        pid="${base%%-*}"
+        if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$pin" 2>/dev/null || true
+        fi
+    done
+    shopt -u nullglob
+}
+
+lsl_shared_mount_attach() {
+    local mount_point="$1"
+    local state_dir lock_file fd
+    [ "${LSL_OVERLAY_DISK:-false}" = true ] && return 0
+    [ -n "$mount_point" ] || return 1
+
+    state_dir="$(lsl_shared_mount_state_dir "$mount_point")"
+    mkdir -p "$state_dir/pins" 2>/dev/null || true
+    lock_file="$state_dir/lock"
+
+    exec {fd}>"$lock_file" || return 1
+    flock "$fd" || {
+        exec {fd}>&-
+        return 1
+    }
+
+    lsl_shared_mount_prune_stale_pins "$state_dir"
+    LSL_SHARED_MOUNT_PIN="$state_dir/pins/$$-$RANDOM.pin"
+    printf 'pid=%s\nmount=%s\n' "$$" "$mount_point" >"$LSL_SHARED_MOUNT_PIN" 2>/dev/null || :
+    LSL_SHARED_MOUNT_DIR="$state_dir"
+    LSL_SHARED_SESSION_ATTACHED=true
+
+    flock -u "$fd" || true
+    exec {fd}>&-
+    return 0
+}
+
+lsl_shared_mount_detach() {
+    local fd pins_count=0 lock_file
+    [ "$LSL_SHARED_SESSION_ATTACHED" = true ] || return 1
+    [ -n "$LSL_SHARED_MOUNT_DIR" ] || return 1
+
+    lock_file="$LSL_SHARED_MOUNT_DIR/lock"
+    exec {fd}>"$lock_file" || return 1
+    flock "$fd" || {
+        exec {fd}>&-
+        return 1
+    }
+
+    if [ -n "$LSL_SHARED_MOUNT_PIN" ]; then
+        rm -f "$LSL_SHARED_MOUNT_PIN" 2>/dev/null || true
+    fi
+    lsl_shared_mount_prune_stale_pins "$LSL_SHARED_MOUNT_DIR"
+    shopt -s nullglob
+    local pins=("$LSL_SHARED_MOUNT_DIR"/pins/*.pin)
+    pins_count="${#pins[@]}"
+    shopt -u nullglob
+
+    flock -u "$fd" || true
+    exec {fd}>&-
+
+    LSL_SHARED_MOUNT_PIN=""
+    LSL_SHARED_MOUNT_DIR=""
+    LSL_SHARED_SESSION_ATTACHED=false
+
+    if [ "$pins_count" -eq 0 ]; then
+        return 0
+    fi
+    return 2
+}
+
 # Function to ensure WSL report exists by running detect-wsl if needed
 ensure_wsl_report() {
     if [ ! -f "$WSL_REPORT" ] || [ ! -s "$WSL_REPORT" ] || grep -q "No WSL distributions found" "$WSL_REPORT" 2>/dev/null; then
@@ -60,6 +156,12 @@ COMMAND=""
 VHDX_OVERRIDE=""
 LSL_OVERLAY_DISK=false
 
+opt_pause() {
+	if [ "${PAUSE_ON_QUIT:-false}" = true ]; then
+		read
+	fi
+}
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         -d|--distribution)
@@ -86,6 +188,10 @@ while [[ $# -gt 0 ]]; do
             CHOOSE_VHDX=true
             shift
             ;;
+	--pause-on-quit)
+	    PAUSE_ON_QUIT=true
+	    shift
+	    ;;
         -h|--help)
             echo "Usage: lsl [OPTIONS] [COMMAND]"
             echo ""
@@ -95,8 +201,12 @@ while [[ $# -gt 0 ]]; do
             echo "      --overlay-disk       qcow2 copy-on-write layer on the VHDX (session writes; parent image unchanged)"
             echo "  -l, --list               List available WSL distributions"
             echo "      --list-vhdx          List VHDX paths saved from lsl-gui (one path per line)"
-            echo "      --choose             Choose a VHDX from find_*.zstd catalogs and mount it"
+            echo "      --choose             Choose a VHDX from find_*.zstd catalogs (terminal: list + letter/number)"
+	    echo "      --pause-on-quit      Wait for user to press enter before quitting"
             echo "  -h, --help               Show this help message"
+            echo ""
+            echo "Environment (optional):"
+            echo "  LSL_CHOOSE_LETTER=a-z   Mount dir suffix basename_LETTER; use with -v to match a prior --choose row"
             echo ""
             echo "Examples:"
             echo "  lsl                      Enter default WSL distribution"
@@ -108,6 +218,7 @@ while [[ $# -gt 0 ]]; do
             echo "  lsl --list-vhdx          Print saved VHDX paths"
             echo "  lsl --choose             Pick a VHDX from find_*.zstd indexes"
             echo "  lsl bash                 Run bash in default distribution"
+	    opt_pause
             exit 0
             ;;
         *)
@@ -125,6 +236,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# LSL_CHOOSE_LETTER (a–z): optional mount-dir suffix. Set by `lsl --choose` for rows 1–26.
+# For `lsl -v PATH` without --choose, unset unless you export LSL_CHOOSE_LETTER to reuse the
+# same tag (e.g. match a prior choose). Otherwise the dir is basename_<md5-of-path>.
 
 # Function to parse WSL report and extract VHDX/distro mappings (merges lsl-gui–saved VHDX paths).
 parse_wsl_report() {
@@ -339,9 +454,137 @@ lsl_catalog_vhdx_paths() {
     done | sort -u
 }
 
+# Stable unique directory name under LSL_MOUNT_BASE: basename_letter from --choose when idx<26, else basename_<8 hex of md5(path)>.
+lsl_set_choose_letter_from_index() {
+    local idx="$1"
+    local letters="abcdefghijklmnopqrstuvwxyz"
+    if [ "$idx" -ge 0 ] && [ "$idx" -lt 26 ]; then
+        LSL_CHOOSE_LETTER="${letters:$idx:1}"
+    else
+        unset LSL_CHOOSE_LETTER
+    fi
+}
+
+lsl_vhdx_mount_dir_name() {
+    local vhdx_file="$1"
+    local base abs hash
+    base="$(basename "$vhdx_file" .vhdx)"
+    base="${base//[^a-zA-Z0-9._-]/_}"
+    [ -n "$base" ] || base="vhdx"
+    abs="$(readlink -f "$vhdx_file" 2>/dev/null || echo "$vhdx_file")"
+    if command -v md5sum >/dev/null 2>&1; then
+        hash="$(printf '%s' "$abs" | md5sum | awk '{print substr($1,1,8)}')"
+    else
+        hash="$(printf '%s' "$abs" | cksum | awk '{print $1}')"
+        hash="${hash:0:8}"
+    fi
+    local tag="${LSL_CHOOSE_LETTER,,}"
+    if [ "${#tag}" -eq 1 ] && [[ "$tag" =~ ^[a-z]$ ]]; then
+        printf '%s\n' "${base}_${tag}"
+    else
+        printf '%s\n' "${base}_${hash}"
+    fi
+}
+
+# Create stable aliases between basename_<letter> and basename_<hash>.
+# This lets direct -v (hash) reuse the choose letter mount dir (and vice versa).
+lsl_maybe_link_mount_aliases() {
+    local vhdx_file="$1"
+    local mount_dir="$2"
+    local base abs hash tag letter_dir hash_dir
+
+    base="$(basename "$vhdx_file" .vhdx)"
+    base="${base//[^a-zA-Z0-9._-]/_}"
+    [ -n "$base" ] || base="vhdx"
+    abs="$(readlink -f "$vhdx_file" 2>/dev/null || echo "$vhdx_file")"
+    if command -v md5sum >/dev/null 2>&1; then
+        hash="$(printf '%s' "$abs" | md5sum | awk '{print substr($1,1,8)}')"
+    else
+        hash="$(printf '%s' "$abs" | cksum | awk '{print $1}')"
+        hash="${hash:0:8}"
+    fi
+
+    tag="${LSL_CHOOSE_LETTER,,}"
+    if [ "${#tag}" -eq 1 ] && [[ "$tag" =~ ^[a-z]$ ]]; then
+        letter_dir="${LSL_MOUNT_BASE}/${base}_${tag}"
+        hash_dir="${LSL_MOUNT_BASE}/${base}_${hash}"
+        # Prefer linking hash -> letter when we just chose a letter.
+        if [ -d "$letter_dir" ] && [ ! -e "$hash_dir" ]; then
+            ln -s "$(basename "$letter_dir")" "$hash_dir" 2>/dev/null || true
+        elif [ -d "$hash_dir" ] && [ ! -e "$letter_dir" ]; then
+            ln -s "$(basename "$hash_dir")" "$letter_dir" 2>/dev/null || true
+        fi
+    else
+        # No letter: still link the other way if a letter dir exists and hash dir doesn't (rare).
+        hash_dir="${LSL_MOUNT_BASE}/${base}_${hash}"
+        # If mount_dir is a letter dir, treat it as such.
+        case "$mount_dir" in
+            "${LSL_MOUNT_BASE}/${base}_"?) letter_dir="$mount_dir" ;;
+            *) letter_dir="" ;;
+        esac
+        if [ -n "$letter_dir" ] && [ -d "$letter_dir" ] && [ ! -e "$hash_dir" ]; then
+            ln -s "$(basename "$letter_dir")" "$hash_dir" 2>/dev/null || true
+        fi
+    fi
+}
+
+lsl_choose_vhdx_letter_menu() {
+    local -a paths=("$@")
+    local n i letter letters="abcdefghijklmnopqrstuvwxyz" reply num idx o
+    n="${#paths[@]}"
+    echo "VHDX files from find catalogs - pick one:" >/dev/tty
+    echo "" >/dev/tty
+    for i in "${!paths[@]}"; do
+        num=$((i + 1))
+        if [ "$i" -lt 26 ]; then
+            letter="${letters:$i:1}"
+            printf '  %s)  %s\n' "$letter" "${paths[$i]}" >/dev/tty
+        else
+            printf '  %2d)  %s\n' "$num" "${paths[$i]}" >/dev/tty
+        fi
+    done
+    echo "" >/dev/tty
+    if [ "$n" -le 26 ]; then
+        local last_letter="${letters:$((n - 1)):1}"
+        echo "Type a letter (a-$last_letter) or a number (1-$n), then Enter." >/dev/tty
+    else
+        echo "Type a letter (a-z) for rows a-z, or a number (1-$n), then Enter." >/dev/tty
+    fi
+    read -r reply </dev/tty
+    reply="${reply//[$'\t\r\n']/}"
+    reply="${reply// /}"
+
+    if [[ "$reply" =~ ^[0-9]+$ ]]; then
+        if [ "$reply" -ge 1 ] && [ "$reply" -le "$n" ]; then
+            idx=$((reply - 1))
+            lsl_set_choose_letter_from_index "$idx"
+            LSL_CHOOSE_OUTPUT_PATH="${paths[$idx]}"
+            return 0
+        fi
+        echo "Invalid number: $reply (need 1-$n)" >/dev/tty
+        return 10
+    fi
+
+    if [ "${#reply}" -eq 1 ] && [[ "$reply" =~ ^[a-zA-Z]$ ]]; then
+        reply="${reply,,}"
+        printf -v o '%d' "'$reply"
+        idx=$((o - 97))
+        if [ "$idx" -ge 0 ] && [ "$idx" -lt 26 ] && [ "$idx" -lt "$n" ]; then
+            lsl_set_choose_letter_from_index "$idx"
+            LSL_CHOOSE_OUTPUT_PATH="${paths[$idx]}"
+            return 0
+        fi
+    fi
+
+    echo "Invalid choice: $reply" >/dev/tty
+    return 10
+}
+
 lsl_choose_vhdx_from_catalog() {
     local -a paths=()
-    local rc=0 selected selected_id
+    local rc=0 selected selected_id idx
+    unset LSL_CHOOSE_LETTER
+    LSL_CHOOSE_OUTPUT_PATH=""
     mapfile -t paths < <(lsl_catalog_vhdx_paths) || rc=$?
     if [ "$rc" -ne 0 ]; then
         return "$rc"
@@ -349,6 +592,12 @@ lsl_choose_vhdx_from_catalog() {
     if [ "${#paths[@]}" -eq 0 ]; then
         echo "Error: no existing .vhdx files found in find catalogs." >&2
         return 1
+    fi
+
+    # Use /dev/tty for interactive selection; sets LSL_CHOOSE_OUTPUT_PATH and LSL_CHOOSE_LETTER.
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        lsl_choose_vhdx_letter_menu "${paths[@]}"
+        return $?
     fi
 
     if command -v zenity >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
@@ -366,7 +615,9 @@ lsl_choose_vhdx_from_catalog() {
         [ -n "$selected" ] || return 10
         selected_id="${selected%%|*}"
         if [[ "$selected_id" =~ ^[0-9]+$ ]] && [ "$selected_id" -ge 1 ] && [ "$selected_id" -le "${#paths[@]}" ]; then
-            printf '%s\n' "${paths[$((selected_id - 1))]}"
+            idx=$((selected_id - 1))
+            lsl_set_choose_letter_from_index "$idx"
+            LSL_CHOOSE_OUTPUT_PATH="${paths[$idx]}"
             return 0
         fi
         return 10
@@ -380,7 +631,9 @@ lsl_choose_vhdx_from_catalog() {
         done
         selected="$(dialog --menu "Select a VHDX from find catalogs" 22 110 14 "${items[@]}" 2>&1 >/dev/tty)" || return 10
         if [[ "$selected" =~ ^[0-9]+$ ]] && [ "$selected" -ge 1 ] && [ "$selected" -le "${#paths[@]}" ]; then
-            printf '%s\n' "${paths[$((selected - 1))]}"
+            idx=$((selected - 1))
+            lsl_set_choose_letter_from_index "$idx"
+            LSL_CHOOSE_OUTPUT_PATH="${paths[$idx]}"
             return 0
         fi
         return 10
@@ -394,24 +647,16 @@ lsl_choose_vhdx_from_catalog() {
         done
         selected="$(whiptail --menu "Select a VHDX from find catalogs" 22 110 14 "${items[@]}" 3>&1 1>&2 2>&3)" || return 10
         if [[ "$selected" =~ ^[0-9]+$ ]] && [ "$selected" -ge 1 ] && [ "$selected" -le "${#paths[@]}" ]; then
-            printf '%s\n' "${paths[$((selected - 1))]}"
+            idx=$((selected - 1))
+            lsl_set_choose_letter_from_index "$idx"
+            LSL_CHOOSE_OUTPUT_PATH="${paths[$idx]}"
             return 0
         fi
         return 10
     fi
 
-    if [ -t 0 ] && [ -t 1 ]; then
-        local pick
-        echo "Choose a VHDX from find catalogs:"
-        select pick in "${paths[@]}"; do
-            [ -n "$pick" ] || return 10
-            printf '%s\n' "$pick"
-            return 0
-        done
-        return 10
-    fi
-
-    printf '%s\n' "${paths[0]}"
+    unset LSL_CHOOSE_LETTER
+    LSL_CHOOSE_OUTPUT_PATH="${paths[0]}"
     return 0
 }
 
@@ -470,14 +715,14 @@ lsl_mount_vhdx() {
     local mount_point="$2"
     local part
 
-    if guestmount -a "$vhdx_file" -i "$mount_point" 2>/dev/null; then
+    if guestmount -a "$vhdx_file" -i "$mount_point" -o allow_other 2>/dev/null; then
         return 0
     fi
-    if LIBGUESTFS_BACKEND=direct guestmount -a "$vhdx_file" -i "$mount_point" 2>/dev/null; then
+    if LIBGUESTFS_BACKEND=direct guestmount -a "$vhdx_file" -i "$mount_point" -o allow_other 2>/dev/null; then
         echo "(guestmount: used LIBGUESTFS_BACKEND=direct)" >&2
         return 0
     fi
-    if run_privileged guestmount -a "$vhdx_file" -i "$mount_point" 2>/dev/null; then
+    if run_privileged guestmount -a "$vhdx_file" -i "$mount_point -o allow_other " 2>/dev/null; then
         echo "(guestmount: used sudo)" >&2
         return 0
     fi
@@ -487,19 +732,19 @@ lsl_mount_vhdx() {
     fi
 
     for part in /dev/sda1 /dev/sda2; do
-        if guestmount -a "$vhdx_file" -m "$part" "$mount_point" 2>/dev/null; then
+        if guestmount -a "$vhdx_file" -m "$part" "$mount_point"  -o allow_other 2>/dev/null; then
             echo "Mounted partition $part" >&2
             return 0
         fi
-        if LIBGUESTFS_BACKEND=direct guestmount -a "$vhdx_file" -m "$part" "$mount_point" 2>/dev/null; then
+        if LIBGUESTFS_BACKEND=direct guestmount -a "$vhdx_file" -m "$part" "$mount_point" -o allow_other 2>/dev/null; then
             echo "Mounted partition $part (direct)" >&2
             return 0
         fi
-        if run_privileged guestmount -a "$vhdx_file" -m "$part" "$mount_point" 2>/dev/null; then
+        if run_privileged guestmount -a "$vhdx_file" -m "$part" "$mount_point" -o allow_other 2>/dev/null; then
             echo "Mounted partition $part (sudo)" >&2
             return 0
         fi
-        if run_privileged env LIBGUESTFS_BACKEND=direct guestmount -a "$vhdx_file" -m "$part" "$mount_point" 2>/dev/null; then
+        if run_privileged env LIBGUESTFS_BACKEND=direct guestmount -a "$vhdx_file" -m "$part" "$mount_point" -o allow_other 2>/dev/null; then
             echo "Mounted partition $part (sudo+direct)" >&2
             return 0
         fi
@@ -575,6 +820,8 @@ mount_and_chroot() {
     local vhdx_mounted=""
     local image_to_mount=""
     local mount_point=""
+    local cleanup_done=0
+    local received_signal=0
 
     LSL_COW_SESSION_IMG=""
     LSL_VHDX_SESSION_MOUNT=""
@@ -600,10 +847,18 @@ mount_and_chroot() {
             mount_point="$LSL_MOUNT_BASE/lsl_sess_${RANDOM}_$$"
         else
             image_to_mount="$vhdx_file"
-            mount_point="$LSL_MOUNT_BASE/$(basename "$vhdx_file" .vhdx)"
+            mount_point="$LSL_MOUNT_BASE/$(lsl_vhdx_mount_dir_name "$vhdx_file")"
+            unset LSL_CHOOSE_LETTER
+        fi
+
+        # If mount_point is a symlink (hash->letter or letter->hash), follow it.
+        if [ -L "$mount_point" ]; then
+            mount_point="$(readlink -f "$mount_point" 2>/dev/null || echo "$mount_point")"
         fi
 
         mkdir -p "$mount_point"
+        # Make alias symlinks so -v and --choose converge.
+        lsl_maybe_link_mount_aliases "$vhdx_file" "$mount_point"
 
         if [ "${LSL_OVERLAY_DISK:-false}" != true ] && mountpoint -q "$mount_point" 2>/dev/null; then
             echo "VHDX already mounted at $mount_point"
@@ -682,13 +937,97 @@ mount_and_chroot() {
     if ! lsl_is_linux_root "$root_fs"; then
         echo "Warning: Root may be incomplete (missing etc/os-release or bash)" >&2
     fi
-    
+
+    # Bind-mount Windows drive mounts (if present) into chroot.
+    # Only bind non-empty /mnt/<letter> directories (c..z) to avoid clutter.
+    local -a bound_mnts=()
+    local d target
+    local i
+    local detach_rc=2
+    local shared_mode=false
+
+    if [ -n "$vhdx_mounted" ] && [ "${LSL_OVERLAY_DISK:-false}" != true ]; then
+        lsl_shared_mount_attach "$vhdx_mounted" || {
+            echo "Warning: shared mount tracking unavailable; falling back to per-session cleanup." >&2
+        }
+        if [ "$LSL_SHARED_SESSION_ATTACHED" = true ]; then
+            shared_mode=true
+        fi
+    fi
+
+    mount_and_chroot_cleanup() {
+        [ "$cleanup_done" -eq 1 ] && return
+        cleanup_done=1
+
+        if [ "$received_signal" -eq 0 ] && [ "$LSL_SHARED_SESSION_ATTACHED" = true ]; then
+            lsl_shared_mount_detach
+            detach_rc=$?
+        fi
+
+        if [ "$shared_mode" != true ] || [ "$detach_rc" -eq 0 ] || [ "${LSL_OVERLAY_DISK:-false}" = true ]; then
+            for (( i=${#bound_mnts[@]}-1; i>=0; i-- )); do
+                umount "${bound_mnts[$i]}" 2>/dev/null || true
+            done
+            umount "$root_fs/proc" 2>/dev/null || true
+            umount "$root_fs/dev/pts" 2>/dev/null || true
+            umount "$root_fs/dev" 2>/dev/null || true
+            umount "$root_fs/sys" 2>/dev/null || true
+        fi
+
+        if [ -n "${LSL_VHDX_SESSION_MOUNT:-}" ]; then
+            if command -v guestunmount >/dev/null 2>&1; then
+                guestunmount "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || run_privileged guestunmount "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || true
+            fi
+            run_privileged umount "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || true
+            rmdir "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || true
+            LSL_VHDX_SESSION_MOUNT=""
+        elif [ "$detach_rc" -eq 0 ] && [ -n "$vhdx_mounted" ] && [ "${LSL_OVERLAY_DISK:-false}" != true ]; then
+            if command -v guestunmount >/dev/null 2>&1; then
+                guestunmount "$vhdx_mounted" 2>/dev/null || run_privileged guestunmount "$vhdx_mounted" 2>/dev/null || true
+            fi
+            run_privileged umount "$vhdx_mounted" 2>/dev/null || true
+        fi
+
+        if [ -n "${LSL_COW_SESSION_IMG:-}" ]; then
+            run_privileged rm -f "$LSL_COW_SESSION_IMG" 2>/dev/null || true
+            LSL_COW_SESSION_IMG=""
+        fi
+    }
+
+    on_mount_and_chroot_signal() {
+        received_signal=1
+        if [ "$LSL_SHARED_SESSION_ATTACHED" = true ]; then
+            lsl_shared_mount_detach >/dev/null 2>&1 || true
+        fi
+        mount_and_chroot_cleanup
+        trap - INT TERM HUP
+        kill -s INT "$$" 2>/dev/null || exit 130
+    }
+
+    trap on_mount_and_chroot_signal INT TERM HUP
+
     # Setup bind mounts for chroot
     mount --bind /proc "$root_fs/proc" 2>/dev/null
     mount --bind /dev "$root_fs/dev" 2>/dev/null
     mount --bind /sys "$root_fs/sys" 2>/dev/null
     mount --bind /dev/pts "$root_fs/dev/pts" 2>/dev/null
-    
+
+    for d in /mnt/{c..z}; do
+        [ -d "$d" ] || continue
+        if ! ls -A "$d" >/dev/null 2>&1; then
+            continue
+        fi
+        target="$root_fs$d"
+        mkdir -p "$target" 2>/dev/null || true
+        if mountpoint -q "$target" 2>/dev/null; then
+            continue
+        fi
+        mount --bind "$d" "$target" 2>/dev/null || true
+        if mountpoint -q "$target" 2>/dev/null; then
+            bound_mnts+=("$target")
+        fi
+    done
+
     # Copy resolv.conf for network
     if [ -f /etc/resolv.conf ]; then
         cp /etc/resolv.conf "$root_fs/etc/resolv.conf" 2>/dev/null || true
@@ -710,27 +1049,9 @@ mount_and_chroot() {
             chroot "$root_fs" /bin/sh -l
         fi
     fi
-    
     local exit_code=$?
-    
-    # Cleanup bind mounts
-    umount "$root_fs/proc" 2>/dev/null || true
-    umount "$root_fs/dev/pts" 2>/dev/null || true
-    umount "$root_fs/dev" 2>/dev/null || true
-    umount "$root_fs/sys" 2>/dev/null || true
-
-    if [ -n "${LSL_VHDX_SESSION_MOUNT:-}" ]; then
-        if command -v guestunmount >/dev/null 2>&1; then
-            guestunmount "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || run_privileged guestunmount "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || true
-        fi
-        run_privileged umount "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || true
-        rmdir "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || true
-        LSL_VHDX_SESSION_MOUNT=""
-    fi
-    if [ -n "${LSL_COW_SESSION_IMG:-}" ]; then
-        run_privileged rm -f "$LSL_COW_SESSION_IMG" 2>/dev/null || true
-        LSL_COW_SESSION_IMG=""
-    fi
+    trap - INT TERM HUP
+    mount_and_chroot_cleanup
 
     return $exit_code
 }
@@ -739,36 +1060,45 @@ mount_and_chroot() {
 lsl_load_config 2>/dev/null || true
 if [ "$LIST_VHDX" = true ]; then
     lsl_vhdx_paths_stdout
+    opt_pause
     exit 0
 fi
 
 if [ "$LIST_ONLY" = true ]; then
     list_distros
+    opt_pause
     exit $?
 fi
 
 if [ "$CHOOSE_VHDX" = true ]; then
     choose_rc=0
-    CHOSEN_VHDX="$(lsl_choose_vhdx_from_catalog)" || choose_rc=$?
+    LSL_CHOOSE_OUTPUT_PATH=""
+    lsl_choose_vhdx_from_catalog || choose_rc=$?
     if [ "$choose_rc" -eq 10 ]; then
+        opt_pause
         exit 0
     fi
     if [ "$choose_rc" -ne 0 ]; then
+        opt_pause
         exit "$choose_rc"
     fi
-    if [ -z "$CHOSEN_VHDX" ]; then
+    if [ -z "${LSL_CHOOSE_OUTPUT_PATH:-}" ]; then
+        opt_pause
         exit 0
     fi
-    VHDX_OVERRIDE="$CHOSEN_VHDX"
+    VHDX_OVERRIDE="$LSL_CHOOSE_OUTPUT_PATH"
 fi
 
 # Direct VHDX mount mode (bypass detection/report)
 if [ -n "$VHDX_OVERRIDE" ]; then
     if [ ! -f "$VHDX_OVERRIDE" ]; then
+	opt_pause
         echo "Error: VHDX file not found: $VHDX_OVERRIDE" >&2
+	opt_pause
         exit 1
     fi
     mount_and_chroot "$VHDX_OVERRIDE" ""
+    opt_pause
     exit $?
 fi
 
@@ -780,6 +1110,7 @@ if [ -n "$DISTRO" ]; then
         echo "Error: Distribution '$DISTRO' not found" >&2
         echo ""
         list_distros
+	opt_pause
         exit 1
     fi
 else
@@ -787,6 +1118,7 @@ else
     if [ -z "$VHDX_INFO" ]; then
         echo "Error: No WSL distributions found" >&2
         echo "Run onboot.sh first to detect WSL distributions" >&2
+	opt_pause
         exit 1
     fi
 fi
@@ -796,6 +1128,7 @@ IFS='|' read -r VHDX_FILE ROOTFS_PATH <<< "$VHDX_INFO"
 # Validate that we have either VHDX or rootfs
 if [ -z "$VHDX_FILE" ] && [ -z "$ROOTFS_PATH" ]; then
     echo "Error: No valid VHDX or rootfs found" >&2
+    opt_pause
     exit 1
 fi
 
