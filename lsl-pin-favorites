@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pin apps to Cinnamon favorites (used by the panel favorites applet).
+# Runs in the user's desktop session (autostart), not during onboot.
+
+if ! command -v gsettings >/dev/null 2>&1; then
+    exit 0
+fi
+
+have_desktop() {
+    local id="$1"
+    [ -f "/usr/share/applications/$id" ] || [ -f "/usr/local/share/applications/$id" ]
+}
+
+choose_brave_desktop_id() {
+    if have_desktop brave-browser.desktop; then
+        printf '%s\n' brave-browser.desktop
+        return 0
+    fi
+    if have_desktop com.brave.Browser.desktop; then
+        printf '%s\n' com.brave.Browser.desktop
+        return 0
+    fi
+    return 1
+}
+
+choose_wezterm_desktop_id() {
+    if have_desktop org.wezfurlong.wezterm.desktop; then
+        printf '%s\n' org.wezfurlong.wezterm.desktop
+        return 0
+    fi
+    if have_desktop wezterm.desktop; then
+        printf '%s\n' wezterm.desktop
+        return 0
+    fi
+    return 1
+}
+
+append_unique() {
+    local item="$1"; shift
+    local x
+    for x in "$@"; do
+        [ "$x" != "$item" ] || { printf '%s\n' "$@"; return 0; }
+    done
+    printf '%s\n' "$@" "$item"
+}
+
+want=()
+wez="$(choose_wezterm_desktop_id 2>/dev/null || true)"
+brave="$(choose_brave_desktop_id 2>/dev/null || true)"
+[ -n "${wez:-}" ] && want+=("$wez")
+[ -n "${brave:-}" ] && want+=("$brave")
+[ "${#want[@]}" -gt 0 ] || exit 0
+
+# Read current favorites as plain lines (strip brackets/quotes/commas).
+cur_raw="$(gsettings get org.cinnamon favorite-apps 2>/dev/null || true)"
+cur_raw="${cur_raw#[}"
+cur_raw="${cur_raw%]}"
+cur_raw="${cur_raw//\'/}"
+cur_raw="${cur_raw//,/}"
+
+cur=()
+while IFS= read -r tok; do
+    tok="${tok#"${tok%%[![:space:]]*}"}"
+    tok="${tok%"${tok##*[![:space:]]}"}"
+    [ -n "$tok" ] && cur+=("$tok")
+done <<<"$cur_raw"
+
+for app in "${want[@]}"; do
+    mapfile -t cur < <(append_unique "$app" "${cur[@]}")
+done
+
+# Build gsettings array literal.
+out="["
+for i in "${!cur[@]}"; do
+    [ "$i" -eq 0 ] || out+=", "
+    out+="'${cur[$i]}'"
+done
+out+="]"
+
+gsettings set org.cinnamon favorite-apps "$out" 2>/dev/null || true
+
