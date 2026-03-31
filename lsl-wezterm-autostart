@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WEZTERM_CFG_SRC="/cdrom/misc/.wezterm.lua"
+WEZTERM_CFG_DST="/home/mint/.wezterm.lua"
+
+if ! command -v wezterm >/dev/null 2>&1; then
+    exit 0
+fi
+
+if [[ -f "$WEZTERM_CFG_SRC" ]] && [[ ! -f "$WEZTERM_CFG_DST" ]]; then
+    cp "$WEZTERM_CFG_SRC" "$WEZTERM_CFG_DST" 2>/dev/null || true
+    chown mint:mint "$WEZTERM_CFG_DST" 2>/dev/null || true
+fi
+
+export DISPLAY=:0
+exec wezterm start -- /cdrom/bin/lsl --choose
