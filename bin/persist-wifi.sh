@@ -43,8 +43,21 @@ collect_current_wifi_line() {
     return 0
 }
 
+cdrom_is_ro() {
+    # Return 0 (true) if /cdrom is currently mounted read-only.
+    local opts
+    opts="$(findmnt -no OPTIONS /cdrom 2>/dev/null || awk '$2=="/cdrom" {print $4; exit}' /proc/mounts 2>/dev/null)"
+    case ",${opts}," in
+        *,ro,*) return 0 ;;
+    esac
+    return 1
+}
+
 sync_state_to_cdrom() {
-    local tmp line
+    local tmp line restore_ro=0
+    if cdrom_is_ro; then
+        restore_ro=1
+    fi
     mount /cdrom -o remount,rw 2>/dev/null || return 0
     tmp="$(mktemp)"
     {
@@ -56,7 +69,11 @@ sync_state_to_cdrom() {
     mv "$tmp" "$CDROM_WIFI_FILE"
     chmod +x "$CDROM_WIFI_FILE" 2>/dev/null || true
     sync
-    mount /cdrom -o remount,ro 2>/dev/null || true
+    # Restore the previous mount state instead of unconditionally forcing ro:
+    # callers like uproot/config.sh remount rw first and expect it to stay rw.
+    if [ "$restore_ro" -eq 1 ]; then
+        mount /cdrom -o remount,ro 2>/dev/null || true
+    fi
 }
 
 wifi_line="$(collect_current_wifi_line || true)"
