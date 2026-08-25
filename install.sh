@@ -32,11 +32,22 @@ LSL_CONFIG_ROOT=/tmp/squashfs/root "$REPO_ROOT/bin/config.sh" --systemd-only
 #cat <<EOF | chroot /tmp/squashfs/root/
 cat bin/squashfs_config.sh | chroot /tmp/squashfs/root/
 
-#Create new filesystem.squashfs and move old one to filesystem_<date>.squashfs
-mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem_new.squashfs -comp zstd -Xcompression-level 22
-#mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_`date +%Y%m%d%H%M%S`.squashfs
-mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_orig.squashfs
-mv /cdrom/casper/filesystem_new.squashfs /cdrom/casper/filesystem.squashfs
+#By default, add a new squashfs layer rather than replacing filesystem.squashfs.
+#Naming: sort LAST in /cdrom/casper/*.squashfs so casper's reverse-order logic
+#gives it HIGHEST precedence (first in lowerdir=...).
+#Set LSL_INSTALL_MERGE=1 to rebuild filesystem.squashfs instead (old behavior).
+ts="$(date +%Y%m%d%H%M%S)"
+if [ "${LSL_INSTALL_MERGE:-0}" = "1" ]; then
+    #Create new filesystem.squashfs and move old one to filesystem_<date>.squashfs
+    mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem_new.squashfs -comp zstd -Xcompression-level 22
+    mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_orig.squashfs
+    mv /cdrom/casper/filesystem_new.squashfs /cdrom/casper/filesystem.squashfs
+else
+    #Append a layer from the overlay upperdir (only the changes).
+    mksquashfs /tmp/squashfs/upper/ /cdrom/casper/filesystem_z${ts}.squashfs -comp zstd -Xcompression-level 22
+    #Save a companion copy of the config script next to the layer (same basename as .squashfs).
+    cp "$REPO_ROOT/bin/squashfs_config.sh" /cdrom/casper/filesystem_z${ts}.sh
+fi
 
 #save SSID from nmcli
 SSID=$(nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2)
