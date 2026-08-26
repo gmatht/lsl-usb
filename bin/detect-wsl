@@ -3,18 +3,33 @@
 # Creates /tmp/wsl report file for use by lsl and lsl-gui (VHDX paths come from lsl-gui browse / lsl state, not scanning).
 
 WSL_REPORT="${WSL_REPORT:-/tmp/wsl}"
+# Windows installer writes Windows-side VHDX paths here (one per line);
+# overridable for testing.
+VHDX_CONF="${LSL_WSL_VHDX_CONF:-/cdrom/lsl-wsl-vhdx.conf}"
+
+# Live-session desktop user (mint on Mint, zorin on Zorin, ...) - used for the
+# /media/<user>/ auto-mount path.
+LSL_DESKTOP_USER="$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)"
+[ -n "$LSL_DESKTOP_USER" ] || LSL_DESKTOP_USER="$(ls -1 /home 2>/dev/null | head -n1 || true)"
+[ -n "$LSL_DESKTOP_USER" ] || LSL_DESKTOP_USER="mint"
 
 # Clear existing report
 > "$WSL_REPORT"
 
 win_path_to_linux() {
-    # Convert a Windows path like C:\Foo\Bar to /mnt/c/Foo/Bar
+    # Convert a Windows path like C:\Foo\Bar to /mnt/c/Foo/Bar.
+    # Accepts both single backslashes (plain Windows paths, e.g. from the
+    # Windows installer's lsl-wsl-vhdx.conf) and doubled backslashes
+    # (hivexregedit export escaping).
     local win="$1"
 
-    if [[ "$win" =~ ^([A-Za-z]):\\\\(.*)$ ]]; then
+    # Collapse doubled backslashes to single.
+    win="${win//\\\\/\\}"
+
+    if [[ "$win" =~ ^([A-Za-z]):\\(.*)$ ]]; then
         local drive="${BASH_REMATCH[1],,}"
         local rest="${BASH_REMATCH[2]}"
-        rest="${rest//\\\\//}"
+        rest="${rest//\\//}"
         echo "/mnt/$drive/$rest"
         return 0
     fi
@@ -94,7 +109,7 @@ detect_wsl_from_ntuser() {
             base_path="$s"
             want_base=0
 
-            if [[ "$base_path" =~ ^[A-Za-z]:\\\\ ]] || [[ "$base_path" =~ ^[A-Za-z]:/ ]]; then
+            if [[ "$base_path" =~ ^[A-Za-z]:\\ ]] || [[ "$base_path" =~ ^[A-Za-z]:/ ]]; then
                 local linux_base=""
                 linux_base="$(win_path_to_linux "$base_path" 2>/dev/null || true)"
 
@@ -163,6 +178,25 @@ detect_wsl_on_partition() {
     done
 }
 
+detect_wsl_vhdx_conf() {
+    [ -f "$VHDX_CONF" ] || return 0
+
+    echo "Reading WSL VHDX paths from $VHDX_CONF..."
+    while IFS= read -r win_path; do
+        [ -z "$win_path" ] && continue
+        case "$win_path" in
+            \#*) continue ;;
+        esac
+        local linux_path
+        if linux_path="$(win_path_to_linux "$win_path")"; then
+            echo "WSL Distro vhdx: $linux_path" >> "$WSL_REPORT"
+            echo "---" >> "$WSL_REPORT"
+        else
+            echo "Warning: could not convert Windows path: $win_path" >&2
+        fi
+    done < "$VHDX_CONF"
+}
+
 print_shortnames() {
     if [ ! -s "$WSL_REPORT" ]; then
         return 0
@@ -215,23 +249,25 @@ for mount_point in /mnt/c /mnt/d; do
     fi
 done
 
-if [ -d "/media/mint/Windows" ]; then
-    echo "Scanning /media/mint/Windows..."
-    detect_wsl_on_partition "/media/mint/Windows"
+if [ -d "/media/$LSL_DESKTOP_USER/Windows" ]; then
+    echo "Scanning /media/$LSL_DESKTOP_USER/Windows..."
+    detect_wsl_on_partition "/media/$LSL_DESKTOP_USER/Windows"
 fi
 
 for mount_point in /media/*/Windows /mnt/*/Windows /media/*/C /mnt/*/C /media/*/D /mnt/*/D; do
-    if [ -d "$mount_point" ] && [ "$mount_point" != "/media/mint/Windows" ]; then
+    if [ -d "$mount_point" ] && [ "$mount_point" != "/media/$LSL_DESKTOP_USER/Windows" ]; then
         echo "Scanning $mount_point..."
         detect_wsl_on_partition "$mount_point"
     fi
 done
 
+detect_wsl_vhdx_conf
+
 if [ ! -s "$WSL_REPORT" ]; then
     echo "No WSL distributions found." >"$WSL_REPORT"
     echo "No WSL distributions detected."
 else
-    count=$(grep -c "WSL.*rootfs:" "$WSL_REPORT" 2>/dev/null || echo "0")
+    count=$(grep -cE "WSL.*(rootfs|vhdx):" "$WSL_REPORT" 2>/dev/null || echo "0")
     echo "Found $count WSL distribution(s). Report written to $WSL_REPORT"
     echo "WSL distro shortnames:"
     print_shortnames

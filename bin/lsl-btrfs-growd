@@ -43,6 +43,13 @@ try_grow() {
         echo "lsl-btrfs-growd: truncate failed (${label})" >&2
         return 0
     fi
+    # The loop device caches the backing-file size; refresh it so the btrfs
+    # resize below sees the grown image (truncate alone is not enough).
+    local loop_dev
+    loop_dev="$(losetup -j "$img" 2>/dev/null | awk -F: '{print $1; exit}')"
+    if [ -n "$loop_dev" ] && [ -b "$loop_dev" ]; then
+        losetup -c "$loop_dev" 2>/dev/null || true
+    fi
     if ! btrfs filesystem resize max "$mp"; then
         echo "lsl-btrfs-growd: btrfs resize failed (${label})" >&2
     fi

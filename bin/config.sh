@@ -10,10 +10,13 @@
 #   LSL_CONFIG_ROOT  Prefix for etc (e.g. chroot); empty = real /
 set -euo pipefail
 
-mount /cdrom -o rw,remount
+mount /cdrom -o rw,remount 2>/dev/null || echo "config.sh: warning: could not remount /cdrom read-write." >&2
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/lsl-common.sh"
+LSL_DESKTOP_USER="$(lsl_desktop_user)"
 CDROM="${LSL_CDROM:-/cdrom}"
 CFG_ROOT="${LSL_CONFIG_ROOT:-}"
 
@@ -52,7 +55,7 @@ sync_cdrom() {
         echo "config.sh: $CDROM not found; skip sync" >&2
         return 0
     fi
-    mkdir -p "$CDROM/bin" "$CDROM/systemd" "$CDROM/misc"
+    mkdir -p "$CDROM/bin" "$CDROM/systemd" "$CDROM/misc" "$CDROM/fuse"
     cp_to_cdrom "$REPO_ROOT/bin/"* "$CDROM/bin/"
     cp_to_cdrom "$REPO_ROOT/onboot.sh" "$CDROM/"
     cp_to_cdrom "$REPO_ROOT/lsl-usb.env" "$CDROM/lsl-usb.env"
@@ -62,6 +65,8 @@ sync_cdrom() {
     shopt -s nullglob
     cp_to_cdrom "$REPO_ROOT/systemd/"*.service "$CDROM/systemd/"
     shopt -u nullglob
+    cp_to_cdrom "$REPO_ROOT/fuse/fat_linux_meta_fs.py" "$CDROM/fuse/fat_linux_meta_fs.py"
+    cp_to_cdrom "$REPO_ROOT/fuse/requirements.txt" "$CDROM/fuse/requirements.txt"
 
     if [[ -x "$REPO_ROOT/bin/persist-wifi.sh" ]]; then
         "$REPO_ROOT/bin/persist-wifi.sh" || true
@@ -72,13 +77,13 @@ install_desktop_shortcuts() {
     if [[ "$SYNC" -eq 0 ]]; then
         return 0
     fi
-    if [[ ! -d /home/mint/Desktop ]]; then
+    if [[ ! -d /home/$LSL_DESKTOP_USER/Desktop ]]; then
         return 0
     fi
-    mkdir -p /home/mint/Desktop
-    chown mint:mint /home/mint/Desktop 2>/dev/null || true
+    mkdir -p /home/$LSL_DESKTOP_USER/Desktop
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop 2>/dev/null || true
 
-    cat <<'EOF' >/home/mint/Desktop/lsl-gui.desktop
+    cat <<'EOF' >/home/$LSL_DESKTOP_USER/Desktop/lsl-gui.desktop
 [Desktop Entry]
 Version=1.0
 Type=Application
@@ -89,10 +94,10 @@ Icon=terminal
 Terminal=false
 Categories=System;Utility;
 EOF
-    chmod +x /home/mint/Desktop/lsl-gui.desktop
-    chown mint:mint /home/mint/Desktop/lsl-gui.desktop
+    chmod +x /home/$LSL_DESKTOP_USER/Desktop/lsl-gui.desktop
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/lsl-gui.desktop
 
-    cat <<'EOF' >/home/mint/Desktop/lsl-shutdown.desktop
+    cat <<'EOF' >/home/$LSL_DESKTOP_USER/Desktop/lsl-shutdown.desktop
 [Desktop Entry]
 Version=1.0
 Type=Application
@@ -103,23 +108,23 @@ Icon=system-shutdown
 Terminal=false
 Categories=System;Utility;
 EOF
-    chmod +x /home/mint/Desktop/lsl-shutdown.desktop
-    chown mint:mint /home/mint/Desktop/lsl-shutdown.desktop
+    chmod +x /home/$LSL_DESKTOP_USER/Desktop/lsl-shutdown.desktop
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/lsl-shutdown.desktop
 }
 
 # Runs even when SYNC=0 (--from-onboot) so login warning is installed after /home exists.
 install_lsl_autostart_warning() {
     local mint_home
     if [[ -n "$CFG_ROOT" ]]; then
-        mint_home="${CFG_ROOT}/home/mint"
+        mint_home="${CFG_ROOT}/home/$LSL_DESKTOP_USER"
     else
-        mint_home="/home/mint"
+        mint_home="/home/$LSL_DESKTOP_USER"
     fi
     if [[ ! -d "$mint_home" ]]; then
         return 0
     fi
     mkdir -p "$mint_home/.config/autostart"
-    chown mint:mint "$mint_home/.config" "$mint_home/.config/autostart" 2>/dev/null || true
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config" "$mint_home/.config/autostart" 2>/dev/null || true
 
     cat <<'EOF' >"$mint_home/.config/autostart/lsl-home-readonly-warning.desktop"
 [Desktop Entry]
@@ -132,48 +137,22 @@ NoDisplay=true
 X-GNOME-Autostart-enabled=true
 EOF
     chmod +x "$mint_home/.config/autostart/lsl-home-readonly-warning.desktop"
-    chown mint:mint "$mint_home/.config/autostart/lsl-home-readonly-warning.desktop"
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config/autostart/lsl-home-readonly-warning.desktop"
 }
 
-install_lsl_wezterm_autostart() {
-    local mint_home
-    if [[ -n "$CFG_ROOT" ]]; then
-        mint_home="${CFG_ROOT}/home/mint"
-    else
-        mint_home="/home/mint"
-    fi
-    if [[ ! -d "$mint_home" ]]; then
-        return 0
-    fi
-    mkdir -p "$mint_home/.config/autostart"
-    chown mint:mint "$mint_home/.config" "$mint_home/.config/autostart" 2>/dev/null || true
-
-    cat <<'EOF' >"$mint_home/.config/autostart/lsl-wezterm-autostart.desktop"
-[Desktop Entry]
-Type=Application
-Name=LSL WezTerm chooser
-Comment=Start WezTerm and select a VHDX from find catalogs
-Exec=/cdrom/bin/lsl-wezterm-autostart
-Hidden=false
-NoDisplay=true
-X-GNOME-Autostart-enabled=true
-EOF
-    chmod +x "$mint_home/.config/autostart/lsl-wezterm-autostart.desktop"
-    chown mint:mint "$mint_home/.config/autostart/lsl-wezterm-autostart.desktop"
-}
 
 install_lsl_pin_favorites_autostart() {
     local mint_home
     if [[ -n "$CFG_ROOT" ]]; then
-        mint_home="${CFG_ROOT}/home/mint"
+        mint_home="${CFG_ROOT}/home/$LSL_DESKTOP_USER"
     else
-        mint_home="/home/mint"
+        mint_home="/home/$LSL_DESKTOP_USER"
     fi
     if [[ ! -d "$mint_home" ]]; then
         return 0
     fi
     mkdir -p "$mint_home/.config/autostart"
-    chown mint:mint "$mint_home/.config" "$mint_home/.config/autostart" 2>/dev/null || true
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config" "$mint_home/.config/autostart" 2>/dev/null || true
 
     cat <<'EOF' >"$mint_home/.config/autostart/lsl-pin-favorites.desktop"
 [Desktop Entry]
@@ -186,7 +165,7 @@ NoDisplay=true
 X-GNOME-Autostart-enabled=true
 EOF
     chmod +x "$mint_home/.config/autostart/lsl-pin-favorites.desktop"
-    chown mint:mint "$mint_home/.config/autostart/lsl-pin-favorites.desktop"
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config/autostart/lsl-pin-favorites.desktop"
 }
 
 ensure_cdrom_path_in_bashrc() {
@@ -233,10 +212,10 @@ install_systemd_units() {
 
     if [[ -n "$CFG_ROOT" ]]; then
         chroot "$CFG_ROOT" systemctl daemon-reload
-        chroot "$CFG_ROOT" systemctl enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service
+        chroot "$CFG_ROOT" systemctl enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service
     elif [[ "$(id -u)" -eq 0 ]]; then
         systemctl daemon-reload
-        systemctl enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service
+        systemctl enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service
     else
         echo "config.sh: systemd install skipped (need root or LSL_CONFIG_ROOT + chroot)" >&2
     fi
@@ -244,7 +223,6 @@ install_systemd_units() {
 
 if [[ "$AUTOSTART_WARN_ONLY" -eq 1 ]]; then
     install_lsl_autostart_warning
-    install_lsl_wezterm_autostart
     exit 0
 fi
 

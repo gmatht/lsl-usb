@@ -7,6 +7,11 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/lsl-common.sh"
+lsl_load_config
+
 for cmd in blkid mount umount mktemp hivexregedit fdisk xxd awk; do
     if ! command -v $cmd &> /dev/null; then
         echo "Error: '$cmd' is required but not installed."
@@ -64,7 +69,14 @@ fi
 echo "    Found most recently booted Windows on: $best_part"
 echo "    Using path: $best_mount"
 
-/cdrom/bin/safe_ntfsfix.sh "$best_part"
+# safe_ntfsfix.sh is not yet battle-tested; only run it when explicitly
+# enabled (LSL_NTFSFIX=1 in lsl-usb.env). Default: skip the repair.
+if [ "${LSL_NTFSFIX:-0}" = "1" ]; then
+    /cdrom/bin/safe_ntfsfix.sh "$best_part"
+else
+    echo "    Skipping safe_ntfsfix.sh (set LSL_NTFSFIX=1 in lsl-usb.env to enable)."
+fi
+mkdir -p /mnt/c
 mount "$best_part" -t ntfs3 /mnt/c
 
 cleanup() {
@@ -136,13 +148,12 @@ parse_drive() {
 	echo "$uuid"
         
         # Use lsblk to cleanly find the device path without any extra garbage
-        local device=$(lsblk -n -o NAME,PARTUUID | grep -i "$uuid" | awk '{print $1}' | sed s/[├└]─//)
+        local device=$(lsblk -ln -o NAME,PARTUUID | grep -i "$uuid" | awk '{print $1}')
         
         if [[ -n "$device" ]]; then
             echo "mount $device $mount_point"
             mount "/dev/$device" -t ntfs3 "$mount_point"
-	    #TODO: double check this is REALLY safe and then fix all NTFS drives bash /cdrom/bin/safe_ntfsfix.sh $devicetfsfix.sh "$best_part"
-	    #mount "$best_part" -t ntfs3 /mnt/c
+	    # (NTFS repair is gated behind LSL_NTFSFIX=1; see the top of this script.)
         fi
     fi
 }

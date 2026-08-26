@@ -188,6 +188,30 @@ while [[ $# -gt 0 ]]; do
             CHOOSE_VHDX=true
             shift
             ;;
+        --find)
+            # Search the Everything EFU index (host-side, not in the chroot).
+            shift
+            if [ -x /cdrom/bin/lsl-find ]; then
+                exec /cdrom/bin/lsl-find "$@"
+            elif command -v lsl-find >/dev/null 2>&1; then
+                exec lsl-find "$@"
+            else
+                echo "lsl-find not found (run the Windows installer with the Everything export option)" >&2
+                exit 1
+            fi
+            ;;
+        --efu)
+            # Rich EFU view: filename + size (alias for lsl-find -l).
+            shift
+            if [ -x /cdrom/bin/lsl-find ]; then
+                exec /cdrom/bin/lsl-find -l "$@"
+            elif command -v lsl-find >/dev/null 2>&1; then
+                exec lsl-find -l "$@"
+            else
+                echo "lsl-find not found (run the Windows installer with the Everything export option)" >&2
+                exit 1
+            fi
+            ;;
 	--pause-on-quit)
 	    PAUSE_ON_QUIT=true
 	    shift
@@ -201,7 +225,9 @@ while [[ $# -gt 0 ]]; do
             echo "      --overlay-disk       qcow2 copy-on-write layer on the VHDX (session writes; parent image unchanged)"
             echo "  -l, --list               List available WSL distributions"
             echo "      --list-vhdx          List VHDX paths saved from lsl-gui (one path per line)"
-            echo "      --choose             Choose a VHDX from find_*.zstd catalogs (terminal: list + letter/number)"
+            echo "      --choose             Choose a VHDX from find_*.zstd / find_everything.efu catalogs (terminal: list + letter/number)"
+            echo "      --find [PATTERN]     Search the Everything EFU index (lsl-find; interactive with fzf)"
+            echo "      --efu [PATTERN]      Rich EFU view: filename + size (lsl-find -l)"
 	    echo "      --pause-on-quit      Wait for user to press enter before quitting"
             echo "  -h, --help               Show this help message"
             echo ""
@@ -216,7 +242,8 @@ while [[ $# -gt 0 ]]; do
             echo "  lsl /path/to/disk.vhdx   Same if the path exists (convenience)"
             echo "  lsl -l                   List all available distributions"
             echo "  lsl --list-vhdx          Print saved VHDX paths"
-            echo "  lsl --choose             Pick a VHDX from find_*.zstd indexes"
+            echo "  lsl --choose             Pick a VHDX from find_*.zstd / find_everything.efu indexes"
+            echo "  lsl --find vhdx          Search the Everything EFU index for 'vhdx'"
             echo "  lsl bash                 Run bash in default distribution"
 	    opt_pause
             exit 0
@@ -437,20 +464,34 @@ lsl_catalog_vhdx_paths() {
     for zst in "$data_dir"/find_*.zstd /mnt/d/Users/lsl-usb/find_*.zstd; do
         catalogs+=("$zst")
     done
+    # The Everything EFU export (Windows-side index, CSV) - same catalog data.
+    for efu in /cdrom/find_everything.efu "$data_dir"/find_everything.efu; do
+        [ -f "$efu" ] && catalogs+=("$efu")
+    done
     shopt -u nullglob
 
     if [ "${#catalogs[@]}" -eq 0 ]; then
-        echo "Error: no find_*.zstd catalogs found in $data_dir or /mnt/d/Users/lsl-usb." >&2
+        echo "Error: no find_*.zstd / find_everything.efu catalogs found in $data_dir, /mnt/d/Users/lsl-usb, or /cdrom." >&2
         return 1
     fi
 
     for zst in "${catalogs[@]}"; do
-        while IFS= read -r raw; do
-            norm="$(lsl_normalize_catalog_vhdx_path "$raw" || true)"
-            [ -n "$norm" ] || continue
-            [ -f "$norm" ] || continue
-            printf '%s\n' "$norm"
-        done < <(zstd -d -c -- "$zst" 2>/dev/null | strings | grep -i '\.vhdx$' | grep -vi '/[Tt]emp/')
+        if [[ "$zst" == *.efu ]]; then
+            # EFU: CSV with quoted filenames - extract the first quoted field.
+            while IFS= read -r raw; do
+                norm="$(lsl_normalize_catalog_vhdx_path "$raw" || true)"
+                [ -n "$norm" ] || continue
+                [ -f "$norm" ] || continue
+                printf '%s\n' "$norm"
+            done < <(sed -n 's/^"\([^"]*\)".*/\1/p' "$zst" | grep -i '\.vhdx$' | grep -vi '/[Tt]emp/')
+        else
+            while IFS= read -r raw; do
+                norm="$(lsl_normalize_catalog_vhdx_path "$raw" || true)"
+                [ -n "$norm" ] || continue
+                [ -f "$norm" ] || continue
+                printf '%s\n' "$norm"
+            done < <(zstd -d -c -- "$zst" 2>/dev/null | strings | grep -i '\.vhdx$' | grep -vi '/[Tt]emp/')
+        fi
     done | sort -u
 }
 

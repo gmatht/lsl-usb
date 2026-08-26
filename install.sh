@@ -1,3 +1,4 @@
+#!/bin/bash
 #mkdir -p work; mkdir -p upper; mkdir -p root
 #mount -t overlay overlay -o upperdir=/tmp/squashfs/
 
@@ -22,15 +23,27 @@ cp /etc/resolv.conf /tmp/squashfs/root/etc/resolv.conf
 LSL_CONFIG_ROOT=/tmp/squashfs/root "$REPO_ROOT/bin/config.sh" --systemd-only
 
 "$REPO_ROOT/bin/mount_all.sh" &&
-	mkdir -p /mnt/c/Users/lsl-usb &&
-	for f in /mnt/*; do ( time find $f | zstd -19 > /mnt/c/Users/lsl-usb/find_$f.zstd) & done
+    DATA_DIR="${LSL_DATA_DIR:-/mnt/c/Users/lsl-usb}" &&
+    mkdir -p "$DATA_DIR" &&
+    if [ ! -f /cdrom/find_everything.efu ]; then
+        # No Windows-side Everything index (EFU) - index each mounted drive for
+        # `lsl --choose` (find catalogs). With an EFU, lsl reads that instead.
+        for f in /mnt/*; do
+            [ -d "$f" ] || continue
+            name="$(basename "$f")"
+            ( time find "$f" -xdev -not -path "$DATA_DIR/*" 2>/dev/null | zstd -19 > "$DATA_DIR/find_${name}.zstd" ) &
+        done
+    fi
 
 
 
 # mount_all.sh expects hivexregedit, fdisk, xxd (packages: libhivex-bin or hivex-tools, fdisk, xxd).
 #"$REPO_ROOT/bin/mount_all.sh" &&
 #cat <<EOF | chroot /tmp/squashfs/root/
-cat bin/squashfs_config.sh | chroot /tmp/squashfs/root/
+if ! cat bin/squashfs_config.sh | chroot /tmp/squashfs/root/; then
+    echo "squashfs_config.sh failed inside the chroot; aborting." >&2
+    exit 1
+fi
 
 #By default, add a new squashfs layer rather than replacing filesystem.squashfs.
 #Naming: sort LAST in /cdrom/casper/*.squashfs so casper's reverse-order logic
@@ -49,16 +62,22 @@ else
     cp "$REPO_ROOT/bin/squashfs_config.sh" /cdrom/casper/filesystem_z${ts}.sh
 fi
 
-#save SSID from nmcli
-SSID=$(nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2)
-#PASSWORD=$(nmcli -s -g 802-11-wireless-security.psk connection show "$SSID" 2>/dev/null)
-PASSWORD=$(nmcli device wifi show-password | grep ^Password: | sed s/^Password:\ //)
-
-echo "SSID: $SSID"
-echo "PASSWORD: $PASSWORD"
-
-echo "nmcli device wifi connect '$SSID' password '$PASSWORD'" > /cdrom/wifi.sh
-chmod +x /cdrom/wifi.sh
+# Save the active wifi connection for the next boot (wifi.sh). Only write it
+# when there is an active SSID; open networks get no password argument.
+SSID="$(nmcli -t -f active,ssid dev wifi 2>/dev/null | grep '^yes' | cut -d: -f2)"
+if [ -n "$SSID" ]; then
+    PASSWORD="$(nmcli -s -g 802-11-wireless-security.psk connection show "$SSID" 2>/dev/null || true)"
+    echo "SSID: $SSID"
+    if [ -n "$PASSWORD" ]; then
+        printf "nmcli device wifi connect %q password %q\n" "$SSID" "$PASSWORD" > /cdrom/wifi.sh
+    else
+        printf "nmcli device wifi connect %q\n" "$SSID" > /cdrom/wifi.sh
+    fi
+    chmod +x /cdrom/wifi.sh
+    echo "wifi.sh written."
+else
+    echo "No active wifi connection; skipping wifi.sh." >&2
+fi
 
 #mount | grep tmp/squash | cut -f3 -d\  | while read d; do umount $d; done
 

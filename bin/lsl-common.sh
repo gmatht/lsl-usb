@@ -19,6 +19,17 @@ lsl_load_config() {
     export LSL_BTRFS_GROW_CHUNK_MIB LSL_BTRFS_MIN_FREE_PCT LSL_HOME_TMPFS_MIB
 }
 
+lsl_desktop_user() {
+    # The live-session desktop user (mint on Mint, zorin on Zorin, ubuntu on
+    # Ubuntu, ...). UID 1000 is the standard first desktop user on
+    # Ubuntu-family live systems; fall back to the first /home entry.
+    local u=""
+    u="$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)"
+    [ -n "$u" ] || u="$(ls -1 /home 2>/dev/null | head -n1 || true)"
+    [ -n "$u" ] || u="mint"
+    printf '%s\n' "$u"
+}
+
 lsl_resolve_data_dir() {
     local d
     d="${LSL_DATA_DIR:-/mnt/c/Users/lsl-usb}"

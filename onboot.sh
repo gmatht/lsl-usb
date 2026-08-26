@@ -1,24 +1,29 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/bin/lsl-common.sh"
+
 # Ensure the desktop user can use multi-user Nix.
-# On first boot, the "mint" account can appear after this script starts, so retry.
+# On first boot, the desktop account can appear after this script starts, so retry.
 lsl_ensure_nix_users_group_membership() {
     if ! getent group nix-users >/dev/null 2>&1; then
         groupadd --system nix-users 2>/dev/null || true
     fi
 
-    if id -u mint >/dev/null 2>&1; then
-        usermod -aG nix-users mint 2>/dev/null || true
-        return 0
-    fi
-    if id -u ubuntu >/dev/null 2>&1; then
-        usermod -aG nix-users ubuntu 2>/dev/null || true
+    local u
+    u="$(lsl_desktop_user)"
+    if id -u "$u" >/dev/null 2>&1; then
+        usermod -aG nix-users "$u" 2>/dev/null || true
         return 0
     fi
     return 1
 }
 
 if ! lsl_ensure_nix_users_group_membership; then
+    # Retry in the background: the desktop account can appear after this script
+    # starts. onboot.service uses KillMode=process, so this subshell survives
+    # the main script exiting (the service is Type=oneshot + RemainAfterExit).
     (
         i=0
         while [ "$i" -lt 180 ]; do # up to ~15 minutes
@@ -188,7 +193,7 @@ if [ -x /cdrom/bin/clean-old-system-patches.sh ]; then
     /cdrom/bin/clean-old-system-patches.sh || true
 fi
 
-sudo touch /run/casper-no-prompt
+touch /run/casper-no-prompt
 
 if [ -f /cdrom/persist.btrfs ]; then
     mkdir -p /persist
@@ -207,22 +212,7 @@ fi
 
 modprobe ntfs3 2>/dev/null || true
 mkdir -p /mnt/c /mnt/d
-if true; then # I hope this new code works...
-	bash /cdrom/bin/mount_all.sh
-else # begin stubbed out code.
-
-#TODO: Should automatically detect which device has C: and D:
-if ! mountpoint -q /mnt/c 2>/dev/null; then
-    bash /cdrom/bin/safe_ntfsfix.sh /dev/nvme0n1p3 
-    mount -t ntfs3 /dev/nvme0n1p3 /mnt/c 2>/dev/null || true
-fi
-if ! mountpoint -q /mnt/d 2>/dev/null; then
-    #Don't autofix D: until we have tested on C:...
-    #bash /cdrom/bin/safe_ntfsfix.sh /dev/nvme1n1p2 
-    mount -t ntfs3 /dev/nvme1n1p2 /mnt/d 2>/dev/null || true
-fi
-
-fi #End Stubbed Out Code.
+bash /cdrom/bin/mount_all.sh
 
 if [ -x /cdrom/bin/wsl-boot-setup ]; then
     /cdrom/bin/wsl-boot-setup
@@ -230,8 +220,6 @@ fi
 
 # --- LSL data dir / home / cache ---
 LSL_ENV_FILE=/cdrom/lsl-usb.env
-# shellcheck source=/dev/null
-. /cdrom/bin/lsl-common.sh
 lsl_load_config
 
 lsl_setup_zram
@@ -256,7 +244,7 @@ if lsl_is_usb_mode; then
     fi
     lsl_prepare_bash_log "$LSL_BASH_LOG"
 else
-    LSL_BASH_LOG=/home/mint/.local/state/lsl/bash.log
+    LSL_BASH_LOG=/home/$LSL_DESKTOP_USER/.local/state/lsl/bash.log
 fi
 
 if ! grep -q "LSL_BASH_LOG_HOOK" /etc/bash.bashrc 2>/dev/null; then
@@ -290,6 +278,19 @@ if lsl_is_usb_mode; then
         mount -t tmpfs -o "size=${LSL_HOME_TMPFS_MIB:-2048}M" tmpfs "$LSL_HOME_TMPFS"
     fi
     mkdir -p "$LSL_HOME_UPPER" "$LSL_HOME_WORK" "$LSL_HOME_LOWER"
+    if [ ! -f /cdrom/home.sfs ]; then
+        # First boot of a Windows-installed image: seed home.sfs from the live
+        # /home (keeps the mint user's login home) so the USB-mode overlay works.
+        mount /cdrom -o remount,rw 2>/dev/null || true
+        echo "Creating /cdrom/home.sfs from live /home (first boot)..."
+        if command -v mksquashfs >/dev/null 2>&1; then
+            mksquashfs /home /cdrom/home.sfs -comp zstd >/dev/null 2>&1 || \
+                echo "WARNING: could not create /cdrom/home.sfs - /home will not persist." >&2
+        else
+            echo "WARNING: mksquashfs not found - /cdrom/home.sfs not created." >&2
+        fi
+        mount /cdrom -o remount,ro 2>/dev/null || true
+    fi
     mount /cdrom/home.sfs "$LSL_HOME_LOWER"
     mount -t overlay overlay -o "lowerdir=${LSL_HOME_LOWER}/,upperdir=${LSL_HOME_UPPER},workdir=${LSL_HOME_WORK}" /home
     {
@@ -320,12 +321,12 @@ else
         cp -a /var/cache/. "$LSL_CACHE_MOUNT/var-cache/" 2>/dev/null || true
     fi
     mount --bind "$LSL_CACHE_MOUNT/var-cache" /var/cache
-    mkdir -p /home/mint/.cache
-    if [ -d /home/mint/.cache ] && [ "$(ls -A /home/mint/.cache 2>/dev/null)" ]; then
-        cp -a /home/mint/.cache/. "$LSL_CACHE_MOUNT/user-cache/" 2>/dev/null || true
+    mkdir -p /home/$LSL_DESKTOP_USER/.cache
+    if [ -d /home/$LSL_DESKTOP_USER/.cache ] && [ "$(ls -A /home/$LSL_DESKTOP_USER/.cache 2>/dev/null)" ]; then
+        cp -a /home/$LSL_DESKTOP_USER/.cache/. "$LSL_CACHE_MOUNT/user-cache/" 2>/dev/null || true
     fi
-    mount --bind "$LSL_CACHE_MOUNT/user-cache" /home/mint/.cache
-    chown -R mint:mint /home/mint/.cache 2>/dev/null || true
+    mount --bind "$LSL_CACHE_MOUNT/user-cache" /home/$LSL_DESKTOP_USER/.cache
+    chown -R $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/.cache 2>/dev/null || true
 
     # Nix: ~99% of disk use is /nix/store; keep it on cache.btrfs. State DB stays with the store.
     # User-editable settings: ~/.config/nix/nix.conf (created below if missing).
@@ -341,15 +342,15 @@ else
     mount --bind "$LSL_CACHE_MOUNT/nix-store" /nix/store
     mount --bind "$LSL_CACHE_MOUNT/nix-var" /nix/var
 
-    mkdir -p /home/mint/.config/nix
-    if [ ! -f /home/mint/.config/nix/nix.conf ]; then
-        cat <<'EOF' >/home/mint/.config/nix/nix.conf
+    mkdir -p /home/$LSL_DESKTOP_USER/.config/nix
+    if [ ! -f /home/$LSL_DESKTOP_USER/.config/nix/nix.conf ]; then
+        cat <<'EOF' >/home/$LSL_DESKTOP_USER/.config/nix/nix.conf
 # LSL-USB: /nix/store and /nix/var live on cache.btrfs (bind-mounted from /mnt/lsl-cache).
 # Edit substituters, experimental-features, trusted-users, etc. here.
 EOF
-        chown mint:mint /home/mint/.config/nix/nix.conf 2>/dev/null || true
+        chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/.config/nix/nix.conf 2>/dev/null || true
     fi
-    chown -R mint:mint /home/mint/.config/nix 2>/dev/null || true
+    chown -R $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/.config/nix 2>/dev/null || true
 
     {
         echo "LSL_HOME_LOWER=$LSL_HOME_LOWER"
@@ -358,6 +359,12 @@ EOF
         echo "LSL_MODE=hdd"
         echo "LSL_CACHE_MOUNT=$LSL_CACHE_MOUNT"
     } > /run/lsl-usb.state
+fi
+
+# Opt-in: host a flatpak installation on the FAT partition via the
+# fat_linux_meta_fs FUSE layer (apps persist without layer rebuilds).
+if [ "${LSL_FLATPAK_FAT:-0}" = "1" ] && [ -x /cdrom/bin/lsl-flatpak-fat.sh ]; then
+    /cdrom/bin/lsl-flatpak-fat.sh mount || true
 fi
 
 lsl_merge_fstab || true
@@ -375,13 +382,24 @@ cd /tmp/steam2/ && mkdir -p upper work root
 mount -t overlay overlay -olowerdir=/mnt/d/SteamLibrary/,upperdir=/tmp/steam/upper,workdir=/tmp/steam/work /tmp/steam/root || true
 mount -t overlay overlay -olowerdir='/mnt/c/Program Files (x86)/Steam',upperdir=/tmp/steam2/upper,workdir=/tmp/steam2/work /tmp/steam2/root || true
 
-chown mint /tmp/steam/root
-chown mint /tmp/steam2/root
+chown "$LSL_DESKTOP_USER" /tmp/steam/root
+chown "$LSL_DESKTOP_USER" /tmp/steam2/root
 
-until bash /cdrom/wifi.sh
-do
-    sleep 1
-done
+# Wait for wifi (bounded): wifi.sh may be missing (no saved profiles) or the
+# network may be down; don't block boot forever. onboot.service is
+# Type=oneshot + RemainAfterExit, so this script should exit when done.
+if [ -x /cdrom/wifi.sh ]; then
+    tries=0
+    until bash /cdrom/wifi.sh; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 60 ]; then
+            echo "wifi.sh still failing after ~5 minutes; continuing without wifi." >&2
+            break
+        fi
+        sleep 5
+    done
+else
+    echo "No /cdrom/wifi.sh; skipping wifi wait." >&2
+fi
 echo FINISHED
-
-while true; do sleep 99999; done
+exit 0

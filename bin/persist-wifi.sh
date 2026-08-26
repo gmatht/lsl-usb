@@ -9,7 +9,11 @@ fi
 
 mountpoint -q /cdrom 2>/dev/null || exit 0
 
-STATE_DIR="/home/mint/.local/state/lsl"
+# Live-session desktop user (mint on Mint, zorin on Zorin, ...).
+LSL_DESKTOP_USER="$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)"
+[ -n "$LSL_DESKTOP_USER" ] || LSL_DESKTOP_USER="$(ls -1 /home 2>/dev/null | head -n1 || true)"
+[ -n "$LSL_DESKTOP_USER" ] || LSL_DESKTOP_USER="mint"
+STATE_DIR="/home/$LSL_DESKTOP_USER/.local/state/lsl"
 STATE_WIFI_FILE="${STATE_DIR}/wifi.history.sh"
 CDROM_WIFI_FILE="/cdrom/wifi.sh"
 

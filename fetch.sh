@@ -59,8 +59,6 @@ else
 fi
 
 # Cleanup - always run regardless of install.sh exit code
-echo "Cleaning up temporary files..."
-#rm -rf "$TEMP_DIR"
-echo "$TEMP_DIR"
+rm -rf "$TEMP_DIR"
 
 exit $INSTALL_EXIT_CODE

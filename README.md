@@ -37,6 +37,36 @@ cd lsl-usb
 sudo ./install.sh
 ```
 
+### Install (from Windows)
+
+```text
+1. Download lsl-usb-win.zip (built by ./build.sh, from the releases page).
+2. Extract it, double-click install.bat.
+```
+
+`install.bat` handles Windows' script friction for you: it clears the
+downloaded-file marker (`Unblock-File`) and runs `install.ps1` with
+`-ExecutionPolicy Bypass`, so the PowerShell execution policy is not a blocker.
+If SmartScreen still warns, right-click the file -> Properties -> Unblock
+(or "More info" -> "Run anyway"). `install.ps1` can also be run directly:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+By default a WinForms GUI starts first: it runs the ISO download/verify in the
+background (with a progress bar) while you configure - flatpak apps to preload
+(detected from your installed Windows apps), WSL VHDX paths, and `LSL_DATA_DIR`.
+Use `-NoGui` for the plain console flow.
+
+To see everything that would be detected and passed to the Linux install
+(ISO, Rufus, USB target, WSL VHDX paths, wifi profiles, bundle contents)
+without downloading or writing anything:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -DryRun
+```
+
 ## First boot checklist
 
 1. Open `/cdrom/lsl-usb.env`.
@@ -86,6 +116,8 @@ sudo ./install.sh
   - Growth chunk size used by `lsl-btrfs-growd`.
 - `LSL_ZRAM_MIB` (default: unset -> about 80% of RAM, min 128 MiB)
   - Set to `0` to disable zram swap.
+- `LSL_NTFSFIX` (default: `0`)
+  - Set to `1` to let `mount_all.sh` run `safe_ntfsfix.sh` on the most-recently-booted Windows partition at boot. Off by default: the repair script is not yet battle-tested.
 
 ## Persistence model
 
@@ -100,7 +132,7 @@ Mode is selected from resolved `LSL_DATA_DIR`:
 - Mounts `/home` from `home.btrfs`.
 - Binds cache paths from `cache.btrfs`:
   - `/var/cache`
-  - `/home/mint/.cache`
+  - `/home/<user>/.cache` (the live-session desktop user: mint on Mint, zorin on Zorin, ...)
   - `/nix/store`
   - `/nix/var`
 - `uphome` is usually enough for day-to-day sync (no squashfs rebuild).
@@ -135,6 +167,10 @@ Mode is selected from resolved `LSL_DATA_DIR`:
 - If you appended a layer (`filesystem_z*.squashfs`), move it out of `/cdrom/casper` to disable it on next boot.
 
 ## Safety notes (read this before writing NTFS/USB)
+
+- **`wifi.sh` stores wifi passwords in plaintext** on the FAT partition (`/cdrom/wifi.sh`). This is inherent to the design - the live system needs them at boot to connect - but anyone with access to the USB can read them. Uncheck "Copy Wifi Settings to LSL" in the installer (or delete `/cdrom/wifi.sh`) if that is a concern.
+- **Preloaded `.snap` files install with `--dangerous`** (no store signature check) - only preload snaps you trust. The first-boot recipe unpins Mint's `nosnap.pref` and installs `snapd` by default (`LSL_SNAP_SUPPORT=0` to keep Mint's default).
+- **`find_everything.efu` contains the full file list of your Windows drives** (filenames, sizes, dates) in plaintext on the FAT partition. Uncheck "Export Everything index" in the installer if that is a concern.
 
 - Disable Windows Fast Startup and fully shut down Windows before mounting writable NTFS.
 - If a Windows volume is hibernated/dirty/BitLocker-locked, do not force writes.
@@ -171,13 +207,51 @@ Mode is selected from resolved `LSL_DATA_DIR`:
 
 ## Project map
 
-- `fetch.sh`: one-liner installer entrypoint.
-- `install.sh`: image customization and initial setup.
+- `fetch.sh`: one-liner installer entrypoint (Linux live session).
+- `install.sh`: image customization and initial setup (Linux live session).
+- `install.ps1` + `install.bat`: Windows installer with a WinForms wizard (ISO selection with Everything discovery, flatpak app preload detected from installed Windows apps, WSL VHDX paths, `LSL_DATA_DIR`, per-network wifi picker, reuse-an-existing-USB). Auto-downloads the Mint 22.x ISO (incremental SHA-256 verify with progress + ETA) and Rufus (Authenticode-verified), writes the USB, drops the lsl layer + config, and generates `wifi.sh` from Windows' saved profiles (netsh). Supports Ubuntu 24.04 based ISOs (Mint 22.x, Zorin 18.x - the live-session user is detected dynamically, not hardcoded to `mint`); refuses Ubuntu 26.04+ (it still uses NetworkManager, but its nmcli is broken, so the nmcli-based tooling breaks). `-NoGui` for the console flow; `-DryRun` for a detection report; `-SkipRufus` to write the image yourself and have the script pick up the USB.
+- `build.sh`: builds the Windows installer bundle (`dist/lsl-usb-win.zip`) - a ~4 KB `filesystem_z0_firstboot.squashfs` layer (systemd unit + scripts only, no distro binaries) plus the FAT-side file set. Runs three gates before packaging: the `install.ps1` test suite (pwsh), `shellcheck -S error` on all shell scripts, and a bundle preflight (layer contents, unit `ExecStart` paths, zip entries).
+- `misc/lsl-firstboot.sh` + `misc/lsl-firstboot.service`: run once on the first boot of a Windows-installed USB - waits for network, runs `uproot --auto-append` (installs `/cdrom/bin/squashfs_config.sh` packages in a chroot overlay and persists a new layer), stamps `/cdrom/casper/lsl-firstboot.done`, then reboots. The recipe also removes Mint's `nosnap.pref` pin and installs `snapd` by default (disable with `LSL_SNAP_SUPPORT=0`) so snaps - including any `.snap` files the Windows installer preloads to `<USB>\snaps\` - can be installed.
+- `misc/lsl-firstboot-progress.sh` + `.desktop`: user-session zenity progress dialog fed by `/run/lsl-firstboot-status` while the first-boot setup runs (the desktop is not blocked; the work is `nice`d/`ionice`d).
 - `onboot.sh`: runtime setup on every boot.
 - `bin/config.sh`: sync scripts to `/cdrom`, install services/shortcuts/autostart entries.
 - `bin/uphome`: persist/sync home data.
-- `bin/uproot`: persist root image changes.
+- `bin/uproot`: persist root image changes (also `--auto-append` for first-boot).
+- `bin/detect-wsl`: detects WSL rootfs dirs on mounted Windows partitions and reads `/cdrom/lsl-wsl-vhdx.conf` (written by `install.ps1`) to add WSL2 VHDX paths - so distros stored anywhere on disk (e.g. `D:\WSL\Ubuntu2404\ext4.vhdx`) are mountable via `lsl`/`lsl-gui` (guestmount).
 - `bin/lsl-common.sh`: shared config loading and mode detection logic.
+- `bin/lsl-precache.sh` + `systemd/lsl-precache.service`: warm the page cache so early reads hit RAM instead of the USB. Order: (1) the startup-critical hot files from `/cdrom/lsl-precache.list` first (recorded by `bin/lsl-precache-profile.sh` via fatrace), then (2) if the whole image (squashfs layers + home.sfs) is under half of total RAM, warm everything else at `ionice idle`, stopping early if unused RAM drops below 10%. Falls back to the hot-file list alone when the image is too big. Unlike `toram`, no copy or pivot is involved - it is just a reclaimable page cache.
+- `bin/lsl-toram.sh`: lazy `toram` - copy the whole running root to a tmpfs and `pivot_root()` into it, then unmount the USB so the stick can be removed mid-session (run anytime after boot, in the background). Stops USB-persistence helpers first; re-insert the stick to persist again.
+- `bin/lsl-boot-time.sh` + `systemd/lsl-boot-stamp.service` + `misc/lsl-boot-time.desktop`: measure boot-to-desktop time and a precache workload probe per boot, logged to `/cdrom/casper/boot-times.log` for comparison.
+- `bin/lsl-rusttools.sh` + `bin/rusttools.list`: install statically-linked CLI tools (ripgrep, fd, bat, eza, zoxide, delta, lazygit, starship, just, ...) to `/cdrom/bin` (on PATH) - musl-static, no runtime deps, persist on the FAT partition.
+- `bin/lsl-appimages.sh` + `bin/appimages.list`: download curated AppImages (RustDesk, KeePassXC, FreeCAD, Joplin, ...) to `/cdrom/appimages` via GitHub latest-release resolution, with a URL cache so the API is only hit once per app.
+- `tests/install.ps1.tests.ps1`: mock-based test harness for `install.ps1` (mocks Get-Volume/registry/es.exe/netsh/WebClient) - run with `pwsh -File tests/install.ps1.tests.ps1`.
+
+## File search
+
+- **Windows**: install [Everything](https://www.voidtools.com) (voidtools) - the
+  installer offers to install the portable version if missing. It powers the
+  ISO picker (full-disk discovery) and the `find_everything.efu` export.
+- **Linux (GUI)**: [FSearch](https://github.com/cboxdoerfer/fsearch) is the
+  closest Everything equivalent (C/GTK, instant results, regex). The installer
+  pre-checks it as a recommended flatpak (`io.github.cboxdoerfer.FSearch`);
+  other options: ANGRYsearch, Recoll (full-text), Catfish, Synapse.
+- **Linux (CLI)**: `lsl-find <pattern>` searches the exported EFU index
+  instantly (the pre-indexed Windows view - no scanning). `fzf` gives
+  interactive fuzzy search; `plocate` indexes the live system's own files
+  (`sudo apt install plocate && sudo updatedb`).
+
+## Testing
+
+```bash
+# PowerShell harness (install.ps1) - mocks Get-Volume/registry/es.exe/netsh/WebClient
+pwsh -NoProfile -File tests/install.ps1.tests.ps1
+
+# Bash regression tests (bats)
+bats tests/bash.tests.bats
+```
+
+CI (`.github/workflows/ci.yml`) runs both, plus shellcheck and `build.sh`, on every
+push; a `v*` tag triggers a release with `dist/lsl-usb-win.zip` attached.
 
 ## Status / roadmap
 

@@ -157,11 +157,11 @@ upper_summary() {
 }
 
 remount_ro() {
-	for f in /home /cdrom /mnt/*
-	do
-		sudo mount -o ro,remount
-	done
-	sync
+    for f in /home /cdrom /mnt/*; do
+        [ -d "$f" ] || continue
+        run_privileged mount -o ro,remount "$f" 2>/dev/null || true
+    done
+    sync
 }
 
 
@@ -297,6 +297,7 @@ main() {
             FALSE "Reboot to USB (no save)" \
             FALSE "Normal reboot (no save)" \
             FALSE "Shutdown (no save)" \
+            FALSE "Load to RAM + remove USB (persistence to USB stops)" \
             FALSE "Cancel" \
             --width=620 --height=360 2>/dev/null || true)"
     elif [ "$GUI_TOOL" = "dialog" ]; then
@@ -310,7 +311,8 @@ main() {
             4 "Reboot to USB (no save)" \
             5 "Normal reboot (no save)" \
             6 "Shutdown (no save)" \
-            7 "Cancel" 2>&1 >/dev/tty || true)"
+            7 "Load to RAM + remove USB (persistence to USB stops)" \
+            8 "Cancel" 2>&1 >/dev/tty || true)"
     elif [ "$GUI_TOOL" = "whiptail" ]; then
         if [ -n "$upper_msg" ]; then
             whiptail --msgbox "$upper_msg" 22 80 3>&1 1>&2 2>&3 || true
@@ -322,7 +324,8 @@ main() {
             4 "Reboot to USB (no save)" \
             5 "Normal reboot (no save)" \
             6 "Shutdown (no save)" \
-            7 "Cancel" 3>&1 1>&2 2>&3 || true)"
+            7 "Load to RAM + remove USB (persistence to USB stops)" \
+            8 "Cancel" 3>&1 1>&2 2>&3 || true)"
     else
         if [ -n "$upper_msg" ]; then
             echo ""
@@ -336,8 +339,9 @@ main() {
         echo "4) Reboot to USB (no save)"
         echo "5) Normal reboot (no save)"
         echo "6) Shutdown (no save)"
-        echo "7) Cancel"
-        read -r -p "Choose (1-7): " selected || true
+        echo "7) Load to RAM + remove USB (persistence to USB stops)"
+        echo "8) Cancel"
+        read -r -p "Choose (1-8): " selected || true
     fi
 
     selected="${selected//$'\r'/}"
@@ -367,7 +371,24 @@ main() {
             save_mode="nosave"
             power_mode="shutdown"
             ;;
-        ""|"Cancel"|"7")
+        "Load to RAM + remove USB"|"7")
+            # Copy the session to RAM and pivot, so the USB can be removed.
+            if [ -x /cdrom/bin/lsl-toram.sh ]; then
+                if run_privileged /cdrom/bin/lsl-toram.sh; then
+                    if [ "$GUI_TOOL" = "zenity" ]; then
+                        zenity --info --title="lsl-usb" --text="Session is now running from RAM. You can remove the USB stick." 2>/dev/null || true
+                    else
+                        echo "Session is now running from RAM. You can remove the USB stick."
+                    fi
+                else
+                    show_error "lsl-toram failed - the USB is still required."
+                fi
+            else
+                show_error "lsl-toram.sh not found on /cdrom."
+            fi
+            exit 0
+            ;;
+        ""|"Cancel"|"8")
             exit 0
             ;;
         *)

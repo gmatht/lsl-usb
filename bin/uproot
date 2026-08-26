@@ -13,6 +13,17 @@ on_error() {
 }
 trap 'on_error $LINENO' ERR
 
+# --auto-append: non-interactive mode for lsl-firstboot.sh. Skips all prompts
+# and the interactive-chroot fallback; runs squashfs_config.sh (if present) and
+# appends a new layer capturing only the changes.
+auto_append=0
+for arg in "$@"; do
+    case "$arg" in
+        --auto-append) auto_append=1 ;;
+        *) echo "Unknown option: $arg" >&2; exit 1 ;;
+    esac
+done
+
 echo "Updating filesystem.squashfs..."
 
 if [ "$EUID" -ne 0 ]; then
@@ -21,15 +32,26 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 ts="$(date +%Y%m%d%H%M%S)"
+
+# Remount /cdrom as read-write when available (best effort), before deciding
+# where logs can live.
+if mountpoint -q /cdrom 2>/dev/null; then
+    mount /cdrom -o remount,rw || echo "Warning: could not remount /cdrom read-write; continuing."
+else
+    echo "Warning: /cdrom is not mounted; writing output/logs may fail."
+fi
+
 if mountpoint -q /persist 2>/dev/null; then
     usb_log_dir="/persist/casper/uproot-logs"
 else
     usb_log_dir="/cdrom/casper/uproot-logs"
 fi
-if ! mkdir -p "$usb_log_dir" 
-then 
-	usb_log_dir=/tmp
+# mkdir -p alone is not enough: on a read-only filesystem it succeeds when the
+# directory already exists, and tee -a then fails. Verify we can actually write.
+if ! mkdir -p "$usb_log_dir" 2>/dev/null || ! touch "$usb_log_dir/.write-test" 2>/dev/null; then
+    usb_log_dir=/tmp
 fi
+rm -f "$usb_log_dir/.write-test" 2>/dev/null || true
 build_log="${usb_log_dir}/uproot-${ts}.log"
 
 log() {
@@ -126,12 +148,10 @@ resolve_live_lowerdirs() {
 prompt_choice() {
     local ans=""
     echo "" >&2
-    #I Don't see anyof this.
     echo "Persist these root changes to the USB image?" >&2
     echo "1) Append new squashfs layer (stacking; fast; may confuse dpkg if you keep many layers)" >&2
     echo "2) Merge into a single filesystem.squashfs (slower; keeps dpkg consistent)" >&2
     echo "3) Skip (do nothing)" >&2
-    echo "... actually I THINK we order the squashfs such that appending won't confuse dpkg, but it WILL add overhead as we have to walk more squashfs" >&2
     read -r -p "Choose (1-3): " ans || true
     case "$ans" in
         1) echo "append" ;;
@@ -211,13 +231,6 @@ prompt_unmount_existing_overlay() {
         *) return 1 ;;
     esac
 }
-
-# Remount /cdrom as read-write when available.
-if mountpoint -q /cdrom 2>/dev/null; then
-    mount /cdrom -o remount,rw || echo "Warning: could not remount /cdrom read-write; continuing."
-else
-    echo "Warning: /cdrom is not mounted; writing output/logs may fail."
-fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -x "$SCRIPT_DIR/persist-wifi.sh" ]; then
@@ -321,7 +334,12 @@ if [ -n "$config_in_chroot" ]; then
     if [ "$squashfs_config_rc" -ne 0 ]; then
         echo "Non-interactive run failed: ${config_in_chroot}"
         echo "See log: $auto_log"
-        log "Non-interactive run failed. Falling back to interactive chroot."
+        log "Non-interactive run failed."
+        if [ "$auto_append" -eq 1 ]; then
+            echo "Auto-append mode: no interactive fallback; aborting (retry on next boot)."
+            exit 1
+        fi
+        echo "Falling back to interactive chroot."
         interactive=1
     fi
 else
@@ -371,7 +389,12 @@ if [ -f /cdrom/casper/filesystem.squashfs ]; then
 fi
 df -h /cdrom 2>/dev/null || true
 
-choice="$(prompt_choice)"
+if [ "$auto_append" -eq 1 ]; then
+    log "Auto-append mode selected."
+    choice="append"
+else
+    choice="$(prompt_choice)"
+fi
 case "$choice" in
     append)
         # Append a new layer from the overlay upperdir only.

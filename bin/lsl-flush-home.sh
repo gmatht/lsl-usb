@@ -23,7 +23,10 @@ LOWER="${LSL_HOME_LOWER:-/run/lsl-home-lower}"
 UPPER="${LSL_HOME_UPPER:-/run/lsl-home-overlay/upper}"
 WORK="${LSL_HOME_WORK:-/run/lsl-home-overlay/work}"
 
-mount /cdrom -o remount,rw
+mount /cdrom -o remount,rw 2>/dev/null || {
+    echo "lsl-flush-home.sh: could not remount /cdrom read-write; aborting." >&2
+    exit 1
+}
 
 ts="$(date +%Y%m%d%H%M%S)"
 tmp_sfs="/cdrom/home_new_${ts}.sfs"
