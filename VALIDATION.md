@@ -151,6 +151,17 @@ under Secure Boot. If your machine's firmware has Secure Boot enabled:
 Note: this applies to UEFI boots. On legacy/CSM (BIOS) boots Secure Boot is not
 involved at all.
 
+**Verified on the 22.3 ISO (pre-hardware check):** the EFI boot chain is the
+standard Ubuntu/Mint one - `boot/grub/efi.img` contains `EFI/boot/bootx64.efi`
+(the **Microsoft-signed shim**) plus `EFI/boot/grubx64.efi` (Canonical-signed
+grub), so the ISO itself is Secure-Boot capable and boots under SB without MOK
+enrollment. The one real SB risk is **DKMS modules**: the first boot installs
+out-of-tree drivers (e.g. `broadcom-sta-dkms`, `rtl8723bu`) that are *not*
+signed by the kernel's key, so under Secure Boot they will **not load** unless a
+MOK is enrolled for the custom key or Secure Boot is disabled. Plan for the
+hardware test accordingly: either disable SB, or expect to enroll a MOK and
+re-sign the DKMS modules (or accept no wifi until SB is off).
+
 ## 3. Persistence
 
 > **Layer size / FAT32:** each `--auto-append` writes a *delta* layer (just your
