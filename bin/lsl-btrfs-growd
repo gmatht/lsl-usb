@@ -43,15 +43,34 @@ try_grow() {
         echo "lsl-btrfs-growd: truncate failed (${label})" >&2
         return 0
     fi
-    # The loop device caches the backing-file size; refresh it so the btrfs
-    # resize below sees the grown image (truncate alone is not enough).
-    local loop_dev
+
+    local loop_dev new_size loop_size
     loop_dev="$(losetup -j "$img" 2>/dev/null | awk -F: '{print $1; exit}')"
+    # Refresh the loop device's view of the grown backing file.
     if [ -n "$loop_dev" ] && [ -b "$loop_dev" ]; then
         losetup -c "$loop_dev" 2>/dev/null || true
     fi
+    # Verify the loop device actually reflects the new file size; some kernels
+    # ignore losetup -c, in which case detach + re-loop and remount it.
+    if [ -n "$loop_dev" ] && [ -b "$loop_dev" ] && command -v blockdev >/dev/null 2>&1; then
+        new_size="$(stat -c %s "$img" 2>/dev/null || echo 0)"
+        loop_size="$(blockdev --getsize64 "$loop_dev" 2>/dev/null || echo 0)"
+        if [ "$loop_size" != "$new_size" ] && [ "$loop_size" -gt 0 ] 2>/dev/null; then
+            echo "lsl-btrfs-growd: loop device did not pick up new size ($loop_size != $new_size); re-looping ${img}." >&2
+            if mountpoint -q "$mp" 2>/dev/null && umount "$mp" 2>/dev/null; then
+                losetup -d "$loop_dev" 2>/dev/null || true
+                loop_dev="$(losetup -f --show "$img" 2>/dev/null || true)"
+                if [ -n "$loop_dev" ]; then
+                    mount -o loop,compress=zstd:3,relatime "$img" "$mp" 2>/dev/null || true
+                fi
+            else
+                echo "lsl-btrfs-growd: cannot remount busy ${label}; a reboot may be needed to grow." >&2
+            fi
+        fi
+    fi
+
     if ! btrfs filesystem resize max "$mp"; then
-        echo "lsl-btrfs-growd: btrfs resize failed (${label})" >&2
+        echo "lsl-btrfs-growd: btrfs resize failed (${label}); a reboot may be required to apply the growth." >&2
     fi
     df -h "$mp" 2>/dev/null || true
 }
