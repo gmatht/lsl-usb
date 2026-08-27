@@ -77,6 +77,28 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   backstop against rapid crash loops.
 - CI: `tests/*.sh` are shellchecked; the release artifact check uses the real
   `filesystem_z0_firstboot.squashfs` name.
+- `lsl-diag.sh` now also captures Secure Boot state (`mokutil --sb-state`) for
+  boot-failure diagnosis.
+- `misc/lsl-firstboot.sh` runs `dpkg --configure -a` + `apt-get install -f`
+  (via `squashfs_config.sh`) before the recipe so an interrupted prior attempt
+  does not wedge; warns on < 3 GiB RAM; logs btrfs/hivex tooling presence; drops
+  a baseline diagnostics tarball on every successful first boot; and removes any
+  corrupt/partial appended layer before giving up.
+- `squashfs_config.sh` skips `guestmount`/`guestfish` on machines with < 3 GiB
+  RAM (the libguestfs appliance can OOM) so first boot does not fail low-RAM.
+- `bin/lsl-flush-home.sh`, `bin/uproot` (append + merge), and `onboot.sh`
+  (first-boot `home.sfs` seed) now pre-check free space on `/cdrom` via
+  `lsl_ensure_cdrom_space` (new `lsl-common.sh` helper) and abort with a clear
+  message instead of a mid-write "No space left on device".
+- `onboot.sh` falls back to a temporary tmpfs `/home` when `btrfs-progs` is not
+  present on the first boot (before firstboot installs it), and is now sourceable
+  for unit tests (`tests/live-emulation.sh` emulates it and asserts the generated
+  fstab block wires `/cdrom` and a btrfs-loop `/home`).
+- `tests/live-emulation.sh` now sources `onboot.sh` and asserts `lsl_merge_fstab`
+  output; `tests/lsl-common.tests.sh` covers `lsl_cdrom_free_mib`,
+  `lsl_ensure_cdrom_space`, and `lsl_data_dir_is_persistent`.
+- Docs (`README.md`, `VALIDATION.md`): Secure Boot / Rufus DD-mode guidance,
+  minimum-RAM recommendation for first boot, and the `guestmount` RAM caveat.
 
 ## [0.1.0] - initial
 

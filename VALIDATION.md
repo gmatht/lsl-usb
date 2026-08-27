@@ -35,6 +35,12 @@ These catch the two biggest unknowns without a physical boot:
       now falls back to a temporary tmpfs `/home` and warns, but HDD persistence
       only becomes real on the second boot. Verify both tools are present in the
       image you wrote (`which hivexget btrfs`; `apt-cache policy ...`).
+- [ ] **Secure Boot off / Rufus DD mode** — this is a BIOS/MBR casper live USB,
+      not a signed UEFI bootloader, so it will **not** boot on firmware with
+      Secure Boot enabled. Check the firmware mode with `mokutil --sb-state` on
+      any Linux box (`SecureBoot enabled` = won't boot there). With Rufus, write
+      in "DD Image" mode (not "ISO" mode) so the stick boots like a real ISO;
+      some UEFIs reject Rufus' "ISO" hybrid partition table.
 
 ## Capture logs on failure
 
@@ -72,6 +78,9 @@ state, and `dmesg`/`journalctl`. A failed first boot also drops
       Note: the apt installs are the long pole - expect 10-30 min on the first
       boot (network + package downloads). The progress dialog shows the phase.
 - [ ] `/cdrom/casper/lsl-firstboot.done` exists; reboot happens.
+- [ ] **Memory**: >= 4 GB RAM recommended for first boot. `guestmount`/`guestfish`
+      are skipped automatically when RAM < 3 GB (VHDX mounting then unavailable),
+      but the apt recipe alone can OOM low-RAM boxes — watch the log for OOM kills.
 - [ ] Second boot: packages present, no firstboot re-run, `lsl-precache.service`
       active, `lsl-boot-time` records a row in `/cdrom/casper/boot-times.log`.
 - [ ] `lsl` / `lsl-gui` list the WSL distros from `lsl-wsl-vhdx.conf` and mount a

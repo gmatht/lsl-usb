@@ -192,6 +192,13 @@ Mode is selected from resolved `LSL_DATA_DIR`:
   - Root/package changes: run `uproot` and choose append/merge.
 - Home read-only warnings:
   - Check the autostart warning helper (`lsl-home-readonly-warning`) and disk health.
+- Won't boot on a UEFI machine / Secure Boot:
+  - This is a BIOS/MBR-style casper live USB, **not** a signed UEFI bootloader,
+    so it will not boot on firmware with Secure Boot enabled. Disable Secure Boot
+    (or enroll a shim via MOK) to boot it. `mokutil --sb-state` on any Linux box
+    reports the firmware Secure Boot mode.
+  - With Rufus, write in **DD Image** mode (not ISO mode) so the stick boots like
+    a real ISO; some firmwares reject Rufus' ISO-mode hybrid partition table.
 
 ## Boot behavior
 
@@ -204,6 +211,12 @@ Mode is selected from resolved `LSL_DATA_DIR`:
 - Starts zram swap setup (configurable with `LSL_ZRAM_MIB`).
 - Refreshes generated fstab block.
 - Runs optional helpers like `wsl-boot-setup`.
+
+The first boot is memory-heavy: the apt recipe plus the libguestfs appliance used
+for `guestmount` VHDX mounting can OOM below ~4 GB RAM. `guestmount`/`guestfish`
+are **skipped automatically on machines with < 3 GB RAM** (VHDX mounting then
+unavailable until more RAM is added); everything else in the first boot still runs.
+Recommendation: **>= 4 GB RAM for first boot**.
 
 ## Project map
 
