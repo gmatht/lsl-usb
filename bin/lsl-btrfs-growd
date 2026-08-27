@@ -37,21 +37,36 @@ try_grow() {
         return 0
     fi
 
-    echo "lsl-btrfs-growd: low free space on ${label} (${fp}% ≤ ${MIN_PCT}%), growing ${img} by ${CHUNK_MIB}MiB…"
+    echo "lsl-btrfs-growd: low free space on ${label} (${fp}% <= ${MIN_PCT}%), growing ${img} by ${CHUNK_MIB}MiB…"
     btrfs filesystem sync "$mp" 2>/dev/null || true
+
     if ! truncate -s "+${CHUNK_MIB}M" "$img"; then
         echo "lsl-btrfs-growd: truncate failed (${label})" >&2
         return 0
     fi
 
+    # Locate the live loop device backing this mount. Prefer findmnt (gives the
+    # actual /dev/loopN for the mountpoint) over losetup -j, which can miss the
+    # device when the backing-file path is a symlink or was resolved differently.
     local loop_dev new_size loop_size
-    loop_dev="$(losetup -j "$img" 2>/dev/null | awk -F: '{print $1; exit}')"
-    # Refresh the loop device's view of the grown backing file.
+    loop_dev="$(findmnt -n -o SOURCE "$mp" 2>/dev/null | grep -E '^/dev/loop' | head -1)"
+
+    # PRIMARY (online): make the live loop device pick up the new file size with
+    # losetup -c. No unmount needed, so this works even while /home is busy.
     if [ -n "$loop_dev" ] && [ -b "$loop_dev" ]; then
         losetup -c "$loop_dev" 2>/dev/null || true
     fi
-    # Verify the loop device actually reflects the new file size; some kernels
-    # ignore losetup -c, in which case detach + re-loop and remount it.
+
+    # Grow the btrfs filesystem to fill the (now larger) device. This is the step
+    # that actually changes the usable space on a busy mount.
+    if ! btrfs filesystem resize max "$mp"; then
+        echo "lsl-btrfs-growd: btrfs resize failed (${label}); a reboot may be required to apply the growth." >&2
+    fi
+
+    # Verify the loop device reflects the grown file. Some kernels silently
+    # ignore losetup -c; if so we try a re-loop, but only when the filesystem can
+    # be unmounted - otherwise leave a clear "reboot needed" note (online growth
+    # of a busy loop-backed FS is fundamentally limited).
     if [ -n "$loop_dev" ] && [ -b "$loop_dev" ] && command -v blockdev >/dev/null 2>&1; then
         new_size="$(stat -c %s "$img" 2>/dev/null || echo 0)"
         loop_size="$(blockdev --getsize64 "$loop_dev" 2>/dev/null || echo 0)"
@@ -62,16 +77,14 @@ try_grow() {
                 loop_dev="$(losetup -f --show "$img" 2>/dev/null || true)"
                 if [ -n "$loop_dev" ]; then
                     mount -o loop,compress=zstd:3,relatime "$img" "$mp" 2>/dev/null || true
+                    btrfs filesystem resize max "$mp" 2>/dev/null || true
                 fi
             else
-                echo "lsl-btrfs-growd: cannot remount busy ${label}; a reboot may be needed to grow." >&2
+                echo "lsl-btrfs-growd: cannot remount busy ${label}; a reboot is required to grow it." >&2
             fi
         fi
     fi
 
-    if ! btrfs filesystem resize max "$mp"; then
-        echo "lsl-btrfs-growd: btrfs resize failed (${label}); a reboot may be required to apply the growth." >&2
-    fi
     df -h "$mp" 2>/dev/null || true
 }
 

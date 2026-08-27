@@ -80,6 +80,21 @@ lsl_ensure_nix_daemon() {
 # Replace the # BEGIN lsl-usb fstab ... # END lsl-usb fstab block in /etc/fstab so
 # installers, disk tools, and "mount -a" see stable UUID/path lines for /cdrom,
 # Windows drive letters, persist, and (HDD mode) loop-backed /home and cache.
+lsl_grow_btrfs_image() {
+    # Grow a btrfs image file to $2 MiB if it is currently smaller. Done while the
+    # image is unmounted (e.g. at boot), so it always succeeds; online growth of a
+    # busy loop-backed FS is unreliable (see bin/lsl-btrfs-growd). The FS itself
+    # is resized by the caller after the (re)mount.
+    local img="$1" want_mib="$2"
+    [ -f "$img" ] || return 0
+    local cur want
+    cur="$(stat -c %s "$img" 2>/dev/null || echo 0)"
+    want="$(( want_mib * 1024 * 1024 ))"
+    if [ "$cur" -lt "$want" ] 2>/dev/null; then
+        truncate -s "${want_mib}M" "$img" 2>/dev/null || true
+    fi
+}
+
 lsl_merge_fstab() {
     local fstab=/etc/fstab
     [ -e "$fstab" ] || touch "$fstab"
@@ -346,16 +361,24 @@ else
     if [ ! -f "$HOME_IMG" ]; then
         truncate -s "${LSL_HOME_BTRFS_MIB:-4096}M" "$HOME_IMG"
         mkfs.btrfs -f "$HOME_IMG" >/dev/null
+    else
+        # Grow to the configured size at boot (unmounted) - reliable; online
+        # growth of a busy /home loop device often fails.
+        lsl_grow_btrfs_image "$HOME_IMG" "${LSL_HOME_BTRFS_MIB:-4096}"
     fi
     if [ ! -f "$CACHE_IMG" ]; then
         truncate -s "${LSL_CACHE_BTRFS_MIB:-2048}M" "$CACHE_IMG"
         mkfs.btrfs -f "$CACHE_IMG" >/dev/null
+    else
+        lsl_grow_btrfs_image "$CACHE_IMG" "${LSL_CACHE_BTRFS_MIB:-2048}"
     fi
     mount -o loop,compress=zstd:3,relatime "$HOME_IMG" /home
+    command -v btrfs >/dev/null 2>&1 && btrfs filesystem resize max /home 2>/dev/null || true
 
     lsl_prepare_bash_log "$LSL_BASH_LOG"
     mkdir -p "$LSL_CACHE_MOUNT"
     mount -o loop,compress=zstd:3,relatime "$CACHE_IMG" "$LSL_CACHE_MOUNT"
+    command -v btrfs >/dev/null 2>&1 && btrfs filesystem resize max "$LSL_CACHE_MOUNT" 2>/dev/null || true
     mkdir -p "$LSL_CACHE_MOUNT/var-cache" "$LSL_CACHE_MOUNT/user-cache"
     if [ -d /var/cache ] && [ "$(ls -A /var/cache 2>/dev/null)" ]; then
         cp -a /var/cache/. "$LSL_CACHE_MOUNT/var-cache/" 2>/dev/null || true
