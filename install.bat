@@ -12,7 +12,7 @@ cd /d "%~dp0"
 
 rem Repo slug used to auto-fetch the latest release of lsl-usb-win.zip via the
 rem GitHub API. Override here (or via env LSL_REPO) with your GitHub owner/name.
-if not defined LSL_REPO set "LSL_REPO=OWNER/REPO"
+if not defined LSL_REPO set "LSL_REPO=gmatht/lsl-usb"
 
 rem --- resolve a PowerShell >= 5.1 to drive the installer --------------------
 set "PS_EXE="

@@ -47,6 +47,22 @@ These catch the two biggest unknowns without a physical boot:
       in "DD Image" mode (not "ISO" mode) so the stick boots like a real ISO;
       some UEFIs reject Rufus' "ISO" hybrid partition table.
 
+### Test matrix (cover before declaring the hardware test passed)
+
+- [ ] **Boot on at least one UEFI machine and one legacy/CSM (BIOS) machine** -
+      the DD-mode hybrid ISO should boot both, but real firmware varies. Note the
+      firmware entry you pick (e.g. "UEFI: SanDisk" vs "UEFI: SanDisk (Partition 2)")
+      - some boards expose two entries for the same stick and only one boots.
+- [ ] **Secure Boot is OFF** on the test machine (or the USB will not boot; the
+      installer now warns about this *before* writing the stick).
+- [ ] **`LSL_REPO` is set** in `install.bat` to your GitHub `owner/name` (shipped
+      default `gmatht/lsl-usb`) so the auto-fetch of `lsl-usb-win.zip` works;
+      otherwise keep `install.bat` beside the bundle, or set `LSL_RELEASE_URL`.
+- [ ] **First boot is the long pole** (10-30 min apt). Use wired Ethernet and
+      watch the zenity phases; if it wedges, the diagnostics tarball's new
+      `hardware.txt` (lsblk/blkid//cdrom mount//proc/cmdline/casper layers)
+      distinguishes DD-mode vs casper-glob vs space failures.
+
 ## Capture logs on failure
 
 On any wedged first boot or `onboot` failure, `lsl-firstboot.sh` writes a
