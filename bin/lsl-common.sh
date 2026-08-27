@@ -50,6 +50,23 @@ lsl_is_usb_mode() {
     esac
 }
 
+lsl_data_dir_is_persistent() {
+    # True when the resolved LSL_DATA_DIR sits on a persistent volume (a real
+    # disk / loop / USB partition), not the live overlay/tmpfs root. Used by
+    # onboot.sh to avoid silently writing HDD-mode images into volatile RAM on
+    # the first boot (before firstboot has installed the tools that mount /mnt/c).
+    local d mp fst
+    d="$(lsl_resolve_data_dir 2>/dev/null || true)"
+    [ -n "$d" ] || return 1
+    mp="$(findmnt -n -o TARGET -T "$d" 2>/dev/null || true)"
+    [ -n "$mp" ] || return 1
+    fst="$(findmnt -n -o FSTYPE -- "$mp" 2>/dev/null || true)"
+    case "$fst" in
+        overlay|aufs|tmpfs|ramfs|"") return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 LSL_HOME_LOWER="${LSL_HOME_LOWER:-/run/lsl-home-lower}"
 LSL_HOME_UPPER="${LSL_HOME_UPPER:-/run/lsl-home-overlay/upper}"
 LSL_HOME_WORK="${LSL_HOME_WORK:-/run/lsl-home-overlay/work}"

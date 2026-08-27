@@ -272,7 +272,27 @@ export LSL_HOME_WORK=/run/lsl-home-overlay/work
 export LSL_HOME_TMPFS=/run/lsl-home-overlay
 export LSL_CACHE_MOUNT=/mnt/lsl-cache
 
-if lsl_is_usb_mode; then
+# If HDD mode but the data dir isn't on a persistent volume yet (e.g. the first
+# boot, before firstboot installed the hivex tools that mount /mnt/c), the path
+# would resolve onto the live overlay and we'd silently write home.btrfs into
+# volatile RAM. Retry the Windows-drive mount once, and if it's still not on a
+# persistent volume, fall back to a temporary tmpfs-overlay /home for this boot
+# (so the only consequence is that first-boot home changes are lost on reboot).
+LSL_FALLBACK_USB_HOME=0
+if ! lsl_is_usb_mode && ! lsl_data_dir_is_persistent; then
+    echo "lsl: HDD data dir $DATA_DIR not on a persistent volume yet; retrying drive mount..." >&2
+    bash /cdrom/bin/mount_all.sh 2>/dev/null || true
+    DATA_DIR="$(lsl_resolve_data_dir)"
+    mkdir -p "$DATA_DIR" 2>/dev/null || true
+    if lsl_data_dir_is_persistent; then
+        echo "lsl: data dir now on a persistent volume: $DATA_DIR" >&2
+    else
+        echo "lsl: WARNING: data dir still not persistent; using a temporary tmpfs-overlay /home for this boot (changes lost on reboot)." >&2
+        LSL_FALLBACK_USB_HOME=1
+    fi
+fi
+
+if lsl_is_usb_mode || [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
     mkdir -p "$LSL_HOME_TMPFS" "$LSL_HOME_UPPER" "$LSL_HOME_WORK" "$LSL_HOME_LOWER"
     if ! mountpoint -q "$LSL_HOME_TMPFS" 2>/dev/null; then
         mount -t tmpfs -o "size=${LSL_HOME_TMPFS_MIB:-2048}M" tmpfs "$LSL_HOME_TMPFS"
