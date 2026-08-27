@@ -115,6 +115,11 @@ if [ "$rc" -ne 0 ]; then
         log "uproot --auto-append FAILED $attempts times; giving up (see $LOG)."
         # Leave a visible marker so the failure isn't silent after reboot.
         touch /cdrom/casper/lsl-firstboot.FAILED 2>/dev/null || true
+        {
+            echo "lsl-firstboot gave up after $attempts attempts ($(date))."
+            echo "See $LOG and the diagnostics tarball (bash /cdrom/bin/lsl-diag.sh)."
+            echo "To retry: boot, open a terminal, run: sudo bash /cdrom/bin/uproot --auto-append"
+        } > /cdrom/casper/lsl-firstboot.FAILED.reason 2>/dev/null || true
         lsl_firstboot_cleanup_partial_layers
         diag "firstboot-failed"
         touch "$STAMP"   # stop the retry loop; the failure is visible in the log

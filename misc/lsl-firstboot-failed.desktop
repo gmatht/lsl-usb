@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=lsl-usb first-boot failure notice
+Comment=Warns at login if the first-boot setup did not complete
+Exec=/usr/local/bin/lsl-firstboot-failed.sh
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

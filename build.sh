@@ -22,7 +22,8 @@ trap 'rm -rf "$STAGE"' EXIT
 command -v mksquashfs >/dev/null 2>&1 || { echo "ERROR: mksquashfs (squashfs-tools) not found" >&2; exit 1; }
 command -v zip       >/dev/null 2>&1 || { echo "ERROR: zip not found" >&2; exit 1; }
 for f in "$REPO_ROOT"/misc/lsl-firstboot.sh "$REPO_ROOT"/misc/lsl-firstboot.service \
-         "$REPO_ROOT"/misc/lsl-firstboot-progress.sh "$REPO_ROOT"/misc/lsl-firstboot-progress.desktop; do
+         "$REPO_ROOT"/misc/lsl-firstboot-progress.sh "$REPO_ROOT"/misc/lsl-firstboot-progress.desktop \
+         "$REPO_ROOT"/misc/lsl-firstboot-failed.sh "$REPO_ROOT"/misc/lsl-firstboot-failed.desktop; do
     [ -f "$f" ] || { echo "ERROR: missing $f" >&2; exit 1; }
 done
 
@@ -77,6 +78,8 @@ install -m 755 "$REPO_ROOT/misc/lsl-firstboot-progress.sh" "$LAYER/usr/local/bin
 install -m 644 "$REPO_ROOT/misc/lsl-firstboot.service" "$LAYER/etc/systemd/system/lsl-firstboot.service"
 install -m 644 "$REPO_ROOT/misc/lsl-firstboot-progress.desktop" "$LAYER/etc/xdg/autostart/lsl-firstboot-progress.desktop"
 install -m 644 "$REPO_ROOT/misc/lsl-boot-time.desktop" "$LAYER/etc/xdg/autostart/lsl-boot-time.desktop"
+install -m 755 "$REPO_ROOT/misc/lsl-firstboot-failed.sh" "$LAYER/usr/local/bin/lsl-firstboot-failed.sh"
+install -m 644 "$REPO_ROOT/misc/lsl-firstboot-failed.desktop" "$LAYER/etc/xdg/autostart/lsl-firstboot-failed.desktop"
 # Enable the unit by symlink (overlayfs handles lower-layer symlinks fine).
 ln -s ../lsl-firstboot.service "$LAYER/etc/systemd/system/multi-user.target.wants/lsl-firstboot.service"
 
@@ -112,7 +115,9 @@ if command -v unsquashfs >/dev/null 2>&1; then
         etc/systemd/system/lsl-firstboot.service \
         etc/systemd/system/multi-user.target.wants/lsl-firstboot.service \
         etc/xdg/autostart/lsl-firstboot-progress.desktop \
-        etc/xdg/autostart/lsl-boot-time.desktop; do
+        etc/xdg/autostart/lsl-boot-time.desktop \
+        etc/xdg/autostart/lsl-firstboot-failed.desktop \
+        usr/local/bin/lsl-firstboot-failed.sh; do
         if ! grep -qF "$want" <<<"$LAYER_LIST"; then
             echo "ERROR: firstboot layer missing: $want" >&2
             FAIL=1
