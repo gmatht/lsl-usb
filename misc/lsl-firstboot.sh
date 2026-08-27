@@ -80,6 +80,8 @@ wait_for_network() {
 if ! wait_for_network; then
     set_phase 'failed - no network after ~5 minutes, will retry on next boot'
     log "No network after ~5 minutes; will retry on next boot (Restart=on-failure)."
+    log "TIP: connect via WIRED Ethernet for first boot; some wireless cards need"
+    log "firmware not present in the base image (preload it via /cdrom/firmware)."
     diag "firstboot-no-network"
     exit 1
 fi

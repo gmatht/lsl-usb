@@ -7,6 +7,15 @@ apt update
 # (interrupted apt install, etc.) before we add more packages.
 dpkg --configure -a || true
 apt-get install -f -y || true
+# Optional offline firmware: the Windows installer (or the user) can drop .deb
+# packages into /cdrom/firmware/ for hardware whose WiFi/ethernet needs
+# out-of-tree firmware not in the base image. Install them first so the first-boot
+# apt can then fetch over that interface even with no preloaded drivers.
+if ls /cdrom/firmware/*.deb >/dev/null 2>&1; then
+    echo "Installing offline firmware from /cdrom/firmware ..."
+    dpkg -i /cdrom/firmware/*.deb >/dev/null 2>&1 || true
+    apt-get install -f -y >/dev/null 2>&1 || true
+fi
 # Full system upgrade is opt-in (LSL_APT_UPGRADE=1); by default only the
 # packages below are installed/upgraded, keeping the base image stable.
 if [ "${LSL_APT_UPGRADE:-0}" = "1" ]; then
