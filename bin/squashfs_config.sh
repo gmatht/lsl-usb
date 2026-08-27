@@ -3,12 +3,26 @@
 set -eo pipefail
 
 apt update
+# Resume cleanly if a previous first-boot attempt left dpkg/apt half-configured
+# (interrupted apt install, etc.) before we add more packages.
+dpkg --configure -a || true
+apt-get install -f -y || true
 # Full system upgrade is opt-in (LSL_APT_UPGRADE=1); by default only the
 # packages below are installed/upgraded, keeping the base image stable.
 if [ "${LSL_APT_UPGRADE:-0}" = "1" ]; then
     apt upgrade -y
 fi
-apt install -y btrfs-progs guestmount neovim nix-bin git steam-installer zenity libhivex-bin chntpw guestfish kexec-tools kitty pv tmux libwin-hivex-perl fdisk xxd asciinema fatrace vmtouch libfuse2t64
+# guestmount/guestfish (libguestfs) are heavy and run a RAM-hungry appliance at
+# runtime to mount WSL VHDXes. Skip them on low-RAM machines so the first boot
+# does not OOM; VHDX mounting is then unavailable (re-run after adding RAM).
+GUESTMOUNT_PKGS=""
+MEM_KB="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+if [ "${MEM_KB:-0}" -lt 3145728 ] 2>/dev/null; then
+    echo "Low RAM (<3 GiB); skipping guestmount/guestfish (WSL VHDX mounting unavailable)."
+else
+    GUESTMOUNT_PKGS="guestmount guestfish"
+fi
+apt install -y btrfs-progs ${GUESTMOUNT_PKGS} neovim nix-bin git steam-installer zenity libhivex-bin chntpw kexec-tools kitty pv tmux libwin-hivex-perl fdisk xxd asciinema fatrace vmtouch libfuse2t64
 
 # Enable snap support: Mint ships /etc/apt/preferences.d/nosnap.pref which blocks
 # snapd. lsl's Windows installer can preload .snap files onto the USB
