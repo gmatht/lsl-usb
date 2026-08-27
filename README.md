@@ -16,6 +16,10 @@ Jokes aside: this project turns a Linux Mint LiveUSB into a WSL-like workflow fo
 
 - Linux Mint 22.2 (or similar Ubuntu-based live image) written to USB.
 - Use [Rufus](https://rufus.ie/) or similar imaging tool; do not use Ventoy for this workflow.
+- **Windows side:** PowerShell **5.1 or newer** (built into Windows 10/11). `install.bat`
+  launches `install.ps1` with `-ExecutionPolicy Bypass`; if `install.ps1` is not
+  next to it, the `.bat` unzips `lsl-usb-win.zip` (or downloads `LSL_RELEASE_URL`)
+  first, so the only manual step is running `install.bat`.
 - Network access during install/customization.
 - Windows partitions should be cleanly shut down before write operations.
 

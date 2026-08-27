@@ -1,4 +1,5 @@
-<#
+<#requires -Version 5.1
+#
 .SYNOPSIS
     lsl-usb Windows installer: creates the Ubuntu-24.04-based live USB (via Rufus)
     and drops the lsl-usb layer + config + wifi script onto it.
