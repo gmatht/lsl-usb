@@ -51,6 +51,10 @@ cp -a /cdrom/casper/uproot-logs/.   "$WORK/uproot-logs/"       2>/dev/null || tr
 if command -v dmesg >/dev/null 2>&1; then
     dmesg > "$WORK/dmesg.txt" 2>/dev/null || true
 fi
+# Secure Boot state (relevant if the USB fails to boot on UEFI firmware).
+if command -v mokutil >/dev/null 2>&1; then
+    mokutil --sb-state > "$WORK/mokutil-sb-state.txt" 2>/dev/null || true
+fi
 if command -v journalctl >/dev/null 2>&1; then
     journalctl -u lsl-firstboot.service -u onboot.service --no-pager -n 500 \
         > "$WORK/journal-lsl.txt" 2>/dev/null || true
