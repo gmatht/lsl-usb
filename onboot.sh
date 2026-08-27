@@ -395,15 +395,19 @@ if [ -x /cdrom/bin/config.sh ]; then
     /cdrom/bin/config.sh --install-autostart-warning-only || true
 fi
 
+# Optional: overlay-writable view of Windows Steam libraries so Linux Steam can
+# use them without modifying the Windows volume. Only set up when the source
+# actually exists (otherwise the overlay mount would fail).
+mount_steam_overlay() {
+    local lower="$1" upper="$2" work="$3" root="$4"
+    [ -d "$lower" ] || return 0
+    mkdir -p "$upper" "$work" "$root"
+    mount -t overlay overlay -olowerdir="$lower",upperdir="$upper",workdir="$work" "$root" 2>/dev/null || true
+    chown "$LSL_DESKTOP_USER" "$root" 2>/dev/null || true
+}
 mkdir -p /tmp/steam /tmp/steam2
-cd /tmp/steam/ && mkdir -p upper work root
-cd /tmp/steam2/ && mkdir -p upper work root
-
-mount -t overlay overlay -olowerdir=/mnt/d/SteamLibrary/,upperdir=/tmp/steam/upper,workdir=/tmp/steam/work /tmp/steam/root || true
-mount -t overlay overlay -olowerdir='/mnt/c/Program Files (x86)/Steam',upperdir=/tmp/steam2/upper,workdir=/tmp/steam2/work /tmp/steam2/root || true
-
-chown "$LSL_DESKTOP_USER" /tmp/steam/root
-chown "$LSL_DESKTOP_USER" /tmp/steam2/root
+mount_steam_overlay "/mnt/d/SteamLibrary" /tmp/steam/upper /tmp/steam/work /tmp/steam/root
+mount_steam_overlay "/mnt/c/Program Files (x86)/Steam" /tmp/steam2/upper /tmp/steam2/work /tmp/steam2/root
 
 # Wait for wifi (bounded): wifi.sh may be missing (no saved profiles) or the
 # network may be down; don't block boot forever. onboot.service is
