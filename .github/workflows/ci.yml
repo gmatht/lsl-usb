@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pwsh-tests:
+    name: PowerShell harness
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run install.ps1 test harness
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/install.ps1.tests.ps1
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Run shellcheck
+        run: |
+          set -e
+          for f in build.sh onboot.sh bin/*.sh bin/uproot bin/detect-wsl bin/lsl misc/lsl-firstboot.sh; do
+            [ -f "$f" ] || continue
+            shellcheck -S warning "$f"
+          done
+
+  bats:
+    name: Bash tests (bats)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Run bats
+        run: bats tests/bash.tests.bats
+
+  build:
+    name: Build bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y squashfs-tools zip
+      - name: Run build.sh
+        run: ./build.sh
+      - name: Verify artifacts
+        run: |
+          test -f dist/lsl-usb-win.zip
+          test -f dist/filesystem_z0_firstboot.squashfs
+          unzip -l dist/lsl-usb-win.zip | grep -q install.ps1
+          unzip -l dist/lsl-usb-win.zip | grep -q filesystem_z0_firstboot.squashfs
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: lsl-usb-win
+          path: dist/lsl-usb-win.zip
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [pwsh-tests, shellcheck, bats, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: lsl-usb-win
+          path: dist
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/lsl-usb-win.zip
+          body: |
+            lsl-usb ${{ github.ref_name }}
+
+            See VALIDATION.md for the real-hardware test checklist.
+            See README.md for usage.
