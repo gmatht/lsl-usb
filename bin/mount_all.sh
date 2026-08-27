@@ -1,7 +1,115 @@
 #!/bin/bash
 
-### mount C: drive as /mnt/c ###
+### mount C: drive as /mnt/c (and D:..Z: by their Windows drive letter) ###
 
+# --- helper function definitions (safe: no side effects, no root) ----------
+# These are defined first so the file can be sourced by tests (see the
+# sourceable guard below) without running any scanning or mounting.
+
+# Reverse the byte order of a hex string (Windows mixed-endian GUID fields).
+reverse_bytes() {
+    local str="$1"
+    local rev=""
+    for (( i=0; i<${#str}; i+=2 )); do
+        rev="${str:$i:2}$rev"
+    done
+    echo "$rev"
+}
+
+# Convert 16 comma-separated hex bytes to a standard UUID string.
+hex_to_uuid() {
+    local hex="$1"
+    hex="${hex//,/}"            # Remove commas -> 32 hex chars (16 bytes)
+    [ ${#hex} -eq 32 ] || return 1
+    local p1; p1=$(reverse_bytes "${hex:0:8}")
+    local p2; p2=$(reverse_bytes "${hex:8:4}")
+    local p3; p3=$(reverse_bytes "${hex:12:4}")
+    local p4="${hex:16:4}"
+    local p5="${hex:20:12}"
+    echo "${p1}-${p2}-${p3}-${p4}-${p5}"
+}
+
+# lsblk helper: device name whose PARTUUID matches $1 (case-insensitive).
+dev_for_uuid() {
+    local u="$1"
+    lsblk -ln -o NAME,PARTUUID 2>/dev/null | awk -v u="$u" 'tolower($2)==tolower(u){print $1; exit}'
+}
+
+
+# Mount a Windows drive letter at /mnt/<lower>. Maps the letter to the correct
+# partition using the MountedDevices registry value:
+#   GPT: \DosDevices\X: = DMIO:ID:<disk GUID><partition GUID>  -> match PARTUUID
+#   MBR: \DosDevices\X: = <4-byte disk sig><8-byte part offset> -> match PTUUID+START
+parse_drive() {
+    local drive="$1"
+    local mount_point="$2"
+
+    local line=""
+    while IFS= read -r line_check; do
+        # hivexget emits the key as "\DosDevices\X:" (single backslashes); strip
+        # backslashes before matching so we don't fight pattern escaping.
+        if [[ "${line_check//\\/}" == *"DosDevices${drive}:"* ]]; then
+            line="$line_check"
+            break
+        fi
+    done <<< "$INPUT"
+
+    [ -n "$line" ] || return 1
+
+    # Already mounted (e.g. C: was mounted above)? nothing to do.
+    if mountpoint -q "$mount_point" 2>/dev/null; then
+        return 0
+    fi
+
+    local hex_str="${line#*=hex(3):}"
+    hex_str="${hex_str// /}"
+
+    # --- GPT path ---
+    local dmio_prefix="44,4d,49,4f,3a,49,44,3a,"
+    if [[ "$hex_str" == "$dmio_prefix"* ]]; then
+        local body="${hex_str#$dmio_prefix}"
+        body="${body//,/}"                       # 64 hex chars: disk(32)+part(32), no separator
+        [ ${#body} -ge 64 ] || return 1
+        local part_hex="${body:32:32}"           # partition GUID bytes
+        [ ${#part_hex} -eq 32 ] || return 1
+        local uuid
+        uuid="$(hex_to_uuid "$part_hex")" || return 1
+        local device
+        device="$(dev_for_uuid "$uuid")"
+        [ -n "$device" ] || return 1
+        echo "    mounting /dev/$device at $mount_point"
+        mount "/dev/$device" -t ntfs3 "$mount_point" || return 1
+        return 0
+    fi
+
+    # --- MBR path (best-effort) ---
+    local mbr="${hex_str//,/}"
+    if [ ${#mbr} -ge 16 ]; then
+        local sig="${mbr:0:8}"                   # 4-byte disk signature
+        local device
+        device="$(lsblk -ln -o NAME,PTUUID 2>/dev/null | awk -v s="$sig" 'tolower($2)==tolower(s){print $1; exit}')"
+        [ -n "$device" ] || return 1
+        # 8-byte starting LBA (little-endian) identifies the partition.
+        local off_hex="${mbr:8:16}"
+        local off=$(( 16#${off_hex:14:2}${off_hex:12:2}${off_hex:10:2}${off_hex:8:2}${off_hex:6:2}${off_hex:4:2}${off_hex:2:2}${off_hex:0:2} ))
+        local part
+        part="$(lsblk -ln -o NAME,START 2>/dev/null | awk -v o="$off" '$2==o{print $1; exit}')"
+        [ -n "$part" ] || return 1
+        echo "    mounting /dev/$part at $mount_point"
+        mount "/dev/$part" -t ntfs3 "$mount_point" || return 1
+        return 0
+    fi
+
+    return 1
+}
+
+# When sourced for unit tests, stop here: the functions above are available but
+# no root check, command check, scanning, or mounting runs.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0 2>/dev/null || true
+fi
+
+# --- real execution path (requires root) -----------------------------------
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root (e.g., sudo $0)"
   exit 1
@@ -89,77 +197,11 @@ trap cleanup EXIT
 
 ### mount D: E: ... etc. ###
 
-# Run hivexget and strip Windows carriage returns (\r)
+# hivexget reads the binary registry; strip Windows carriage returns.
 INPUT=$(hivexget /mnt/c/Windows/System32/config/SYSTEM 'MountedDevices' | tr -d '\r')
-
-# Function to reverse the byte order of a hex string
-reverse_bytes() {
-    local str="$1"
-    local rev=""
-    for (( i=0; i<${#str}; i+=2 )); do
-        rev="${str:$i:2}$rev"
-    done
-    echo "$rev"
-}
-
-# Function to convert 16 comma-separated hex bytes to a standard UUID string
-hex_to_uuid() {
-    local hex="$1"
-    hex="${hex//,/}" # Remove commas
-    
-    # Split and reverse the first 3 parts (Windows mixed-endian GUID format)
-    local p1=$(reverse_bytes "${hex:0:8}")
-    local p2=$(reverse_bytes "${hex:8:4}")
-    local p3=$(reverse_bytes "${hex:12:4}")
-    local p4="${hex:16:4}"
-    local p5="${hex:20:12}"
-    
-    echo "${p1}-${p2}-${p3}-${p4}-${p5}"
-}
-
-# Function to parse a specific drive letter
-parse_drive() {
-    local drive="$1"
-    local mount_point="$2"
-    
-    local line=""
-    while IFS= read -r line_check; do
-        if [[ "$line_check" == "\"\\\\DosDevices\\\\${drive}:\""* ]]; then
-            line="$line_check"
-            break
-        fi
-    done <<< "$INPUT"
-    
-    if [[ -z "$line" ]]; then
-        return 1 
-    fi
-    
-    # Strip everything before and including =hex(3):
-    local hex_str="${line#*=hex(3):}"
-    hex_str="${hex_str// /}" 
-    
-    # Strip the DMIO:ID: prefix to isolate the 16-byte Disk GUID
-    local dmio_prefix="44,4d,49,4f,3a,49,44,3a,"
-    
-    if [[ "$hex_str" == "$dmio_prefix"* ]]; then
-        local guid_hex="${hex_str#$dmio_prefix}"
-        local uuid=$(hex_to_uuid "$guid_hex")
-
-	echo "$uuid"
-        
-        # Use lsblk to cleanly find the device path without any extra garbage
-        local device=$(lsblk -ln -o NAME,PARTUUID | grep -i "$uuid" | awk '{print $1}')
-        
-        if [[ -n "$device" ]]; then
-            echo "mount $device $mount_point"
-            mount "/dev/$device" -t ntfs3 "$mount_point"
-	    # (NTFS repair is gated behind LSL_NTFSFIX=1; see the top of this script.)
-        fi
-    fi
-}
 
 # Output the clean mount commands
 for i in {C..Z}
 do
 	parse_drive "$i" "/mnt/${i,,}"
-done 
+done
