@@ -188,7 +188,16 @@ if [ -z "$best_part" ]; then
 fi
 
 if [ -z "$best_part" ]; then
-    echo "Error: No Windows installation found."
+    # No readable Windows volume. Distinguish "no Windows at all" from "Windows is
+    # BitLocker/LUKS encrypted" so the operator isn't left guessing why mount failed.
+    enc="$(lsblk -lno NAME,FSTYPE 2>/dev/null | awk '$2 ~ /BitLocker|crypto_LUKS|crypto/ {print "/dev/"$1}')"
+    if [ -n "$enc" ]; then
+        echo "Error: no readable Windows volume found. The following partition(s) appear encrypted:" >&2
+        echo "$enc" >&2
+        echo "       Decrypt them in Windows (or suspend BitLocker) before using this tool." >&2
+    else
+        echo "Error: No Windows installation found."
+    fi
     exit 1
 fi
 
