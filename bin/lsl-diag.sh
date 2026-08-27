@@ -10,13 +10,26 @@ set -u
 TAG="${1:-diag}"
 TS="$(date +%Y%m%d%H%M%S)"
 
-# Destination: first writable, Windows-readable location we can find.
+# Destination: first writable, reboot-surviving location we can find. /tmp is RAM
+# and is lost on reboot, so it is the last resort; /cdrom (the USB itself) is
+# preferred when no Windows volume is mounted (e.g. first boot, hivex missing).
 DEST=""
-for cand in /mnt/c/lsl-diag /mnt/c/Users/lsl-usb/lsl-diag /persist/casper/lsl-diag /tmp/lsl-diag; do
+LSL_DIAG_CDROM_RW=0
+for cand in /mnt/c/lsl-diag /mnt/c/Users/lsl-usb/lsl-diag /persist/casper/lsl-diag /cdrom/lsl-diag /tmp/lsl-diag; do
     mkdir -p "$cand" 2>/dev/null || continue
     if [ -w "$cand" ]; then
         DEST="$cand"
         break
+    fi
+    # /cdrom is normally read-only; try a temporary rw remount so the
+    # diagnostics survive a reboot on the USB itself instead of in RAM.
+    if [ "${cand#/cdrom}" != "$cand" ]; then
+        mount -o remount,rw /cdrom 2>/dev/null || true
+        if [ -w "$cand" ]; then
+            DEST="$cand"
+            LSL_DIAG_CDROM_RW=1
+            break
+        fi
     fi
 done
 [ -n "$DEST" ] || DEST=/tmp/lsl-diag
@@ -71,5 +84,13 @@ if [ -z "$ARCHIVE" ] || [ ! -f "$ARCHIVE" ]; then
     cp -a "$WORK/." "$ARCHIVE/" 2>/dev/null || true
 fi
 
+if [ "${LSL_DIAG_CDROM_RW:-0}" = "1" ]; then
+    mount -o remount,ro /cdrom 2>/dev/null || true
+fi
+
 echo "lsl-diag: wrote $ARCHIVE"
-echo "lsl-diag: copy this off the USB / Windows volume before rebooting."
+if [ "${LSL_DIAG_CDROM_RW:-0}" = "1" ]; then
+    echo "lsl-diag: written to the USB (/cdrom) - it survives a reboot; copy it off when convenient."
+else
+    echo "lsl-diag: copy this off the USB / Windows volume before rebooting."
+fi
