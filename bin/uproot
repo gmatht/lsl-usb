@@ -299,8 +299,20 @@ mount --bind /cdrom /tmp/squashfs/root/cdrom || true
 #    mount --bind /persist /tmp/squashfs/root/persist || true
 #fi
 
-# Copy resolv.conf for network access
-#cp /etc/resolv.conf /tmp/squashfs/root/etc/resolv.conf || true
+# Give the chroot working DNS. The live /etc/resolv.conf is usually a
+# systemd-resolved stub (127.0.0.53) or an NM-managed file; neither resolves
+# inside the chroot (no systemd-resolved there), so use the real upstream
+# nameservers instead. (This was previously commented out, which broke apt in
+# the chroot with "Could not resolve <repo>" - caught by qemu-boot-test.sh.)
+resolv_src=""
+for f in /run/systemd/resolve/resolv.conf /run/NetworkManager/resolv.conf /etc/resolv.conf; do
+    [ -f "$f" ] && resolv_src="$f" && break
+done
+if [ -n "$resolv_src" ]; then
+    rm -f /tmp/squashfs/root/etc/resolv.conf
+    grep -E '^nameserver' "$resolv_src" > /tmp/squashfs/root/etc/resolv.conf 2>/dev/null \
+        || cp "$resolv_src" /tmp/squashfs/root/etc/resolv.conf 2>/dev/null || true
+fi
 
 # Make chroot usable for apt/dpkg tooling.
 mount --bind /proc /tmp/squashfs/root/proc 2>/dev/null || true
