@@ -99,6 +99,15 @@ try {
 # so resolve the bundle dir here.
 if (-not $BundleDir) { $BundleDir = $PSScriptRoot }
 
+# Shared Windows-detection helpers (Get-LocalAppData, Get-WslVhdxPaths,
+# Get-InstalledWindowsApps) live in bin/lsl-win-detect.ps1. Dot-source it when
+# present (repo checkout or bundle). The test harness loads it itself, so the
+# guard naturally skips it there ($PSScriptRoot is null under Invoke-Expression).
+if ($BundleDir) {
+    $detectModule = Join-Path $BundleDir 'bin\lsl-win-detect.ps1'
+    if (Test-Path $detectModule) { . $detectModule }
+}
+
 function WriteStep([string]$msg) {
     Write-Host ''
     Write-Host "==> $msg" -ForegroundColor Cyan
@@ -146,13 +155,62 @@ function Test-SecureBootEnabled {
     }
 }
 
-function Warn-SecureBoot {
-    if (Test-SecureBootEnabled) {
-        Write-Warn2 'Secure Boot appears to be ENABLED in this machine firmware.'
-        Write-Info 'The lsl-usb live USB is a BIOS/MBR casper image written in Rufus DD mode;'
-        Write-Info 'it has no signed UEFI bootloader and will NOT boot while Secure Boot is on.'
-        Write-Info 'Disable Secure Boot in the firmware setup before booting the USB.'
+function Confirm-SecureBoot {
+    if (-not (Test-SecureBootEnabled)) { return }
+    # Guidance is written for the END USER (the person booting the USB), not the
+    # developer: what to do if the machine's firmware has Secure Boot turned on.
+    Write-Warn2 'Secure Boot is ENABLED in this machine firmware.'
+    Write-Info 'Linux Mint ships a Microsoft-signed boot shim, so the USB usually boots'
+    Write-Info 'under Secure Boot. On first boot you may see a blue "MOK management" screen'
+    Write-Info 'asking to enroll Linux Mint' + [char]39 + 's signing key - choose "Enroll MOK" and continue.'
+    Write-Info 'If the USB will not start at all, disable Secure Boot in your firmware setup'
+    Write-Info '(Boot / Security / Authentication menu) and try again.'
+    $ans = Read-Host 'If you have enrolled the MOK (or disabled Secure Boot), type OK to continue; otherwise press Enter to abort'
+    if ($ans -ne 'OK') {
+        Write-Err2 'Aborted. Enroll the Linux Mint MOK or disable Secure Boot, then re-run the installer.'
+        exit 1
     }
+}
+
+function Assert-UsbCapacity {
+    # Windows-side space budget (#5): the installer knows the target volume size
+    # up front, so warn BEFORE the Rufus write + first boot instead of discovering
+    # it mid-apt. Estimates what lsl-usb adds on top of the base ISO Rufus writes.
+    param($Vol, $IsoSizeBytes = 0)
+    if (-not $Vol -or -not $IsWindows) { return }
+    try {
+        $v = Get-Volume -DriveLetter $Vol.DriveLetter -ErrorAction SilentlyContinue
+        if (-not $v -or $null -eq $v.SizeRemaining -or $null -eq $v.Size) { return }
+        # Appended squashfs layer (apt-installed changes): ~4 GB worst case.
+        # /cdrom/home.sfs seeded from live /home: ~2 GB. Plus a 1 GB buffer.
+        $addedEst = 4GB + 2GB + 1GB
+        $remainingAfterIso = $v.SizeRemaining - $IsoSizeBytes
+        if ($remainingAfterIso -lt $addedEst) {
+            Write-Warn2 ('Target USB {0}: ~{1:N1} GB free; after the {2:N1} GB ISO is written, ~{3:N1} GB remains.' -f $Vol.DriveLetter, ($v.SizeRemaining/1GB), ($IsoSizeBytes/1GB), ($remainingAfterIso/1GB))
+            Write-Info  ('lsl-usb then needs ~{0:N1} GB for the appended layer + home.sfs (+ buffer). Use a larger USB (>= 16 GB recommended).' -f ($addedEst/1GB))
+            Write-Info  'You can continue, but the first boot may fail to persist changes if space runs out.'
+            $ans = Read-Host 'Type OK to continue anyway, or press Enter to abort'
+            if ($ans -ne 'OK') { Write-Err2 'Aborted - use a larger USB.'; exit 1 }
+        }
+    } catch {
+        # If capacity cannot be read, let it proceed (Rufus/format will surface issues).
+    }
+}
+
+function Warn-LowRamWindows {
+    # Best-effort only: this is the INSTALLER machine's RAM. The machine that
+    # actually boots the USB may differ, so the authoritative low-RAM guard stays
+    # in lsl-firstboot.sh (Linux side). Keep this as a courtesy heads-up.
+    if (-not $IsWindows) { return }
+    try {
+        $bytes = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory
+        if ($bytes -and $bytes -lt 4GB) {
+            Write-Warn2 ('This machine has only {0:N1} GB RAM.' -f ($bytes/1GB))
+            Write-Info 'The first boot installs packages and can need >= 4 GB RAM. If you will boot this'
+            Write-Info 'USB on THIS machine, expect a slow or OOM-prone first boot. (The boot machine''s'
+            Write-Info 'RAM is checked again at first boot.)'
+        }
+    } catch {}
 }
 
 function Show-CompatNotes {
@@ -578,6 +636,185 @@ function Get-WifiLines {
 }
 
 # ---------------------------------------------------------------------------
+# Network driver detection + staging.
+#
+# Most wifi/ethernet hardware works out of the box with the ISO's kernel
+# (Mint 22.x / Zorin 18.x = 6.8) or its linux-firmware. A short list of
+# chipsets needs an out-of-tree driver. We detect those from Windows (PnP
+# hardware IDs - the same IDs lspci -nn / lsusb would show on Linux) and
+# pre-stage the driver source on the USB so first boot can build/install it
+# (see /cdrom/bin/squashfs_config.sh). The live ISO has no kernel headers, so
+# the build happens in the first-boot recipe once network is up - same
+# constraint as the rest of the recipe; the staged driver then persists in the
+# new layer and wifi works on every later boot.
+# ---------------------------------------------------------------------------
+function Get-NetworkHardware {
+    # Enumerate network PnP devices and extract the PCI/USB hardware IDs.
+    $out = @()
+    try {
+        $devs = @(Get-CimInstance Win32_PnPEntity -Filter "PNPClass='Net'" -ErrorAction SilentlyContinue)
+    } catch {
+        $devs = @()
+    }
+    foreach ($d in $devs) {
+        $id = $null
+        try { $id = $d.PNPDeviceID } catch { }
+        if (-not $id) { continue }
+        $m = [regex]::Match($id, '^PCI\\VEN_([0-9A-Fa-f]{4})&DEV_([0-9A-Fa-f]{4})')
+        if ($m.Success) {
+            $out += [pscustomobject]@{
+                Name = $d.Name; PnpId = $id; Kind = 'PCI'
+                Vendor = $m.Groups[1].Value.ToUpperInvariant()
+                Device = $m.Groups[2].Value.ToUpperInvariant()
+                Id = "$($m.Groups[1].Value.ToUpperInvariant()):$($m.Groups[2].Value.ToUpperInvariant())"
+            }
+            continue
+        }
+        $m = [regex]::Match($id, '^USB\\VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})')
+        if ($m.Success) {
+            $out += [pscustomobject]@{
+                Name = $d.Name; PnpId = $id; Kind = 'USB'
+                Vendor = $m.Groups[1].Value.ToUpperInvariant()
+                Device = $m.Groups[2].Value.ToUpperInvariant()
+                Id = "$($m.Groups[1].Value.ToUpperInvariant()):$($m.Groups[2].Value.ToUpperInvariant())"
+            }
+        }
+    }
+    return ,$out
+}
+
+function Get-DriverTable {
+    # Curated chipsets that need out-of-tree drivers on Ubuntu 24.04 (Mint 22.x
+    # / Zorin 18.x, kernel 6.8). Everything else is in-kernel or in
+    # linux-firmware (shipped in the ISO). Source:
+    #   ubuntu  -> .deb from archive.ubuntu.com (apt installs + DKMS builds)
+    #   github  -> DKMS source tarball from GitHub (built via dkms at first boot)
+    return ,@(
+        @{ Id = '10EC:C821'; Kind = 'PCI'; Chip = 'Realtek RTL8821CE'; Pkg = 'rtl8821ce'; Source = 'github'; Repo = 'tomaspinho/rtl8821ce'; Branch = 'master'; Note = 'common in budget laptops' },
+        @{ Id = '10EC:D723'; Kind = 'PCI'; Chip = 'Realtek RTL8723DE'; Pkg = 'rtl8723de'; Source = 'github'; Repo = 'lwfinger/rtl8723de'; Branch = 'current'; Note = '' },
+        @{ Id = '0BDA:B812'; Kind = 'USB'; Chip = 'Realtek RTL88x2BU'; Pkg = 'rtl88x2bu'; Source = 'github'; Repo = 'morrownr/88x2bu-20210702'; Branch = 'main'; Note = 'common USB wifi dongle' },
+        @{ Id = '0BDA:8812'; Kind = 'USB'; Chip = 'Realtek RTL8812AU'; Pkg = 'rtl8812au-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'universe'; Note = '' },
+        @{ Id = '0BDA:881A'; Kind = 'USB'; Chip = 'Realtek RTL8814AU'; Pkg = 'rtl8814au'; Source = 'github'; Repo = 'morrownr/8814au'; Branch = 'main'; Note = '' },
+        @{ Id = '0BDA:8179'; Kind = 'USB'; Chip = 'Realtek RTL8188EU'; Pkg = 'rtl8188eu'; Source = 'github'; Repo = 'lwfinger/rtl8188eu'; Branch = 'master'; Note = '' },
+        @{ Id = '0BDA:B720'; Kind = 'USB'; Chip = 'Realtek RTL8723BU'; Pkg = 'rtl8723bu'; Source = 'github'; Repo = 'lwfinger/rtl8723bu'; Branch = 'master'; Note = '' },
+        @{ Id = '14E4:4365'; Kind = 'PCI'; Chip = 'Broadcom BCM43142'; Pkg = 'broadcom-sta-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'restricted'; Note = 'wl driver' },
+        @{ Id = '14E4:43A0'; Kind = 'PCI'; Chip = 'Broadcom BCM4360'; Pkg = 'broadcom-sta-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'restricted'; Note = 'wl driver' },
+        @{ Id = '14E4:43B1'; Kind = 'PCI'; Chip = 'Broadcom BCM4352'; Pkg = 'broadcom-sta-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'restricted'; Note = 'wl driver' },
+        @{ Id = '14E4:4727'; Kind = 'PCI'; Chip = 'Broadcom BCM4313'; Pkg = 'broadcom-sta-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'restricted'; Note = 'wl driver' }
+    )
+}
+
+function Resolve-DriverNeeds {
+    # Match detected hardware against the known-problem table.
+    param([object[]]$Hardware)
+    $table = Get-DriverTable
+    $out = @()
+    foreach ($h in $Hardware) {
+        $hit = $table | Where-Object { $_.Id -eq $h.Id }
+        if ($hit) {
+            $out += [pscustomobject]@{ Hardware = $h; Table = $hit }
+        }
+    }
+    return ,$out
+}
+
+function Get-UbuntuPackageUrl {
+    # Resolve the exact .deb URL for a package in a suite+component by parsing
+    # the archive's Packages index (cached in %TEMP% - the universe index is
+    # ~10 MB gz, so it is fetched once per suite+component, like the sha256sum
+    # cache used for the ISO).
+    param([string]$Package, [string]$Suite = 'noble-updates', [string]$Component = 'universe')
+    $cache = Join-Path $env:TEMP "lsl-apt-$Suite-$Component-Packages.gz"
+    if (-not (Test-Path $cache)) {
+        try {
+            Download "http://archive.ubuntu.com/ubuntu/dists/$Suite/$Component/binary-amd64/Packages.gz" $cache
+        } catch {
+            return ''
+        }
+    }
+    if (-not (Test-Path $cache)) { return '' }
+    try {
+        $fs = [System.IO.File]::OpenRead($cache)
+        $gz = New-Object System.IO.Compression.GZipStream($fs, [System.IO.Compression.CompressionMode]::Decompress)
+        $sr = New-Object System.IO.StreamReader($gz)
+        $inBlock = $false
+        $filename = ''
+        while (($line = $sr.ReadLine()) -ne $null) {
+            if ($line -eq "Package: $Package") { $inBlock = $true; continue }
+            if ($inBlock) {
+                if ($line -match '^Filename: (.+)$') { $filename = $Matches[1]; break }
+                if ($line -eq '') { $inBlock = $false }
+            }
+        }
+        $sr.Close(); $gz.Close(); $fs.Close()
+        if ($filename) { return "http://archive.ubuntu.com/ubuntu/$filename" }
+    } catch { }
+    return ''
+}
+
+function Get-DriverDownloadUrl {
+    # Download URL + local filename for a driver table entry.
+    param($Entry)
+    if ($Entry.Source -eq 'ubuntu') {
+        $url = Get-UbuntuPackageUrl -Package $Entry.Pkg -Suite $Entry.Suite -Component $Entry.Component
+        if (-not $url) { return $null }
+        return [pscustomobject]@{ Url = $url; FileName = [System.IO.Path]::GetFileName($url) }
+    }
+    # github: tarball of the repo's default branch (tar.gz extracts with tar,
+    # which is always present at first boot - no unzip dependency).
+    $url = "https://github.com/$($Entry.Repo)/archive/refs/heads/$($Entry.Branch).tar.gz"
+    return [pscustomobject]@{ Url = $url; FileName = "$($Entry.Pkg).tar.gz" }
+}
+
+function Install-DriverPackages {
+    # Detect this machine's network hardware, match against the known-problem
+    # table, and stage the driver source to <USB>:\drivers\. First boot builds
+    # and installs them (see /cdrom/bin/squashfs_config.sh). Writes a
+    # lsl-drivers.txt report on the USB. Returns the report lines.
+    param($Vol, [switch]$SkipDownload)
+    $root = "$($Vol.DriveLetter):\"
+    $drvDir = Join-Path $root 'drivers'
+    $report = @()
+    $hw = Get-NetworkHardware
+    if (-not $hw) {
+        $report += 'No network hardware detected (WMI unavailable?) - nothing staged.'
+        try { $report | Set-Content -Encoding ascii -Path (Join-Path $root 'lsl-drivers.txt') } catch { }
+        return ,$report
+    }
+    $needs = Resolve-DriverNeeds -Hardware $hw
+    if (-not $needs) {
+        $report += 'No known problem chipsets detected - the ISO kernel should cover this machine.'
+        try { $report | Set-Content -Encoding ascii -Path (Join-Path $root 'lsl-drivers.txt') } catch { }
+        return ,$report
+    }
+    New-Item -ItemType Directory -Force -Path $drvDir | Out-Null
+    foreach ($n in $needs) {
+        $t = $n.Table
+        $dl = Get-DriverDownloadUrl -Entry $t
+        if (-not $dl) {
+            $report += "SKIP  $($t.Chip) ($($n.Hardware.Id)): could not resolve download URL"
+            continue
+        }
+        $dest = Join-Path $drvDir $dl.FileName
+        if ($SkipDownload) {
+            $report += "STAGE $($t.Chip) ($($n.Hardware.Id)): $($dl.FileName) (download skipped)"
+            continue
+        }
+        try {
+            Download $dl.Url $dest
+            if (-not (Test-Path $dest) -or (Get-Item $dest).Length -eq 0) { throw 'empty download' }
+            $mb = [math]::Round((Get-Item $dest).Length / 1MB, 1)
+            $report += "STAGE $($t.Chip) ($($n.Hardware.Id)): $($dl.FileName) ($mb MB)"
+        } catch {
+            Remove-Item $dest -Force -ErrorAction SilentlyContinue
+            $report += "FAIL  $($t.Chip) ($($n.Hardware.Id)): $($_.Exception.Message)"
+        }
+    }
+    try { $report | Set-Content -Encoding ascii -Path (Join-Path $root 'lsl-drivers.txt') } catch { }
+    return ,$report
+}
+
+# ---------------------------------------------------------------------------
 # WSL VHDX: locate Windows-side WSL disk images and write them to the USB so
 # Linux (detect-wsl) can mount them via guestmount. One Windows path per line
 # in /cdrom/lsl-wsl-vhdx.conf; Linux converts C:\... to /mnt/c/... at boot.
@@ -789,6 +1026,23 @@ function Show-DryRunReport {
     $wifiNames = @(Get-WifiProfileNames)
     if ($wifiNames) { $wifiNames | ForEach-Object { Write-Info "  $_" } }
     else { Write-Warn2 'No saved wifi profiles found.' }
+
+    WriteStep 'Network drivers (would be staged to <USB>:\drivers\)'
+    $hw = Get-NetworkHardware
+    if ($hw) {
+        $hw | ForEach-Object { Write-Info "  $($_.Name)  [$($_.Id)]" }
+        $needs = Resolve-DriverNeeds -Hardware $hw
+        if ($needs) {
+            $needs | ForEach-Object {
+                $src = if ($_.Table.Source -eq 'ubuntu') { $_.Table.Pkg } else { "$($_.Table.Pkg) (github)" }
+                Write-Info "  -> needs $($_.Table.Chip): $src"
+            }
+        } else {
+            Write-Info '  No known problem chipsets - the ISO kernel should cover this machine.'
+        }
+    } else {
+        Write-Warn2 'No network hardware detected (WMI unavailable?).'
+    }
 
     WriteStep 'Reuse an existing Mint live USB (skip Rufus)'
     $usbs = @(Find-UsbVolumes -Label '')
@@ -1270,14 +1524,33 @@ try {
     $chkEverything.Checked = $true
     $page3.Controls.Add($chkEverything)
 
+    # Network driver preload: detect this machine's chipsets (WMI is fast, so
+    # this is synchronous like the netsh picker) and offer to stage the drivers.
+    $drvNeeds = Resolve-DriverNeeds -Hardware (Get-NetworkHardware)
+    $chkDrivers = New-Object System.Windows.Forms.CheckBox
+    $chkDrivers.Text = 'Preload Linux drivers for this PC network hardware'
+    $chkDrivers.Location = New-Object System.Drawing.Point(10, 296)
+    $chkDrivers.Size = New-Object System.Drawing.Size(560, 20)
+    $chkDrivers.Checked = $true
+    $page3.Controls.Add($chkDrivers)
+    $lblDrivers = New-Object System.Windows.Forms.Label
+    $lblDrivers.Location = New-Object System.Drawing.Point(10, 318)
+    $lblDrivers.Size = New-Object System.Drawing.Size(560, 20)
+    if ($drvNeeds.Count -gt 0) {
+        $lblDrivers.Text = 'Detected: ' + (($drvNeeds | ForEach-Object { "$($_.Table.Chip) ($($_.Hardware.Id))" }) -join ', ')
+    } else {
+        $lblDrivers.Text = 'No special network drivers needed (ISO kernel covers this machine).'
+    }
+    $page3.Controls.Add($lblDrivers)
+
     # Per-network picker (pre-checked; netsh is fast so this is synchronous).
     $lblWifi = New-Object System.Windows.Forms.Label
     $lblWifi.Text = 'Networks to copy (checked = include in wifi.sh):'
-    $lblWifi.Location = New-Object System.Drawing.Point(10, 260)
+    $lblWifi.Location = New-Object System.Drawing.Point(10, 340)
     $lblWifi.Size = New-Object System.Drawing.Size(560, 18)
     $page3.Controls.Add($lblWifi)
     $wifiHost = New-Object System.Windows.Forms.Panel
-    $wifiHost.Location = New-Object System.Drawing.Point(0, 280)
+    $wifiHost.Location = New-Object System.Drawing.Point(0, 360)
     $wifiHost.Size = New-Object System.Drawing.Size(600, 200)
     $wifiHost.AutoScroll = $true
     $page3.Controls.Add($wifiHost)
@@ -1366,6 +1639,7 @@ try {
     $tip.SetToolTip($txtExtra, 'Extra flathub app IDs, comma-separated (e.g. org.mozilla.firefox).')
     $tip.SetToolTip($txtVhdx, 'WSL2 disk images to pass to Linux (detected automatically; add or remove).')
     $tip.SetToolTip($txtData, 'Where Linux stores persistent data (default /mnt/c/Users/lsl-usb).')
+    $tip.SetToolTip($chkDrivers, 'Stages out-of-tree wifi/ethernet drivers for this PC onto the USB; first boot builds and installs them (needs network for the build tools).')
     $tip.SetToolTip($btnBack, 'Previous step.')
     $tip.SetToolTip($btnNext, 'Next step; on the last page, installs once the ISO is ready.')
     $tip.ShowAlways = $true   # show tooltips even on disabled controls
@@ -1500,6 +1774,7 @@ try {
         DataDir       = $txtData.Text.Trim()
         Wifi          = $chkWifi.Checked
         WifiNetworks  = @($wifiChecks | Where-Object { $_.Checked } | ForEach-Object { $_.Text })
+        Drivers       = $chkDrivers.Checked
         Efu           = $chkEfu.Checked
         InstallEverything = $chkEverything.Checked
         UseExistingUsb = $state.ReuseUsb
@@ -1518,10 +1793,11 @@ if ($DryRun) {
 }
 
 # Pre-flight: this installer writes to the USB and launches Rufus, both of which
-# require Administrator rights, and the DD-mode live USB will not boot with
-# Secure Boot enabled - warn before any destructive step.
+# require Administrator rights, and the DD-mode live USB interacts with Secure
+# Boot - confirm with the user before any destructive step.
 Assert-Admin
-Warn-SecureBoot
+Confirm-SecureBoot
+Warn-LowRamWindows
 
 # GUI first: starts before the ISO download/verify, runs them in the
 # background, and collects configuration while the user waits.
@@ -1530,6 +1806,7 @@ $copyWifi = $true
 $wifiNetworks = @()
 $doEfu = $true
 $installEverything = $true
+$preloadDrivers = $true
 if (-not $NoGui) {
     $gui = Show-InstallerGui -IsoPath $IsoPath -MintVersion $MintVersion -DownloadDir $DownloadDir `
         -WslVhdx $WslVhdx -FlatpakApps $FlatpakApps
@@ -1542,6 +1819,7 @@ if (-not $NoGui) {
     $wifiNetworks = $gui.WifiNetworks
     $doEfu = $gui.Efu
     $installEverything = $gui.InstallEverything
+    $preloadDrivers = $gui.Drivers
     if ($gui.UseExistingUsb) {
         $vol = $gui.UseExistingUsb
         WriteStep "Using existing Mint live USB: $($vol.DriveLetter): ($($vol.FileSystemLabel)) - no Rufus write."
@@ -1581,8 +1859,22 @@ if (-not $vol) {
     }
 }
 
+# Windows-side space budget: the installer knows the volume size up front, so
+# warn before the Rufus write + first boot that the stick may be too small.
+$isoSize = 0
+if ($iso -and (Test-Path $iso)) { try { $isoSize = (Get-Item $iso).Length } catch {} }
+Assert-UsbCapacity -Vol $vol -IsoSizeBytes $isoSize
+
 WriteStep 'Dropping lsl-usb files onto the USB...'
 Install-LslFiles -Vol $vol -BundleDir $BundleDir
+
+if ($preloadDrivers) {
+    WriteStep 'Preloading network drivers for this machine...'
+    $drvReport = Install-DriverPackages -Vol $vol
+    $drvReport | ForEach-Object { Write-Info "  $_" }
+} else {
+    Write-Info 'Skipping network driver preload (unchecked).'
+}
 
 if ($guiDataDir) {
     $envFile = "$($vol.DriveLetter):\lsl-usb.env"
