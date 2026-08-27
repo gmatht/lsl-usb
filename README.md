@@ -23,7 +23,11 @@ Jokes aside: this project turns a Linux Mint LiveUSB into a WSL-like workflow fo
   without manually installing WMF. **Vista / PowerShell 2.0 are not supported**
   (they lack the cmdlets `install.ps1` uses). It launches `install.ps1` with
   `-ExecutionPolicy Bypass`; if `install.ps1` is not next to it, the `.bat` unzips
-  `lsl-usb-win.zip` (or downloads `LSL_RELEASE_URL`) first.
+  `lsl-usb-win.zip` (or downloads `LSL_RELEASE_URL`) first. If neither is present,
+  `install.bat` queries the GitHub API for the latest `lsl-usb-win.zip` release
+  asset (set `LSL_REPO=owner/name` near the top of `install.bat`); the CI/CD
+  workflow `release.yml` builds and publishes that asset. So the only manual step
+  is running `install.bat`.
 - Network access during install/customization.
 - Windows partitions should be cleanly shut down before write operations.
 
