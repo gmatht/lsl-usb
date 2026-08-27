@@ -64,6 +64,14 @@ LSL_TEST_FST=;        assert '! lsl_data_dir_is_persistent' 'empty fstype not pe
 LSL_TEST_FST=vfat;    assert 'lsl_data_dir_is_persistent' 'vfat (USB) data dir persistent'
 unset -f findmnt
 
+# --- lsl_cdrom_is_vfat / lsl_fat32_max_bytes --------------------------------
+findmnt() { echo "${LSL_TEST_FSTYPE:-}"; }
+LSL_TEST_FSTYPE=vfat;   assert 'lsl_cdrom_is_vfat' 'vfat /cdrom detected as FAT'
+LSL_TEST_FSTYPE=ext4;   assert '! lsl_cdrom_is_vfat' 'ext4 /cdrom not FAT'
+LSL_TEST_FSTYPE=;       assert '! lsl_cdrom_is_vfat' 'unknown /cdrom not FAT'
+unset -f findmnt
+assert 'test "$(lsl_fat32_max_bytes)" = 4294901760' 'fat32 max bytes is 4 GiB - 64 KiB'
+
 
 # --- lsl_vhdx_append: dedupe + persist -------------------------------------
 LSL_VHDX_LIST_FILE="$(mktemp)"

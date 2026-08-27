@@ -175,6 +175,17 @@ write_append_layer() {
         log "Refusing to write layer: only $(lsl_cdrom_free_mib) MiB free on /cdrom (need ~${need})."
         return 1
     fi
+    # FAT32 file-size ceiling: a squashfs written to a vfat /cdrom may not exceed
+    # ~4 GiB. Refuse up front (with a clear message) instead of failing mid-write.
+    if lsl_cdrom_is_vfat; then
+        local fatcap; fatcap="$(lsl_fat32_max_bytes)"
+        if [ "${upper_bytes:-0}" -gt "$fatcap" ] 2>/dev/null; then
+            echo "ERROR: the layer (~${upper_bytes} bytes of changes) would exceed the FAT32 4 GiB file limit on /cdrom." >&2
+            echo "       Use smaller, more frequent appends, or move the data dir to an HDD (LSL_DATA_DIR)." >&2
+            log "Refusing to write layer: ${upper_bytes} bytes exceeds FAT32 limit ${fatcap}."
+            return 1
+        fi
+    fi
     echo "Writing new layer squashfs: $layer"
     mksquashfs /tmp/squashfs/upper "$layer" -comp zstd -Xcompression-level 22
     if [ -n "${squashfs_config_used_host:-}" ] && [ -f "$squashfs_config_used_host" ]; then
@@ -424,12 +435,28 @@ case "$choice" in
             log "Merge skipped: insufficient space on /cdrom (need ~${need} MiB)."
             exit 1
         fi
+        # FAT32 file-size ceiling for the merged image (base + changes).
+        if lsl_cdrom_is_vfat; then
+            fatcap="$(lsl_fat32_max_bytes)"
+            est="$(( ${cur_bytes:-0} + upper_bytes ))"
+            if [ "$est" -gt "$fatcap" ] 2>/dev/null; then
+                echo "ERROR: the merged image (~${est} bytes) would exceed the FAT32 4 GiB file limit on /cdrom." >&2
+                echo "       Use append instead (smaller, incremental layers)." >&2
+                log "Merge skipped: ${est} bytes exceeds FAT32 limit ${fatcap}."
+                exit 1
+            fi
+        fi
+        # Drop apt caches/lists from the layer so it stays small (and under the
+        # FAT32 limit). The apt archives are bind-mounted from the host, but
+        # /var/lib/apt/lists lives in the overlay and would otherwise be baked in.
+        chroot /tmp/squashfs/root apt-get clean >/dev/null 2>&1 || true
+        rm -rf /tmp/squashfs/root/var/lib/apt/lists/* 2>/dev/null || true
         echo "Building merged filesystem.squashfs..."
         merge_log="${usb_log_dir}/merge-${ts}.log"
         if ! (cd /tmp/squashfs/root && mksquashfs . "$new" \
             -comp zstd -Xcompression-level 22 \
             -one-file-system \
-            -wildcards -e "home/*") >"$merge_log" 2>&1; then
+            -wildcards -e "home/*" "var/cache/apt/archives/*" "var/lib/apt/lists/*") >"$merge_log" 2>&1; then
             echo "Merge failed."
             log "Merge failed (see $(basename "$merge_log"))."
             if grep -qiE "no space left on device|file too large|File too large" "$merge_log" 2>/dev/null; then

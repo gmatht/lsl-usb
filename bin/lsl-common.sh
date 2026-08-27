@@ -88,6 +88,24 @@ lsl_ensure_cdrom_space() {
     [ "$av" -ge "$need" ] 2>/dev/null
 }
 
+lsl_cdrom_fstype() {
+    # Filesystem type of the mounted /cdrom, or empty if it cannot be determined.
+    findmnt -n -o FSTYPE /cdrom 2>/dev/null || true
+}
+
+lsl_cdrom_is_vfat() {
+    # True when /cdrom is a FAT32 volume, which imposes a ~4 GiB single-file
+    # ceiling that mksquashfs cannot exceed (a layer written past it fails
+    # cryptically mid-write).
+    [ "$(lsl_cdrom_fstype)" = "vfat" ]
+}
+
+lsl_fat32_max_bytes() {
+    # FAT32 maximum single file size is 4 GiB minus one cluster; use 4 GiB - 64 KiB
+    # as a conservative, always-safe ceiling for pre-write size checks.
+    echo 4294901760
+}
+
 LSL_HOME_LOWER="${LSL_HOME_LOWER:-/run/lsl-home-lower}"
 LSL_HOME_UPPER="${LSL_HOME_UPPER:-/run/lsl-home-overlay/upper}"
 LSL_HOME_WORK="${LSL_HOME_WORK:-/run/lsl-home-overlay/work}"
