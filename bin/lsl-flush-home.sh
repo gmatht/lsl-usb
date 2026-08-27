@@ -32,6 +32,14 @@ ts="$(date +%Y%m%d%H%M%S)"
 tmp_sfs="/cdrom/home_new_${ts}.sfs"
 
 echo "Writing merged /home to ${tmp_sfs}..."
+# Free-space guard: a full FAT partition makes mksquashfs fail cryptically.
+sz="$(du -sm /home 2>/dev/null | awk '{print $1}')"; sz="${sz:-0}"
+need_mib="$(( sz + 64 ))"
+if ! lsl_ensure_cdrom_space "$need_mib"; then
+    echo "lsl-flush-home.sh: only $(lsl_cdrom_free_mib) MiB free on /cdrom; need ~${need_mib} MiB to flush /home. Aborting." >&2
+    mount /cdrom -o remount,ro 2>/dev/null || true
+    exit 1
+fi
 mksquashfs /home "$tmp_sfs" -comp zstd -b 512K -one-file-system -noappend
 
 if [ -f /cdrom/home.sfs ]; then

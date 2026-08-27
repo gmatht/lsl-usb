@@ -161,12 +161,20 @@ prompt_choice() {
 }
 
 write_append_layer() {
-    local ts layer meta
+    local ts layer meta need sz
     ts="$(date +%Y%m%d%H%M%S)"
     # Naming: make it sort LAST in /cdrom/casper/*.squashfs so casper's reverse-order logic
     # gives it HIGHEST precedence (first in lowerdir=...).
     layer="/cdrom/casper/filesystem_z${ts}.squashfs"
     meta="/cdrom/casper/filesystem_z${ts}.sh"
+    # Free-space guard: avoid a cryptic mksquashfs failure on a full FAT partition.
+    sz="$(du -sm /tmp/squashfs/upper 2>/dev/null | awk '{print $1}')"; sz="${sz:-0}"
+    need="$(( sz + 64 ))"
+    if ! lsl_ensure_cdrom_space "$need"; then
+        echo "ERROR: /cdrom has less than ${need} MiB free; cannot write $layer." >&2
+        log "Refusing to write layer: only $(lsl_cdrom_free_mib) MiB free on /cdrom (need ~${need})."
+        return 1
+    fi
     echo "Writing new layer squashfs: $layer"
     mksquashfs /tmp/squashfs/upper "$layer" -comp zstd -Xcompression-level 22
     if [ -n "${squashfs_config_used_host:-}" ] && [ -f "$squashfs_config_used_host" ]; then
@@ -399,13 +407,23 @@ case "$choice" in
     append)
         # Append a new layer from the overlay upperdir only.
         log "User selected: append"
-        write_append_layer
+        if ! write_append_layer; then
+            echo "Append failed (see log). Not persisting." >&2
+            exit 1
+        fi
         ;;
     merge)
         # Merge into a single filesystem.squashfs by squashing the merged view.
         log "User selected: merge"
         new="/cdrom/casper/filesystem_new.squashfs"
         backup="/cdrom/casper/filesystem_${ts}.squashfs"
+        # Free-space guard before the (large) merge write.
+        need="$(( ( ${cur_bytes:-0} / 1048576 ) + ( upper_bytes / 1048576 ) + 128 ))"
+        if ! lsl_ensure_cdrom_space "$need"; then
+            echo "ERROR: not enough free space on /cdrom to merge (need ~${need} MiB). Use append instead." >&2
+            log "Merge skipped: insufficient space on /cdrom (need ~${need} MiB)."
+            exit 1
+        fi
         echo "Building merged filesystem.squashfs..."
         merge_log="${usb_log_dir}/merge-${ts}.log"
         if ! (cd /tmp/squashfs/root && mksquashfs . "$new" \
@@ -421,7 +439,9 @@ case "$choice" in
                 case "${yn:-}" in
                     y|Y|yes|YES)
                         log "Fallback: append after merge failure"
-                        write_append_layer
+                        if ! write_append_layer; then
+                            echo "Append also failed (space?). Not persisting." >&2
+                        fi
                         exit 0
                         ;;
                 esac
