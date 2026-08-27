@@ -178,6 +178,12 @@ lsl_merge_fstab() {
     rm -f "$block"
 }
 
+# Sourceable for unit tests: define functions but do not run the boot logic
+# when sourced (BASH_SOURCE != $0).
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0 2>/dev/null || true
+fi
+
 # Keep /cdrom read-only by default; only remount rw when explicitly persisting images.
 mount /cdrom/ -o remount,ro 2>/dev/null || true
 
@@ -279,6 +285,14 @@ export LSL_CACHE_MOUNT=/mnt/lsl-cache
 # persistent volume, fall back to a temporary tmpfs-overlay /home for this boot
 # (so the only consequence is that first-boot home changes are lost on reboot).
 LSL_FALLBACK_USB_HOME=0
+# HDD mode also needs btrfs-progs to create home.btrfs/cache.btrfs. On the
+# first boot that tool may not be in the base image yet (firstboot installs it
+# afterwards), so fall back to a temporary tmpfs /home rather than fail.
+if ! lsl_is_usb_mode && ! command -v mkfs.btrfs >/dev/null 2>&1; then
+    echo "lsl: btrfs-progs not installed; cannot create persistent home.btrfs on the first boot." >&2
+    echo "lsl: using a temporary tmpfs-overlay /home instead (changes lost on reboot)." >&2
+    LSL_FALLBACK_USB_HOME=1
+fi
 if ! lsl_is_usb_mode && ! lsl_data_dir_is_persistent; then
     echo "lsl: HDD data dir $DATA_DIR not on a persistent volume yet; retrying drive mount..." >&2
     bash /cdrom/bin/mount_all.sh 2>/dev/null || true
@@ -304,8 +318,14 @@ if lsl_is_usb_mode || [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
         mount /cdrom -o remount,rw 2>/dev/null || true
         echo "Creating /cdrom/home.sfs from live /home (first boot)..."
         if command -v mksquashfs >/dev/null 2>&1; then
-            mksquashfs /home /cdrom/home.sfs -comp zstd >/dev/null 2>&1 || \
-                echo "WARNING: could not create /cdrom/home.sfs - /home will not persist." >&2
+            sz="$(du -sm /home 2>/dev/null | awk '{print $1}')"; sz="${sz:-0}"
+            need_mib="$(( sz + 64 ))"
+            if lsl_ensure_cdrom_space "$need_mib"; then
+                mksquashfs /home /cdrom/home.sfs -comp zstd >/dev/null 2>&1 || \
+                    echo "WARNING: could not create /cdrom/home.sfs - /home will not persist." >&2
+            else
+                echo "WARNING: only $(lsl_cdrom_free_mib) MiB free on /cdrom; need ~${need_mib} MiB - /home.sfs not created." >&2
+            fi
         else
             echo "WARNING: mksquashfs not found - /cdrom/home.sfs not created." >&2
         fi
