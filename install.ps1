@@ -81,7 +81,8 @@ param(
     [switch]$SkipIsoDownload,
     [switch]$SkipRufus,
     [switch]$NoGui,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$NoElevation
 )
 
 Set-StrictMode -Version 2.0
@@ -110,6 +111,50 @@ function Write-Err2([string]$msg) { Write-Host "    ERROR: $msg" -ForegroundColo
 # ---------------------------------------------------------------------------
 # Compatibility note shown to the user at the start.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Pre-flight checks (must run before any USB write / Rufus launch).
+# ---------------------------------------------------------------------------
+function Test-IsAdmin {
+    # Non-Windows (e.g. the pwsh CI harness) has no relevant token model here.
+    if (-not $IsWindows) { return $true }
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $p = [Security.Principal.WindowsPrincipal]::new($id)
+        return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        # If we cannot determine, let it proceed - Rufus / USB writes fail loudly.
+        return $true
+    }
+}
+
+function Assert-Admin {
+    if ($NoElevation) { return }
+    if (Test-IsAdmin) { return }
+    Write-Err2 'This installer must be run as Administrator.'
+    Write-Info 'Right-click install.bat (or install.ps1) and choose "Run as administrator",'
+    Write-Info 'then run it again. Rufus and writing to the USB both require admin rights.'
+    exit 1
+}
+
+function Test-SecureBootEnabled {
+    if (-not $IsWindows) { return $false }
+    try {
+        # Confirm-SecureBootUEFI exists on Windows 8+/Server 2012+ with SB support.
+        return [bool](Confirm-SecureBootUEFI -ErrorAction SilentlyContinue)
+    } catch {
+        return $false
+    }
+}
+
+function Warn-SecureBoot {
+    if (Test-SecureBootEnabled) {
+        Write-Warn2 'Secure Boot appears to be ENABLED in this machine firmware.'
+        Write-Info 'The lsl-usb live USB is a BIOS/MBR casper image written in Rufus DD mode;'
+        Write-Info 'it has no signed UEFI bootloader and will NOT boot while Secure Boot is on.'
+        Write-Info 'Disable Secure Boot in the firmware setup before booting the USB.'
+    }
+}
+
 function Show-CompatNotes {
     WriteStep 'Compatibility:'
     Write-Info '  Supported   : Ubuntu 24.04 based live distros - Linux Mint 22.x, Zorin OS 18.x.'
@@ -219,6 +264,27 @@ function Install-Everything {
     return $es
 }
 
+function Find-LocalIsos {
+    # Filesystem fallback for existing-ISO discovery when Everything's index is
+    # unavailable (e.g. a freshly-installed Everything still building its index,
+    # or Everything not installed at all). Scans Downloads + common ISO/image
+    # folders. Newest first. Independent of Everything.
+    if (-not $IsWindows) { return ,@() }
+    $dirs = @()
+    try { $dirs += Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Downloads' } catch {}
+    try { $dirs += [Environment]::GetFolderPath('CommonDownloads') } catch {}
+    $dirs += @('C:\ISO', 'D:\ISO', 'C:\Images', 'D:\Images')
+    $hits = @()
+    foreach ($d in $dirs) {
+        if (-not (Test-Path $d)) { continue }
+        try {
+            $hits += Get-ChildItem -Path $d -Filter '*.iso' -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | ForEach-Object { $_.FullName }
+        } catch {}
+    }
+    return ,@($hits | Select-Object -First 20)
+}
+
 function Find-EverythingIsos {
     # Use Everything's index (fast, whole-disk) to find .iso files, newest first.
     # Returns an empty array when Everything is absent or its index is not running.
@@ -233,7 +299,9 @@ function Find-EverythingIsos {
 
 function Select-ExistingIso {
     # Offer the ISOs Everything found; returns the chosen path or '' to download.
+    # Falls back to a direct disk scan when Everything's index isn't ready yet.
     $isos = Find-EverythingIsos
+    if (-not $isos) { $isos = Find-LocalIsos }
     if (-not $isos) { return '' }
     WriteStep "Found $($isos.Count) existing ISO image(s) via Everything (voidtools):"
     for ($i = 0; $i -lt $isos.Count; $i++) {
@@ -1448,6 +1516,12 @@ if ($DryRun) {
         -BundleDir $BundleDir -RufusPath $RufusPath -WslVhdx $WslVhdx -VolumeLabel $VolumeLabel
     exit 0
 }
+
+# Pre-flight: this installer writes to the USB and launches Rufus, both of which
+# require Administrator rights, and the DD-mode live USB will not boot with
+# Secure Boot enabled - warn before any destructive step.
+Assert-Admin
+Warn-SecureBoot
 
 # GUI first: starts before the ISO download/verify, runs them in the
 # background, and collects configuration while the user waits.
