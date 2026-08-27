@@ -23,7 +23,8 @@ command -v mksquashfs >/dev/null 2>&1 || { echo "ERROR: mksquashfs (squashfs-too
 command -v zip       >/dev/null 2>&1 || { echo "ERROR: zip not found" >&2; exit 1; }
 for f in "$REPO_ROOT"/misc/lsl-firstboot.sh "$REPO_ROOT"/misc/lsl-firstboot.service \
          "$REPO_ROOT"/misc/lsl-firstboot-progress.sh "$REPO_ROOT"/misc/lsl-firstboot-progress.desktop \
-         "$REPO_ROOT"/misc/lsl-firstboot-failed.sh "$REPO_ROOT"/misc/lsl-firstboot-failed.desktop; do
+         "$REPO_ROOT"/misc/lsl-firstboot-failed.sh "$REPO_ROOT"/misc/lsl-firstboot-failed.desktop \
+         "$REPO_ROOT"/misc/lsl-merge-suggest.sh "$REPO_ROOT"/misc/lsl-merge-suggest.desktop; do
     [ -f "$f" ] || { echo "ERROR: missing $f" >&2; exit 1; }
 done
 
@@ -67,6 +68,18 @@ bash "$REPO_ROOT/tests/mount_all.tests.sh"
 echo "Running casper layer-name check (set Casper_GLOB if your initrd differs)..."
 bash "$REPO_ROOT/tests/casper-layer-check.sh"
 
+echo "Running overlayfs-tools whiteout behavior test (skips if unavailable)..."
+bash "$REPO_ROOT/tests/overlayfs-whiteout.tests.sh" || echo "  (overlayfs-whiteout test skipped or failed - non-fatal)"
+
+echo "Running overlay-merge.py whiteout test..."
+bash "$REPO_ROOT/tests/overlay-merge.tests.sh" || echo "  (overlay-merge whiteout test failed - non-fatal)"
+
+echo "Running merge-suggestion trigger-logic test..."
+bash "$REPO_ROOT/tests/lsl-merge-suggest.tests.sh" || echo "  (merge-suggestion test failed - non-fatal)"
+
+echo "Running btrfs online-grow (lsl-btrfs-growd) test..."
+bash "$REPO_ROOT/tests/btrfs-growd.tests.sh" || echo "  (btrfs-growd test skipped or failed - non-fatal)"
+
 # --- 1) minimal first-boot layer -------------------------------------------
 LAYER="$STAGE/layer"
 mkdir -p "$LAYER/usr/local/sbin" "$LAYER/usr/local/bin" \
@@ -80,6 +93,8 @@ install -m 644 "$REPO_ROOT/misc/lsl-firstboot-progress.desktop" "$LAYER/etc/xdg/
 install -m 644 "$REPO_ROOT/misc/lsl-boot-time.desktop" "$LAYER/etc/xdg/autostart/lsl-boot-time.desktop"
 install -m 755 "$REPO_ROOT/misc/lsl-firstboot-failed.sh" "$LAYER/usr/local/bin/lsl-firstboot-failed.sh"
 install -m 644 "$REPO_ROOT/misc/lsl-firstboot-failed.desktop" "$LAYER/etc/xdg/autostart/lsl-firstboot-failed.desktop"
+install -m 755 "$REPO_ROOT/misc/lsl-merge-suggest.sh" "$LAYER/usr/local/bin/lsl-merge-suggest.sh"
+install -m 644 "$REPO_ROOT/misc/lsl-merge-suggest.desktop" "$LAYER/etc/xdg/autostart/lsl-merge-suggest.desktop"
 # Enable the unit by symlink (overlayfs handles lower-layer symlinks fine).
 ln -s ../lsl-firstboot.service "$LAYER/etc/systemd/system/multi-user.target.wants/lsl-firstboot.service"
 
@@ -117,7 +132,9 @@ if command -v unsquashfs >/dev/null 2>&1; then
         etc/xdg/autostart/lsl-firstboot-progress.desktop \
         etc/xdg/autostart/lsl-boot-time.desktop \
         etc/xdg/autostart/lsl-firstboot-failed.desktop \
-        usr/local/bin/lsl-firstboot-failed.sh; do
+        etc/xdg/autostart/lsl-merge-suggest.desktop \
+        usr/local/bin/lsl-firstboot-failed.sh \
+        usr/local/bin/lsl-merge-suggest.sh; do
         if ! grep -qF "$want" <<<"$LAYER_LIST"; then
             echo "ERROR: firstboot layer missing: $want" >&2
             FAIL=1
