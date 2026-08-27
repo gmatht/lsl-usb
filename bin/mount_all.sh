@@ -35,6 +35,14 @@ dev_for_uuid() {
     lsblk -ln -o NAME,PARTUUID 2>/dev/null | awk -v u="$u" 'tolower($2)==tolower(u){print $1; exit}'
 }
 
+# Read-only dirty/hibernation check. Returns 0 (dirty) when ntfsfix reports a
+# problem; if ntfsfix is unavailable we conservatively report clean (rw mount).
+ntfs_is_dirty() {
+    local dev="$1"
+    command -v ntfsfix >/dev/null 2>&1 || return 1
+    ntfsfix -n "$dev" 2>&1 | grep -qiE "dirty|hibernat|corrupt" || return 1
+    return 0
+}
 
 # Mount a Windows drive letter at /mnt/<lower>. Maps the letter to the correct
 # partition using the MountedDevices registry value:
@@ -77,8 +85,13 @@ parse_drive() {
         local device
         device="$(dev_for_uuid "$uuid")"
         [ -n "$device" ] || return 1
-        echo "    mounting /dev/$device at $mount_point"
-        mount "/dev/$device" -t ntfs3 "$mount_point" || return 1
+        if ntfs_is_dirty "/dev/$device"; then
+            echo "    mounting /dev/$device at $mount_point (READ-ONLY; dirty NTFS)" >&2
+            mount "/dev/$device" -t ntfs3 -o ro "$mount_point" || return 1
+        else
+            echo "    mounting /dev/$device at $mount_point"
+            mount "/dev/$device" -t ntfs3 "$mount_point" || return 1
+        fi
         return 0
     fi
 
@@ -95,8 +108,13 @@ parse_drive() {
         local part
         part="$(lsblk -ln -o NAME,START 2>/dev/null | awk -v o="$off" '$2==o{print $1; exit}')"
         [ -n "$part" ] || return 1
-        echo "    mounting /dev/$part at $mount_point"
-        mount "/dev/$part" -t ntfs3 "$mount_point" || return 1
+        if ntfs_is_dirty "/dev/$part"; then
+            echo "    mounting /dev/$part at $mount_point (READ-ONLY; dirty NTFS)" >&2
+            mount "/dev/$part" -t ntfs3 -o ro "$mount_point" || return 1
+        else
+            echo "    mounting /dev/$part at $mount_point"
+            mount "/dev/$part" -t ntfs3 "$mount_point" || return 1
+        fi
         return 0
     fi
 
@@ -185,7 +203,15 @@ else
     echo "    Skipping safe_ntfsfix.sh (set LSL_NTFSFIX=1 in lsl-usb.env to enable)."
 fi
 mkdir -p /mnt/c
-mount "$best_part" -t ntfs3 /mnt/c
+# Refuse to mount a dirty/hibernated NTFS read-write: that risks corrupting the
+# Windows volume. ntfsfix -n is a read-only check; if it's unavailable we proceed
+# rw but the README warns the user to shut Windows down cleanly first.
+if ntfs_is_dirty "$best_part"; then
+    echo "    WARNING: $best_part looks dirty/hibernated; mounting READ-ONLY to avoid corruption." >&2
+    mount "$best_part" -t ntfs3 -o ro /mnt/c || mount "$best_part" -t ntfs-3g -o ro /mnt/c
+else
+    mount "$best_part" -t ntfs3 /mnt/c
+fi
 
 cleanup() {
     if [ "$needs_unmount" = true ] && [ -n "$best_mount" ]; then
