@@ -93,7 +93,7 @@ cp -a "$REPO_ROOT/bin" "$BUNDLE/bin"
 cp -a "$REPO_ROOT/systemd" "$BUNDLE/systemd"
 cp -a "$REPO_ROOT/fuse" "$BUNDLE/fuse"
 cp -a "$REPO_ROOT/onboot.sh" "$REPO_ROOT/lsl-usb.env" "$BUNDLE/"
-cp -a "$REPO_ROOT/install.ps1" "$REPO_ROOT/install.bat" "$REPO_ROOT/VERSION" "$BUNDLE/"
+cp -a "$REPO_ROOT/install.ps1" "$REPO_ROOT/install.bat" "$REPO_ROOT/resolve-powershell.ps1" "$REPO_ROOT/VERSION" "$BUNDLE/"
 cp -a "$DIST/filesystem_z0_firstboot.squashfs" "$BUNDLE/"
 
 # --- 3. zip it ---------------------------------------------------------------

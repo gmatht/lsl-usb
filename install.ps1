@@ -630,7 +630,7 @@ function Install-LslFiles {
             $copied += "$d\"
         }
     }
-    foreach ($f in @('onboot.sh', 'lsl-usb.env')) {
+    foreach ($f in @('onboot.sh', 'lsl-usb.env', 'resolve-powershell.ps1')) {
         $src = Join-Path $BundleDir $f
         if (Test-Path $src) {
             Copy-Item $src (Join-Path $root $f) -Force
