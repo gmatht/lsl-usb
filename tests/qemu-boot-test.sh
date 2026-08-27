@@ -80,6 +80,10 @@ cp "$BUNDLE/filesystem_z0_firstboot.squashfs" "$MNT/casper/filesystem_z0_firstbo
 cp "$ISO_MNT/casper/vmlinuz" "$WORK/vmlinuz"
 cp "$ISO_MNT/casper/initrd.lz" "$WORK/initrd.lz"
 umount "$ISO_MNT"; umount "$MNT"; losetup -d "$LOOP"
+# Force the FAT32 writes out of the page cache into usb.img before QEMU opens
+# it - without this, a freshly-built disk can be read with stale/truncated
+# blocks at boot (casper then fails to mount filesystem.squashfs).
+sync
 
 echo "Booting under KVM (console only) - first boot can take 20-40 min (apt + layer pack)..."
 echo "  (waiting for 'First-boot setup complete' on the console, up to ~40 min)"
@@ -87,7 +91,7 @@ echo "  (waiting for 'First-boot setup complete' on the console, up to ~40 min)"
 # network-online.target reliably with it, which lsl-firstboot.service waits on.
 # forward_to_console lets us detect the completion line without mounting the live
 # disk (mounting a disk another OS is writing would risk corruption).
-qemu-system-x86_64 -enable-kvm -m 4096 \
+qemu-system-x86_64 -enable-kvm -m 8192 \
   -drive file="$DISK",format=raw \
   -kernel "$WORK/vmlinuz" -initrd "$WORK/initrd.lz" \
   -append "boot=casper username=mint hostname=mint console=ttyS0 noprompt systemd.journald.forward_to_console=1 --" \
