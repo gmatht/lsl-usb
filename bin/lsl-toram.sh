@@ -86,6 +86,13 @@ if [ "${LSL_TORAM_TEST:-0}" = "1" ]; then
 fi
 
 echo "Switching the session root to RAM..."
+# Best-effort snapshot in case the pivot wedges the session (the USB is still
+# mounted here, so the tarball survives a hard reset).
+if [ -x /cdrom/bin/lsl-diag.sh ]; then
+    bash /cdrom/bin/lsl-diag.sh toram-pre >/dev/null 2>&1 || true
+fi
+echo "NOTE: after the swap, persistence writes (uphome / lsl-home-flushd /"
+echo "      uproot / persist-wifi) are unavailable until the USB is re-inserted."
 mount --make-rprivate /
 cd "$NEW"
 pivot_root . "$OLD"

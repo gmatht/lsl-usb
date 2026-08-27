@@ -9,6 +9,11 @@ first real validation pass. Do it in order; each step is a prerequisite for the 
 - A Windows machine with Everything (voidtools) installed and its index current.
 - A USB stick >= 16 GB (FAT32, Rufus-written Mint 22.x live USB).
 - A second machine (or the same one) to boot the USB from.
+- **First boot needs network for `apt`.** Prefer **wired Ethernet**; some wireless
+  cards need firmware absent from the base image. For fully-offline first boots,
+  drop `.deb` packages into `<USB>:/firmware/` before booting (installed by
+  `squashfs_config.sh` before apt). If there is no network, first boot retries on
+  the next boot (it does not silently proceed to a base image).
 
 ## 0. Automated pre-checks (run before burning time on real hardware)
 
@@ -92,8 +97,10 @@ state, and `dmesg`/`journalctl`. A failed first boot also drops
 - [ ] `uproot` append and merge both work; the new layer boots.
 - [ ] `lsl-toram.sh` (LSL_TORAM_TEST=1 first): copies root to RAM, no pivot.
 - [ ] `lsl-toram.sh` full: pivot succeeds, USB removable, session continues.
-      **Rollback**: if the pivot fails, reboot (the USB is untouched until the
-      final unmount).
+      **Rollback**: if the pivot fails, hard-reset (the USB is untouched until the
+      final unmount, and `lsl-diag.sh toram-pre` is captured beforehand).
+      After the swap, uphome/uproot/lsl-home-flushd are unavailable until the USB
+      is re-inserted.
 
 ## 4. Performance
 
