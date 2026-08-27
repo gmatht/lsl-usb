@@ -85,13 +85,13 @@ umount "$ISO_MNT"; umount "$MNT"; losetup -d "$LOOP"
 # blocks at boot (casper then fails to mount filesystem.squashfs).
 sync
 
-echo "Booting under KVM (console only) - first boot can take 20-40 min (apt + layer pack)..."
-echo "  (waiting for 'First-boot setup complete' on the console, up to ~40 min)"
+echo "Booting under KVM (console only) - first boot can take 30-50 min (apt + layer pack)..."
+echo "  (waiting for 'First-boot setup complete' on the console, up to ~60 min)"
 # virtio-net-pci is used (not e1000) because NetworkManager reaches
 # network-online.target reliably with it, which lsl-firstboot.service waits on.
 # forward_to_console lets us detect the completion line without mounting the live
 # disk (mounting a disk another OS is writing would risk corruption).
-qemu-system-x86_64 -enable-kvm -m 8192 \
+qemu-system-x86_64 -enable-kvm -m 8192 -smp 4 \
   -drive file="$DISK",format=raw \
   -kernel "$WORK/vmlinuz" -initrd "$WORK/initrd.lz" \
   -append "boot=casper username=mint hostname=mint console=ttyS0 noprompt systemd.journald.forward_to_console=1 --" \
@@ -100,7 +100,7 @@ qemu-system-x86_64 -enable-kvm -m 8192 \
 QEMU_PID=$!
 
 RC=1
-for i in $(seq 1 240); do   # up to 40 min
+for i in $(seq 1 360); do   # up to 60 min
   if grep -q "First-boot setup complete" "$WORK/boot.log" 2>/dev/null; then
     echo "Saw first-boot completion on console."; break
   fi
