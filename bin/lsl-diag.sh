@@ -42,6 +42,8 @@ trap 'rm -rf "$WORK"' EXIT
 cp -a /run/lsl-usb.state        "$WORK/lsl-usb.state"        2>/dev/null || true
 cp -a /run/lsl-firstboot-status "$WORK/lsl-firstboot-status" 2>/dev/null || true
 cp -a /cdrom/lsl-usb.env        "$WORK/lsl-usb.env"          2>/dev/null || true
+cp -a /cdrom/VERSION        "$WORK/VERSION"          2>/dev/null || true
+cp -a /cdrom/lsl-build.txt  "$WORK/lsl-build.txt"    2>/dev/null || true
 cp -a /cdrom/casper/lsl-firstboot.attempts "$WORK/lsl-firstboot.attempts" 2>/dev/null || true
 cp -a /cdrom/casper/lsl-firstboot.FAILED     "$WORK/lsl-firstboot.FAILED"     2>/dev/null || true
 cp -a /cdrom/casper/boot-times.log "$WORK/boot-times.log"     2>/dev/null || true
@@ -58,6 +60,7 @@ cp -a /cdrom/casper/uproot-logs/.   "$WORK/uproot-logs/"       2>/dev/null || tr
     echo "=== df -h ==="; df -h 2>/dev/null
     echo "=== losetup ==="; losetup -a 2>/dev/null
     echo "=== lsl-data-dir ==="; ls -ld /mnt/c/Users/lsl-usb 2>/dev/null
+    echo "=== lsl-build ==="; cat /cdrom/lsl-build.txt 2>/dev/null; echo; cat /cdrom/VERSION 2>/dev/null
     echo "=== systemctl lsl-* ==="; systemctl list-units 'lsl-*' 2>/dev/null
 } > "$WORK/system-state.txt" 2>/dev/null || true
 
