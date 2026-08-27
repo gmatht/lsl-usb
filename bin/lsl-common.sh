@@ -67,6 +67,27 @@ lsl_data_dir_is_persistent() {
     esac
 }
 
+lsl_cdrom_free_mib() {
+    # Available MiB on /cdrom, or 0 if it cannot be determined.
+    local av
+    av="$(df -m --output=avail /cdrom 2>/dev/null | tail -1 | tr -d ' ')"
+    case "$av" in
+        ''|*[!0-9]*) echo 0 ;;
+        *) echo "$av" ;;
+    esac
+}
+
+lsl_ensure_cdrom_space() {
+    # $1 = required MiB on /cdrom. Returns 0 if at least that much is free (or
+    # if free space is unknown - we let the write fail naturally rather than
+    # blocking a persist that might still fit, avoiding a cryptic mksquashfs
+    # "No space left on device" mid-write).
+    local need="${1:-0}"
+    local av; av="$(lsl_cdrom_free_mib)"
+    [ "$av" -gt 0 ] 2>/dev/null || return 0
+    [ "$av" -ge "$need" ] 2>/dev/null
+}
+
 LSL_HOME_LOWER="${LSL_HOME_LOWER:-/run/lsl-home-lower}"
 LSL_HOME_UPPER="${LSL_HOME_UPPER:-/run/lsl-home-overlay/upper}"
 LSL_HOME_WORK="${LSL_HOME_WORK:-/run/lsl-home-overlay/work}"

@@ -47,6 +47,24 @@ LSL_TEST_FSTYPE=ntfs3;    assert 'lsl_data_dir_is_persistent' 'data dir on ntfs3
 LSL_TEST_FSTYPE=vfat;     assert 'lsl_data_dir_is_persistent' 'data dir on vfat (USB) -> persistent'
 LSL_TEST_FSTYPE=;         assert '! lsl_data_dir_is_persistent' 'data dir on unknown fstype -> not persistent'
 
+# --- lsl_cdrom_free_mib / lsl_ensure_cdrom_space ------------------------------
+# Mock df to emulate --output=avail (header "Avail" then the value).
+df() { echo "Avail"; echo "${LSL_TEST_AVAIL:-0}"; }
+LSL_TEST_AVAIL=500; assert 'lsl_ensure_cdrom_space 256' '500 MiB free, need 256 -> ok'
+LSL_TEST_AVAIL=100; assert '! lsl_ensure_cdrom_space 256' '100 MiB free, need 256 -> not ok'
+LSL_TEST_AVAIL=0;   assert 'lsl_ensure_cdrom_space 256' 'unknown free -> non-blocking ok'
+
+# --- lsl_data_dir_is_persistent ----------------------------------------------
+# Mock findmnt to return a fixed fstype for every query (TARGET + FSTYPE).
+findmnt() { echo "${LSL_TEST_FST:-}"; }
+LSL_TEST_FST=overlay; LSL_DATA_DIR=/mnt/c/Users/lsl-usb; assert '! lsl_data_dir_is_persistent' 'overlay data dir not persistent'
+LSL_TEST_FST=ntfs3;   assert 'lsl_data_dir_is_persistent' 'ntfs3 data dir persistent'
+LSL_TEST_FST=tmpfs;   assert '! lsl_data_dir_is_persistent' 'tmpfs data dir not persistent'
+LSL_TEST_FST=;        assert '! lsl_data_dir_is_persistent' 'empty fstype not persistent'
+LSL_TEST_FST=vfat;    assert 'lsl_data_dir_is_persistent' 'vfat (USB) data dir persistent'
+unset -f findmnt
+
+
 # --- lsl_vhdx_append: dedupe + persist -------------------------------------
 LSL_VHDX_LIST_FILE="$(mktemp)"
 VH="$(mktemp)"   # must be a real file: lsl_vhdx_append requires -f
