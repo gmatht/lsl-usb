@@ -27,7 +27,13 @@ ATTEMPT_FILE="${LSL_FIRSTBOOT_ATTEMPT:-/cdrom/casper/lsl-firstboot.attempts}"
 NET_TRIES="${LSL_FIRSTBOOT_NET_TRIES:-60}"
 TS="$(date +%Y%m%d%H%M%S)"
 
-set_phase() { echo "phase=$*" > "$STATUS"; }
+set_phase() {
+    echo "phase=$*" > "$STATUS"
+    # Surface progress to the console (if one is attached) and the journal so a
+    # long, unattended first boot can be seen alive without the GUI dialog.
+    echo "lsl-firstboot: phase=$*" > /dev/tty1 2>/dev/null || true
+    logger -t lsl-firstboot "phase=$*" 2>/dev/null || true
+}
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
 
