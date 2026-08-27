@@ -40,12 +40,13 @@ These catch the two biggest unknowns without a physical boot:
       now falls back to a temporary tmpfs `/home` and warns, but HDD persistence
       only becomes real on the second boot. Verify both tools are present in the
       image you wrote (`which hivexget btrfs`; `apt-cache policy ...`).
-- [ ] **Secure Boot off / Rufus DD mode** — this is a BIOS/MBR casper live USB,
-      not a signed UEFI bootloader, so it will **not** boot on firmware with
-      Secure Boot enabled. Check the firmware mode with `mokutil --sb-state` on
-      any Linux box (`SecureBoot enabled` = won't boot there). With Rufus, write
-      in "DD Image" mode (not "ISO" mode) so the stick boots like a real ISO;
-      some UEFIs reject Rufus' "ISO" hybrid partition table.
+- [ ] **Rufus DD mode** — with Rufus, write in "DD Image" mode (not "ISO" mode)
+      so the stick boots like a real ISO; some UEFIs reject Rufus' "ISO" hybrid
+      partition table. **Secure Boot**: Mint ships a Microsoft-signed shim, so the
+      USB normally boots under Secure Boot (you may need a one-time MOK enrollment
+      on first boot - see the Secure Boot section below); if it will not start,
+      disable Secure Boot in firmware. The installer now confirms this with you
+      before writing (see "Secure Boot & Linux Mint" below).
 
 ### Test matrix (cover before declaring the hardware test passed)
 
@@ -104,10 +105,61 @@ state, and `dmesg`/`journalctl`. A failed first boot also drops
       but the apt recipe alone can OOM low-RAM boxes — watch the log for OOM kills.
 - [ ] Second boot: packages present, no firstboot re-run, `lsl-precache.service`
       active, `lsl-boot-time` records a row in `/cdrom/casper/boot-times.log`.
-- [ ] `lsl` / `lsl-gui` list the WSL distros from `lsl-wsl-vhdx.conf` and mount a
+- [ ] `lsl` / and `lsl-gui` list the WSL distros from `lsl-wsl-vhdx.conf` and mount a
       vhdx via guestmount.
 
+### Expected timing & what good looks like (first boot)
+
+- **0-1 min** — USB boots, `lsl-firstboot.service` starts after network; the
+  zenity dialog shows phase "waiting for network".
+- **1-5 min** — network acquired; phase moves to "installing packages and packing
+  layer". This is the long pole: **expect 10-30 min** of apt downloads/build.
+- **~30-45 min** — `uproot --auto-append` finishes, `/cdrom/casper/lsl-firstboot.done`
+  is written, the machine reboots.
+- **Second boot (2-5 min)** — desktop appears; recipe packages are present; no
+  firstboot dialog; `lsl-precache.service` runs; a row appears in
+  `/cdrom/casper/boot-times.log`.
+
+**What good looks like:** the zenity phases advance; `cat /cdrom/casper/lsl-firstboot.done`
+exists after the first boot; on the second boot your installed apps are there and
+`lsl-firstboot` does NOT run again.
+
+**Things that should never happen (wedged - capture the diag tarball):**
+- First boot sits on "waiting for network" >5 min on a working network -> captive
+  portal or DNS issue (see the captive-portal lines in the firstboot log).
+- `uproot` fails and after 5 attempts the USB reboots into the *base* Mint image
+  (no recipe packages) -> `lsl-firstboot.FAILED` + `.FAILED.reason` will be on the
+  USB; open a terminal and run `sudo bash /cdrom/bin/uproot --auto-append`.
+- The USB will not boot at all with Secure Boot on without MOK enrollment (see
+  below).
+
+### Secure Boot & Linux Mint (what to do if it won't boot)
+
+Linux Mint's ISO ships a **Microsoft-signed boot shim**, so the USB normally boots
+under Secure Boot. If your machine's firmware has Secure Boot enabled:
+
+1. Try booting first - it usually works. On the very first boot you may see a blue
+   **MOK management** screen. Choose **Enroll MOK** (press Continue; the password
+   is normally empty), then it boots. This enrolls Linux Mint's signing key so grub
+   can load.
+2. If it still will not start, reboot into your firmware setup (often F2 / Del /
+   F12 at power-on -> Boot / Security / Authentication) and **disable Secure Boot**,
+   then boot the USB again.
+3. The installer warns you about this and asks for confirmation before writing -
+   if you already enrolled the MOK (or disabled Secure Boot), just continue.
+
+Note: this applies to UEFI boots. On legacy/CSM (BIOS) boots Secure Boot is not
+involved at all.
+
 ## 3. Persistence
+
+> **Layer size / FAT32:** each `--auto-append` writes a *delta* layer (just your
+> changes), bounded by a 4 GiB FAT32 file limit - `uproot` refuses an append that
+> would exceed it. A single **merge** into one `filesystem.squashfs` packs the
+> *entire* rootfs (base + changes) and CAN exceed 4 GiB; `uproot` also refuses a
+> merge that would, on a FAT32 `/cdrom`. We keep `/cdrom` as FAT32 (not exFAT):
+> grub's exFAT support in the Mint ISO is unreliable for booting, whereas stacked
+> FAT32 delta layers are safe. **Prefer repeated appends over merging.**
 
 - [ ] `uphome` flushes `/home` to `home.sfs`; reboot keeps home changes.
 - [ ] `uproot` append and merge both work; the new layer boots.
