@@ -11,7 +11,9 @@ setlocal
 cd /d "%~dp0"
 
 rem Repo slug used to auto-fetch the latest release of lsl-usb-win.zip via the
-rem GitHub API. Override here (or via env LSL_REPO) with your GitHub owner/name.
+rem direct latest-release download URL (no API token, no REST-API rate limit -
+rem GitHub 302-redirects it to the asset). Override here (or via env LSL_REPO)
+rem with your GitHub owner/name, or set LSL_RELEASE_URL to bypass auto-fetch.
 if not defined LSL_REPO set "LSL_REPO=gmatht/lsl-usb"
 
 rem --- resolve a PowerShell >= 5.1 to drive the installer --------------------
@@ -28,8 +30,10 @@ if not exist "%~dp0install.ps1" (
     set "BUNDLE_URL="
     if defined LSL_RELEASE_URL ( set "BUNDLE_URL=%LSL_RELEASE_URL%" )
     if not defined BUNDLE_URL if not "%LSL_REPO%"=="OWNER/REPO" (
-        echo Querying GitHub for the latest %LSL_REPO% release of lsl-usb-win.zip ...
-        for /f "delims=" %%u in ('%PS_EXE% -NoProfile -ExecutionPolicy Bypass -Command "$repo='%LSL_REPO%'; try { $r=Invoke-RestMethod -Uri \"https://api.github.com/repos/$repo/releases/latest\" -Headers @{'User-Agent'='lsl-usb'}; ($r.assets ^| Where-Object { $_.name -eq 'lsl-usb-win.zip' } ^| Select-Object -First 1).browser_download_url } catch { Write-Error $_; exit 1 }"') do set "BUNDLE_URL=%%u"
+        echo Downloading the latest %LSL_REPO% release of lsl-usb-win.zip ...
+        rem Direct latest-release download URL: no API token, no REST-API rate limit.
+        rem Invoke-WebRequest follows GitHub's 302 redirect to the actual asset.
+        set "BUNDLE_URL=https://github.com/%LSL_REPO%/releases/latest/download/lsl-usb-win.zip"
     )
     if not defined BUNDLE_URL (
         echo ERROR: install.ps1 not found next to this launcher and no download source.
