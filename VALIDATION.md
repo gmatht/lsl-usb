@@ -14,17 +14,19 @@ first real validation pass. Do it in order; each step is a prerequisite for the 
 
 These catch the two biggest unknowns without a physical boot:
 
-- [ ] **Casper layer glob** — confirm the appended `filesystem_z*.squashfs`
-      layers are actually picked up by the target Mint initrd. Extract it and
-      check the glob, then run the check:
+- [ ] **Casper layer glob** — VERIFIED against `linuxmint-22.3-cinnamon-64bit.iso`:
+      its initrd's `main/scripts/casper` globs `filesystem*.squashfs` (any suffix,
+      line 91/142/647) and stacks them lexically with the **lexically-greatest
+      file as the top layer**. Order is `filesystem.squashfs` (base) <
+      `filesystem_z0_firstboot.squashfs` < `filesystem_z<timestamp>.squashfs`
+      (appended layer, top), so the first-boot packages and unit appear on the
+      second boot. `bash tests/casper-layer-check.sh` passes with the default glob.
+      To re-verify on a different image:
       ```bash
-      unmkinitramfs /cdrom/casper/initrd . && \
-        grep -nE 'filesystem.*squashfs' ./main/scripts/casper
+      unmkinitramfs /cdrom/casper/initrd /tmp/ir && \
+        grep -nE '\*\.squashfs' /tmp/ir/main/scripts/casper
       Casper_GLOB='<the glob you found>' bash tests/casper-layer-check.sh
       ```
-      If a layer is reported as *skipped*, the second boot will not see the
-      first-boot packages (or the firstboot unit). Rename the layers or patch
-      the initrd before proceeding.
 - [ ] **`bash tests/mount_all.tests.sh`** passes (GPT/MBR drive-letter GUID
       resolution; the partition GUID must match `PARTUUID`).
 - [ ] **`bash tests/lsl-common.tests.sh`** and **`build.sh`** pass locally.
