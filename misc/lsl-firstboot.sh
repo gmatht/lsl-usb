@@ -75,12 +75,34 @@ wait_for_network() {
         local state
         state="$(nmcli -t -f connectivity g 2>/dev/null || true)"
         case "$state" in
-            full|limited) return 0 ;;   # limited = captive portal; apt may still work
+            full) return 0 ;;
+            limited)
+                # 'limited' usually means a captive portal (or an offline network).
+                # apt will fail until the portal is accepted, so warn and probe.
+                log "Network is 'limited' (captive portal or no Internet)."
+                if captive_portal_detected; then
+                    log "CAPTIVE PORTAL detected - open a browser, log in to the portal,"
+                    log "then the first boot can proceed. A wired Ethernet connection"
+                    log "avoids captive portals; prefer it for first boot."
+                else
+                    log "Network 'limited' but no portal page found; apt may still fail - prefer wired Ethernet."
+                fi
+                return 0 ;;
         esac
         sleep 5
         tries=$((tries + 1))
     done
     return 1
+}
+
+# Best-effort captive-portal probe. A connectivity check that returns 204 means
+# we are truly online; anything else (redirect, login page, or no response)
+# suggests a portal (or being offline). Non-fatal either way.
+captive_portal_detected() {
+    command -v curl >/dev/null 2>&1 || return 1
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' -m 8 'http://connectivitycheck.gstatic.com/generate_204' 2>/dev/null || echo 000)"
+    [ "$code" != "204" ]
 }
 
 if ! wait_for_network; then
