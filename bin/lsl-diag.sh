@@ -64,6 +64,17 @@ cp -a /cdrom/casper/uproot-logs/.   "$WORK/uproot-logs/"       2>/dev/null || tr
     echo "=== systemctl lsl-* ==="; systemctl list-units 'lsl-*' 2>/dev/null
 } > "$WORK/system-state.txt" 2>/dev/null || true
 
+# Hardware / boot-context for a remote post-mortem (distinguishes DD-mode vs
+# ISO-mode / casper-glob / space failures without physical access).
+{
+    echo "=== /cdrom mount ==="; findmnt -n -o SOURCE,FSTYPE,OPTIONS,TARGET /cdrom 2>/dev/null
+    echo "=== /proc/cmdline ==="; cat /proc/cmdline 2>/dev/null; echo
+    echo "=== lsblk -f ==="; lsblk -f 2>/dev/null
+    echo "=== blkid ==="; blkid 2>/dev/null
+    echo "=== casper layers ==="; ls -l /cdrom/casper/filesystem*.squashfs 2>/dev/null
+    echo "=== /etc/fstab ==="; cat /etc/fstab 2>/dev/null
+} > "$WORK/hardware.txt" 2>/dev/null || true
+
 if command -v dmesg >/dev/null 2>&1; then
     dmesg > "$WORK/dmesg.txt" 2>/dev/null || true
 fi
