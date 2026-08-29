@@ -20,7 +20,6 @@
   label { display:block; }
 </style>
 </head>
-<body onload="Window_OnLoad">
 <h2>lsl-usb installer &mdash; legacy mode</h2>
 <div id="reco">Probing this PC...</div>
 
@@ -54,32 +53,14 @@
   <div class="row">
     Rufus: <input id="rufus" size="55">
     <button onclick="BrowseRufus()">Browse...</button>
-    <span id="rufusHint">(auto-detected: PATH, C:\rufus.exe, or Downloads)</span>
+    <span id="rufusHint">(auto-detected if on PATH)</span>
   </div>
   <div class="row">
     <button id="bWrite" onclick="LaunchRufus()">Launch Rufus with selected ISO</button>
   </div>
-  <div class="row">
-    <span id="rufusReco">&nbsp;</span>
-    <button id="bDlRufus" onclick="DownloadRufus()">Download Rufus (auto-pick version)</button>
-  </div>
 </fieldset>
 
-<fieldset><legend>Preload Linux apps on the USB (flatpak + AppImage)</legend>
-  <div class="row">
-    Target USB drive:
-    <select id="swDrive" size="1"></select>
-    <button onclick="RefreshDrives()">Refresh</button>
-  </div>
-  <div class="row">
-    <button onclick="DiscoverLinuxApps()">Scan installed Windows apps &#8594; Linux equivalents</button>
-    <button id="bStageSw" onclick="StageLinuxApps()">Stage checked to &lt;USB&gt;\flatpaks\ + \appimages\</button>
-  </div>
-  <div id="swList" class="row"></div>
-  <div class="row" id="swStatus">&nbsp;</div>
-</fieldset>
-
-<div class="row"><textarea id="log" readonly"></textarea></div>
+<div class="row"><textarea id="log" readonly></textarea></div>
 
 <script language="VBScript">
 Option Explicit
@@ -87,32 +68,21 @@ Dim oWSH, oFSO, is64, ramKB, recoText, watchTimer, watchBase, watchName
 Dim rufusWatchTimer, rufusWatchBase, rufusWatchDest
 
 Sub Log(s)
-  Call InitEnv()
   document.getElementById("log").value = document.getElementById("log").value & s & vbCrLf
 End Sub
 
 Function Env(n)
-  Call InitEnv()
   Env = oWSH.ExpandEnvironmentStrings("%" & n & "%")
 End Function
 
 Function BundleDir()
-  Call InitEnv()
   Dim p
-  p = document.URL
-  If Left(p, 8) = "file:///" Then p = Mid(p, 9)
-  If Left(p, 6) = "file://" Then p = Mid(p, 7)
-  p = Replace(p, "/", "")
+  p = window.location.pathname
+  p = Replace(Mid(p, 2), "/", "")
   BundleDir = oFSO.GetParentFolderName(p)
 End Function
 
-Sub InitEnv()
-  If oWSH Is Nothing Then Set oWSH = CreateObject("WScript.Shell")
-  If oFSO Is Nothing Then Set oFSO = CreateObject("Scripting.FileSystemObject")
-End Sub
-
 Function RX(pat, src, grp)
-  Call InitEnv()
   Dim re, m
   Set re = New RegExp
   re.Pattern = pat
@@ -120,15 +90,13 @@ Function RX(pat, src, grp)
   re.Global = False
   Set m = re.Execute(src)
   If m.Count > 0 And m(0).SubMatches.Count >= grp Then
-    RX = m(0).SubMatches(grp - 1)
-
+    RX = m(0).SubMatches(grg - 1)
   Else
     RX = ""
   End If
 End Function
 
 Function RXAll(pat, src)
-  Call InitEnv()
   Dim re, m, c, out
   Set re = New RegExp
   re.Pattern = pat
@@ -143,13 +111,11 @@ Function RXAll(pat, src)
 End Function
 
 Sub Window_OnLoad()
-  Call InitEnv()
   Set oWSH = CreateObject("WScript.Shell")
   Set oFSO = CreateObject("Scripting.FileSystemObject")
   Call Recommend()
   Call AutoRufus()
   Call ScanISOs()
-  Call DiscoverLinuxApps()
   If is64 Then
     document.getElementById("url").value = "https://mirrors.kernel.org/linuxmint/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso"
   Else
@@ -161,7 +127,6 @@ Sub Window_OnLoad()
 End Sub
 
 Sub Recommend()
-  Call InitEnv()
   Dim arch, w6432, exec, out, line
   arch = Env("PROCESSOR_ARCHITECTURE")
   w6432 = Env("PROCESSOR_ARCHITEW6432")
@@ -190,7 +155,6 @@ Sub Recommend()
 End Sub
 
 Function DriverTable()
-  Call InitEnv()
   DriverTable = Array( _
     "0BDA:8812|Realtek RTL8812AU|rtl8812au-dkms", _
     "0BDA:881A|Realtek RTL8814AU|rtl8814au", _
@@ -203,14 +167,12 @@ Function DriverTable()
 End Function
 
 Function RatableClasses()
-  Call InitEnv()
   RatableClasses = Array("Net", "Display", "MEDIA", "Bluetooth", _
     "Biometric", "Image", "SmartCardReader", "HDC", "SCSIAdapter", _
     "Modem", "PCMCIA", "Camera", "61883")
 End Function
 
 Function ParsePnp(pnp, ByRef kind, ByRef ven, ByRef dev)
-  Call InitEnv()
   Dim re, m
   Set re = New RegExp
   re.IgnoreCase = True
@@ -230,7 +192,6 @@ Function ParsePnp(pnp, ByRef kind, ByRef ven, ByRef dev)
 End Function
 
 Function ReadCache(kind, ven, dev)
-  Call InitEnv()
   Dim f, html
   html = ""
   f = BundleDir() & "\lsl-hw-cache\lsl-lhw-" & LCase(kind) & "-" _
@@ -242,7 +203,6 @@ Function ReadCache(kind, ven, dev)
 End Function
 
 Function RateDevice(kind, ven, dev, name)
-  Call InitEnv()
   Dim id, html, ksup, src, third, t, parts, mm, mmm, inKernel, bridge
   id = ven & ":" & dev
   For Each t In DriverTable()
@@ -291,7 +251,6 @@ Function RateDevice(kind, ven, dev, name)
 End Function
 
 Sub ScanHardware()
-  Call InitEnv()
   Dim wmi, col, d, pnp, kind, ven, dev, classes, cls, keep, id, nm
   Dim r, parts, line, rep, cA, cC, cD, cU, opt
   document.getElementById("devs").length = 0
@@ -337,7 +296,6 @@ Sub ScanHardware()
 End Sub
 
 Sub LookupSelected()
-  Call InitEnv()
   Dim v, url
   v = document.getElementById("devs").value
   If v = "" Then Log("Scan hardware first, then pick a device.") : Exit Sub
@@ -347,7 +305,6 @@ Sub LookupSelected()
 End Sub
 
 Sub ScanISOs()
-  Call InitEnv()
   Dim dirs(5), i, dd, f, html, any
   dirs(0) = oWSH.SpecialFolders("Desktop")
   dirs(1) = oWSH.SpecialFolders("MyDocuments") & "\Downloads"
@@ -374,7 +331,6 @@ Sub ScanISOs()
 End Sub
 
 Function SelectedISO()
-  Call InitEnv()
   Dim el, els
   Set els = document.getElementsByTagName("input")
   For Each el In els
@@ -384,7 +340,6 @@ Function SelectedISO()
 End Function
 
 Sub BrowseISO()
-  Call InitEnv()
   Dim sa, f
   Set sa = CreateObject("Shell.Application")
   Set f = sa.BrowseForFolder(0, "Select an ISO image", 0, 0)
@@ -396,7 +351,6 @@ Sub BrowseISO()
 End Sub
 
 Sub Download()
-  Call InitEnv()
   Dim url, dest, cmd, rc
   url = document.getElementById("url").value
   dest = oWSH.SpecialFolders("MyDocuments") & "\Downloads\" & oFSO.GetFileName(url)
@@ -404,7 +358,7 @@ Sub Download()
     Log("BITS on XP caps at TLS 1.0; use Open in browser & watch Downloads for https URLs.")
     Exit Sub
   End If
-  cmd = "bitsadmin /transfer lsl /download /priority normal """ & url & """ """ & dest & """"
+  cmd = "bitsadmin /transfer lsl /download /priority normal """ & url & """ """ & dest & """
   Log("BITS: " & cmd)
   rc = oWSH.Run(cmd, 1, True)
   If rc = 0 And oFSO.FileExists(dest) Then
@@ -417,7 +371,6 @@ Sub Download()
 End Sub
 
 Sub DownloadInBrowser()
-  Call InitEnv()
   Dim url
   url = document.getElementById("url").value
   Log("Opening browser: " & url & "  (browser handles TLS 1.2; we watch Downloads)")
@@ -432,7 +385,6 @@ Sub DownloadInBrowser()
 End Sub
 
 Sub WatchDownloads()
-  Call InitEnv()
   Dim i, dd, f, newest, ntime
   On Error Resume Next
   newest = "" : ntime = 0
@@ -461,144 +413,28 @@ Sub WatchDownloads()
 End Sub
 
 Sub AutoRufus()
-  Call InitEnv()
-  Dim p, dirs(5), i, dd, f, foundExe, foundZip
+  Dim p
   On Error Resume Next
   p = oWSH.ExpandEnvironmentStrings("%SystemDrive%") & "\rufus.exe"
   If Not oFSO.FileExists(p) Then p = oWSH.Exec("cmd /c where rufus.exe").StdOut.ReadLine
   On Error GoTo 0
-  foundExe = "" : foundZip = ""
-  If p <> "" Then foundExe = p
-  ' Also look for rufus*.exe / rufus*.zip in common Download folders.
-  dirs(0) = oWSH.SpecialFolders("MyDocuments") & "\Downloads"
-  dirs(1) = Env("USERPROFILE") & "\Downloads"
-  dirs(2) = oWSH.SpecialFolders("Desktop")
-  dirs(3) = Env("SystemDrive") & "\"
-  dirs(4) = oWSH.SpecialFolders("MyDocuments")
-  dirs(5) = Env("USERPROFILE")
-  For i = 0 To UBound(dirs)
-    dd = dirs(i)
-    If oFSO.FolderExists(dd) Then
-      For Each f In oFSO.GetFolder(dd).Files
-        If LCase(Left(oFSO.GetFileName(f.Name), 5)) = "rufus" Then
-          If LCase(oFSO.GetExtensionName(f.Name)) = "exe" And foundExe = "" Then foundExe = f.Path
-          If LCase(oFSO.GetExtensionName(f.Name)) = "zip" And foundZip = "" Then foundZip = f.Path
-        End If
-      Next
-    End If
-  Next
-  If foundExe <> "" Then
-    document.getElementById("rufus").value = foundExe
-    document.getElementById("rufusHint").innerText = "auto-detected: " & foundExe
-  ElseIf foundZip <> "" Then
-    document.getElementById("rufus").value = foundZip
-    document.getElementById("rufusHint").innerText = "found rufus*.zip (extract to run): " & foundZip
-  Else
-    document.getElementById("rufusHint").innerText = "not found - Download or Browse"
-  End If
-  ' Tell the user what the Download button will fetch for this machine.
-  If is64 Then
-    document.getElementById("rufusReco").innerText = _
-      "Auto-pick (64-bit): Rufus 4.15 (current). 32-bit XP? use 2.18."
-  Else
-    document.getElementById("rufusReco").innerText = _
-      "Auto-pick (32-bit / WinXP): Rufus 2.18 (best XP support)"
-  End If
+  If p <> "" Then document.getElementById("rufus").value = p
 End Sub
 
 Sub BrowseRufus()
-  Call InitEnv()
   Dim sa, f
   Set sa = CreateObject("Shell.Application")
   Set f = sa.BrowseForFolder(0, "Select rufus.exe", 0, 0)
   If Not f Is Nothing Then document.getElementById("rufus").value = f.Self.Path
 End Sub
 
-' --- Pick the right Rufus URL for the current architecture -------------------
-Function RufusURL()
-  Call InitEnv()
-  If is64 Then
-    RufusURL = "https://github.com/pbatard/rufus/releases/download/v4.15/rufus-4.15.exe"
-  Else
-    ' 32-bit build: Rufus 2.18 is the last line with first-class WinXP support.
-    RufusURL = "https://github.com/pbatard/rufus/releases/download/v2.18/rufus-2.18.exe"
-  End If
-End Function
-
-Sub DownloadRufus()
-  Call InitEnv()
-  Dim url, dest, cmd, rc
-  url = RufusURL()
-  dest = oWSH.SpecialFolders("MyDocuments") & "\Downloads\" & oFSO.GetFileName(url)
-  ' Rufus is only served over https; XP's BITS caps at TLS 1.0, so let the
-  ' browser do TLS and watch the Downloads folder (same pattern as the ISO download).
-  If LCase(Left(url, 8)) = "https://" Then
-    Log("Rufus is https-only; opening in browser (handles TLS 1.2). Watching Downloads...")
-    oWSH.Run url
-    rufusWatchDest = dest
-    rufusWatchBase = Array( _
-      oWSH.SpecialFolders("MyDocuments") & "\Downloads", _
-      Env("USERPROFILE") & "\Downloads", _
-      oWSH.SpecialFolders("Desktop"), _
-      oWSH.SpecialFolders("MyDocuments"))
-    rufusWatchTimer = window.setInterval("WatchRufus", 2000)
-    Exit Sub
-  End If
-  cmd = "bitsadmin /transfer lslrufus /download /priority normal """ & url & """ """ & dest & """"
-  Log("BITS (Rufus): " & cmd)
-  rc = oWSH.Run(cmd, 1, True)
-  If rc = 0 And oFSO.FileExists(dest) Then
-    document.getElementById("rufus").value = dest
-    Log("Rufus downloaded to " & dest)
-  Else
-    Log("BITS failed (rc=" & rc & "); falling back to browser. Watch Downloads.")
-    oWSH.Run url
-    rufusWatchDest = dest
-    rufusWatchBase = Array( _
-      oWSH.SpecialFolders("MyDocuments") & "\Downloads", _
-      Env("USERPROFILE") & "\Downloads", _
-      oWSH.SpecialFolders("Desktop"), _
-      oWSH.SpecialFolders("MyDocuments"))
-    rufusWatchTimer = window.setInterval("WatchRufus", 2000)
-  End If
-End Sub
-
-Sub WatchRufus()
-  Call InitEnv()
-  Dim i, dd, f, found
-  On Error Resume Next
-  found = ""
-  For i = 0 To UBound(rufusWatchBase)
-    dd = rufusWatchBase(i)
-    If oFSO.FolderExists(dd) Then
-      For Each f In oFSO.GetFolder(dd).Files
-        If LCase(oFSO.GetFileName(f.Path)) = LCase(oFSO.GetFileName(rufusWatchDest)) Then
-          If LCase(oFSO.GetExtensionName(f.Name)) <> "part" _
-             And LCase(oFSO.GetExtensionName(f.Name)) <> "crdownload" Then found = f.Path
-        End If
-      Next
-    End If
-  Next
-  On Error GoTo 0
-  If found <> "" Then
-    window.clearInterval rufusWatchTimer
-    document.getElementById("rufus").value = found
-    document.getElementById("rufusReco").innerText = "Downloaded: " & oFSO.GetFileName(found)
-    Log("Rufus detected in Downloads: " & found)
-  End If
-End Sub
-
-
-
-
 Sub LaunchRufus()
-  Call InitEnv()
   Dim iso, ru, cmd
   iso = SelectedISO()
   If iso = "" Then Log("Pick or download an ISO first.") : Exit Sub
   ru = document.getElementById("rufus").value
   If Not oFSO.FileExists(ru) Then Log("Rufus not found: " & ru) : Exit Sub
-  cmd = """" & ru & """ -i """ & iso & """"
+  cmd = """" & ru & """ -i """ & iso & """
   Log("Launching Rufus: " & cmd)
   oWSH.Run cmd, 1, False
 End Sub
