@@ -58,6 +58,10 @@
   <div class="row">
     <button id="bWrite" onclick="LaunchRufus()">Launch Rufus with selected ISO</button>
   </div>
+  <div class="row">
+    <span id="rufusReco">&nbsp;</span>
+    <button id="bDlRufus" onclick="DownloadRufus()">Download Rufus (auto-pick version)</button>
+  </div>
 </fieldset>
 
 <div class="row"><textarea id="log" readonly></textarea></div>
@@ -418,6 +422,14 @@ Sub AutoRufus()
   If Not oFSO.FileExists(p) Then p = oWSH.Exec("cmd /c where rufus.exe").StdOut.ReadLine
   On Error GoTo 0
   If p <> "" Then document.getElementById("rufus").value = p
+  ' Tell the user what the Download button will fetch for this machine.
+  If is64 Then
+    document.getElementById("rufusReco").innerText = _
+      "Auto-pick (64-bit): Rufus 4.15 (current). 32-bit XP? use 2.18."
+  Else
+    document.getElementById("rufusReco").innerText = _
+      "Auto-pick (32-bit / WinXP): Rufus 2.18 (best XP support)"
+  End If
 End Sub
 
 Sub BrowseRufus()
@@ -425,6 +437,77 @@ Sub BrowseRufus()
   Set sa = CreateObject("Shell.Application")
   Set f = sa.BrowseForFolder(0, "Select rufus.exe", 0, 0)
   If Not f Is Nothing Then document.getElementById("rufus").value = f.Self.Path
+End Sub
+
+' --- Pick the right Rufus URL for the current architecture -------------------
+Function RufusURL()
+  If is64 Then
+    RufusURL = "https://github.com/pbatard/rufus/releases/download/v4.15/rufus-4.15.exe"
+  Else
+    ' 32-bit build: Rufus 2.18 is the last line with first-class WinXP support.
+    RufusURL = "https://github.com/pbatard/rufus/releases/download/v2.18/rufus-2.18.exe"
+  End If
+End Function
+
+Sub DownloadRufus()
+  Dim url, dest, cmd, rc
+  url = RufusURL()
+  dest = oWSH.SpecialFolders("MyDocuments") & "\Downloads\" & oFSO.GetFileName(url)
+  ' Rufus is only served over https; XP's BITS caps at TLS 1.0, so let the
+  ' browser do TLS and watch the Downloads folder (same pattern as the ISO download).
+  If LCase(Left(url, 8)) = "https://" Then
+    Log("Rufus is https-only; opening in browser (handles TLS 1.2). Watching Downloads...")
+    oWSH.Run url
+    rufusWatchDest = dest
+    rufusWatchBase = Array( _
+      oWSH.SpecialFolders("MyDocuments") & "\Downloads", _
+      Env("USERPROFILE") & "\Downloads", _
+      oWSH.SpecialFolders("Desktop"), _
+      oWSH.SpecialFolders("MyDocuments"))
+    rufusWatchTimer = window.setInterval("WatchRufus", 2000)
+    Exit Sub
+  End If
+  cmd = "bitsadmin /transfer lslrufus /download /priority normal """ & url & """ """ & dest & """"
+  Log("BITS (Rufus): " & cmd)
+  rc = oWSH.Run(cmd, 1, True)
+  If rc = 0 And oFSO.FileExists(dest) Then
+    document.getElementById("rufus").value = dest
+    Log("Rufus downloaded to " & dest)
+  Else
+    Log("BITS failed (rc=" & rc & "); falling back to browser. Watch Downloads.")
+    oWSH.Run url
+    rufusWatchDest = dest
+    rufusWatchBase = Array( _
+      oWSH.SpecialFolders("MyDocuments") & "\Downloads", _
+      Env("USERPROFILE") & "\Downloads", _
+      oWSH.SpecialFolders("Desktop"), _
+      oWSH.SpecialFolders("MyDocuments"))
+    rufusWatchTimer = window.setInterval("WatchRufus", 2000)
+  End If
+End Sub
+
+Sub WatchRufus()
+  Dim i, dd, f, found
+  On Error Resume Next
+  found = ""
+  For i = 0 To UBound(rufusWatchBase)
+    dd = rufusWatchBase(i)
+    If oFSO.FolderExists(dd) Then
+      For Each f In oFSO.GetFolder(dd).Files
+        If LCase(oFSO.GetFileName(f.Path)) = LCase(oFSO.GetFileName(rufusWatchDest)) Then
+          If LCase(oFSO.GetExtensionName(f.Name)) <> "part" _
+             And LCase(oFSO.GetExtensionName(f.Name)) <> "crdownload" Then found = f.Path
+        End If
+      Next
+    End If
+  Next
+  On Error GoTo 0
+  If found <> "" Then
+    window.clearInterval rufusWatchTimer
+    document.getElementById("rufus").value = found
+    document.getElementById("rufusReco").innerText = "Downloaded: " & oFSO.GetFileName(found)
+    Log("Rufus detected in Downloads: " & found)
+  End If
 End Sub
 
 Sub LaunchRufus()
