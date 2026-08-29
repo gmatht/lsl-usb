@@ -10,22 +10,31 @@ rem -ExecutionPolicy Bypass to the resolved PowerShell.
 setlocal
 cd /d "%~dp0"
 rem --- distro recommendation (semi-support for WinXP+) -----------------------
-rem We can't probe RAM reliably from a .bat on WinXP, so we only gate on CPU
-rem architecture. A 64-bit CPU gets Mint Cinnamon 22.x (64-bit, ~2GB RAM); a
-rem 32-bit CPU gets antiX 26 (i386 / antix26_386) for legacy hardware.
+rem Probe CPU arch + total RAM (wmic os get TotalVisibleMemorySize, in KB),
+rem then recommend: 64-bit CPU + >=2GB RAM -> Mint Cinnamon 22.x; else antiX
+rem 26 (i386 / antix26_386). The user confirms or changes the choice later.
 set "LSL_64BIT="
 if "%PROCESSOR_ARCHITECTURE%"=="AMD64" set "LSL_64BIT=1"
 if "%PROCESSOR_ARCHITECTURE%"=="IA64" set "LSL_64BIT=1"
 if DEFINED PROCESSOR_ARCHITEW6432 set "LSL_64BIT=1"
 
-echo.
-echo lsl-usb - recommended distro for this PC:
-if defined LSL_64BIT (
-    echo   64-bit CPU detected  ->  Mint Cinnamon 22.x (64-bit, ~2GB RAM)
-) else (
-    echo   32-bit CPU detected  ->  antiX 26 (i386 / antix26_386)
+set "LSL_RAM_KB="
+for /f "skip=1 tokens=*" %%m in ('wmic os get TotalVisibleMemorySize 2^>nul') do (
+    if not defined LSL_RAM_KB set /a LSL_RAM_KB=%%m 2>nul
 )
-echo   (confirm or change your choice in the installer)
+
+set "LSL_RECO=Mint Cinnamon 22.x (64-bit, >=2GB RAM)"
+if not defined LSL_64BIT set "LSL_RECO=antiX 26 (i386 / antix26_386)"
+if defined LSL_64BIT if defined LSL_RAM_KB if %LSL_RAM_KB% LSS 2097152 set "LSL_RECO=antiX 26 (i386 / antix26_386)"
+
+echo.
+echo lsl-usb - recommended distro for this PC:  %LSL_RECO%
+if defined LSL_RAM_KB (
+    echo   RAM detected: %LSL_RAM_KB% KB   (choose what you want via: wmic os get TotalVisibleMemorySize)
+) else (
+    echo   RAM detected: unknown (wmic unavailable)   (choose what you want via: wmic os get TotalVisibleMemorySize)
+)
+echo   Confirm or change your choice in the installer.
 echo.
 
 rem Repo slug used to auto-fetch the latest release of lsl-usb-win.zip via the
