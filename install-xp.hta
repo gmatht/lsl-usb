@@ -238,7 +238,7 @@ Function RateDevice(kind, ven, dev, name)
   name = RX("<h2 class='top'>Device '([^']+)'", html, 1)
   ksup = RX("supported by kernel versions <a[^>]*>([^<]+)</a>", html, 1)
   src  = RX("<td>([0-9.]+)&nbsp;-&nbsp;([0-9.]+)</td>\s*<td>([^<]+)</td>", html, 3)
-  third = RXAll("<li><a href=""https://github.com/([^""]+)""", html)
+  third = RXAll("<li><a href=""https://github.com/([^""]+)""">", html)
   If ksup = "" Then
     If third <> "" Then
       RateDevice = "U|no LKDDb entry - out-of-tree options: " & Replace(third, "|", ", ")
@@ -375,14 +375,15 @@ End Sub
 
 Sub Download()
   Call InitEnv()
-  Dim url, dest, cmd, rc
+  Dim url, dest, cmd, rc, q
   url = document.getElementById("url").value
   dest = oWSH.SpecialFolders("MyDocuments") & "\Downloads\" & oFSO.GetFileName(url)
   If LCase(Left(url, 8)) = "https://" Then
     Log("BITS on XP caps at TLS 1.0; use Open in browser & watch Downloads for https URLs.")
     Exit Sub
   End If
-  cmd = "bitsadmin /transfer lsl /download /priority normal """ & url & """ """ & dest & """
+  q = Chr(34)
+  cmd = "bitsadmin /transfer lsl /download /priority normal " & q & url & q & " " & q & dest & q
   Log("BITS: " & cmd)
   rc = oWSH.Run(cmd, 1, True)
   If rc = 0 And oFSO.FileExists(dest) Then
@@ -458,12 +459,13 @@ End Sub
 
 Sub LaunchRufus()
   Call InitEnv()
-  Dim iso, ru, cmd
+  Dim iso, ru, cmd, q
   iso = SelectedISO()
   If iso = "" Then Log("Pick or download an ISO first.") : Exit Sub
   ru = document.getElementById("rufus").value
   If Not oFSO.FileExists(ru) Then Log("Rufus not found: " & ru) : Exit Sub
-  cmd = """" & ru & """ -i """ & iso & """
+  q = Chr(34)
+  cmd = q & ru & q & " -i " & q & iso & q
   Log("Launching Rufus: " & cmd)
   oWSH.Run cmd, 1, False
 End Sub
