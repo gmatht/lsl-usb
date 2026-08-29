@@ -94,7 +94,8 @@ Function RX(pat, src, grp)
   re.Global = False
   Set m = re.Execute(src)
   If m.Count > 0 And m(0).SubMatches.Count >= grp Then
-    RX = m(0).SubMatches(grg - 1)
+    RX = m(0).SubMatches(grp - 1)
+
   Else
     RX = ""
   End If
@@ -361,7 +362,7 @@ Sub Download()
     Log("BITS on XP caps at TLS 1.0; use Open in browser & watch Downloads for https URLs.")
     Exit Sub
   End If
-  cmd = "bitsadmin /transfer lsl /download /priority normal """ & url & """ """ & dest & """
+  cmd = "bitsadmin /transfer lsl /download /priority normal """ & url & """ """ & dest & """"
   Log("BITS: " & cmd)
   rc = oWSH.Run(cmd, 1, True)
   If rc = 0 And oFSO.FileExists(dest) Then
@@ -516,7 +517,7 @@ Sub LaunchRufus()
   If iso = "" Then Log("Pick or download an ISO first.") : Exit Sub
   ru = document.getElementById("rufus").value
   If Not oFSO.FileExists(ru) Then Log("Rufus not found: " & ru) : Exit Sub
-  cmd = """" & ru & """ -i """ & iso & """
+  cmd = """" & ru & """ -i """ & iso & """"
   Log("Launching Rufus: " & cmd)
   oWSH.Run cmd, 1, False
 End Sub
