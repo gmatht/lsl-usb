@@ -1,0 +1,5 @@
+# Keep Windows scripts as CRLF on checkout but store normalised (LF) in git
+# so diffs stay minimal. cmd/.bat require CRLF line endings to run on Windows.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.hta text eol=crlf

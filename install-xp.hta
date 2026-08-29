@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="x-ua-compatible" content="IE=8">
+<hta:application applicationname="lsl-usb (legacy / WinXP+)" version="1.0"
+  border="dialog" caption="yes" maximizebutton="no" minimizebutton="yes"
+  singleinstance="yes" windowstate="normal" scroll="auto" />
+<title>lsl-usb installer (legacy / WinXP+)</title>
+<style>
+  body { font: 11pt Tahoma, Verdana, sans-serif; background:#f4f4f4; margin:8px; }
+  h2 { font-size:13pt; margin:0 0 4px 0; }
+  #reco { background:#e8f0ff; border:1px solid #9bb; padding:6px; margin:6px 0; white-space:pre; }
+  fieldset { margin:6px 0; padding:6px; }
+  #log { width:100%; height:120px; font:9pt Consolas, monospace; }
+  button { font:10pt Tahoma; padding:3px 8px; }
+  .row { margin:3px 0; }
+</style>
+</head>
+<body>
+<h2>lsl-usb installer &mdash; legacy mode</h2>
+<div id="reco">Probing this PC...</div>
+
+<fieldset><legend>ISO image</legend>
+  <div class="row">
+    <button id="bBrowse" onclick="BrowseISO()">Browse for ISO...</button>
+    <button id="bScan" onclick="ScanISOs()">Re-scan common folders</button>
+  </div>
+  <div id="isoList" class="row"></div>
+</fieldset>
+
+<fieldset><legend>Download (if you don't have an ISO)</legend>
+  <div class="row">URL: <input id="url" size="70"
+    value="https://github.com/gmatht/lsl-usb/releases/download/v1/linuxmint.iso"></div>
+  <div class="row">
+    <button id="bDl" onclick="Download()">Download via BITS</button>
+    <button id="bBrowser" onclick="DownloadInBrowser()">Open in browser &amp; watch Downloads</button>
+  </div>
+  <div class="row" id="dlStatus">&nbsp;</div>
+</fieldset>
+
+<fieldset><legend>Write to USB (Rufus)</legend>
+  <div class="row">
+    Rufus: <input id="rufus" size="55">
+    <button onclick="BrowseRufus()">Browse...</button>
+    <span id="rufusHint">(auto-detected if on PATH)</span>
+  </div>
+  <div class="row">
+    <button id="bWrite" onclick="LaunchRufus()">Launch Rufus with selected ISO</button>
+  </div>
+</fieldset>
+
+<div class="row"><textarea id="log" readonly></textarea></div>
+
+<script language="VBScript">
+Option Explicit
+Dim oWSH, oFSO, oShell, is64, ramKB, recoText, watchTimer, watchBase, watchName
+
+Sub Log(s)
+  document.getElementById("log").value = document.getElementById("log").value & s & vbCrLf
+End Sub
+
+Function Env(n)
+  Env = oWSH.ExpandEnvironmentStrings("%" & n & "%")
+End Function
+
+Sub Window_OnLoad()
+  Set oWSH = CreateObject("WScript.Shell")
+  Set oFSO = CreateObject("Scripting.FileSystemObject")
+  Set oShell = oWSH
+  Call Recommend()
+  Call AutoRufus()
+  Call ScanISOs()
+  Log("Legacy mode ready. CPU/RAM gate: " & recoText & ".")
+End Sub
+
+' --- arch + TotalVisibleMemorySize (wmic) recommendation (mirrors install.bat) ---
+Sub Recommend()
+  Dim arch, w6432, exec, out, line
+  arch = Env("PROCESSOR_ARCHITECTURE")
+  w6432 = Env("PROCESSOR_ARCHITEW6432")
+  is64 = (arch = "AMD64" Or arch = "IA64" Or w6432 <> "")
+  ramKB = 0
+  On Error Resume Next
+  Set exec = oWSH.Exec("wmic os get TotalVisibleMemorySize")
+  If Err.Number = 0 Then
+    out = exec.StdOut.ReadAll
+    For Each line In Split(out, vbCrLf)
+      If IsNumeric(Trim(line)) Then ramKB = CLng(Trim(line))
+    Next
+  End If
+  On Error GoTo 0
+  If is64 And ramKB >= 2097152 Then
+    recoText = "Mint Cinnamon 22.x (64-bit, >=2GB RAM)"
+  Else
+    recoText = "antiX 26 (i386 / antix26_386)"
+  End If
+  Dim ramStr
+  If ramKB > 0 Then ramStr = CStr(ramKB) & " KB" Else ramStr = "unknown (wmic unavailable)"
+  document.getElementById("reco").innerText = _
+    "Recommended for this PC: " & recoText & vbCrLf & _
+    "  arch=" & arch & "  w6432=" & w6432 & "  RAM=" & ramStr & vbCrLf & _
+    "  (confirm/change your choice; pick any ISO below)"
+End Sub
+
+' --- ISO discovery across common user folders ---
+Sub ScanISOs()
+  Dim dirs(5), i, d, f, html, any
+  dirs(0) = oWSH.SpecialFolders("Desktop")
+  dirs(1) = oWSH.SpecialFolders("MyDocuments") & "\Downloads"
+  dirs(2) = oWSH.SpecialFolders("MyDocuments")
+  dirs(3) = Env("USERPROFILE") & "\Downloads"
+  dirs(4) = Env("SystemDrive") & "\"
+  dirs(5) = Env("USERPROFILE")
+  html = ""
+  any = False
+  For i = 0 To UBound(dirs)
+    d = dirs(i)
+    If oFSO.FolderExists(d) Then
+      For Each f In oFSO.GetFolder(d).Files
+        If LCase(oFSO.GetExtensionName(f.Name)) = "iso" Then
+          any = True
+          html = html & "<label><input type='radio' name='iso' value='" _
+            & Replace(f.Path, "'", "") & "'>" & f.Path & "</label><br>"
+        End If
+      Next
+    End If
+  Next
+  If Not any Then html = "<i>No .iso found in Desktop / My Documents / Downloads. Browse or download one.</i>"
+  document.getElementById("isoList").innerHTML = html
+End Sub
+
+Function SelectedISO()
+  Dim el, els
+  Set els = document.getElementsByTagName("input")
+  For Each el In els
+    If el.Name = "iso" And el.Checked Then SelectedISO = el.Value : Exit Function
+  Next
+  SelectedISO = ""
+End Function
+
+Sub BrowseISO()
+  Dim sa, f
+  Set sa = CreateObject("Shell.Application")
+  Set f = sa.BrowseForFolder(0, "Select an ISO image", 0, 0)
+  If Not f Is Nothing Then
+    document.getElementById("isoList").innerHTML = _
+      "<label><input type='radio' name='iso' value='" & f.Self.Path & "' checked>" _
+      & f.Self.Path & "</label><br>"
+  End If
+End Sub
+
+' --- Download via BITS (http; TLS 1.0 on XP can't reach github over https) ---
+Sub Download()
+  Dim url, dest, cmd, rc
+  url = document.getElementById("url").value
+  dest = oWSH.SpecialFolders("MyDocuments") & "\Downloads\" & oFSO.GetFileName(url)
+  If LCase(Left(url, 8)) = "https://" Then
+    Log("BITS on XP lacks TLS 1.2; use 'Open in browser & watch Downloads' for https URLs.")
+    Exit Sub
+  End If
+  cmd = "bitsadmin /transfer lsl /download /priority normal """ & url & """ """ & dest & """"
+  Log("BITS: " & cmd)
+  rc = oWSH.Run(cmd, 1, True)
+  If rc = 0 And oFSO.FileExists(dest) Then
+    document.getElementById("isoList").innerHTML = _
+      "<label><input type='radio' name='iso' value='" & dest & "' checked>" & dest & "</label><br>"
+    Log("Downloaded to " & dest)
+  Else
+    Log("BITS failed (rc=" & rc & "). Try the browser button instead.")
+  End If
+End Sub
+
+' --- Workaround for https/GitHub: let the browser do TLS, watch Downloads ---
+Sub DownloadInBrowser()
+  Dim url
+  url = document.getElementById("url").value
+  Log("Opening browser: " & url & "  (browser handles TLS 1.2; we watch Downloads)")
+  oWSH.Run url
+  watchBase = Array( _
+    oWSH.SpecialFolders("MyDocuments") & "\Downloads", _
+    Env("USERPROFILE") & "\Downloads", _
+    oWSH.SpecialFolders("Desktop"), _
+    oWSH.SpecialFolders("MyDocuments"))
+  watchName = ""
+  watchTimer = window.setInterval("WatchDownloads", 2000)
+End Sub
+
+Sub WatchDownloads()
+  Dim i, d, f, newest, ntime
+  On Error Resume Next
+  newest = "" : ntime = 0
+  For i = 0 To UBound(watchBase)
+    d = watchBase(i)
+    If oFSO.FolderExists(d) Then
+      For Each f In oFSO.GetFolder(d).Files
+        If LCase(oFSO.GetExtensionName(f.Name)) = "iso" Or _
+           LCase(oFSO.GetExtensionName(f.Name)) = "part" Then
+          If f.DateLastModified > ntime Then ntime = f.DateLastModified : newest = f.Path
+        End If
+      Next
+    End If
+  Next
+  On Error GoTo 0
+  If newest <> "" Then
+    document.getElementById("dlStatus").innerText = "Watching: " & newest
+    ' .part means in-progress; wait until it becomes a stable .iso
+    If LCase(oFSO.GetExtensionName(newest)) = "iso" Then
+      window.clearInterval watchTimer
+      document.getElementById("isoList").innerHTML = _
+        "<label><input type='radio' name='iso' value='" & newest & "' checked>" & newest & "</label><br>"
+      document.getElementById("dlStatus").innerText = "Detected: " & newest
+      Log("Download detected in Downloads: " & newest)
+    End If
+  End If
+End Sub
+
+' --- Rufus orchestration ---
+Sub AutoRufus()
+  Dim p
+  On Error Resume Next
+  p = oWSH.ExpandEnvironmentStrings("%SystemDrive%") & "\rufus.exe"
+  If Not oFSO.FileExists(p) Then p = oWSH.Exec("cmd /c where rufus.exe").StdOut.ReadLine
+  On Error GoTo 0
+  If p <> "" Then document.getElementById("rufus").value = p
+End Sub
+
+Sub BrowseRufus()
+  Dim sa, f
+  Set sa = CreateObject("Shell.Application")
+  Set f = sa.BrowseForFolder(0, "Select rufus.exe", 0, 0)
+  If Not f Is Nothing Then document.getElementById("rufus").value = f.Self.Path
+End Sub
+
+Sub LaunchRufus()
+  Dim iso, ru, cmd
+  iso = SelectedISO()
+  If iso = "" Then Log("Pick or download an ISO first.") : Exit Sub
+  ru = document.getElementById("rufus").value
+  If Not oFSO.FileExists(ru) Then Log("Rufus not found: " & ru) : Exit Sub
+  cmd = """" & ru & """ -i """ & iso & """"
+  Log("Launching Rufus: " & cmd)
+  oWSH.Run cmd, 1, False
+End Sub
+</script>
+</body>
+</html>

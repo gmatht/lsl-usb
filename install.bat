@@ -68,6 +68,14 @@ for /f "delims=" %%r in ('powershell -NoProfile -ExecutionPolicy Bypass -Command
 )
 if defined PS_EXE goto have_ps
 
+if exist "%~dp0install-xp.hta" (
+    echo No PowerShell 5.1+ (XP/older?). Falling back to the legacy HTA GUI:
+    echo   %~dp0install-xp.hta
+    echo   (arch + TotalVisibleMemorySize based recommendation; ISO via BITS or browser,
+    echo    then writes the USB with Rufus)
+    start "" "%~dp0install-xp.hta"
+    exit /b 0
+)
 echo ERROR: no PowerShell 5.1+ available and it could not be auto-fetched.
 echo        Install Windows Management Framework 5.1 or PowerShell 7, then re-run.
 pause
