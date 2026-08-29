@@ -81,8 +81,10 @@ End Function
 
 Function BundleDir()
   Dim p
-  p = window.location.pathname
-  p = Replace(Mid(p, 2), "/", "")
+  p = document.URL
+  If Left(p, 8) = "file:///" Then p = Mid(p, 9)
+  If Left(p, 6) = "file://" Then p = Mid(p, 7)
+  p = Replace(p, "/", "")
   BundleDir = oFSO.GetParentFolderName(p)
 End Function
 
@@ -271,28 +273,29 @@ Sub ScanHardware()
   End If
   For Each d In col
     pnp = "" & d.PNPDeviceID
-    If Not ParsePnp(pnp, kind, ven, dev) Then GoTo NextDev
-    cls = "" & d.PNPClass
-    keep = False
-    For Each classes In RatableClasses()
-      If cls = classes Then keep = True
-    Next
-    If Not keep Then GoTo NextDev
-    nm = "" & d.Name
-    id = ven & ":" & dev
-    r = RateDevice(kind, ven, dev, nm)
-    parts = Split(r, "|", 2)
-    If parts(0) = "A" Then cA = cA + 1
-    If parts(0) = "C" Then cC = cC + 1
-    If parts(0) = "D" Then cD = cD + 1
-    If parts(0) = "U" Then cU = cU + 1
-    line = "[" & parts(0) & "] " & nm & " (" & id & ")  - " & parts(1)
-    rep = rep & line & vbCrLf
-    Set opt = document.createElement("option")
-    opt.value = LCase(kind) & ":" & LCase(ven) & "-" & LCase(dev)
-    opt.text = cls & " - " & nm & " (" & id & ")"
-    document.getElementById("devs").options.add opt
-NextDev:
+    If ParsePnp(pnp, kind, ven, dev) Then
+      cls = "" & d.PNPClass
+      keep = False
+      For Each classes In RatableClasses()
+        If cls = classes Then keep = True
+      Next
+      If keep Then
+        nm = "" & d.Name
+        id = ven & ":" & dev
+        r = RateDevice(kind, ven, dev, nm)
+        parts = Split(r, "|", 2)
+        If parts(0) = "A" Then cA = cA + 1
+        If parts(0) = "C" Then cC = cC + 1
+        If parts(0) = "D" Then cD = cD + 1
+        If parts(0) = "U" Then cU = cU + 1
+        line = "[" & parts(0) & "] " & nm & " (" & id & ")  - " & parts(1)
+        rep = rep & line & vbCrLf
+        Set opt = document.createElement("option")
+        opt.value = LCase(kind) & ":" & LCase(ven) & "-" & LCase(dev)
+        opt.text = cls & " - " & nm & " (" & id & ")"
+        document.getElementById("devs").options.add opt
+      End If
+    End If
   Next
   document.getElementById("compat").value = _
     "Summary: A=" & cA & " (in-kernel)  C=" & cC & " (out-of-tree)  D=" & cD & " (no driver)  U=" & cU & " (unknown)" & vbCrLf & vbCrLf & rep
