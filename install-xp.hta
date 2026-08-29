@@ -53,7 +53,7 @@
   <div class="row">
     Rufus: <input id="rufus" size="55">
     <button onclick="BrowseRufus()">Browse...</button>
-    <span id="rufusHint">(auto-detected if on PATH)</span>
+    <span id="rufusHint">(auto-detected: PATH, C:\rufus.exe, or Downloads)</span>
   </div>
   <div class="row">
     <button id="bWrite" onclick="LaunchRufus()">Launch Rufus with selected ISO</button>
@@ -417,12 +417,40 @@ Sub WatchDownloads()
 End Sub
 
 Sub AutoRufus()
-  Dim p
+  Dim p, dirs(5), i, dd, f, foundExe, foundZip
   On Error Resume Next
   p = oWSH.ExpandEnvironmentStrings("%SystemDrive%") & "\rufus.exe"
   If Not oFSO.FileExists(p) Then p = oWSH.Exec("cmd /c where rufus.exe").StdOut.ReadLine
   On Error GoTo 0
-  If p <> "" Then document.getElementById("rufus").value = p
+  foundExe = "" : foundZip = ""
+  If p <> "" Then foundExe = p
+  ' Also look for rufus*.exe / rufus*.zip in common Download folders.
+  dirs(0) = oWSH.SpecialFolders("MyDocuments") & "\Downloads"
+  dirs(1) = Env("USERPROFILE") & "\Downloads"
+  dirs(2) = oWSH.SpecialFolders("Desktop")
+  dirs(3) = Env("SystemDrive") & "\"
+  dirs(4) = oWSH.SpecialFolders("MyDocuments")
+  dirs(5) = Env("USERPROFILE")
+  For i = 0 To UBound(dirs)
+    dd = dirs(i)
+    If oFSO.FolderExists(dd) Then
+      For Each f In oFSO.GetFolder(dd).Files
+        If LCase(Left(oFSO.GetFileName(f.Name), 5)) = "rufus" Then
+          If LCase(oFSO.GetExtensionName(f.Name)) = "exe" And foundExe = "" Then foundExe = f.Path
+          If LCase(oFSO.GetExtensionName(f.Name)) = "zip" And foundZip = "" Then foundZip = f.Path
+        End If
+      Next
+    End If
+  Next
+  If foundExe <> "" Then
+    document.getElementById("rufus").value = foundExe
+    document.getElementById("rufusHint").innerText = "auto-detected: " & foundExe
+  ElseIf foundZip <> "" Then
+    document.getElementById("rufus").value = foundZip
+    document.getElementById("rufusHint").innerText = "found rufus*.zip (extract to run): " & foundZip
+  Else
+    document.getElementById("rufusHint").innerText = "not found - Download or Browse"
+  End If
   ' Tell the user what the Download button will fetch for this machine.
   If is64 Then
     document.getElementById("rufusReco").innerText = _
