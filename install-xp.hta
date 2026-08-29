@@ -20,6 +20,7 @@
   label { display:block; }
 </style>
 </head>
+<body onload="Window_OnLoad">
 <h2>lsl-usb installer &mdash; legacy mode</h2>
 <div id="reco">Probing this PC...</div>
 
@@ -64,15 +65,15 @@
   </div>
 </fieldset>
 
-<fieldset><legend>Carry Windows software on the USB</legend>
+<fieldset><legend>Preload Linux apps on the USB (flatpak + AppImage)</legend>
   <div class="row">
     Target USB drive:
     <select id="swDrive" size="1"></select>
     <button onclick="RefreshDrives()">Refresh</button>
   </div>
   <div class="row">
-    <button onclick="DiscoverSoftware()">Scan installed + portable apps</button>
-    <button id="bStageSw" onclick="StageSoftware()">Copy checked to &lt;USB&gt;\software\</button>
+    <button onclick="DiscoverLinuxApps()">Scan installed Windows apps &#8594; Linux equivalents</button>
+    <button id="bStageSw" onclick="StageLinuxApps()">Stage checked to &lt;USB&gt;\flatpaks\ + \appimages\</button>
   </div>
   <div id="swList" class="row"></div>
   <div class="row" id="swStatus">&nbsp;</div>
@@ -84,17 +85,19 @@
 Option Explicit
 Dim oWSH, oFSO, is64, ramKB, recoText, watchTimer, watchBase, watchName
 Dim rufusWatchTimer, rufusWatchBase, rufusWatchDest
-Dim swItems, swCount, targetDrive
 
 Sub Log(s)
+  Call InitEnv()
   document.getElementById("log").value = document.getElementById("log").value & s & vbCrLf
 End Sub
 
 Function Env(n)
+  Call InitEnv()
   Env = oWSH.ExpandEnvironmentStrings("%" & n & "%")
 End Function
 
 Function BundleDir()
+  Call InitEnv()
   Dim p
   p = document.URL
   If Left(p, 8) = "file:///" Then p = Mid(p, 9)
@@ -103,7 +106,13 @@ Function BundleDir()
   BundleDir = oFSO.GetParentFolderName(p)
 End Function
 
+Sub InitEnv()
+  If oWSH Is Nothing Then Set oWSH = CreateObject("WScript.Shell")
+  If oFSO Is Nothing Then Set oFSO = CreateObject("Scripting.FileSystemObject")
+End Sub
+
 Function RX(pat, src, grp)
+  Call InitEnv()
   Dim re, m
   Set re = New RegExp
   re.Pattern = pat
@@ -119,6 +128,7 @@ Function RX(pat, src, grp)
 End Function
 
 Function RXAll(pat, src)
+  Call InitEnv()
   Dim re, m, c, out
   Set re = New RegExp
   re.Pattern = pat
@@ -133,12 +143,13 @@ Function RXAll(pat, src)
 End Function
 
 Sub Window_OnLoad()
+  Call InitEnv()
   Set oWSH = CreateObject("WScript.Shell")
   Set oFSO = CreateObject("Scripting.FileSystemObject")
   Call Recommend()
   Call AutoRufus()
   Call ScanISOs()
-  Call DiscoverSoftware()
+  Call DiscoverLinuxApps()
   If is64 Then
     document.getElementById("url").value = "https://mirrors.kernel.org/linuxmint/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso"
   Else
@@ -150,6 +161,7 @@ Sub Window_OnLoad()
 End Sub
 
 Sub Recommend()
+  Call InitEnv()
   Dim arch, w6432, exec, out, line
   arch = Env("PROCESSOR_ARCHITECTURE")
   w6432 = Env("PROCESSOR_ARCHITEW6432")
@@ -178,6 +190,7 @@ Sub Recommend()
 End Sub
 
 Function DriverTable()
+  Call InitEnv()
   DriverTable = Array( _
     "0BDA:8812|Realtek RTL8812AU|rtl8812au-dkms", _
     "0BDA:881A|Realtek RTL8814AU|rtl8814au", _
@@ -190,12 +203,14 @@ Function DriverTable()
 End Function
 
 Function RatableClasses()
+  Call InitEnv()
   RatableClasses = Array("Net", "Display", "MEDIA", "Bluetooth", _
     "Biometric", "Image", "SmartCardReader", "HDC", "SCSIAdapter", _
     "Modem", "PCMCIA", "Camera", "61883")
 End Function
 
 Function ParsePnp(pnp, ByRef kind, ByRef ven, ByRef dev)
+  Call InitEnv()
   Dim re, m
   Set re = New RegExp
   re.IgnoreCase = True
@@ -215,6 +230,7 @@ Function ParsePnp(pnp, ByRef kind, ByRef ven, ByRef dev)
 End Function
 
 Function ReadCache(kind, ven, dev)
+  Call InitEnv()
   Dim f, html
   html = ""
   f = BundleDir() & "\lsl-hw-cache\lsl-lhw-" & LCase(kind) & "-" _
@@ -226,6 +242,7 @@ Function ReadCache(kind, ven, dev)
 End Function
 
 Function RateDevice(kind, ven, dev, name)
+  Call InitEnv()
   Dim id, html, ksup, src, third, t, parts, mm, mmm, inKernel, bridge
   id = ven & ":" & dev
   For Each t In DriverTable()
@@ -274,6 +291,7 @@ Function RateDevice(kind, ven, dev, name)
 End Function
 
 Sub ScanHardware()
+  Call InitEnv()
   Dim wmi, col, d, pnp, kind, ven, dev, classes, cls, keep, id, nm
   Dim r, parts, line, rep, cA, cC, cD, cU, opt
   document.getElementById("devs").length = 0
@@ -319,6 +337,7 @@ Sub ScanHardware()
 End Sub
 
 Sub LookupSelected()
+  Call InitEnv()
   Dim v, url
   v = document.getElementById("devs").value
   If v = "" Then Log("Scan hardware first, then pick a device.") : Exit Sub
@@ -328,6 +347,7 @@ Sub LookupSelected()
 End Sub
 
 Sub ScanISOs()
+  Call InitEnv()
   Dim dirs(5), i, dd, f, html, any
   dirs(0) = oWSH.SpecialFolders("Desktop")
   dirs(1) = oWSH.SpecialFolders("MyDocuments") & "\Downloads"
@@ -354,6 +374,7 @@ Sub ScanISOs()
 End Sub
 
 Function SelectedISO()
+  Call InitEnv()
   Dim el, els
   Set els = document.getElementsByTagName("input")
   For Each el In els
@@ -363,6 +384,7 @@ Function SelectedISO()
 End Function
 
 Sub BrowseISO()
+  Call InitEnv()
   Dim sa, f
   Set sa = CreateObject("Shell.Application")
   Set f = sa.BrowseForFolder(0, "Select an ISO image", 0, 0)
@@ -374,6 +396,7 @@ Sub BrowseISO()
 End Sub
 
 Sub Download()
+  Call InitEnv()
   Dim url, dest, cmd, rc
   url = document.getElementById("url").value
   dest = oWSH.SpecialFolders("MyDocuments") & "\Downloads\" & oFSO.GetFileName(url)
@@ -394,6 +417,7 @@ Sub Download()
 End Sub
 
 Sub DownloadInBrowser()
+  Call InitEnv()
   Dim url
   url = document.getElementById("url").value
   Log("Opening browser: " & url & "  (browser handles TLS 1.2; we watch Downloads)")
@@ -408,6 +432,7 @@ Sub DownloadInBrowser()
 End Sub
 
 Sub WatchDownloads()
+  Call InitEnv()
   Dim i, dd, f, newest, ntime
   On Error Resume Next
   newest = "" : ntime = 0
@@ -436,6 +461,7 @@ Sub WatchDownloads()
 End Sub
 
 Sub AutoRufus()
+  Call InitEnv()
   Dim p, dirs(5), i, dd, f, foundExe, foundZip
   On Error Resume Next
   p = oWSH.ExpandEnvironmentStrings("%SystemDrive%") & "\rufus.exe"
@@ -481,6 +507,7 @@ Sub AutoRufus()
 End Sub
 
 Sub BrowseRufus()
+  Call InitEnv()
   Dim sa, f
   Set sa = CreateObject("Shell.Application")
   Set f = sa.BrowseForFolder(0, "Select rufus.exe", 0, 0)
@@ -489,6 +516,7 @@ End Sub
 
 ' --- Pick the right Rufus URL for the current architecture -------------------
 Function RufusURL()
+  Call InitEnv()
   If is64 Then
     RufusURL = "https://github.com/pbatard/rufus/releases/download/v4.15/rufus-4.15.exe"
   Else
@@ -498,6 +526,7 @@ Function RufusURL()
 End Function
 
 Sub DownloadRufus()
+  Call InitEnv()
   Dim url, dest, cmd, rc
   url = RufusURL()
   dest = oWSH.SpecialFolders("MyDocuments") & "\Downloads\" & oFSO.GetFileName(url)
@@ -535,6 +564,7 @@ Sub DownloadRufus()
 End Sub
 
 Sub WatchRufus()
+  Call InitEnv()
   Dim i, dd, f, found
   On Error Resume Next
   found = ""
@@ -559,127 +589,10 @@ Sub WatchRufus()
 End Sub
 
 
-' --- Carry Windows software onto the USB (installed + portable) ---------------------
-' Populate the target-drive <select> with ready USB/removable/fixed volumes.
-Sub RefreshDrives()
-  Dim fso, d, html, any
-  Set fso = CreateObject("Scripting.FileSystemObject")
-  html = ""
-  any = False
-  For Each d In fso.Drives
-    On Error Resume Next
-    If (d.DriveType = 1 Or d.DriveType = 2) And fso.GetDrive(d.DriveLetter & ":").IsReady Then
-      html = html & "<option value='" & UCase(d.DriveLetter) & "'>" & UCase(d.DriveLetter) & ": (" & d.VolumeName & ")</option>"
-      any = True
-    End If
-    On Error GoTo 0
-  Next
-  If Not any Then html = "<option value=''>no USB/removable drive found</option>"
-  document.getElementById("swDrive").innerHTML = html
-End Sub
 
-' Scan installed programs (Uninstall registry keys) + portable .exe in common folders.
-Sub DiscoverSoftware()
-  Dim key, subkey, sk, disp, uninst, dirs(3), i, dd, f, nm, lst, regKeys(2), rk
-  swCount = 0
-  ReDim swItems(0)
-  ' --- installed apps via Uninstall registry keys ---
-  regKeys(0) = "HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall"
-  regKeys(1) = "HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-  regKeys(2) = "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall"
-  For rk = 0 To 2
-    key = regKeys(rk)
-    On Error Resume Next
-    Set sk = oWSH.RegEnumKey(key)
-    If Err.Number = 0 Then
-      For Each subkey In sk
-        disp = oWSH.RegRead(key & "\" & subkey & "\DisplayName")
-        If Err.Number = 0 Then
-          uninst = ""
-          uninst = oWSH.RegRead(key & "\" & subkey & "\UninstallString")
-          AddSw disp, uninst, "installed"
-        End If
-        Err.Clear
-      Next
-    End If
-    On Error GoTo 0
-  Next
-  ' --- portable .exe in common folders (skip installers/uninstallers) ---
-  dirs(0) = Env("ProgramFiles")
-  dirs(1) = Env("ProgramFiles(x86)")
-  dirs(2) = Env("LOCALAPPDATA") & "\Programs"
-  dirs(3) = oWSH.SpecialFolders("Desktop")
-  For i = 0 To UBound(dirs)
-    dd = dirs(i)
-    If oFSO.FolderExists(dd) Then
-      For Each f In oFSO.GetFolder(dd).Files
-        If LCase(oFSO.GetExtensionName(f.Name)) = "exe" Then
-          nm = f.Name
-          If InStr(1, nm, "uninstall", 1) = 0 And InStr(1, nm, "setup", 1) = 0 Then
-            AddSw nm, f.Path, "portable"
-          End If
-        End If
-      Next
-    End If
-  Next
-  ' Render as checkboxes
-  If swCount = 0 Then
-    lst = "<i>No software found. You can Browse to add installer .exe files.</i>"
-  Else
-    lst = ""
-    For i = 0 To swCount - 1
-      parts = Split(swItems(i), "|")
-      lst = lst & "<label><input type='checkbox' name='sw' value='" & Replace(parts(1), "'", "") & "'>" _
-        & parts(0) & " <small>(" & parts(2) & ")</small></label><br>"
-    Next
-  End If
-  document.getElementById("swList").innerHTML = lst
-  document.getElementById("swStatus").innerText = swCount & " item(s) found. Check what to copy, then pick the USB drive above."
-  Call RefreshDrives()
-End Sub
-
-' Append one discovered item to the swItems array.
-Sub AddSw(name, path, kind)
-  If swCount = 0 Then ReDim swItems(0) Else ReDim Preserve swItems(swCount)
-  swItems(swCount) = name & "|" & path & "|" & kind
-  swCount = swCount + 1
-End Sub
-
-' Copy each checked item to <USB>:\software\
-Sub StageSoftware()
-  Dim drv, dest, els, el, copied, html, fn
-  drv = document.getElementById("swDrive").value
-  If drv = "" Then Log("Pick a target USB drive first.") : Exit Sub
-  dest = drv & ":\software"
-  On Error Resume Next
-  oFSO.CreateFolder dest
-  On Error GoTo 0
-  Set els = document.getElementsByTagName("input")
-  copied = 0
-  html = ""
-  For Each el In els
-    If el.Name = "sw" And el.Checked Then
-      On Error Resume Next
-      oFSO.CopyFile el.Value, dest & "\", True
-      If Err.Number = 0 Then
-        copied = copied + 1
-        fn = oFSO.GetFileName(el.Value)
-        html = html & "  copied " & fn & vbCrLf
-      Else
-        html = html & "  FAILED " & el.Value & " (rc=" & Err.Number & ")" & vbCrLf
-      End If
-      On Error GoTo 0
-    End If
-  Next
-  If copied = 0 Then
-    document.getElementById("swStatus").innerText = "Nothing copied (no items checked, or copy failed)."
-  Else
-    document.getElementById("swStatus").innerText = "Copied " & copied & " item(s) to " & dest
-  End If
-  Log("Software staging -> " & dest & ":" & vbCrLf & html)
-End Sub
 
 Sub LaunchRufus()
+  Call InitEnv()
   Dim iso, ru, cmd
   iso = SelectedISO()
   If iso = "" Then Log("Pick or download an ISO first.") : Exit Sub
