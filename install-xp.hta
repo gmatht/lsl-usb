@@ -1,10 +1,12 @@
-<!DOCTYPE html>
+<!-- NO <!DOCTYPE>: a strict doctype forces IE standards mode, which does not
+     paint HTA's native Win32 controls until a repaint (hover). Quirks/IE mode
+     lays them out correctly. We do NOT host ISOs - the default URL points at
+     the distro's official mirror (same one install.ps1 uses). -->
 <html>
 <head>
-<meta http-equiv="x-ua-compatible" content="IE=8">
-<hta:application applicationname="lsl-usb (legacy / WinXP+)" version="1.0"
-  border="dialog" caption="yes" maximizebutton="no" minimizebutton="yes"
-  singleinstance="yes" windowstate="normal" scroll="auto" />
+<meta http-equiv="x-ua-compatible" content="IE=9">
+<hta:application id="lsl" applicationname="lsl-usb (legacy / WinXP+)"
+  version="1.0" border="dialog" caption="yes" maximizebutton="no" minimizebutton="yes" singleinstance="yes" windowstate="normal" scroll="auto" />
 <title>lsl-usb installer (legacy / WinXP+)</title>
 <style>
   body { font: 11pt Tahoma, Verdana, sans-serif; background:#f4f4f4; margin:8px; }
@@ -14,6 +16,7 @@
   #log { width:100%; height:120px; font:9pt Consolas, monospace; }
   button { font:10pt Tahoma; padding:3px 8px; }
   .row { margin:3px 0; }
+  label { display:block; }
 </style>
 </head>
 <body>
@@ -29,10 +32,9 @@
 </fieldset>
 
 <fieldset><legend>Download (if you don't have an ISO)</legend>
-  <div class="row">URL: <input id="url" size="70"
-    value="https://github.com/gmatht/lsl-usb/releases/download/v1/linuxmint.iso"></div>
+  <div class="row">URL: <input id="url" size="72"></div>
   <div class="row">
-    <button id="bDl" onclick="Download()">Download via BITS</button>
+    <button id="bDl" onclick="Download()">Download via BITS (http only)</button>
     <button id="bBrowser" onclick="DownloadInBrowser()">Open in browser &amp; watch Downloads</button>
   </div>
   <div class="row" id="dlStatus">&nbsp;</div>
@@ -53,7 +55,7 @@
 
 <script language="VBScript">
 Option Explicit
-Dim oWSH, oFSO, oShell, is64, ramKB, recoText, watchTimer, watchBase, watchName
+Dim oWSH, oFSO, is64, ramKB, recoText, watchTimer, watchBase, watchName
 
 Sub Log(s)
   document.getElementById("log").value = document.getElementById("log").value & s & vbCrLf
@@ -66,11 +68,20 @@ End Function
 Sub Window_OnLoad()
   Set oWSH = CreateObject("WScript.Shell")
   Set oFSO = CreateObject("Scripting.FileSystemObject")
-  Set oShell = oWSH
   Call Recommend()
   Call AutoRufus()
   Call ScanISOs()
+  ' Default the URL box to the distro's REAL mirror (we do not host ISOs).
+  If is64 Then
+    document.getElementById("url").value = _
+      "https://mirrors.kernel.org/linuxmint/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso"
+  Else
+    document.getElementById("url").value = "https://antixlinux.com/download/"
+  End If
   Log("Legacy mode ready. CPU/RAM gate: " & recoText & ".")
+  ' Force a layout repaint (defensive; doctype removed above is the real fix).
+  document.body.style.visibility = "hidden"
+  window.setTimeout "document.body.style.visibility='visible'", 0
 End Sub
 
 ' --- arch + TotalVisibleMemorySize (wmic) recommendation (mirrors install.bat) ---
@@ -90,7 +101,7 @@ Sub Recommend()
   End If
   On Error GoTo 0
   If is64 And ramKB >= 2097152 Then
-    recoText = "Mint Cinnamon 22.x (64-bit, >=2GB RAM)"
+    recoText = "Mint Cinnamon 22.3 (64-bit, >=2GB RAM)"
   Else
     recoText = "antiX 26 (i386 / antix26_386)"
   End If
@@ -149,13 +160,13 @@ Sub BrowseISO()
   End If
 End Sub
 
-' --- Download via BITS (http; TLS 1.0 on XP can't reach github over https) ---
+' --- Download via BITS (http only; TL0 on XP can't reach TLS1.2 https mirrors) ---
 Sub Download()
   Dim url, dest, cmd, rc
   url = document.getElementById("url").value
   dest = oWSH.SpecialFolders("MyDocuments") & "\Downloads\" & oFSO.GetFileName(url)
   If LCase(Left(url, 8)) = "https://" Then
-    Log("BITS on XP lacks TLS 1.2; use 'Open in browser & watch Downloads' for https URLs.")
+    Log("BITS on XP caps at TLS 1.0; use 'Open in browser & watch Downloads' for https URLs.")
     Exit Sub
   End If
   cmd = "bitsadmin /transfer lsl /download /priority normal """ & url & """ """ & dest & """"
@@ -170,7 +181,7 @@ Sub Download()
   End If
 End Sub
 
-' --- Workaround for https/GitHub: let the browser do TLS, watch Downloads ---
+' --- Workaround for https mirrors: let the browser do TLS, then watch Downloads ---
 Sub DownloadInBrowser()
   Dim url
   url = document.getElementById("url").value
