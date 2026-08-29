@@ -64,12 +64,27 @@
   </div>
 </fieldset>
 
-<div class="row"><textarea id="log" readonly></textarea></div>
+<fieldset><legend>Carry Windows software on the USB</legend>
+  <div class="row">
+    Target USB drive:
+    <select id="swDrive" size="1"></select>
+    <button onclick="RefreshDrives()">Refresh</button>
+  </div>
+  <div class="row">
+    <button onclick="DiscoverSoftware()">Scan installed + portable apps</button>
+    <button id="bStageSw" onclick="StageSoftware()">Copy checked to &lt;USB&gt;\software\</button>
+  </div>
+  <div id="swList" class="row"></div>
+  <div class="row" id="swStatus">&nbsp;</div>
+</fieldset>
+
+<div class="row"><textarea id="log" readonly"></textarea></div>
 
 <script language="VBScript">
 Option Explicit
 Dim oWSH, oFSO, is64, ramKB, recoText, watchTimer, watchBase, watchName
 Dim rufusWatchTimer, rufusWatchBase, rufusWatchDest
+Dim swItems, swCount, targetDrive
 
 Sub Log(s)
   document.getElementById("log").value = document.getElementById("log").value & s & vbCrLf
@@ -123,6 +138,7 @@ Sub Window_OnLoad()
   Call Recommend()
   Call AutoRufus()
   Call ScanISOs()
+  Call DiscoverSoftware()
   If is64 Then
     document.getElementById("url").value = "https://mirrors.kernel.org/linuxmint/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso"
   Else
@@ -540,6 +556,128 @@ Sub WatchRufus()
     document.getElementById("rufusReco").innerText = "Downloaded: " & oFSO.GetFileName(found)
     Log("Rufus detected in Downloads: " & found)
   End If
+End Sub
+
+
+' --- Carry Windows software onto the USB (installed + portable) ---------------------
+' Populate the target-drive <select> with ready USB/removable/fixed volumes.
+Sub RefreshDrives()
+  Dim fso, d, html, any
+  Set fso = CreateObject("Scripting.FileSystemObject")
+  html = ""
+  any = False
+  For Each d In fso.Drives
+    On Error Resume Next
+    If (d.DriveType = 1 Or d.DriveType = 2) And fso.GetDrive(d.DriveLetter & ":").IsReady Then
+      html = html & "<option value='" & UCase(d.DriveLetter) & "'>" & UCase(d.DriveLetter) & ": (" & d.VolumeName & ")</option>"
+      any = True
+    End If
+    On Error GoTo 0
+  Next
+  If Not any Then html = "<option value=''>no USB/removable drive found</option>"
+  document.getElementById("swDrive").innerHTML = html
+End Sub
+
+' Scan installed programs (Uninstall registry keys) + portable .exe in common folders.
+Sub DiscoverSoftware()
+  Dim key, subkey, sk, disp, uninst, dirs(3), i, dd, f, nm, lst, regKeys(2), rk
+  swCount = 0
+  ReDim swItems(0)
+  ' --- installed apps via Uninstall registry keys ---
+  regKeys(0) = "HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+  regKeys(1) = "HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+  regKeys(2) = "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+  For rk = 0 To 2
+    key = regKeys(rk)
+    On Error Resume Next
+    Set sk = oWSH.RegEnumKey(key)
+    If Err.Number = 0 Then
+      For Each subkey In sk
+        disp = oWSH.RegRead(key & "\" & subkey & "\DisplayName")
+        If Err.Number = 0 Then
+          uninst = ""
+          uninst = oWSH.RegRead(key & "\" & subkey & "\UninstallString")
+          AddSw disp, uninst, "installed"
+        End If
+        Err.Clear
+      Next
+    End If
+    On Error GoTo 0
+  Next
+  ' --- portable .exe in common folders (skip installers/uninstallers) ---
+  dirs(0) = Env("ProgramFiles")
+  dirs(1) = Env("ProgramFiles(x86)")
+  dirs(2) = Env("LOCALAPPDATA") & "\Programs"
+  dirs(3) = oWSH.SpecialFolders("Desktop")
+  For i = 0 To UBound(dirs)
+    dd = dirs(i)
+    If oFSO.FolderExists(dd) Then
+      For Each f In oFSO.GetFolder(dd).Files
+        If LCase(oFSO.GetExtensionName(f.Name)) = "exe" Then
+          nm = f.Name
+          If InStr(1, nm, "uninstall", 1) > 0 Then GoTo SkipFile
+          If InStr(1, nm, "setup", 1) > 0 Then GoTo SkipFile
+          AddSw nm, f.Path, "portable"
+        End If
+SkipFile:
+      Next
+    End If
+  Next
+  ' Render as checkboxes
+  If swCount = 0 Then
+    lst = "<i>No software found. You can Browse to add installer .exe files.</i>"
+  Else
+    lst = ""
+    For i = 0 To swCount - 1
+      parts = Split(swItems(i), "|")
+      lst = lst & "<label><input type='checkbox' name='sw' value='" & Replace(parts(1), "'", "") & "'>" _
+        & parts(0) & " <small>(" & parts(2) & ")</small></label><br>"
+    Next
+  End If
+  document.getElementById("swList").innerHTML = lst
+  document.getElementById("swStatus").innerText = swCount & " item(s) found. Check what to copy, then pick the USB drive above."
+  Call RefreshDrives()
+End Sub
+
+' Append one discovered item to the swItems array.
+Sub AddSw(name, path, kind)
+  If swCount = 0 Then ReDim swItems(0) Else ReDim Preserve swItems(swCount)
+  swItems(swCount) = name & "|" & path & "|" & kind
+  swCount = swCount + 1
+End Sub
+
+' Copy each checked item to <USB>:\software\
+Sub StageSoftware()
+  Dim drv, dest, els, el, copied, html, fn
+  drv = document.getElementById("swDrive").value
+  If drv = "" Then Log("Pick a target USB drive first.") : Exit Sub
+  dest = drv & ":\software"
+  On Error Resume Next
+  oFSO.CreateFolder dest
+  On Error GoTo 0
+  Set els = document.getElementsByTagName("input")
+  copied = 0
+  html = ""
+  For Each el In els
+    If el.Name = "sw" And el.Checked Then
+      On Error Resume Next
+      oFSO.CopyFile el.Value, dest & "\", True
+      If Err.Number = 0 Then
+        copied = copied + 1
+        fn = oFSO.GetFileName(el.Value)
+        html = html & "  copied " & fn & vbCrLf
+      Else
+        html = html & "  FAILED " & el.Value & " (rc=" & Err.Number & ")" & vbCrLf
+      End If
+      On Error GoTo 0
+    End If
+  Next
+  If copied = 0 Then
+    document.getElementById("swStatus").innerText = "Nothing copied (no items checked, or copy failed)."
+  Else
+    document.getElementById("swStatus").innerText = "Copied " & copied & " item(s) to " & dest
+  End If
+  Log("Software staging -> " & dest & ":" & vbCrLf & html)
 End Sub
 
 Sub LaunchRufus()
