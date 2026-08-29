@@ -615,11 +615,10 @@ Sub DiscoverSoftware()
       For Each f In oFSO.GetFolder(dd).Files
         If LCase(oFSO.GetExtensionName(f.Name)) = "exe" Then
           nm = f.Name
-          If InStr(1, nm, "uninstall", 1) > 0 Then GoTo SkipFile
-          If InStr(1, nm, "setup", 1) > 0 Then GoTo SkipFile
-          AddSw nm, f.Path, "portable"
+          If InStr(1, nm, "uninstall", 1) = 0 And InStr(1, nm, "setup", 1) = 0 Then
+            AddSw nm, f.Path, "portable"
+          End If
         End If
-SkipFile:
       Next
     End If
   Next
