@@ -1,0 +1,25 @@
+# Statically-linked CLI tools for lsl-usb (bin/lsl-rusttools.sh).
+# Format: name<TAB>owner/repo<TAB>asset-substring<TAB>binary-name<TAB>windows-equivalent
+# The latest release's first asset whose name contains the substring is
+# downloaded; .tar.gz assets are extracted and the named binary installed to
+# /cdrom/bin (already on PATH). musl-static builds have no runtime deps.
+rg	BurntSushi/ripgrep	x86_64-unknown-linux-musl.tar.gz	rg	ripgrep (VS Code search)
+rgr	acheronfail/repgrep	x86_64-unknown-linux-musl.tar.gz	rgr	interactive ripgrep (repgrep)
+rga	phiresky/ripgrep-all	x86_64-unknown-linux-musl.tar.gz	rga	ripgrep-all (grep zips/pdfs)
+fd	sharkdp/fd	x86_64-unknown-linux-musl.tar.gz	fd	find alternative
+bat	sharkdp/bat	x86_64-unknown-linux-musl.tar.gz	bat	cat alternative
+eza	eza-community/eza	x86_64-unknown-linux-gnu.tar.gz	eza	ls alternative
+zoxide	ajeetdsouza/zoxide	x86_64-unknown-linux-musl.tar.gz	zoxide	cd alternative
+delta	dandavison/delta	x86_64-unknown-linux-musl.tar.gz	delta	git diff viewer
+lazygit	jesseduffield/lazygit	Linux_x86_64.tar.gz	lazygit	git TUI
+starship	starship/starship	x86_64-unknown-linux-musl.tar.gz	starship	shell prompt
+just	casey/just	x86_64-unknown-linux-musl.tar.gz	just	make alternative
+hyperfine	sharkdp/hyperfine	x86_64-unknown-linux-musl.tar.gz	hyperfine	benchmarking
+bottom	ClementTsang/bottom	x86_64-unknown-linux-musl.tar.gz	btm	task manager
+dust	bootandy/dust	x86_64-unknown-linux-musl.tar.gz	dust	disk usage
+duf	muesli/duf	linux_x86_64.tar.gz	duf	df alternative
+tealdeer	tealdeer-rs/tealdeer	linux-x86_64-musl	tealdeer	man pages
+sd	sharkdp/sd	x86_64-unknown-linux-musl.tar.gz	sd	sed alternative
+tokei	XAMPPRocky/tokei	x86_64-unknown-linux-musl.tar.gz	tokei	code statistics
+xh	ducaale/xh	x86_64-unknown-linux-musl.tar.gz	xh	curl alternative
+gping	orf/gping	Linux-x86_64.tar.gz	gping	ping with graph
