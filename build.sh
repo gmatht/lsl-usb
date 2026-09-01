@@ -111,6 +111,96 @@ cp -a "$REPO_ROOT/onboot.sh" "$REPO_ROOT/lsl-usb.env" "$BUNDLE/"
 cp -a "$REPO_ROOT/install.ps1" "$REPO_ROOT/install.bat" "$REPO_ROOT/resolve-powershell.ps1" "$REPO_ROOT/VERSION" "$BUNDLE/"
 cp -a "$DIST/filesystem_z0_firstboot.squashfs" "$BUNDLE/"
 
+# --- 2b) repack the initrd to add the HDD-mirror auto-detect hook ------------
+# The base initrd ships from the Mint ISO Rufus wrote. We inject our casper-premount
+# hook (initramfs/lsl_hdd_mirror.sh) so the live root can assemble from a local
+# mirror of the squashfs layers. The unmodified initrd is preserved as
+# casper/initrd.safe.lz so the user can boot a known-good "safe" entry (no mirror,
+# pure USB). Set LSL_BASE_INITRD to override the source initrd location.
+repack_initrd() {
+    local base="${LSL_BASE_INITRD:-/cdrom/casper/initrd.lz}"
+    if [ ! -f "$base" ]; then
+        echo "WARNING: base initrd not found at $base; set LSL_BASE_INITRD to enable" >&2
+        echo "         boot-from-HDD auto-detect. Skipping initrd repack." >&2
+        return 0
+    fi
+    command -v unmkinitramfs >/dev/null 2>&1 || { echo "ERROR: unmkinitramfs missing; cannot repack initrd." >&2; return 1; }
+    local tmp; tmp="$(mktemp -d)"
+    if ! unmkinitramfs "$base" "$tmp" 2>/dev/null; then
+        echo "ERROR: unmkinitramfs failed on $base" >&2; rm -rf "$tmp"; return 1
+    fi
+    local casper_hook="$REPO_ROOT/initramfs/lsl_hdd_mirror.sh"
+    local live_hook="$REPO_ROOT/initramfs/lsl_liveboot_mirror.sh"
+    local antix_hook="$REPO_ROOT/initramfs/lsl_antix_mirror.sh"
+    [ -f "$casper_hook" ] || { echo "ERROR: $casper_hook missing" >&2; rm -rf "$tmp"; return 1; }
+    [ -f "$live_hook" ] || { echo "ERROR: $live_hook missing" >&2; rm -rf "$tmp"; return 1; }
+    [ -f "$antix_hook" ] || { echo "ERROR: $antix_hook missing" >&2; rm -rf "$tmp"; return 1; }
+    local injected=0
+    for d in "$tmp"/*/; do
+        # --- Debian live-boot (also antiX's live-init fork roots) ---
+        # live-boot's run_scripts *sources* the ORDER file in the script dir, so
+        # the ORDER MUST exist (otherwise `. "${initdir}/ORDER"` fails and /init
+        # aborts under set -e). We dot-source our hook so `export
+        # LIVE_MEDIA_PATH=sfs` reaches Live()/find_livefs in the live-boot shell.
+        if [ -d "${d}usr/lib/live/boot" ] && [ ! -f "${d}scripts/live-premount/00lsl_liveboot_mirror" ]; then
+            mkdir -p "${d}scripts/live-premount"
+            cp "$live_hook" "${d}scripts/live-premount/00lsl_liveboot_mirror"
+            chmod +x "${d}scripts/live-premount/00lsl_liveboot_mirror"
+            order="${d}scripts/live-premount/ORDER"
+            if [ ! -f "$order" ]; then
+                printf '. /scripts/live-premount/00lsl_liveboot_mirror "$@"\n' > "$order"
+            elif ! grep -q '00lsl_liveboot_mirror' "$order"; then
+                printf '. /scripts/live-premount/00lsl_liveboot_mirror "$@"\n' >> "$order"
+            fi
+            injected=1
+        fi
+        # --- antiX live-init (32-bit x86; a live-boot fork, monolithic /init) ---
+        # antiX's /init calls find_linuxfs_file() and honours SQFILE_FILE (default
+        # /antiX/linuxfs). We drop the hook at the initrd root and source it just
+        # before that call so `export SQFILE_FILE=/sfs/filesystem.squashfs` reaches
+        # antiX's scanner. The hook is SOURCED (no `return`/`exit`), so it must not
+        # be executed as a subprocess; the leading `. ` sources it in /init's shell.
+        if [ -f "${d}init" ] && grep -q 'DEFAULT_SQFILE=/antiX/linuxfs' "${d}init" 2>/dev/null && [ ! -f "${d}lsl_antix_mirror.sh" ]; then
+            cp "$antix_hook" "${d}lsl_antix_mirror.sh"
+            chmod +x "${d}lsl_antix_mirror.sh"
+            # Insert the source line right before the find_linuxfs_file CALL (the
+            # only bare call; the function definition is 'find_linuxfs_file() {'
+            # and is not matched by the end-of-line anchor).
+            if ! grep -q 'lsl_antix_mirror' "${d}init"; then
+                sed -i 's#^[[:space:]]*find_linuxfs_file[[:space:]]*$#. /lsl_antix_mirror.sh\n        find_linuxfs_file#' "${d}init"
+            fi
+            injected=1
+        fi
+        # --- casper (Mint/Ubuntu) ---
+        if [ -d "${d}scripts/casper-premount" ] && [ ! -f "${d}scripts/casper-premount/zz_lsl_hdd_mirror" ]; then
+            cp "$casper_hook" "${d}scripts/casper-premount/zz_lsl_hdd_mirror"
+            chmod +x "${d}scripts/casper-premount/zz_lsl_hdd_mirror"
+            # casper's run_scripts *sources* the ORDER file; each ORDER line runs the
+            # script as a subprocess, so an exported LAYERFS_PATH would NOT reach
+            # casper. Source the hook instead (dot-prefixed line) so it runs in
+            # casper's shell and its export propagates to find_livefs.
+            order="${d}scripts/casper-premount/ORDER"
+            if [ -f "$order" ] && ! grep -q 'zz_lsl_hdd_mirror' "$order"; then
+                printf '. /scripts/casper-premount/zz_lsl_hdd_mirror "$@"\n' >> "$order"
+            fi
+            injected=1
+        fi
+    done
+    mkdir -p "$DIST/casper"
+    cp "$base" "$DIST/casper/initrd.safe.lz"   # original, untouched
+    local comp="gzip"; command -v lz4 >/dev/null 2>&1 && comp="lz4"
+    if [ "$comp" = "lz4" ]; then
+        ( for dd in "$tmp"/*/; do ( cd "$dd" && find . -print0 | cpio -0 -H newc -o ); done ) | lz4 -l -9 - "$DIST/casper/initrd.lz"
+    else
+        ( for dd in "$tmp"/*/; do ( cd "$dd" && find . -print0 | cpio -0 -H newc -o ); done ) | gzip -9 -c > "$DIST/casper/initrd.lz"
+    fi
+    rm -rf "$tmp"
+    echo "Repacked initrd -> $DIST/casper/initrd.lz (compressor=$comp, hook injected=$injected; original saved as initrd.safe.lz)"
+}
+repack_initrd || { echo "ERROR: initrd repack failed." >&2; exit 1; }
+# Ship both initrds in the bundle so install.ps1 copies them onto the USB.
+cp -a "$DIST/casper" "$BUNDLE/casper"
+
 # --- 3. zip it ---------------------------------------------------------------
 # rm first: zip -qr updates an existing archive and leaves stale entries behind.
 rm -f "$DIST/lsl-usb-win.zip"
@@ -160,7 +250,9 @@ done
 # Capture the listing once: grep -q on a pipe exits early and SIGPIPEs unzip,
 # which under pipefail makes the check spuriously fail (intermittently).
 ZIP_LIST="$(unzip -l "$DIST/lsl-usb-win.zip")"
-for want in filesystem_z0_firstboot.squashfs bin/ systemd/ fuse/ onboot.sh lsl-usb.env install.ps1 install.bat; do
+wants="filesystem_z0_firstboot.squashfs bin/ systemd/ fuse/ onboot.sh lsl-usb.env install.ps1 install.bat"
+[ -f "$DIST/casper/initrd.lz" ] && wants="$wants casper/initrd.lz"
+for want in $wants; do
     if ! grep -qE "[[:space:]]$want$" <<<"$ZIP_LIST"; then
         echo "ERROR: zip missing top-level entry: $want" >&2
         FAIL=1
@@ -172,6 +264,23 @@ if [ "$FAIL" -ne 0 ]; then
     exit 1
 fi
 echo "Preflight OK."
+
+echo "Preflight: verifying hardware cache matches the ID list..."
+if [ -f "$REPO_ROOT/tools/hw-cache-ids.txt" ] && [ -d "$REPO_ROOT/lsl-hw-cache" ]; then
+    # Count IDs in the list (non-comment, non-blank, valid format) and compare to
+    # the shipped LKDDb page count so a dropped upstream fetch is caught in CI.
+    # grep -c returns 1 when there are zero matches; guard it so set -e doesn't abort.
+    want="$(grep -vE '^[[:space:]]*(#|$)' "$REPO_ROOT/tools/hw-cache-ids.txt" | grep -cE '^(pci|usb):[0-9a-fA-F]{4}-[0-9a-fA-F]{4}([[:space:]]|$)' || true)"
+    have="$(ls -1 "$REPO_ROOT/lsl-hw-cache"/*.html 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "$want" != "$have" ]; then
+        echo "ERROR: hardware cache mismatch: $want IDs in tools/hw-cache-ids.txt but $have pages in lsl-hw-cache/." >&2
+        echo "       Re-run: pwsh tools/build-hw-cache.ps1" >&2
+        exit 1
+    fi
+    echo "Hardware cache: $have pages match $want IDs."
+else
+    echo "WARNING: skipping hardware-cache check (tools/hw-cache-ids.txt or lsl-hw-cache/ missing)."
+fi
 
 echo "Built:"
 ls -lh "$DIST/lsl-usb-win.zip" "$DIST/filesystem_z0_firstboot.squashfs"

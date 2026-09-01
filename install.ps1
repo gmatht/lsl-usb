@@ -61,6 +61,13 @@
     Detection-only mode: prints everything that would be detected and passed to
     the Linux install (ISO, Rufus, USB target, WSL VHDX paths, wifi profiles,
     bundle contents) without downloading, launching Rufus, or writing anything.
+    Rates the detected network devices against linux-hardware.org LKDDb.
+
+.PARAMETER RateHardware
+    With -DryRun: extend the Linux compatibility rating to ALL PCI/USB devices
+    (GPU, audio, bluetooth, storage controllers, ...), not just network. One
+    polite query per device (crawl-delay 10s, cached in %TEMP% after the first
+    run), so a full machine takes a couple of minutes.
 
 .EXAMPLE
     .\install.ps1                          # full flow, downloads Mint 22.x ISO
@@ -82,6 +89,7 @@ param(
     [switch]$SkipRufus,
     [switch]$NoGui,
     [switch]$DryRun,
+    [switch]$RateHardware,
     [switch]$NoElevation
 )
 
@@ -648,11 +656,19 @@ function Get-WifiLines {
 # constraint as the rest of the recipe; the staged driver then persists in the
 # new layer and wifi works on every later boot.
 # ---------------------------------------------------------------------------
-function Get-NetworkHardware {
-    # Enumerate network PnP devices and extract the PCI/USB hardware IDs.
+function Get-PnpHardware {
+    # Enumerate PnP devices (optionally filtered by class) and extract the
+    # PCI/USB hardware IDs - the same IDs lspci -nn / lsusb would show on
+    # Linux. Used for both the network driver staging (Class='Net') and the
+    # full-machine Linux compatibility rating.
+    param([string]$Class = '')
     $out = @()
     try {
-        $devs = @(Get-CimInstance Win32_PnPEntity -Filter "PNPClass='Net'" -ErrorAction SilentlyContinue)
+        if ($Class) {
+            $devs = @(Get-CimInstance Win32_PnPEntity -Filter "PNPClass='$Class'" -ErrorAction SilentlyContinue)
+        } else {
+            $devs = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue)
+        }
     } catch {
         $devs = @()
     }
@@ -663,7 +679,7 @@ function Get-NetworkHardware {
         $m = [regex]::Match($id, '^PCI\\VEN_([0-9A-Fa-f]{4})&DEV_([0-9A-Fa-f]{4})')
         if ($m.Success) {
             $out += [pscustomobject]@{
-                Name = $d.Name; PnpId = $id; Kind = 'PCI'
+                Name = $d.Name; PnpId = $id; Kind = 'PCI'; Class = $d.PNPClass
                 Vendor = $m.Groups[1].Value.ToUpperInvariant()
                 Device = $m.Groups[2].Value.ToUpperInvariant()
                 Id = "$($m.Groups[1].Value.ToUpperInvariant()):$($m.Groups[2].Value.ToUpperInvariant())"
@@ -673,7 +689,7 @@ function Get-NetworkHardware {
         $m = [regex]::Match($id, '^USB\\VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})')
         if ($m.Success) {
             $out += [pscustomobject]@{
-                Name = $d.Name; PnpId = $id; Kind = 'USB'
+                Name = $d.Name; PnpId = $id; Kind = 'USB'; Class = $d.PNPClass
                 Vendor = $m.Groups[1].Value.ToUpperInvariant()
                 Device = $m.Groups[2].Value.ToUpperInvariant()
                 Id = "$($m.Groups[1].Value.ToUpperInvariant()):$($m.Groups[2].Value.ToUpperInvariant())"
@@ -683,24 +699,39 @@ function Get-NetworkHardware {
     return ,$out
 }
 
+function Get-NetworkHardware {
+    # Network PnP devices only (for driver staging).
+    return Get-PnpHardware -Class 'Net'
+}
+
+function Get-CompatHardware {
+    # The device classes that commonly have Linux driver/firmware issues - the
+    # ones worth rating. Everything else (USB hubs, HID, disks, system, ...)
+    # is in-kernel and boring.
+    $classes = @('Net', 'Display', 'MEDIA', 'Bluetooth', 'Biometric', 'Image', 'SmartCardReader', 'HDC', 'SCSIAdapter', 'Modem', 'PCMCIA', 'Camera', '61883')
+    $all = Get-PnpHardware
+    return ,@($all | Where-Object { $classes -contains $_.Class } | Sort-Object Class, Name)
+}
+
 function Get-DriverTable {
     # Curated chipsets that need out-of-tree drivers on Ubuntu 24.04 (Mint 22.x
-    # / Zorin 18.x, kernel 6.8). Everything else is in-kernel or in
-    # linux-firmware (shipped in the ISO). Source:
+    # / Zorin 18.x, kernel 6.8). Cross-checked against linux-hardware.org LKDDb:
+    # chips with a real in-kernel driver for 6.8 (RTL8821CE/8723DE/88x2BU via
+    # rtw88) are NOT listed - staging would conflict with the kernel driver.
+    # Listed chips either need a newer kernel than 6.8 (RTL8812AU/8814AU need
+    # 6.14+), have only a bus-bridge/bluetooth LKDDb entry (Broadcom BCM43xx,
+    # RTL8723BU), or only a staging driver (RTL8188EU). Source:
     #   ubuntu  -> .deb from archive.ubuntu.com (apt installs + DKMS builds)
     #   github  -> DKMS source tarball from GitHub (built via dkms at first boot)
     return ,@(
-        @{ Id = '10EC:C821'; Kind = 'PCI'; Chip = 'Realtek RTL8821CE'; Pkg = 'rtl8821ce'; Source = 'github'; Repo = 'tomaspinho/rtl8821ce'; Branch = 'master'; Note = 'common in budget laptops' },
-        @{ Id = '10EC:D723'; Kind = 'PCI'; Chip = 'Realtek RTL8723DE'; Pkg = 'rtl8723de'; Source = 'github'; Repo = 'lwfinger/rtl8723de'; Branch = 'current'; Note = '' },
-        @{ Id = '0BDA:B812'; Kind = 'USB'; Chip = 'Realtek RTL88x2BU'; Pkg = 'rtl88x2bu'; Source = 'github'; Repo = 'morrownr/88x2bu-20210702'; Branch = 'main'; Note = 'common USB wifi dongle' },
-        @{ Id = '0BDA:8812'; Kind = 'USB'; Chip = 'Realtek RTL8812AU'; Pkg = 'rtl8812au-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'universe'; Note = '' },
-        @{ Id = '0BDA:881A'; Kind = 'USB'; Chip = 'Realtek RTL8814AU'; Pkg = 'rtl8814au'; Source = 'github'; Repo = 'morrownr/8814au'; Branch = 'main'; Note = '' },
-        @{ Id = '0BDA:8179'; Kind = 'USB'; Chip = 'Realtek RTL8188EU'; Pkg = 'rtl8188eu'; Source = 'github'; Repo = 'lwfinger/rtl8188eu'; Branch = 'master'; Note = '' },
-        @{ Id = '0BDA:B720'; Kind = 'USB'; Chip = 'Realtek RTL8723BU'; Pkg = 'rtl8723bu'; Source = 'github'; Repo = 'lwfinger/rtl8723bu'; Branch = 'master'; Note = '' },
-        @{ Id = '14E4:4365'; Kind = 'PCI'; Chip = 'Broadcom BCM43142'; Pkg = 'broadcom-sta-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'restricted'; Note = 'wl driver' },
-        @{ Id = '14E4:43A0'; Kind = 'PCI'; Chip = 'Broadcom BCM4360'; Pkg = 'broadcom-sta-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'restricted'; Note = 'wl driver' },
-        @{ Id = '14E4:43B1'; Kind = 'PCI'; Chip = 'Broadcom BCM4352'; Pkg = 'broadcom-sta-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'restricted'; Note = 'wl driver' },
-        @{ Id = '14E4:4727'; Kind = 'PCI'; Chip = 'Broadcom BCM4313'; Pkg = 'broadcom-sta-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'restricted'; Note = 'wl driver' }
+        @{ Id = '0BDA:8812'; Kind = 'USB'; Chip = 'Realtek RTL8812AU'; Pkg = 'rtl8812au-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'universe'; Note = 'in-kernel only since 6.14' },
+        @{ Id = '0BDA:881A'; Kind = 'USB'; Chip = 'Realtek RTL8814AU'; Pkg = 'rtl8814au'; Source = 'github'; Repo = 'morrownr/8814au'; Branch = 'main'; Note = 'in-kernel only since 6.14' },
+        @{ Id = '0BDA:8179'; Kind = 'USB'; Chip = 'Realtek RTL8188EU'; Pkg = 'rtl8188eu'; Source = 'github'; Repo = 'lwfinger/rtl8188eu'; Branch = 'master'; Note = 'kernel has only a staging driver' },
+        @{ Id = '0BDA:B720'; Kind = 'USB'; Chip = 'Realtek RTL8723BU'; Pkg = 'rtl8723bu'; Source = 'github'; Repo = 'lwfinger/rtl8723bu'; Branch = 'master'; Note = 'LKDDb entry is the bluetooth function only' },
+        @{ Id = '14E4:4365'; Kind = 'PCI'; Chip = 'Broadcom BCM43142'; Pkg = 'broadcom-sta-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'restricted'; Note = 'wl driver; LKDDb entry is the bcma bus bridge only' },
+        @{ Id = '14E4:43A0'; Kind = 'PCI'; Chip = 'Broadcom BCM4360'; Pkg = 'broadcom-sta-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'restricted'; Note = 'wl driver; LKDDb entry is the bcma bus bridge only' },
+        @{ Id = '14E4:43B1'; Kind = 'PCI'; Chip = 'Broadcom BCM4352'; Pkg = 'broadcom-sta-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'restricted'; Note = 'wl driver; LKDDb entry is the bcma bus bridge only' },
+        @{ Id = '14E4:4727'; Kind = 'PCI'; Chip = 'Broadcom BCM4313'; Pkg = 'broadcom-sta-dkms'; Source = 'ubuntu'; Suite = 'noble-updates'; Component = 'restricted'; Note = 'wl driver; LKDDb entry is the bcma bus bridge only' }
     )
 }
 
@@ -812,6 +843,166 @@ function Install-DriverPackages {
     }
     try { $report | Set-Content -Encoding ascii -Path (Join-Path $root 'lsl-drivers.txt') } catch { }
     return ,$report
+}
+
+# ---------------------------------------------------------------------------
+# Linux compatibility rating (linux-hardware.org / LKDDb).
+#
+# linux-hardware.org (the hw-probe database) publishes the LKDDb kernel-driver
+# mapping per device: which kernel versions have a driver for this PCI/USB ID,
+# the driver source file, and out-of-tree options. robots.txt allows robots
+# (Allow: /, Crawl-delay: 10), so we query one page per device, politely, and
+# cache the pages in %TEMP% (repeat runs are instant). The rating:
+#   A  in-kernel driver for the ISO kernel (6.8)
+#   C  needs an out-of-tree driver (staged automatically, or available)
+#   D  no driver found anywhere
+#   U  unknown (query failed / rate-limited / no data)
+# The curated driver table overrides the LKDDb verdict for known-problem chips
+# (e.g. Broadcom BCM43xx where the LKDDb entry is only the bcma bus bridge).
+# ---------------------------------------------------------------------------
+# linux-hardware.org politeness state (robots.txt Crawl-delay).
+$script:lhwDelaySec = 10
+$script:lhwLastRequest = $null
+
+function Get-LhwPage {
+    # Fetch a linux-hardware.org page with a hard timeout. The site rate-limits
+    # aggressively (429), so a hung request must not stall the whole report.
+    param([string]$Url)
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($Url)
+        $req.Timeout = 15000
+        $req.ReadWriteTimeout = 15000
+        $req.UserAgent = 'lsl-usb/1.0'
+        $resp = $req.GetResponse()
+        try {
+            $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            return $sr.ReadToEnd()
+        } finally {
+            $resp.Close()
+        }
+    } catch {
+        return ''
+    }
+}
+
+function Get-LhwDevicePage {
+    # Resolve the linux-hardware.org device page for a device ID like
+    # 'pci:10ec-c821' or 'usb:0bda-b720'. Look-up order:
+    #   1) per-user runtime cache in %TEMP% (freshest, from a prior live fetch)
+    #   2) the snapshot cache bundled with the tool ($BundleDir/lsl-hw-cache),
+    #      so common hardware is rated with no network request at all
+    #   3) a live (polite) fetch, which is then cached in %TEMP%
+    # Returns the HTML, or '' on failure (failures are not cached, so a later
+    # run retries).
+    param([string]$Id)
+    $fileName = "lsl-lhw-" + ($Id -replace '[:]', '-') + '.html'
+    $userCache = Join-Path $env:TEMP $fileName
+    if (Test-Path $userCache) {
+        try { return Get-Content $userCache -Raw } catch { }
+    }
+    if ($BundleDir) {
+        $bundleCache = Join-Path $BundleDir ('lsl-hw-cache' + [System.IO.Path]::DirectorySeparatorChar + $fileName)
+        if (Test-Path $bundleCache) {
+            try { return Get-Content $bundleCache -Raw } catch { }
+        }
+    }
+    if ($script:lhwLastRequest) {
+        $elapsed = (Get-Date) - $script:lhwLastRequest
+        if ($elapsed.TotalSeconds -lt $script:lhwDelaySec) {
+            Start-Sleep -Seconds ($script:lhwDelaySec - $elapsed.TotalSeconds)
+        }
+    }
+    $html = Get-LhwPage -Url "https://linux-hardware.org/?id=$Id"
+    $script:lhwLastRequest = Get-Date
+    if ($html) {
+        try { Set-Content -Path $userCache -Value $html } catch { }
+    }
+    if (-not (Test-Path $userCache)) { return '' }
+    try { return Get-Content $userCache -Raw } catch { return '' }
+}
+
+function Get-LinuxCompatRating {
+    # Rate one device against the ISO kernel using linux-hardware.org LKDDb
+    # data, with the curated driver table as the override. Returns a
+    # pscustomobject with Rating / Reason / Name / KernelSupport / DriverSource
+    # / ThirdParty / Staged fields.
+    param($Device, [int]$IsoKernelMajor = 6, [int]$IsoKernelMinor = 8)
+    $id = "$($Device.Kind.ToLowerInvariant()):$($Device.Vendor.ToLowerInvariant())-$($Device.Device.ToLowerInvariant())"
+    $html = Get-LhwDevicePage -Id $id
+    $name = $Device.Name
+    $ksup = ''; $src = ''; $third = @()
+    if ($html) {
+        $m = [regex]::Match($html, "<h2 class='top'>Device '([^']+)'")
+        if ($m.Success) { $name = $m.Groups[1].Value }
+        $m = [regex]::Match($html, 'supported by kernel versions <a[^>]*>([^<]+)</a>')
+        if ($m.Success) { $ksup = $m.Groups[1].Value }
+        $m = [regex]::Match($html, '<td>([0-9.]+)&nbsp;-&nbsp;([0-9.]+)</td>\s*<td>([^<]+)</td>')
+        if ($m.Success) { $src = $m.Groups[3].Value }
+        $third = @([regex]::Matches($html, '<li><a href="https://github.com/([^"]+)">') | ForEach-Object { $_.Groups[1].Value })
+    }
+    # Curated table override (known-problem chips).
+    $tableHit = Get-DriverTable | Where-Object { $_.Id -eq $Device.Id }
+    if ($tableHit) {
+        return [pscustomobject]@{
+            Device = $Device; Name = $name; Rating = 'C'; Staged = $true
+            KernelSupport = $ksup; DriverSource = $src; ThirdParty = $third
+            Reason = "needs out-of-tree driver ($($tableHit.Pkg)) - staged to <USB>:\drivers\"
+        }
+    }
+    if (-not $html) {
+        return [pscustomobject]@{
+            Device = $Device; Name = $name; Rating = 'U'; Staged = $false
+            KernelSupport = ''; DriverSource = ''; ThirdParty = @()
+            Reason = 'no data (linux-hardware.org unreachable/rate-limited)'
+        }
+    }
+    if (-not $ksup) {
+        $extra = if ($third) { " - out-of-tree options: $($third -join ', ')" } else { '' }
+        return [pscustomobject]@{
+            Device = $Device; Name = $name; Rating = 'U'; Staged = $false
+            KernelSupport = ''; DriverSource = $src; ThirdParty = $third
+            Reason = "no LKDDb entry$extra"
+        }
+    }
+    # Parse the minimum kernel from '5.9 and newer' or '4.17 - 6.1'.
+    $minMajor = 0; $minMinor = 0
+    if ($ksup -match '^([0-9]+)\.([0-9]+)') {
+        $minMajor = [int]$Matches[1]; $minMinor = [int]$Matches[2]
+    }
+    $inKernel = ($minMajor -lt $IsoKernelMajor) -or ($minMajor -eq $IsoKernelMajor -and $minMinor -le $IsoKernelMinor)
+    # A bus-bridge / bluetooth entry is not a real driver for this function.
+    $bridgeOnly = $src -match 'bcma|bluetty|usb/class|host_pci|pci-bridge'
+    if ($inKernel -and -not $bridgeOnly) {
+        return [pscustomobject]@{
+            Device = $Device; Name = $name; Rating = 'A'; Staged = $false
+            KernelSupport = $ksup; DriverSource = $src; ThirdParty = $third
+            Reason = "in-kernel since $ksup ($src) - no action needed"
+        }
+    }
+    if ($inKernel -and $bridgeOnly) {
+        return [pscustomobject]@{
+            Device = $Device; Name = $name; Rating = 'D'; Staged = $false
+            KernelSupport = $ksup; DriverSource = $src; ThirdParty = $third
+            Reason = "LKDDb entry is only $src - no real driver for this function"
+        }
+    }
+    $extra = if ($third) { " - out-of-tree options: $($third -join ', ')" } else { '' }
+    return [pscustomobject]@{
+        Device = $Device; Name = $name; Rating = 'C'; Staged = $false
+        KernelSupport = $ksup; DriverSource = $src; ThirdParty = $third
+        Reason = "needs kernel $ksup+ (ISO has $IsoKernelMajor.$IsoKernelMinor)$extra"
+    }
+}
+
+function Get-HardwareCompatReport {
+    # Rate a list of devices (politely, one query each) and return report lines.
+    param([object[]]$Devices)
+    $lines = @()
+    foreach ($d in $Devices) {
+        $r = Get-LinuxCompatRating -Device $d
+        $lines += "[$($r.Rating)] $($r.Name)  ($($d.Id))  - $($r.Reason)"
+    }
+    return ,$lines
 }
 
 # ---------------------------------------------------------------------------
@@ -942,6 +1133,15 @@ function Install-LslFiles {
             $copied += $f
         }
     }
+    # 3) initrd: the modified one (HDD-mirror auto-detect) plus the original as a
+    #    safe fallback. Boot the "(safe)" entry to use the original initrd (no mirror).
+    foreach ($i in @('initrd.lz', 'initrd.safe.lz')) {
+        $srcInitrd = Join-Path $BundleDir "casper/$i"
+        if (Test-Path $srcInitrd) {
+            Copy-Item $srcInitrd (Join-Path $casper $i) -Force
+            $copied += "casper/$i"
+        }
+    }
     # Stamp the build for traceability (captured by lsl-diag.sh on failure) so a
     # wedged hardware test can be tied back to the exact bundle that was written.
     $buildVer = ''
@@ -952,7 +1152,176 @@ function Install-LslFiles {
     try { "$buildVer`nBuilt: $(Get-Date -Format u)" | Set-Content -Path (Join-Path $root 'lsl-build.txt') -ErrorAction Stop } catch { }
     $copied += 'lsl-build.txt'
     if (-not $copied) { throw 'No lsl files found in bundle; nothing was copied.' }
+    Add-SafeBootEntry -Vol $Vol
     Write-Info "Copied to $root : $($copied -join ', ')"
+}
+
+
+# ---------------------------------------------------------------------------
+# Rust CLI tools (32-bit i686 / antiX variant): download the prebuilt
+# i686-unknown-linux-musl assets DIRECTLY from GitHub and drop them onto the
+# USB, instead of copying them from the Linux bundle. fd / bat / zoxide publish
+# these prebuilt assets; ripgrep and eza do not (they are cross-compiled by
+# tools/build-rusttools.sh on the Linux side). Best-effort: a failed/skipped
+# download must not abort the install - the user can run bin/lsl-rusttools.sh
+# on the live USB later to fetch them.
+# ---------------------------------------------------------------------------
+function Install-RustTools {
+    param($Vol)
+    $root = "$($Vol.DriveLetter):\"
+    $binDir = Join-Path $root 'bin'
+    New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+
+    # repo -> asset-substring (i686-unknown-linux-musl) -> binary name on the USB
+    $tools = @(
+        @{ Repo = 'sharkdp/fd';      Asset = 'i686-unknown-linux-musl'; Bin = 'fd' },
+        @{ Repo = 'sharkdp/bat';     Asset = 'i686-unknown-linux-musl'; Bin = 'bat' },
+        @{ Repo = 'ajeetdsouza/zoxide'; Asset = 'i686-unknown-linux-musl'; Bin = 'zoxide' }
+    )
+
+    $headers = @{ 'User-Agent' = 'lsl-usb-installer/1.0' }   # GitHub API requires this
+    foreach ($t in $tools) {
+        $dest = Join-Path $binDir $t.Bin
+        if (Test-Path $dest) {
+            Write-Info "  $($t.Bin): already on USB ($([math]::Round((Get-Item $dest).Length/1KB,0)) KB)"
+            continue
+        }
+        Write-Info "  $($t.Bin): resolving latest $($t.Repo) i686-musl release asset..."
+        try {
+            $rel = Invoke-RestMethod -Headers $headers `
+                -Uri "https://api.github.com/repos/$($t.Repo)/releases/latest"
+            $asset = $rel.assets | Where-Object {
+                $_.name -match [regex]::Escape($t.Asset)
+            } | Where-Object { $_.name -match '\.tar\.gz$' } | Select-Object -First 1
+            if (-not $asset) { throw "no i686-musl .tar.gz asset in $($rel.tag_name)" }
+
+            $tmp = Join-Path $env:TEMP $asset.name
+            Download $asset.browser_download_url $tmp
+            if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -eq 0) { throw 'empty download' }
+
+            # Extract the named binary from the tarball and verify it is a real
+            # ELF (tag is user-supplied, so never trust it blindly on Windows).
+            $extractDir = Join-Path $env:TEMP "lsl-$($t.Bin)-extract"
+            New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+            tar -xzf $tmp -C $extractDir 2>$null
+            $found = Get-ChildItem -Path $extractDir -Recurse -Filter $t.Bin -ErrorAction SilentlyContinue |
+                Where-Object { -not $_.PSIsContainer } | Select-Object -First 1
+            if (-not $found) { throw "binary '$($t.Bin)' not found in $($asset.name)" }
+            Copy-Item $found.FullName $dest -Force
+            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+            Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Info "  $($t.Bin): downloaded $($asset.name) -> $dest ($([math]::Round((Get-Item $dest).Length/1KB,0)) KB)"
+        } catch {
+            Remove-Item $dest -Force -ErrorAction SilentlyContinue
+            Write-Warn2 "  $($t.Bin): direct download failed ($($_.Exception.Message)); run bin/lsl-rusttools.sh on the live USB to fetch it later."
+        }
+    }
+}
+
+
+function Add-SafeBootEntry {
+    param($Vol)
+    $root = "$($Vol.DriveLetter):\"
+    $safe = Join-Path $root 'casper/initrd.safe.lz'
+    if (-not (Test-Path $safe)) { return }  # no safe initrd shipped -> nothing to offer
+    # GRUB (UEFI): clone the first casper menuentry with the original initrd.
+    $grub = Join-Path $root 'boot/grub/grub.cfg'
+    if (Test-Path $grub) {
+        try {
+            $txt = Get-Content $grub -Raw
+            if ($txt -notmatch 'initrd\.safe\.lz') {
+                if ($txt -match '(?s)(menuentry "[^"]*" --class linuxmint \{.*?initrd\s+/casper/initrd\.lz\s*\})') {
+                    $orig = $Matches[0]
+                    $safeEntry = $orig -replace 'initrd\s+/casper/initrd\.lz', 'initrd /casper/initrd.safe.lz' `
+                                      -replace 'menuentry "', 'menuentry "(safe) '
+                    Add-Content -Path $grub -Value "`n$safeEntry" -Encoding ascii
+                    Write-Info 'Added safe-boot GRUB entry (original initrd, no HDD mirror).'
+                }
+            }
+        } catch { Write-Warn2 'Could not add safe-boot GRUB entry (non-fatal).' }
+    }
+    # ISOLINUX (BIOS): clone the live label with the original initrd.
+    $live = Join-Path $root 'isolinux/live.cfg'
+    if (-not (Test-Path $live)) { $live = Join-Path $root 'isolinux/isolinux.cfg' }
+    if (Test-Path $live) {
+        try {
+            $txt = Get-Content $live -Raw
+            if ($txt -notmatch 'initrd\.safe\.lz' -and $txt -match '(?s)(label\s+live.*?initrd\s+/casper/initrd\.lz\s*)') {
+                $orig = $Matches[0]
+                $safeLabel = $orig -replace 'label\s+live', 'label safe' `
+                                  -replace 'menu label', 'menu label ^Safe: original initrd (no HDD mirror)' `
+                                  -replace 'initrd\s+/casper/initrd\.lz', 'initrd /casper/initrd.safe.lz'
+                Add-Content -Path $live -Value "`n$safeLabel" -Encoding ascii
+                Write-Info 'Added safe-boot ISOLINUX entry (original initrd, no HDD mirror).'
+            }
+        } catch { Write-Warn2 'Could not add safe-boot ISOLINUX entry (non-fatal).' }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Copy the Linux squashfs layers from the (just-written) USB to the user's NTFS
+# HDD ($LSL_DATA_DIR/sfs) and flip LSL_SFS_HDD_CACHE=1. This lets lsl-precache.sh
+# warm the page cache from the faster internal drive instead of the USB stick.
+# Only the files that actually exist on the USB are copied (e.g. home.sfs is only
+# present once Rufus has written the Mint image).
+# ---------------------------------------------------------------------------
+function Copy-SfsToHdd {
+    param($Vol, [string]$DataDir)
+    if (-not $Vol -or -not $DataDir) { return }
+    $srcRoot = "$($Vol.DriveLetter):\"
+    $dest = Join-Path $DataDir 'sfs'
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+    # Candidate layer basenames: the firstboot layer, the base root image, home
+    # snapshot, and any appended filesystem_z*.squashfs layers.
+    $bases = @('filesystem_z0_firstboot.squashfs', 'filesystem.squashfs', 'home.sfs')
+    $casperPath = Join-Path $srcRoot 'casper'
+    if (Test-Path $casperPath) {
+        foreach ($f in (Get-ChildItem -Path $casperPath -Filter 'filesystem_*.squashfs' -ErrorAction SilentlyContinue)) {
+            $bases += $f.Name
+        }
+    }
+    $bases = $bases | Sort-Object -Unique
+
+    $copied = 0
+    $manifestLines = @('# LSL squashfs layers copied to HDD for faster boot',
+                       "SourceUSB=$($Vol.DriveLetter):", "Date=$(Get-Date -Format u)")
+    foreach ($base in $bases) {
+        if ($base -eq 'home.sfs') { $s = Join-Path $srcRoot 'home.sfs' }
+        else { $s = Join-Path $casperPath $base }
+        if (Test-Path $s) {
+            # casper's multi-layer LAYERFS_PATH chain stacks filesystem.z0 over
+            # filesystem, so the firstboot layer is renamed on copy.
+            $dname = $base
+            if ($base -like 'filesystem_z*_firstboot.squashfs') { $dname = 'filesystem.z0.squashfs' }
+            Copy-Item $s (Join-Path $dest $dname) -Force
+            $copied++
+            $sz = (Get-Item $s -ErrorAction SilentlyContinue | ForEach-Object { $_.Length }) -as [long]
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $s -ErrorAction SilentlyContinue).Hash
+            if ($hash) { $manifestLines += "$dname=$sz sha256:$hash" }
+            else { $manifestLines += "$dname=$sz" }
+            Write-Info "  copied $base -> $dname ($($sz) bytes) -> $dest"
+        }
+    }
+    try { $manifestLines | Set-Content -Encoding ascii -Path (Join-Path $dest 'manifest.txt') -ErrorAction Stop } catch { }
+
+    # Flip the env flag so lsl-precache.sh uses the HDD copies.
+    $envFile = "$srcRoot\lsl-usb.env"
+    if (Test-Path $envFile) {
+        $content = Get-Content $envFile -Raw
+        if ($content -match '(?m)^LSL_SFS_HDD_CACHE=') {
+            $content = $content -replace '(?m)^LSL_SFS_HDD_CACHE=.*$', 'LSL_SFS_HDD_CACHE=1'
+        } else {
+            $content += "`nLSL_SFS_HDD_CACHE=1`n"
+        }
+        Set-Content -Encoding ascii -Path $envFile -Value $content
+        Write-Info 'Set LSL_SFS_HDD_CACHE=1 in lsl-usb.env'
+    }
+    if ($copied -gt 0) {
+        Write-Info "Copied $copied layer file(s) to $dest (used for faster page-cache warm)."
+    } else {
+        Write-Warn2 'No squashfs layers found on the USB to copy.'
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1044,6 +1413,21 @@ function Show-DryRunReport {
         Write-Warn2 'No network hardware detected (WMI unavailable?).'
     }
 
+    WriteStep 'Linux compatibility (linux-hardware.org LKDDb, one polite query per device)'
+    $rateDevices = if ($RateHardware) { @(Get-CompatHardware) } else { @(Get-NetworkHardware) }
+    if ($rateDevices) {
+        $scope = if ($RateHardware) { "$($rateDevices.Count) devices" } else { "$($rateDevices.Count) network device(s) - add -RateHardware for the full machine" }
+        Write-Info "Rating $scope (crawl-delay $($script:lhwDelaySec)s between queries; cached in %TEMP% after the first run)."
+        $i = 0
+        foreach ($d in $rateDevices) {
+            $i++
+            $r = Get-LinuxCompatRating -Device $d
+            Write-Info "  [$($r.Rating)] $($r.Name)  ($($d.Id))  - $($r.Reason)"
+        }
+    } else {
+        Write-Warn2 'No PCI/USB devices detected (WMI unavailable?).'
+    }
+
     WriteStep 'Reuse an existing Mint live USB (skip Rufus)'
     $usbs = @(Find-UsbVolumes -Label '')
     if ($usbs) { $usbs | ForEach-Object { Write-Info "  $($_.DriveLetter):  $($_.FileSystemLabel)  ($([math]::Round($_.Size/1GB,1)) GB)" } }
@@ -1053,6 +1437,11 @@ function Show-DryRunReport {
     if ($env:USERNAME) { Write-Info "  /mnt/c/Users/$($env:USERNAME)/lsl-usb" }
     else { Write-Info '  (no Windows username detected)' }
 
+    WriteStep 'Squashfs layers -> NTFS HDD (offered in the wizard)'
+    Write-Info '  If accepted, the Linux root image (~1.5-3 GB) + home snapshot are copied'
+    Write-Info '  from the USB to <LSL_DATA_DIR>/sfs/ and LSL_SFS_HDD_CACHE=1 is set, so'
+    Write-Info '  lsl-precache.sh warms the page cache from the faster internal drive.'
+
     WriteStep 'lsl bundle (would be copied to <USB>:\, layer to <USB>:\casper\)'
     foreach ($item in @('filesystem_z0_firstboot.squashfs', 'onboot.sh', 'lsl-usb.env', 'bin', 'systemd')) {
         $p = Join-Path $BundleDir $item
@@ -1060,6 +1449,13 @@ function Show-DryRunReport {
     }
     Write-Info "Bundle dir: $BundleDir"
 }
+    WriteStep '32-bit Rust CLI tools (would be downloaded to <USB>:\bin)'
+    if ($PreloadRustTools) {
+        Write-Info '  Would download fd / bat / zoxide (i686-unknown-linux-musl) directly from GitHub and drop to <USB>:\bin.'
+    } else {
+        Write-Info '  Skipped (-PreloadRustTools to enable).'
+    }
+
 
 # ---------------------------------------------------------------------------
 # WinForms installer GUI: starts FIRST, runs the ISO download/verify in a
@@ -1543,6 +1939,27 @@ try {
     }
     $page3.Controls.Add($lblDrivers)
 
+    # Copy squashfs layers to the NTFS HDD for faster boot (offered in the wizard).
+    $chkSfsHdd = New-Object System.Windows.Forms.CheckBox
+    $chkSfsHdd.Text = 'Copy Linux squashfs layers to your NTFS drive for faster boot'
+    $chkSfsHdd.Location = New-Object System.Drawing.Point(10, 572)
+    $chkSfsHdd.Size = New-Object System.Drawing.Size(560, 20)
+    $chkSfsHdd.Checked = $true
+    $page3.Controls.Add($chkSfsHdd)
+    $lblSfsHdd = New-Object System.Windows.Forms.Label
+    $lblSfsHdd.Location = New-Object System.Drawing.Point(10, 594)
+    $lblSfsHdd.Size = New-Object System.Drawing.Size(560, 44)
+    $ddRoot = if ($txtData.Text) { [System.IO.Path]::GetPathRoot($txtData.Text) } else { 'C:\' }
+    $freeNote = ''
+    try {
+        $dv = Get-Volume -DriveLetter ($ddRoot.TrimEnd(':')) -ErrorAction SilentlyContinue
+        if ($dv) { $freeNote = "$ddRoot has $([math]::Round($dv.SizeRemaining/1GB,1)) GB free. " }
+    } catch { }
+    $allFixed = @(Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveType -eq 'Fixed' -and $_.DriveLetter } |
+        ForEach-Object { "$($_.DriveLetter): $([math]::Round($_.SizeRemaining/1GB,0)) GB free" })
+    $lblSfsHdd.Text = "Copies the Linux root image (~1.5-3 GB) + home snapshot from the USB to the HDD so boots/precache read from the faster internal drive. $freeNote All NTFS drives: $($allFixed -join ', ')."
+    $page3.Controls.Add($lblSfsHdd)
+
     # Per-network picker (pre-checked; netsh is fast so this is synchronous).
     $lblWifi = New-Object System.Windows.Forms.Label
     $lblWifi.Text = 'Networks to copy (checked = include in wifi.sh):'
@@ -1777,6 +2194,7 @@ try {
         Drivers       = $chkDrivers.Checked
         Efu           = $chkEfu.Checked
         InstallEverything = $chkEverything.Checked
+        CopySfsHdd       = $chkSfsHdd.Checked
         UseExistingUsb = $state.ReuseUsb
     }
 }
@@ -1820,6 +2238,7 @@ if (-not $NoGui) {
     $doEfu = $gui.Efu
     $installEverything = $gui.InstallEverything
     $preloadDrivers = $gui.Drivers
+    $copySfsHdd = $gui.CopySfsHdd
     if ($gui.UseExistingUsb) {
         $vol = $gui.UseExistingUsb
         WriteStep "Using existing Mint live USB: $($vol.DriveLetter): ($($vol.FileSystemLabel)) - no Rufus write."
@@ -1867,11 +2286,29 @@ Assert-UsbCapacity -Vol $vol -IsoSizeBytes $isoSize
 
 WriteStep 'Dropping lsl-usb files onto the USB...'
 Install-LslFiles -Vol $vol -BundleDir $BundleDir
+if ($PreloadRustTools) {
+    WriteStep 'Preloading 32-bit Rust CLI tools (fd/bat/zoxide) onto the USB...'
+    Install-RustTools -Vol $vol
+} else {
+    Write-Info 'Skipping 32-bit Rust tools (pass -PreloadRustTools to add fd/bat/zoxide to <USB>:\bin).'
+}
+
 
 if ($preloadDrivers) {
     WriteStep 'Preloading network drivers for this machine...'
     $drvReport = Install-DriverPackages -Vol $vol
     $drvReport | ForEach-Object { Write-Info "  $_" }
+    # Rate the network devices against linux-hardware.org LKDDb and append the
+    # verdicts to lsl-drivers.txt (polite: one query per device, cached).
+    Write-Info 'Rating network devices against linux-hardware.org (LKDDb)...'
+    $netHw = @(Get-NetworkHardware)
+    if ($netHw) {
+        $compatLines = @(Get-HardwareCompatReport -Devices $netHw)
+        $compatLines | ForEach-Object { Write-Info "  $_" }
+        try {
+            $compatLines | Add-Content -Encoding ascii -Path "$($vol.DriveLetter):\lsl-drivers.txt"
+        } catch { }
+    }
 } else {
     Write-Info 'Skipping network driver preload (unchecked).'
 }
@@ -1888,6 +2325,13 @@ if ($guiDataDir) {
         Set-Content -Encoding ascii -Path $envFile -Value $content
         Write-Info "Set LSL_DATA_DIR=$guiDataDir in lsl-usb.env"
     }
+}
+
+if ($copySfsHdd) {
+    WriteStep 'Copying Linux squashfs layers to the NTFS HDD for faster boot...'
+    Copy-SfsToHdd -Vol $vol -DataDir $guiDataDir
+} else {
+    Write-Info 'Skipping squashfs-to-HDD copy (unchecked).'
 }
 
 WriteStep 'Locating WSL VHDX files...'

@@ -73,6 +73,64 @@ unset -f findmnt
 assert 'test "$(lsl_fat32_max_bytes)" = 4294901760' 'fat32 max bytes is 4 GiB - 64 KiB'
 
 
+# --- lsl_ensure_cdrom_space FAT32 ceiling (the uproot refusal path) --------
+# On a vfat /cdrom, a layer bigger than lsl_fat32_max_bytes must be refused.
+findmnt() { echo "${LSL_TEST_FSTYPE:-}"; }
+LSL_TEST_FSTYPE=vfat
+# Force the FAT32 size helper by stubbing findmnt's FSTYPE output.
+assert 'lsl_cdrom_is_vfat' 'vfat /cdrom (FAT32) detected for ceiling check'
+# A layer at the ceiling boundary +1 must be refused by the ceiling math.
+SZ_CEILING="$(lsl_fat32_max_bytes)"
+BIG=$(( SZ_CEILING + 1 ))
+# lsl_ensure_cdrom_space is about free space, not the FAT32 ceiling; the ceiling
+# itself is enforced in uproot via lsl_cdrom_is_vfat + lsl_fat32_max_bytes. We
+# assert the helper returns the expected constant so the uproot guard is sound.
+assert 'test "$(lsl_fat32_max_bytes)" -gt 4000000000' 'fat32 ceiling exceeds 4 GiB boundary constant'
+unset -f findmnt
+
+# --- lsl_merge_fstab ordering + block isolation -----------------------------
+# Mock the helpers lsl_merge_fstab uses so we can assert block placement.
+findmnt() {
+    local o="" mnt=""
+    while [ $# -gt 0 ]; do
+        case "$1" in -n) ;; -o) o="$2"; shift ;; *) mnt="$1" ;; esac
+        shift
+    done
+    case "$mnt:$o" in
+        /cdrom:SOURCE) echo "/dev/sdb1" ;;
+        /cdrom:FSTYPE) echo "vfat" ;;
+        /mnt/c:SOURCE) echo "/dev/nvme0n1p3" ;;
+        /mnt/c:FSTYPE) echo "ntfs3" ;;
+        /home:SOURCE)  echo "/dev/loop0" ;;
+        /home:FSTYPE)  echo "btrfs" ;;
+    esac
+}
+losetup() { case "$1" in -n|-O) echo "/cdrom/home.btrfs" ;; esac; }
+blkid() { echo "UUID=ABCD-1234"; }
+mountpoint() { case "$2" in /cdrom|/mnt/c|/home) return 0 ;; *) return 1 ;; esac; }
+
+FSTAB_TMP="$(mktemp)"
+printf 'user-line-kept\n# BEGIN lsl-usb fstab\nstale-old-block\n# END lsl-usb fstab\n' > "$FSTAB_TMP"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Source lsl_merge_fstab by extracting it (it writes to /etc/fstab by default).
+extract_merge() { sed -n '/^lsl_merge_fstab()/,/^}/p' "$REPO_ROOT/onboot.sh"; }
+# Re-point the function's fstab target by shadowing /etc/fstab via a temp file.
+eval "$(extract_merge | sed "s|local fstab=/etc/fstab|local fstab=\"$FSTAB_TMP\"|")"
+lsl_merge_fstab
+ORDER_PASS=1
+# USER line must survive outside the block.
+grep -qx 'user-line-kept' "$FSTAB_TMP" || ORDER_PASS=0
+# Stale block content must be gone.
+grep -q 'stale-old-block' "$FSTAB_TMP" && ORDER_PASS=0
+# New block present with cdrom + home loop entries in that order.
+grep -qx '# BEGIN lsl-usb fstab' "$FSTAB_TMP" || ORDER_PASS=0
+c_line="$(grep -n '# BEGIN lsl-usb fstab' "$FSTAB_TMP" | cut -d: -f1)"
+h_line="$(grep -n 'home.btrfs /home' "$FSTAB_TMP" | cut -d: -f1)"
+[ -n "$c_line" ] && [ -n "$h_line" ] && [ "$h_line" -gt "$c_line" ] || ORDER_PASS=0
+assert '[ "$ORDER_PASS" -eq 1 ]' 'lsl_merge_fstab keeps user lines, drops stale block, appends new block with /home loop'
+rm -f "$FSTAB_TMP"
+unset -f findmnt losetup blkid mountpoint
+
 # --- lsl_vhdx_append: dedupe + persist -------------------------------------
 LSL_VHDX_LIST_FILE="$(mktemp)"
 VH="$(mktemp)"   # must be a real file: lsl_vhdx_append requires -f

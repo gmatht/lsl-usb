@@ -85,6 +85,27 @@ try_grow() {
         fi
     fi
 
+    # Re-check: did the usable space actually increase? On kernels that silently
+    # ignore losetup -c AND with a busy mount, the resize cannot take effect
+    # online. Report that clearly and leave a persistent marker so the user
+    # knows a reboot (or unmount) is the only fix.
+    after_fp="$(free_pct "$mp")" || after_fp=""
+    case "$after_fp" in
+        ''|*[!0-9]*) after_fp="$fp" ;;
+    esac
+    if [ "$after_fp" -le "$MIN_PCT" ]; then
+        echo "lsl-btrfs-growd: WARNING: ${label} still at ${after_fp}% after grow attempt." >&2
+        echo "lsl-btrfs-growd:   online growth is not supported by this kernel while ${label} is busy." >&2
+        echo "lsl-btrfs-growd:   reboot (or unmount ${label}) to apply the grown backing file." >&2
+        # Persistent note so it survives the session and is visible on next boot.
+        local datadir
+        datadir="$(lsl_resolve_data_dir 2>/dev/null || true)"
+        if [ -n "$datadir" ] && [ -d "$datadir" ]; then
+            echo "$(date -Iseconds) ${label}: online grow attempted but kernel did not apply (busy loop device); reboot to apply." \
+                >> "$datadir/lsl-btrfs-grow.log" 2>/dev/null || true
+        fi
+    fi
+
     df -h "$mp" 2>/dev/null || true
 }
 
@@ -95,5 +116,5 @@ while true; do
     fi
     try_grow /home "$(lsl_home_btrfs_path)" home
     try_grow "${LSL_CACHE_MOUNT:-/mnt/lsl-cache}" "$(lsl_cache_btrfs_path)" cache
-    sleep 60
+    sleep "${LSL_BTRFS_GROW_INTERVAL_SEC:-60}"
 done

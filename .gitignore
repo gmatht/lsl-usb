@@ -1,0 +1,7 @@
+# Build artifacts
+dist/
+# Rust cross-compile working trees (clones + target dirs)
+tools/rusttools-build/
+tmp/
+.pir/
+*.swp

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=lsl-usb boot time
+Comment=Records desktop-ready time and precache probe for lsl-boot-time
+Exec=/bin/bash /cdrom/bin/lsl-boot-time.sh --desktop
+Terminal=false
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,16 @@
+[Unit]
+Description=Warm page cache with files used at startup (USB live boot)
+# /cdrom and the squashfs overlay are available from the initramfs onward;
+# start early, in parallel with the desktop, but as a background nicety.
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /cdrom/bin/lsl-precache.sh
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=600
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Stamp boot start time for lsl-boot-time
+DefaultDependencies=no
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /cdrom/bin/lsl-boot-time.sh --mark
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

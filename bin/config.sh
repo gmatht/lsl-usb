@@ -141,6 +141,52 @@ EOF
 }
 
 
+install_lsl_kitty_conf() {
+    # Ship a Windows-Terminal-like kitty config so the default terminal matches
+    # what users expect from Windows. Installed into the desktop user's config.
+    local mint_home kitty_dir
+    if [[ -n "$CFG_ROOT" ]]; then
+        mint_home="${CFG_ROOT}/home/$LSL_DESKTOP_USER"
+    else
+        mint_home="/home/$LSL_DESKTOP_USER"
+    fi
+    [[ -d "$mint_home" ]] || return 0
+    kitty_dir="$mint_home/.config/kitty"
+    mkdir -p "$kitty_dir"
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config" "$kitty_dir" 2>/dev/null || true
+    cp -a --no-preserve=ownership "$REPO_ROOT/misc/kitty.conf" "$kitty_dir/kitty.conf"
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$kitty_dir/kitty.conf" 2>/dev/null || true
+}
+
+install_lsl_wezterm_autostart() {
+    # Pin WezTerm to the desktop/panel and add it to autostart so the terminal
+    # opens on first login (mirrors the Windows Terminal expectation). The actual
+    # favorites pinning is done by bin/lsl-pin-favorites; here we just ensure the
+    # WezTerm autostart entry exists for the desktop user.
+    local mint_home
+    if [[ -n "$CFG_ROOT" ]]; then
+        mint_home="${CFG_ROOT}/home/$LSL_DESKTOP_USER"
+    else
+        mint_home="/home/$LSL_DESKTOP_USER"
+    fi
+    [[ -d "$mint_home" ]] || return 0
+    mkdir -p "$mint_home/.config/autostart"
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config" "$mint_home/.config/autostart" 2>/dev/null || true
+
+    cat <<'EOF' >"$mint_home/.config/autostart/lsl-wezterm.desktop"
+[Desktop Entry]
+Type=Application
+Name=LSL WezTerm
+Comment=Open a terminal on first login (Windows-Terminal-like)
+Exec=/cdrom/bin/lsl-pin-favorites
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+EOF
+    chmod +x "$mint_home/.config/autostart/lsl-wezterm.desktop"
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config/autostart/lsl-wezterm.desktop"
+}
+
 install_lsl_pin_favorites_autostart() {
     local mint_home
     if [[ -n "$CFG_ROOT" ]]; then
@@ -198,7 +244,7 @@ install_systemd_units() {
     fi
     shopt -s nullglob
     local f found=0
-    for f in "$REPO_ROOT/systemd/"*.service; do
+    for f in "$REPO_ROOT/systemd/"*.service "$REPO_ROOT/systemd/"*.timer; do
         cp -a "$f" "$sysdir/"
         found=1
     done
@@ -215,7 +261,7 @@ install_systemd_units() {
         chroot "$CFG_ROOT" systemctl enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service
     elif [[ "$(id -u)" -eq 0 ]]; then
         systemctl daemon-reload
-        systemctl enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service
+        systemctl enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service lsl-win-backup.timer
     else
         echo "config.sh: systemd install skipped (need root or LSL_CONFIG_ROOT + chroot)" >&2
     fi
@@ -232,5 +278,6 @@ if [[ "$SKIP_AUTOSTART_WARN" -eq 0 ]]; then
     install_lsl_autostart_warning
     install_lsl_wezterm_autostart
     install_lsl_pin_favorites_autostart
+    install_lsl_kitty_conf
 fi
 install_systemd_units

@@ -19,9 +19,26 @@
 #   LSL_TORAM_TEST=1  stop after the RAM copy (no pivot) - dry run.
 set -euo pipefail
 
-[ "$EUID" -eq 0 ] || { echo "Please run as root." >&2; exit 1; }
 [ -e /run/lsl-toram.done ] && { echo "Session is already running from RAM."; exit 0; }
 mountpoint -q /cdrom || { echo "/cdrom is not mounted; this does not look like a live session." >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || { echo "Please run as root." >&2; exit 1; }
+
+# Refuse to pivot while a persistence write is in flight: uphome/uproot/flush hold
+# open files in the old root and would be left in an inconsistent state by the
+# pivot (and their writes would be lost). Let the in-flight job finish first.
+for pf in /run/lsl-home-flush.pid /run/lsl-uproot.pid /run/lsl-flush-home.pid; do
+    if [ -f "$pf" ] && kill -0 "$(cat "$pf" 2>/dev/null)" 2>/dev/null; then
+        echo "ERROR: a persistence write is in progress ($pf); wait for it to finish before toram." >&2
+        exit 1
+    fi
+done
+# Also refuse if any LSL persistence unit is actively running.
+for u in lsl-home-flushd.service lsl-btrfs-growd.service; do
+    if systemctl is-active --quiet "$u" 2>/dev/null; then
+        echo "ERROR: $u is active; stop it (or wait for it to finish) before pivoting to RAM." >&2
+        exit 1
+    fi
+done
 
 NEW=/lsl-toram-root
 OLD=/lsl-toram-old

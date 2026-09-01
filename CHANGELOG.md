@@ -23,7 +23,7 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   `fat_linux_meta_fs` FUSE layer.
 - First-boot recipe: apt tools, snap unpin (`LSL_SNAP_SUPPORT`), flatpak refs,
   nvim AppImage (ELF-verified), rust tools, AppImages.
-- Test harness (PowerShell, 20 tests) + bats (16 tests) + CI + release workflow.
+- Test harness (PowerShell, ~55 assertions) + bats (~77 tests) + CI + release workflow.
 - `VALIDATION.md` (real-hardware checklist), `VERSION`, `CHANGELOG.md`.
 
 ### Changed

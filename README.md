@@ -104,7 +104,77 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -DryRun
 - Config-driven persistence with USB mode and HDD mode.
 - Background daemons for home flush (`lsl-home-flushd`) and btrfs growth (`lsl-btrfs-growd`).
 - WezTerm autostart and desktop integration helpers.
+- **Network driver preload**: the Windows installer detects this PC's wifi/ethernet
+  chipsets (PnP hardware IDs) and stages out-of-tree drivers (Realtek RTL8821CE /
+  RTL8723DE / RTL88x2BU / RTL8812AU / RTL8814AU / RTL8188EU / RTL8723BU, Broadcom
+  BCM43xx) to `<USB>\drivers\`; first boot builds and installs them via DKMS so
+  wifi works on every later boot.
+- **Linux compatibility rating**: the installer rates every detected device
+  (wifi/ethernet/GPU/NVMe/bluetooth/audio/webcam/…) against the Linux kernel the
+  ISO ships, using linux-hardware.org LKDDb data, and prints an A–D rating in the
+  DryRun report. A bundled snapshot of the 500 most common devices
+  (`lsl-hw-cache/`, consumer-form-factor-tuned) means the rating needs **no network
+  request at all** for common
+  hardware — see [Hardware compatibility rating](#hardware-compatibility-rating-linux-hardwareorg-lkddb).
 - Does not modify Windows bootloader or partition table layout.
+- **Daily Windows-folder backups to squashfs.** `bin/lsl-win-backup.sh` backs
+  selected Windows folders (on mounted NTFS) into squashfs images with per-job
+  include/exclude POSIX-ERE regexes, a space *estimate* (learned ratio or quick
+  sample), and a daily incremental that captures files changed in the last ~24h
+  (a chaining window so nothing is missed between runs). A systemd timer runs it
+  daily; see [Backups and speed-ups](#backups-and-speed-ups).
+- **Copy the squashfs layers to the NTFS HDD for speed.** The installer wizard
+  (and `bin/lsl-copy-sfs-hdd.sh`) can copy the Linux root layers + home snapshot
+  from the USB to the internal HDD; `lsl-precache.sh` then warms the page cache
+  from the faster drive. See
+  [Backups and speed-ups](#backups-and-speed-ups).
+
+## Hardware compatibility rating (linux-hardware.org LKDDb)
+
+The Windows installer reports how well your hardware will work on the Mint 22.x
+ISO's kernel. It enumerates PnP devices (network, display, multimedia, Bluetooth,
+…), and for each one queries the [linux-hardware.org](https://linux-hardware.org)
+LKDDb (Linux Kernel Driver Database) to learn the minimum kernel that supports
+it, then compares against the ISO kernel (6.8). Ratings:
+
+- **A** – in-kernel since before the ISO kernel → works out of the box.
+- **C** – needs a newer kernel than the ISO ships (or a known-problem chip with a
+  staged out-of-tree driver) → action noted / driver preloaded.
+- **D** – the only LKDDb match is a bus bridge / Bluetooth entry, not a real
+  driver for this function.
+- **U** – no LKDDb data (e.g. newest GPU/NVMe) or the site was unreachable.
+
+### Bundled offline cache (`lsl-hw-cache/`)
+
+To avoid a network request (and the upstream rate-limiting) for every device,
+the bundle ships a snapshot of the **500 most common** devices' LKDDb pages in
+`lsl-hw-cache/lsl-lhw-<type>-<vid>-<did>.html` (a hand-curated set plus the top-50
+most frequent PCI devices per functional class — storage, network, display,
+multimedia, USB — and the next-most-common consumer devices, all derived
+data-driven from the
+[bsdhw/PCIconf](https://github.com/bsdhw/PCIconf) corpus of 14k+ real machine
+`pciconf` dumps, **tuned to consumer form factors** — Notebook/Desktop/Convertible/
+Tablet/All-In-One/Mini-PC, excluding Server/Firewall/SoC). At rating time the installer
+checks, in order: the per-user `%TEMP%` cache → **the bundled cache** → a live
+(polite, Crawl-delay-respecting) fetch. So a typical PC rates instantly and
+offline.
+
+- **Source / attribution:** pages are from [linux-hardware.org](https://linux-hardware.org),
+  which republishes the LKDDb under an open license; the device/driver facts are
+derived from the upstream Linux kernel. The device-ID list in `tools/hw-cache-ids.txt`
+  is a hand-curated set **augmented with PCIconf-derived devices** (top-50 per
+  functional class plus the next-most-common consumer devices), derived from the
+  [bsdhw/PCIconf](https://github.com/bsdhw/PCIconf)
+  corpus of real-world `pciconf` dumps, **restricted to consumer form factors**
+  (CC-licensed — attribution to bsdhw). Regenerate
+  with `tools/build-hw-cache.ps1`.
+- **Refresh / rebuild:** `pwsh tools/build-hw-cache.ps1` re-fetches any missing
+  pages (idempotent; respects `robots.txt` Crawl-delay and backs off on HTTP 429).
+  The device ID list lives in `tools/hw-cache-ids.txt`. The build date is recorded
+  by the commit that last updated `lsl-hw-cache/`.
+- **TODO:** stand up a local mirror (e.g. `www.easyp.net`) of the LKDDb pages so
+the bundle can ship a complete, always-fresh cache with no dependence on the
+  upstream rate limiter — see `TODO.md`.
 
 ## Configuration reference (`/cdrom/lsl-usb.env`)
 
@@ -126,10 +196,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -DryRun
   - Free-space threshold for auto-grow behavior.
 - `LSL_BTRFS_GROW_CHUNK_MIB` (default: `1024`)
   - Growth chunk size used by `lsl-btrfs-growd`.
+- `LSL_BTRFS_GROW_INTERVAL_SEC` (default: `60`)
+  - How often `lsl-btrfs-growd` polls free space (lower this on embedded/low-RAM boxes).
 - `LSL_ZRAM_MIB` (default: unset -> about 80% of RAM, min 128 MiB)
   - Set to `0` to disable zram swap.
 - `LSL_NTFSFIX` (default: `0`)
   - Set to `1` to let `mount_all.sh` run `safe_ntfsfix.sh` on the most-recently-booted Windows partition at boot. Off by default: the repair script is not yet battle-tested.
+- `LSL_BACKUP_DIR` (default: `<LSL_DATA_DIR>/backups`)
+  - Where `lsl-win-backup.sh` writes the squashfs images and its `.state` files.
+- `LSL_BACKUP_CONF` (default: `<LSL_BACKUP_DIR>/backup.conf`)
+  - The backup job file (see [Backups and speed-ups](#backups-and-speed-ups)).
+- `LSL_BACKUP_WINDOW_HOURS` (default: `24.1`)
+  - The capture window for the first/incremental run when there is no previous
+    run timestamp (slightly > 24h so daily cron jitter never skips a file).
+- `LSL_BACKUP_INCR_SLACK_SEC` (default: `600`)
+  - Overlap subtracted from the previous run's timestamp for each incremental run.
+- `LSL_BACKUP_KEEP` (default: `7`)
+  - Number of squashfs images retained per job before pruning the oldest.
+- `LSL_SFS_HDD_CACHE` (default: `0`)
+  - Set to `1` (by the installer wizard or `lsl-copy-sfs-hdd.sh --use`) so
+    `lsl-precache.sh` warms the page cache from the HDD copy of the layers.
 
 ## Persistence model
 
@@ -178,7 +264,29 @@ Mode is selected from resolved `LSL_DATA_DIR`:
 - Revert root: replace `/cdrom/casper/filesystem.squashfs` with one backup `filesystem_*.squashfs`.
 - If you appended a layer (`filesystem_z*.squashfs`), move it out of `/cdrom/casper` to disable it on next boot.
 
-## Safety notes (read this before writing NTFS/USB)
+## Known limitations
+
+- **Wi‑Fi secrets are plaintext on FAT** (`/cdrom/wifi.sh`). This is inherent:
+  the live boot needs the passphrase with no interactive unlock. On HDD mode the
+  secret can live in the encrypted `home.btrfs`; on USB/ FAT mode it stays
+  readable by anyone with the stick. Uncheck "Copy Wifi Settings to LSL" (or
+  delete `/cdrom/wifi.sh`) to avoid it; open networks need no secret and are
+  safe to auto-connect. This is a deliberate design tradeoff, not a bug — any
+  key material stored beside the boot files would be equally readable.
+- **Out‑of‑tree drivers and Secure Boot.** First boot installs DKMS drivers
+  (Realtek/Broadcom) that are *not* signed by the kernel key, so under Secure
+  Boot they will not load unless a MOK is enrolled (or Secure Boot is off). Plan
+  accordingly (see the Secure Boot section above).
+- **Online btrfs growth is kernel‑limited.** `lsl-btrfs-growd` grows the backing
+  file and refreshes the loop device, but some kernels silently ignore
+  `losetup -c` while `/home` (or the cache) is busy; the new space then only
+  applies after a reboot (or an unmount). The daemon logs this to
+  `<LSL_DATA_DIR>/lsl-btrfs-grow.log` rather than failing silently.
+- **`lsl-toram.sh` removes the USB.** After the pivot, persistence writes
+  (uphome / uproot / lsl-home-flushd) are unavailable until the stick is
+  re‑inserted; a concurrent persistence write is now refused for safety.
+
+
 
 - **`wifi.sh` stores wifi passwords in plaintext** on the FAT partition (`/cdrom/wifi.sh`). This is inherent to the design - the live system needs them at boot to connect - but anyone with access to the USB can read them. Uncheck "Copy Wifi Settings to LSL" in the installer (or delete `/cdrom/wifi.sh`) if that is a concern.
 - **Preloaded `.snap` files install with `--dangerous`** (no store signature check) - only preload snaps you trust. The first-boot recipe unpins Mint's `nosnap.pref` and installs `snapd` by default (`LSL_SNAP_SUPPORT=0` to keep Mint's default).
@@ -234,7 +342,7 @@ Recommendation: **>= 4 GB RAM for first boot**.
 
 - `fetch.sh`: one-liner installer entrypoint (Linux live session).
 - `install.sh`: image customization and initial setup (Linux live session).
-- `install.ps1` + `install.bat`: Windows installer with a WinForms wizard (ISO selection with Everything discovery, flatpak app preload detected from installed Windows apps, WSL VHDX paths, `LSL_DATA_DIR`, per-network wifi picker, reuse-an-existing-USB). Auto-downloads the Mint 22.x ISO (incremental SHA-256 verify with progress + ETA) and Rufus (Authenticode-verified), writes the USB, drops the lsl layer + config, and generates `wifi.sh` from Windows' saved profiles (netsh). Supports Ubuntu 24.04 based ISOs (Mint 22.x, Zorin 18.x - the live-session user is detected dynamically, not hardcoded to `mint`); refuses Ubuntu 26.04+ (it still uses NetworkManager, but its nmcli is broken, so the nmcli-based tooling breaks). `-NoGui` for the console flow; `-DryRun` for a detection report; `-SkipRufus` to write the image yourself and have the script pick up the USB.
+- `install.ps1` + `install.bat`: Windows installer with a WinForms wizard (ISO selection with Everything discovery, flatpak app preload detected from installed Windows apps, WSL VHDX paths, `LSL_DATA_DIR`, per-network wifi picker, network-driver preload, reuse-an-existing-USB). Auto-downloads the Mint 22.x ISO (incremental SHA-256 verify with progress + ETA) and Rufus (Authenticode-verified), writes the USB, drops the lsl layer + config, generates `wifi.sh` from Windows' saved profiles (netsh), and stages out-of-tree network drivers for this PC's chipsets to `<USB>\drivers\` (`.deb` from the Ubuntu archive, or DKMS source tarballs from GitHub - built at first boot). It also rates every detected device against the ISO kernel using linux-hardware.org LKDDb, served from the bundled `lsl-hw-cache/` so no network is needed for common hardware. Supports Ubuntu 24.04 based ISOs (Mint 22.x, Zorin 18.x - the live-session user is detected dynamically, not hardcoded to `mint`); refuses Ubuntu 26.04+ (it still uses NetworkManager, but its nmcli is broken, so the nmcli-based tooling breaks). `-NoGui` for the console flow; `-DryRun` for a detection report; `-SkipRufus` to write the image yourself and have the script pick up the USB; `-RateHardware` to rate all detected hardware (not just network).
 - `build.sh`: builds the Windows installer bundle (`dist/lsl-usb-win.zip`) - a ~4 KB `filesystem_z0_firstboot.squashfs` layer (systemd unit + scripts only, no distro binaries) plus the FAT-side file set. Runs three gates before packaging: the `install.ps1` test suite (pwsh), `shellcheck -S error` on all shell scripts, and a bundle preflight (layer contents, unit `ExecStart` paths, zip entries).
 - `misc/lsl-firstboot.sh` + `misc/lsl-firstboot.service`: run once on the first boot of a Windows-installed USB - waits for network, runs `uproot --auto-append` (installs `/cdrom/bin/squashfs_config.sh` packages in a chroot overlay and persists a new layer), stamps `/cdrom/casper/lsl-firstboot.done`, then reboots. The recipe also removes Mint's `nosnap.pref` pin and installs `snapd` by default (disable with `LSL_SNAP_SUPPORT=0`) so snaps - including any `.snap` files the Windows installer preloads to `<USB>\snaps\` - can be installed.
 - `misc/lsl-firstboot-progress.sh` + `.desktop`: user-session zenity progress dialog fed by `/run/lsl-firstboot-status` while the first-boot setup runs (the desktop is not blocked; the work is `nice`d/`ionice`d).
@@ -249,6 +357,7 @@ Recommendation: **>= 4 GB RAM for first boot**.
 - `bin/lsl-boot-time.sh` + `systemd/lsl-boot-stamp.service` + `misc/lsl-boot-time.desktop`: measure boot-to-desktop time and a precache workload probe per boot, logged to `/cdrom/casper/boot-times.log` for comparison.
 - `bin/lsl-rusttools.sh` + `bin/rusttools.list`: install statically-linked CLI tools (ripgrep, fd, bat, eza, zoxide, delta, lazygit, starship, just, ...) to `/cdrom/bin` (on PATH) - musl-static, no runtime deps, persist on the FAT partition.
 - `bin/lsl-appimages.sh` + `bin/appimages.list`: download curated AppImages (RustDesk, KeePassXC, FreeCAD, Joplin, ...) to `/cdrom/appimages` via GitHub latest-release resolution, with a URL cache so the API is only hit once per app.
+- `tools/hw-cache-ids.txt` + `tools/build-hw-cache.ps1` + `tools/pciconf-top50.py`: the device-ID list (500 common PCI/USB devices: a hand-curated set plus PCIconf-derived devices — top-50 per functional class and the next-most-common consumer devices, tuned to consumer form factors), the polite one-time fetcher that builds `lsl-hw-cache/` (shipped in the bundle so the compatibility rating needs no network for common hardware), and the parser that derives the PCIconf sections from a clone of the corpus.
 - `tests/install.ps1.tests.ps1`: mock-based test harness for `install.ps1` (mocks Get-Volume/registry/es.exe/netsh/WebClient) - run with `pwsh -File tests/install.ps1.tests.ps1`.
 
 ## File search
@@ -265,6 +374,95 @@ Recommendation: **>= 4 GB RAM for first boot**.
   interactive fuzzy search; `plocate` indexes the live system's own files
   (`sudo apt install plocate && sudo updatedb`).
 
+## Backups and speed-ups
+
+### Backing up Windows folders to squashfs (daily)
+
+`bin/lsl-win-backup.sh` backs up selected Windows folders (mounted under
+`/mnt/c/...`) into squashfs images. Each *job* in `<LSL_BACKUP_DIR>/backup.conf`
+specifies a source folder, optional include/exclude POSIX-ERE regexes (matched
+against each file's path **relative to the source**), and a mode:
+
+```bash
+job Documents
+source /mnt/c/Users/you/Documents
+include \.txt$
+include \.md$
+exclude node_modules
+exclude \.tmp$
+mode both            # full | incremental | both
+```
+
+- `lsl-win-backup.sh --estimate` reports, per job, the file count, raw size, and
+  an **estimated** squashfs size (from the ratio learned on the previous run, a
+  quick sample compression, or a fallback factor), plus free space on the target.
+- `lsl-win-backup.sh --run` writes `<job>_<timestamp>_full.squashfs` and/or
+  `<job>_<timestamp>_incr.squashfs`. The incremental captures files modified
+  since the previous run (minus `LSL_BACKUP_INCR_SLACK_SEC` of overlap), so a
+  daily run never misses a file even with scheduling drift; the first run falls
+  back to the `LSL_BACKUP_WINDOW_HOURS` (24.1h) window from now.
+- `lsl-win-backup.sh --add-folder` interactively adds a job.
+- A systemd timer runs it daily: `lsl-win-backup.sh --install-timer` (also enabled
+  automatically by `config.sh`, where it is a no-op until jobs exist).
+
+### Copying the squashfs layers to the NTFS HDD for speed
+
+The Linux root layers (`/cdrom/casper/filesystem*.squashfs`) and `home.sfs` are
+read from the USB by casper at boot. To speed up *post-boot* reads and reduce USB
+wear, copy those layers to the internal HDD:
+
+- The Windows installer wizard offers this on the config page (showing free space
+  on the HDD(s)) and, if accepted, copies the layers into
+  `<LSL_DATA_DIR>/sfs/` and sets `LSL_SFS_HDD_CACHE=1`.
+- From Linux, `bin/lsl-copy-sfs-hdd.sh` is the ad-hoc counterpart: `--yes` copies
+  (with a manifest + size/sha verify), `--status` shows which copies are current
+  vs the USB, `--verify` re-checks them, and `--use`/`--no-use` toggle the flag.
+- When `LSL_SFS_HDD_CACHE=1`, `lsl-precache.sh` warms the page cache from the
+  HDD copies instead of the USB (and the copy is the source for `toram`).
+
+**Boot-from-HDD auto-detect.** The initrd carries a mirror hook (built into
+`casper/initrd.lz` by `build.sh`) that, at boot, scans local block devices, mounts
+exactly one read-only (NTFS via the initrd's `ntfs-3g`, else native), and looks for
+a `*/sfs/manifest.txt` carrying the LSL beacon. If every recorded layer is present
+with the expected size (+ sha256 when recorded) it redirects the live root to that
+mirror. Two hook implementations share the same scan/verify/mirror layout:
+
+- **casper (Mint/Ubuntu):** `initramfs/lsl_hdd_mirror.sh` is a casper-premount
+  hook that sets casper's `LAYERFS_PATH` to the multi-layer entry
+  (`filesystem.z0.squashfs`, which casper stacks over `filesystem.squashfs`).
+- **live-boot (Debian):** `initramfs/lsl_liveboot_mirror.sh` is a live-premount
+  hook that exports `LIVE_MEDIA_PATH=sfs`, so live-boot's *own* `find_livefs`
+  scanner discovers `sfs/*.squashfs` on the internal disk and assembles the root
+  from it. No patching of live-boot internals is required.
+- **antiX (32-bit x86):** `initramfs/lsl_antix_mirror.sh` is sourced by antiX's
+  monolithic live-init just before `find_linuxfs_file`; it exports
+  `SQFILE_FILE=sfs/filesystem.squashfs` and `FROM_BOOT=hd,usb` so antiX's own
+  scanner adopts the mirror. (antiX only scans `usb,cd` by default, so the
+  internal HDD must be explicitly enabled via `FROM_BOOT`.) This reuses the same
+  `sfs/` mirror layout - antiX honours `SQFILE_FILE` pointing anywhere, so no
+  duplicate `linuxfs` copy is needed.
+
+In both cases `/cdrom` (bin/, onboot.sh, lsl-usb.env) stays on the USB, the hook
+never panics and never changes the root, and if anything is missing or fails
+verification it does nothing - casper/live-boot simply fall back to the USB
+(which just boots a little slower). The **same mirror layout** (`sfs/filesystem.squashfs`
++ `sfs/filesystem.z0.squashfs` + `sfs/manifest.txt`) serves both frameworks, and a
+cmdline flag `lsl_no_hdd_mirror` disables the hook entirely. The hook is
+POSIX-`sh` and architecture-agnostic. The casper and live-boot variants run
+unchanged on a 32-bit (i386) Debian live image; the antiX variant is itself a
+32-bit live-init fork and is validated under `qemu-system-i386`. (antiX ships a
+*different* live-init fork that uses `linuxfs` and its own `sq=`/`from=` levers
+rather than `filesystem.squashfs`/`LIVE_MEDIA_PATH`, so it needs its own hook -
+now implemented; it still shares the same `sfs/` mirror layout.)
+
+**Safe initrd.** `build.sh` also preserves the original initrd as
+`casper/initrd.safe.lz`, and `install.ps1` adds a "(safe)" boot-menu entry that
+uses it (no mirror, pure USB) - so a suspect mirror can never brick the boot.
+
+See `tests/qemu-hdd-mirror-test.sh` (casper/Mint) and
+`tests/qemu-hdd-mirror-liveboot-test.sh` (live-boot/Debian) for end-to-end KVM boot
+tests that build a USB image + an HDD mirror and assert the hook adopts it.
+
 ## Testing
 
 ```bash
@@ -273,6 +471,18 @@ pwsh -NoProfile -File tests/install.ps1.tests.ps1
 
 # Bash regression tests (bats)
 bats tests/bash.tests.bats
+
+# End-to-end KVM boot test: builds a USB image + an HDD mirror and asserts the
+# auto-detect hook adopts the mirror (needs a Mint/Ubuntu ISO + /dev/kvm).
+bash tests/qemu-hdd-mirror-test.sh /path/to/linuxmint.iso
+
+# End-to-end KVM boot test for live-boot/Debian (mirror adoption + safe fallback).
+# Needs a Debian live-boot ISO (e.g. debian-live-*-amd64-xfce.iso) + /dev/kvm.
+bash tests/qemu-hdd-mirror-liveboot-test.sh /path/to/debian-live.iso
+
+# End-to-end KVM boot test for antiX (32-bit x86) live-init + the HDD mirror
+# (adopt + lsl_no_hdd_mirror fallback). Needs an antiX ISO + /dev/kvm.
+bash tests/qemu-hdd-mirror-antix-test.sh /path/to/antiX-*-386-full.iso
 ```
 
 CI (`.github/workflows/ci.yml`) runs both, plus shellcheck and `build.sh`, on every

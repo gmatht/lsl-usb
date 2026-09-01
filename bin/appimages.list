@@ -1,0 +1,19 @@
+# Curated AppImages for lsl-usb (bin/lsl-appimages.sh).
+# Format: name<TAB>type<TAB>source<TAB>asset-substring
+#   type=github: source = owner/repo; the latest release's first .appimage
+#                asset whose name contains the substring is downloaded.
+#   type=url:    source = direct URL (substring unused).
+# All entries verified to resolve via the GitHub API (2026-08).
+rustdesk	github	rustdesk/rustdesk	x86_64
+keepassxc	github	keepassxreboot/keepassxc	x86_64
+freecad	github	FreeCAD/FreeCAD	x86_64
+standardnotes	github	standardnotes/app	x86_64
+logseq	github	logseq/logseq	x86_64
+heroic	github	Heroic-Games-Launcher/HeroicGamesLauncher	x86_64
+protonup-qt	github	DavidoTek/ProtonUp-Qt	x86_64
+openra	github	OpenRA/OpenRA	x86_64
+onlyoffice	github	ONLYOFFICE/DesktopEditors	x86_64
+joplin	github	laurent22/joplin	AppImage
+audacity	github	audacity/audacity	x64
+anytype	github	anyproto/anytype-ts	AppImage
+pcsx2	github	PCSX2/pcsx2	x64

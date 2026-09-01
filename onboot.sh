@@ -336,13 +336,18 @@ if lsl_is_usb_mode || [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
             sz="$(du -sm /home 2>/dev/null | awk '{print $1}')"; sz="${sz:-0}"
             need_mib="$(( sz + 64 ))"
             if lsl_ensure_cdrom_space "$need_mib"; then
-                mksquashfs /home /cdrom/home.sfs -comp zstd >/dev/null 2>&1 || \
-                    echo "WARNING: could not create /cdrom/home.sfs - /home will not persist." >&2
+                if mksquashfs /home /cdrom/home.sfs -comp zstd >/dev/null 2>&1; then
+                    echo "Created /cdrom/home.sfs ($(du -h /cdrom/home.sfs 2>/dev/null | cut -f1))."
+                else
+                    echo "ERROR: mksquashfs failed while creating /cdrom/home.sfs - /home will NOT persist." >&2
+                    echo "       Check that /cdrom is writable and has ~${need_mib} MiB free; reboot and retry." >&2
+                fi
             else
-                echo "WARNING: only $(lsl_cdrom_free_mib) MiB free on /cdrom; need ~${need_mib} MiB - /home.sfs not created." >&2
+                echo "ERROR: only $(lsl_cdrom_free_mib) MiB free on /cdrom; need ~${need_mib} MiB - /home.sfs NOT created." >&2
+                echo "       USB-mode home persistence will not work until space is freed (or a larger stick is used)." >&2
             fi
         else
-            echo "WARNING: mksquashfs not found - /cdrom/home.sfs not created." >&2
+            echo "ERROR: mksquashfs not found - /cdrom/home.sfs NOT created; USB-mode home will not persist." >&2
         fi
         mount /cdrom -o remount,ro 2>/dev/null || true
     fi

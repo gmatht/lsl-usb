@@ -1,0 +1,65 @@
+#!/bin/sh
+# gzip-99 - produce the smallest possible *gzip-compatible* (DEFLATE) file.
+#
+# Strategy (all produce a standard RFC-1952 gzip stream, so `gzip -d` on the
+# target decodes them with zero extra tooling):
+#   1. gzip -9                       (baseline DEFLATE)
+#   2. 7z a -tgzip -mx=9            (better DEFLATE, same container) -- if present
+#   3. advdef -z -4                 (advanceCOMP re-DEFLATE, standard gzip) -- if present
+# Each candidate is kept only if it is byte-identical on decompression AND
+# strictly smaller. Net effect: smallest gzip stream we can make.
+#
+# Usage: gzip-99 OUTPUT.gz   (compresses stdin -> OUTPUT.gz)
+set -e
+
+HASHCMD="$(command -v sha256sum md5sum | head -n1)"
+[ -n "$HASHCMD" ] || { echo "gzip-99: no sha256sum/md5sum" >&2; exit 1; }
+myhash() { "$HASHCMD" "$@" | sed 's/ .*//'; }
+
+if [ -z "$1" ]; then
+    echo "USAGE: $0 OUTPUT.gz   (compresses stdin to OUTPUT.gz)" >&2
+    exit 1
+fi
+OUT="$1"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+time gzip -9 > "$OUT"
+ORIG_HASH="$(gunzip < "$OUT" | myhash)"
+
+accept_new() {
+    if [ "$(gunzip < "$OUT" | myhash)" = "$ORIG_HASH" ]; then
+        oldsize=$(stat -c%s "$OUT")
+        newsize=$(stat -c%s "$OUT.new")
+        if [ "$oldsize" -gt "$newsize" ]; then
+            echo "$oldsize -> $newsize: saved $((oldsize - newsize)) bytes"
+            mv -f "$OUT.new" "$OUT"
+        else
+            echo "$oldsize -> $newsize: no savings, discarded"
+        fi
+    else
+        echo "$OUT.new corrupt, deleting" >&2
+        rm -f "$OUT.new"
+    fi
+}
+
+# 7-Zip re-DEFLATE into a gzip container (still gzip -d compatible).
+# NOTE: feed 7z the RAW file, not the gzip -- re-gzipping a gzip stream corrupts.
+if command -v 7z >/dev/null 2>&1; then
+    rm -f "$OUT.new" || true
+    echo "trying 7z -tgzip -mx=9"
+    gunzip < "$OUT" > "$TMP/raw"   # recover the original bytes
+    time 7z a "$OUT.new" -mx=9 -tgzip "$TMP/raw" >/dev/null
+    accept_new
+fi
+
+# advanceCOMP: tighter DEFLATE, produces a standard gzip file.
+if command -v advdef >/dev/null 2>&1; then
+    cp "$OUT" "$OUT.new"
+    echo "trying advdef -4 -z"
+    time advdef -4 -z "$OUT.new" >/dev/null
+    accept_new
+fi
+
+echo "gzip-99: $OUT ($(stat -c%s "$OUT") bytes)"
+rm -f "$OUT.new"   # drop any leftover candidate temp

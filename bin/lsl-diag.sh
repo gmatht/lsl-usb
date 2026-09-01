@@ -87,6 +87,16 @@ if command -v journalctl >/dev/null 2>&1; then
         > "$WORK/journal-lsl.txt" 2>/dev/null || true
 fi
 
+# Optional setup-health probes (Nix / Steam overlays). Best-effort: the scripts
+# may be absent on older bundles; only run them when present so the diag tarball
+# still captures what it can on a wedged first boot.
+if [ -x /cdrom/bin/lsl-nix-doctor.sh ]; then
+    bash /cdrom/bin/lsl-nix-doctor.sh > "$WORK/nix-doctor.txt" 2>&1 || true
+fi
+if [ -x /cdrom/bin/lsl-steam-doctor.sh ]; then
+    bash /cdrom/bin/lsl-steam-doctor.sh > "$WORK/steam-doctor.txt" 2>&1 || true
+fi
+
 # --- package it ------------------------------------------------------------
 ARCHIVE="$DEST/lsl-${TAG}-${TS}.tar.gz"
 if command -v tar >/dev/null 2>&1; then

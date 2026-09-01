@@ -9,11 +9,14 @@
 $ErrorActionPreference = 'Stop'
 
 function Resolve-Existing {
-    $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue
-    if ($pwsh) {
-        $v = & $pwsh.Path -NoProfile -Command '$PSVersionTable.PSVersion' 2>$null
-        if ($v -and ([version]$v -ge [version]'5.1')) { return $pwsh.Path }
-    }
+    # A broken pwsh install must not abort detection; fall through to the host.
+    try {
+        $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+        if ($pwsh) {
+            $v = & $pwsh.Path -NoProfile -Command '$PSVersionTable.PSVersion' 2>$null
+            if ($v -and ([version]$v -ge [version]'5.1')) { return $pwsh.Path }
+        }
+    } catch {}
     if ($PSVersionTable.PSVersion -ge [version]'5.1') { return 'powershell' }
     return $null
 }
