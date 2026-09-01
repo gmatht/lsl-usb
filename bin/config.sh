@@ -258,10 +258,10 @@ install_systemd_units() {
 
     if [[ -n "$CFG_ROOT" ]]; then
         chroot "$CFG_ROOT" systemctl daemon-reload
-        chroot "$CFG_ROOT" systemctl enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service
+        chroot "$CFG_ROOT" systemctl enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service lsl-reclaim-win-swap.service
     elif [[ "$(id -u)" -eq 0 ]]; then
         systemctl daemon-reload
-        systemctl enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service lsl-win-backup.timer
+        systemctl enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service lsl-win-backup.timer lsl-reclaim-win-swap.service
     else
         echo "config.sh: systemd install skipped (need root or LSL_CONFIG_ROOT + chroot)" >&2
     fi

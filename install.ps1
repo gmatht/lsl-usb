@@ -1946,6 +1946,20 @@ try {
     $chkSfsHdd.Size = New-Object System.Drawing.Size(560, 20)
     $chkSfsHdd.Checked = $true
     $page3.Controls.Add($chkSfsHdd)
+
+    # Reclaim Windows pagefile.sys / WSL2 swapfile.vhdx as compressed swap (opt-in).
+    $chkReclaim = New-Object System.Windows.Forms.CheckBox
+    $chkReclaim.Text = 'Reclaim Windows pagefile.sys + WSL2 swapfile as compressed swap'
+    $chkReclaim.Location = New-Object System.Drawing.Point(10, 640)
+    $chkReclaim.Size = New-Object System.Drawing.Size(560, 20)
+    $chkReclaim.Checked = $false   # experimental: renames Windows system files; opt in explicitly
+    $page3.Controls.Add($chkReclaim)
+    $lblReclaim = New-Object System.Windows.Forms.Label
+    $lblReclaim.Location = New-Object System.Drawing.Point(10, 662)
+    $lblReclaim.Size = New-Object System.Drawing.Size(560, 34)
+    $lblReclaim.Text = 'Renames pagefile.sys and each WSL2 swapfile.vhdx (after a clean-shutdown check) and uses that space as compressed swap. Safe only if Windows was shut down normally (no Fast Startup / hibernate).'
+    $page3.Controls.Add($lblReclaim)
+    $tip.SetToolTip($chkReclaim, 'Off by default. On a clean shutdown, renames Windows pagefile.sys / WSL2 swapfile.vhdx to temp files and uses them as zram backing (compressed swap). Temp files are deleted at Linux shutdown; a Windows task also deletes them on next boot.')
     $lblSfsHdd = New-Object System.Windows.Forms.Label
     $lblSfsHdd.Location = New-Object System.Drawing.Point(10, 594)
     $lblSfsHdd.Size = New-Object System.Drawing.Size(560, 44)
@@ -2195,6 +2209,7 @@ try {
         Efu           = $chkEfu.Checked
         InstallEverything = $chkEverything.Checked
         CopySfsHdd       = $chkSfsHdd.Checked
+        ReclaimWinSwap   = $chkReclaim.Checked
         UseExistingUsb = $state.ReuseUsb
     }
 }
@@ -2225,6 +2240,7 @@ $wifiNetworks = @()
 $doEfu = $true
 $installEverything = $true
 $preloadDrivers = $true
+$reclaimWinSwap = $false
 if (-not $NoGui) {
     $gui = Show-InstallerGui -IsoPath $IsoPath -MintVersion $MintVersion -DownloadDir $DownloadDir `
         -WslVhdx $WslVhdx -FlatpakApps $FlatpakApps
@@ -2239,6 +2255,7 @@ if (-not $NoGui) {
     $installEverything = $gui.InstallEverything
     $preloadDrivers = $gui.Drivers
     $copySfsHdd = $gui.CopySfsHdd
+    $reclaimWinSwap = $gui.ReclaimWinSwap
     if ($gui.UseExistingUsb) {
         $vol = $gui.UseExistingUsb
         WriteStep "Using existing Mint live USB: $($vol.DriveLetter): ($($vol.FileSystemLabel)) - no Rufus write."
@@ -2325,6 +2342,24 @@ if ($guiDataDir) {
         Set-Content -Encoding ascii -Path $envFile -Value $content
         Write-Info "Set LSL_DATA_DIR=$guiDataDir in lsl-usb.env"
     }
+}
+
+if ($reclaimWinSwap) {
+    $reclaimEnv = "$($vol.DriveLetter):\lsl-usb.env"
+    if (Test-Path $reclaimEnv) {
+        $rc = Get-Content $reclaimEnv -Raw
+        if ($rc -match '(?m)^LSL_RECLAIM_WIN_SWAP=') {
+            $rc = $rc -replace '(?m)^LSL_RECLAIM_WIN_SWAP=.*$', 'LSL_RECLAIM_WIN_SWAP=1'
+        } else {
+            $rc += "`nLSL_RECLAIM_WIN_SWAP=1`n"
+        }
+        Set-Content -Encoding ascii -Path $reclaimEnv -Value $rc
+        Write-Info 'Set LSL_RECLAIM_WIN_SWAP=1 in lsl-usb.env (reclaims pagefile.sys / WSL2 swapfile as compressed swap)'
+    } else {
+        Write-Warn2 "lsl-usb.env not found on $($vol.DriveLetter):; LSL_RECLAIM_WIN_SWAP not set (set it manually in lsl-usb.env)."
+    }
+} else {
+    Write-Info 'Leaving LSL_RECLAIM_WIN_SWAP off (unchecked in installer).'
 }
 
 if ($copySfsHdd) {

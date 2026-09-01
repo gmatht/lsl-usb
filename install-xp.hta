@@ -1,7 +1,8 @@
-<!-- NO <!DOCTYPE>: a strict doctype forces IE standards mode, which does not
-    A's native Win32 controls until a repaint (hover). Quirks/IE mode
-     lays them out correctly. We do NOT host ISOs - the default URL points at
-     the distro's official mirror (same one install.ps1 uses). -->
+<!-- NO <!DOCTYPE>: a strict doctype forces the latest IE standards (edge)
+     mode, which does not lay out HTA's native Win32 controls until a repaint
+     (hover). Quirks/IE mode lays them out correctly. We do NOT host ISOs -
+     the default URL points at the distro's official mirror (same one
+     install.ps1 uses). -->
 <html>
 <head>
 <meta http-equiv="x-ua-compatible" content="IE=9">
@@ -20,7 +21,7 @@
   label { display:block; }
 </style>
 </head>
-<body onload="Window_OnLoad">
+<body onload="Window_OnLoad()">
 <h2>lsl-usb installer &mdash; legacy mode</h2>
 <div id="reco">Probing this PC...</div>
 
@@ -59,6 +60,9 @@
   <div class="row">
     <button id="bWrite" onclick="LaunchRufus()">Launch Rufus with selected ISO</button>
   </div>
+  <div class="row">
+    <label><input type='checkbox' id='chkReclaim'> Reclaim Windows pagefile.sys / WSL2 swapfile.vhdx as compressed swap (renames them after a clean shutdown; needs LSL_RECLAIM_WIN_SWAP)</label>
+  </div>
 </fieldset>
 
 <div class="row"><textarea id="log" readonly></textarea></div>
@@ -67,6 +71,7 @@
 Option Explicit
 Dim oWSH, oFSO, is64, ramKB, recoText, watchTimer, watchBase, watchName
 Dim rufusWatchTimer, rufusWatchBase, rufusWatchDest
+Dim reclaimWatchTimer, reclaimAttempts
 
 Sub Log(s)
   Call InitEnv()
@@ -82,13 +87,14 @@ Function BundleDir()
   Call InitEnv()
   Dim p
   p = window.location.pathname
-  p = Replace(Mid(p, 2), "/", "")
+  p = Replace(p, "/", "\")
+  If Left(p, 1) = "\" Then p = Mid(p, 2)
   BundleDir = oFSO.GetParentFolderName(p)
 End Function
 
 Sub InitEnv()
-  If oWSH Is Nothing Then Set oWSH = CreateObject("WScript.Shell")
-  If oFSO Is Nothing Then Set oFSO = CreateObject("Scripting.FileSystemObject")
+  If TypeName(oWSH) = "Empty" Or TypeName(oWSH) = "Nothing" Then Set oWSH = CreateObject("WScript.Shell")
+  If TypeName(oFSO) = "Empty" Or TypeName(oFSO) = "Nothing" Then Set oFSO = CreateObject("Scripting.FileSystemObject")
 End Sub
 
 Function RX(pat, src, grp)
@@ -238,7 +244,7 @@ Function RateDevice(kind, ven, dev, name)
   name = RX("<h2 class='top'>Device '([^']+)'", html, 1)
   ksup = RX("supported by kernel versions <a[^>]*>([^<]+)</a>", html, 1)
   src  = RX("<td>([0-9.]+)&nbsp;-&nbsp;([0-9.]+)</td>\s*<td>([^<]+)</td>", html, 3)
-  third = RXAll("<li><a href=""https://github.com/([^""]+)""">", html)
+  third = RXAll("<li><a href=""https://github.com/([^""]+)"">", html)
   If ksup = "" Then
     If third <> "" Then
       RateDevice = "U|no LKDDb entry - out-of-tree options: " & Replace(third, "|", ", ")
@@ -305,7 +311,7 @@ Sub ScanHardware()
         Set opt = document.createElement("option")
         opt.value = LCase(kind) & ":" & LCase(ven) & "-" & LCase(dev)
         opt.text = cls & " - " & nm & " (" & id & ")"
-        document.getElementById("devs").options.add opt
+        document.getElementById("devs").add opt
       End If
     End If
   Next
@@ -441,10 +447,15 @@ End Sub
 
 Sub AutoRufus()
   Call InitEnv()
-  Dim p
+  Dim p, exec
   On Error Resume Next
   p = oWSH.ExpandEnvironmentStrings("%SystemDrive%") & "\rufus.exe"
-  If Not oFSO.FileExists(p) Then p = oWSH.Exec("cmd /c where rufus.exe").StdOut.ReadLine
+  If Not oFSO.FileExists(p) Then
+    Set exec = oWSH.Exec("cmd /c where rufus.exe 2>nul")
+    p = exec.StdOut.ReadLine
+    If Err.Number <> 0 Or p = "" Then p = ""
+    Err.Clear
+  End If
   On Error GoTo 0
   If p <> "" Then document.getElementById("rufus").value = p
 End Sub
@@ -455,6 +466,58 @@ Sub BrowseRufus()
   Set sa = CreateObject("Shell.Application")
   Set f = sa.BrowseForFolder(0, "Select rufus.exe", 0, 0)
   If Not f Is Nothing Then document.getElementById("rufus").value = f.Self.Path
+End Sub
+
+Function ReplaceEnvLine(content, key, val)
+  Dim lines, i, out, done, ln
+  lines = Split(content, vbCrLf)
+  out = ""
+  done = False
+  For i = 0 To UBound(lines)
+    ln = lines(i)
+    If Left(ln, Len(key & "=")) = (key & "=") Or Left(ln, Len("# " & key & "=")) = ("# " & key & "=") Then
+      out = out & key & "=" & val & vbCrLf
+      done = True
+    Else
+      out = out & ln & vbCrLf
+    End If
+  Next
+  If Not done Then out = out & key & "=" & val & vbCrLf
+  ReplaceEnvLine = out
+End Function
+
+Sub WatchReclaim()
+  Call InitEnv()
+  Dim d, root, envPath, ts, content, found
+  On Error Resume Next
+  found = False
+  For Each d In oFSO.Drives
+    If d.IsReady Then
+      root = d.DriveLetter & ":\"
+      envPath = root & "lsl-usb.env"
+      If oFSO.FileExists(envPath) Then
+        content = oFSO.OpenTextFile(envPath, 1).ReadAll
+        content = ReplaceEnvLine(content, "LSL_RECLAIM_WIN_SWAP", "1")
+        Set ts = oFSO.OpenTextFile(envPath, 2, True)
+        ts.Write content
+        ts.Close
+        Log("Set LSL_RECLAIM_WIN_SWAP=1 in " & envPath)
+        found = True
+        Exit For
+      End If
+    End If
+  Next
+  On Error GoTo 0
+  If found Then
+    window.clearInterval reclaimWatchTimer
+    Log("Reclaim option applied. (Renames pagefile.sys / WSL2 swapfile as compressed swap on a clean shutdown.)")
+  Else
+    reclaimAttempts = reclaimAttempts + 1
+    If reclaimAttempts > 40 Then
+      window.clearInterval reclaimWatchTimer
+      Log("Could not find the LSL USB volume with lsl-usb.env within ~2 min; set LSL_RECLAIM_WIN_SWAP=1 manually.")
+    End If
+  End If
 End Sub
 
 Sub LaunchRufus()
@@ -468,6 +531,11 @@ Sub LaunchRufus()
   cmd = q & ru & q & " -i " & q & iso & q
   Log("Launching Rufus: " & cmd)
   oWSH.Run cmd, 1, False
+  If document.getElementById("chkReclaim").checked Then
+    reclaimAttempts = 0
+    reclaimWatchTimer = window.setInterval("WatchReclaim", 3000)
+    Log("Reclaim option checked: will set LSL_RECLAIM_WIN_SWAP=1 on the LSL USB once it appears.")
+  End If
 End Sub
 </script>
 </body>

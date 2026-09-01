@@ -5,6 +5,14 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
 ## [Unreleased]
 
 ### Added
+- `lsl-reclaim-win-swap.sh` (opt-in, `LSL_RECLAIM_WIN_SWAP=1`): after verifying a
+  clean Windows shutdown (read-write NTFS and no `hiberfil.sys`), rename Windows's
+  `pagefile.sys` and each WSL2 distro's `swapfile.vhdx` to temp files and reuse that
+  space as the backing device for a zram (compressed) swap tier. The renamed temp
+  files are deleted at Linux shutdown (returning the space to Windows) and a
+  best-effort Windows Scheduled Task also deletes them on the next Windows boot.
+  Wired into `onboot.sh` and released via `lsl-reclaim-win-swap.service`, and
+  exposed as an opt-in checkbox in `install.ps1` (WinForms) and `install-xp.hta`.
 - Windows installer wizard (WinForms): ISO selection with Everything discovery,
   flatpak app preload (detected from installed Windows apps + recommended apps
   like FSearch), WSL VHDX paths, `LSL_DATA_DIR` (pre-filled), per-network wifi

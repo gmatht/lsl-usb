@@ -245,6 +245,12 @@ lsl_load_config
 
 lsl_setup_zram
 
+# Opt-in: reclaim Windows pagefile.sys / WSL2 swapfile.vhdx as compressed swap
+# (after verifying a clean Windows shutdown). See bin/lsl-reclaim-win-swap.sh.
+if [ "${LSL_RECLAIM_WIN_SWAP:-0}" = "1" ] && [ -x /cdrom/bin/lsl-reclaim-win-swap.sh ]; then
+    /cdrom/bin/lsl-reclaim-win-swap.sh || true
+fi
+
 DATA_DIR="$(lsl_resolve_data_dir)"
 mkdir -p "$DATA_DIR" 2>/dev/null || true
 
