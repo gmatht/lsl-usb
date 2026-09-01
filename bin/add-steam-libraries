@@ -1,7 +1,12 @@
 #!/bin/bash
 # add-steam-libraries - Automatically add mounted Steam libraries to Steam configuration
 
-STEAM_USER="${STEAM_USER:-mint}"
+STEAM_USER="${STEAM_USER:-}"
+if [ -z "$STEAM_USER" ]; then
+    STEAM_USER="$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)"
+fi
+[ -n "$STEAM_USER" ] || STEAM_USER="$(ls -1 /home 2>/dev/null | head -n1 || true)"
+[ -n "$STEAM_USER" ] || STEAM_USER="mint"
 STEAM_HOME="/home/$STEAM_USER"
 STEAM_CONFIG_DIR="$STEAM_HOME/.steam/steam"
 STEAM_CONFIG_DIR_ALT="$STEAM_HOME/.local/share/Steam"
@@ -108,7 +113,7 @@ main() {
     local libraries_added=0
     
     # Check mounted overlay directories from onboot.sh
-    # /tmp/steam/root is mounted from /media/mint/Games/SteamLibrary/
+    # /tmp/steam/root is mounted from /media/$STEAM_USER/Games/SteamLibrary/
     if [ -d "/tmp/steam/root" ] && mountpoint -q "/tmp/steam/root" 2>/dev/null; then
         normalized=$(normalize_library_path "/tmp/steam/root")
         if [ -n "$normalized" ] && is_valid_steam_library "$normalized"; then
@@ -133,18 +138,17 @@ main() {
     fi
     
     # Also check source locations (before overlay mounts)
-    for lib_path in "/media/mint/Games/SteamLibrary"; do
-        if [ -d "$lib_path" ] && is_valid_steam_library "$lib_path"; then
-            normalized=$(normalize_library_path "$lib_path")
-            if [ -n "$normalized" ]; then
-                echo "Found Steam library: $normalized"
-                if ! add_library_via_console "$normalized"; then
-                    add_library_to_config "$normalized"
-                fi
-                libraries_added=$((libraries_added + 1))
+    lib_path="/media/$STEAM_USER/Games/SteamLibrary"
+    if [ -d "$lib_path" ] && is_valid_steam_library "$lib_path"; then
+        normalized=$(normalize_library_path "$lib_path")
+        if [ -n "$normalized" ]; then
+            echo "Found Steam library: $normalized"
+            if ! add_library_via_console "$normalized"; then
+                add_library_to_config "$normalized"
             fi
+            libraries_added=$((libraries_added + 1))
         fi
-    done
+    fi
     
     if [ $libraries_added -eq 0 ]; then
         echo "No Steam libraries found to add."

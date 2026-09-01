@@ -1,0 +1,474 @@
+<!-- NO <!DOCTYPE>: a strict doctype forces IE standards mode, which does not
+    A's native Win32 controls until a repaint (hover). Quirks/IE mode
+     lays them out correctly. We do NOT host ISOs - the default URL points at
+     the distro's official mirror (same one install.ps1 uses). -->
+<html>
+<head>
+<meta http-equiv="x-ua-compatible" content="IE=9">
+<hta:application id="lsl" applicationname="lsl-usb (legacy / WinXP+)"
+  version="1.0" border="dialog" caption="yes" maximizebutton="no" minimizebutton="yes" singleinstance="yes" windowstate="normal" scroll="auto" />
+<title>lsl-usb installer (legacy / WinXP+)</title>
+<style>
+  body { font: 11pt Tahoma, Verdana, sans-serif; background:#f4f4f4; margin:8px; }
+  h2 { font-size:13pt; margin:0 0 4px 0; }
+  #reco { background:#e8f0ff; border:1px solid #9bb; padding:6px; margin:6px 0; white-space:pre; }
+  fieldset { margin:6px 0; padding:6px; }
+  #log { width:100%; height:120px; font:9pt Consolas, monospace; }
+  #compat { width:100%; height:160px; font:9pt Consolas, monospace; }
+  button { font:10pt Tahoma; padding:3px 8px; }
+  .row { margin:3px 0; }
+  label { display:block; }
+</style>
+</head>
+<body onload="Window_OnLoad">
+<h2>lsl-usb installer &mdash; legacy mode</h2>
+<div id="reco">Probing this PC...</div>
+
+<fieldset><legend>Linux hardware compatibility (linux-hardware.org LKDDb)</legend>
+  <div class="row">
+    <button onclick="ScanHardware()">Scan this PC's hardware</button>
+    <button onclick="LookupSelected()">Look up selected on linux-hardware.org (browser)</button>
+  </div>
+  <div class="row"><select id="devs" size="1" style="width:100%"></select></div>
+  <div class="row"><textarea id="compat" readonly></textarea></div>
+</fieldset>
+
+<fieldset><legend>ISO image</legend>
+  <div class="row">
+    <button id="bBrowse" onclick="BrowseISO()">Browse for ISO...</button>
+    <button id="bScan" onclick="ScanISOs()">Re-scan common folders</button>
+  </div>
+  <div id="isoList" class="row"></div>
+</fieldset>
+
+<fieldset><legend>Download (if you don't have an ISO)</legend>
+  <div class="row">URL: <input id="url" size="72"></div>
+  <div class="row">
+    <button id="bDl" onclick="Download()">Download via BITS (http only)</button>
+    <button id="bBrowser" onclick="DownloadInBrowser()">Open in browser &amp; watch Downloads</button>
+  </div>
+  <div class="row" id="dlStatus">&nbsp;</div>
+</fieldset>
+
+<fieldset><legend>Write to USB (Rufus)</legend>
+  <div class="row">
+    Rufus: <input id="rufus" size="55">
+    <button onclick="BrowseRufus()">Browse...</button>
+    <span id="rufusHint">(auto-detected if on PATH)</span>
+  </div>
+  <div class="row">
+    <button id="bWrite" onclick="LaunchRufus()">Launch Rufus with selected ISO</button>
+  </div>
+</fieldset>
+
+<div class="row"><textarea id="log" readonly></textarea></div>
+
+<script language="VBScript">
+Option Explicit
+Dim oWSH, oFSO, is64, ramKB, recoText, watchTimer, watchBase, watchName
+Dim rufusWatchTimer, rufusWatchBase, rufusWatchDest
+
+Sub Log(s)
+  Call InitEnv()
+  document.getElementById("log").value = document.getElementById("log").value & s & vbCrLf
+End Sub
+
+Function Env(n)
+  Call InitEnv()
+  Env = oWSH.ExpandEnvironmentStrings("%" & n & "%")
+End Function
+
+Function BundleDir()
+  Call InitEnv()
+  Dim p
+  p = window.location.pathname
+  p = Replace(Mid(p, 2), "/", "")
+  BundleDir = oFSO.GetParentFolderName(p)
+End Function
+
+Sub InitEnv()
+  If oWSH Is Nothing Then Set oWSH = CreateObject("WScript.Shell")
+  If oFSO Is Nothing Then Set oFSO = CreateObject("Scripting.FileSystemObject")
+End Sub
+
+Function RX(pat, src, grp)
+  Call InitEnv()
+  Dim re, m
+  Set re = New RegExp
+  re.Pattern = pat
+  re.IgnoreCase = True
+  re.Global = False
+  Set m = re.Execute(src)
+  If m.Count > 0 And m(0).SubMatches.Count >= grp Then
+    RX = m(0).SubMatches(grp - 1)
+  Else
+    RX = ""
+  End If
+End Function
+
+Function RXAll(pat, src)
+  Call InitEnv()
+  Dim re, m, c, out
+  Set re = New RegExp
+  re.Pattern = pat
+  re.IgnoreCase = True
+  re.Global = True
+  Set m = re.Execute(src)
+  out = ""
+  For Each c In m
+    If out = "" Then out = c.SubMatches(0) Else out = out & "|" & c.SubMatches(0)
+  Next
+  RXAll = out
+End Function
+
+Sub Window_OnLoad()
+  Call InitEnv()
+  Set oWSH = CreateObject("WScript.Shell")
+  Set oFSO = CreateObject("Scripting.FileSystemObject")
+  Call Recommend()
+  Call AutoRufus()
+  Call ScanISOs()
+  If is64 Then
+    document.getElementById("url").value = "https://mirrors.kernel.org/linuxmint/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso"
+  Else
+    document.getElementById("url").value = "https://antixlinux.com/download/"
+  End If
+  Log("Legacy mode ready. CPU/RAM gate: " & recoText & ".")
+  document.body.style.visibility = "hidden"
+  window.setTimeout "document.body.style.visibility='visible'", 0
+End Sub
+
+Sub Recommend()
+  Call InitEnv()
+  Dim arch, w6432, exec, out, line
+  arch = Env("PROCESSOR_ARCHITECTURE")
+  w6432 = Env("PROCESSOR_ARCHITEW6432")
+  is64 = (arch = "AMD64" Or arch = "IA64" Or w6432 <> "")
+  ramKB = 0
+  On Error Resume Next
+  Set exec = oWSH.Exec("wmic os get TotalVisibleMemorySize")
+  If Err.Number = 0 Then
+    out = exec.StdOut.ReadAll
+    For Each line In Split(out, vbCrLf)
+      If IsNumeric(Trim(line)) Then ramKB = CLng(Trim(line))
+    Next
+  End If
+  On Error GoTo 0
+  If is64 And ramKB >= 2097152 Then
+    recoText = "Mint Cinnamon 22.3 (64-bit, >=2GB RAM)"
+  Else
+    recoText = "antiX 26 (i386 / antix26_386)"
+  End If
+  Dim ramStr
+  If ramKB > 0 Then ramStr = CStr(ramKB) & " KB" Else ramStr = "unknown (wmic unavailable)"
+  document.getElementById("reco").innerText = _
+    "Recommended for this PC: " & recoText & vbCrLf & _
+    "  arch=" & arch & "  w6432=" & w6432 & "  RAM=" & ramStr & vbCrLf & _
+    "  (confirm/change your choice; pick any ISO below)"
+End Sub
+
+Function DriverTable()
+  Call InitEnv()
+  DriverTable = Array( _
+    "0BDA:8812|Realtek RTL8812AU|rtl8812au-dkms", _
+    "0BDA:881A|Realtek RTL8814AU|rtl8814au", _
+    "0BDA:8179|Realtek RTL8188EU|rtl8188eu", _
+    "0BDA:B720|Realtek RTL8723BU|rtl8723bu", _
+    "14E4:4365|Broadcom BCM43142|broadcom-sta-dkms", _
+    "14E4:43A0|Broadcom BCM4360|broadcom-sta-dkms", _
+    "14E4:43B1|Broadcom BCM4352|broadcom-sta-dkms", _
+    "14E4:4727|Broadcom BCM4313|broadcom-sta-dkms")
+End Function
+
+Function RatableClasses()
+  Call InitEnv()
+  RatableClasses = Array("Net", "Display", "MEDIA", "Bluetooth", _
+    "Biometric", "Image", "SmartCardReader", "HDC", "SCSIAdapter", _
+    "Modem", "PCMCIA", "Camera", "61883")
+End Function
+
+Function ParsePnp(pnp, ByRef kind, ByRef ven, ByRef dev)
+  Call InitEnv()
+  Dim re, m
+  Set re = New RegExp
+  re.IgnoreCase = True
+  re.Pattern = "PCI\\VEN_([0-9A-Fa-f]{4})&DEV_([0-9A-Fa-f]{4})"
+  Set m = re.Execute(pnp)
+  If m.Count > 0 Then
+    kind = "PCI" : ven = UCase(m(0).SubMatches(0)) : dev = UCase(m(0).SubMatches(1))
+    ParsePnp = True : Exit Function
+  End If
+  re.Pattern = "USB\\VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})"
+  Set m = re.Execute(pnp)
+  If m.Count > 0 Then
+    kind = "USB" : ven = UCase(m(0).SubMatches(0)) : dev = UCase(m(0).SubMatches(1))
+    ParsePnp = True : Exit Function
+  End If
+  ParsePnp = False
+End Function
+
+Function ReadCache(kind, ven, dev)
+  Call InitEnv()
+  Dim f, html
+  html = ""
+  f = BundleDir() & "\lsl-hw-cache\lsl-lhw-" & LCase(kind) & "-" _
+    & UCase(ven) & "-" & UCase(dev) & ".html"
+  On Error Resume Next
+  If oFSO.FileExists(f) Then html = oFSO.OpenTextFile(f, 1).ReadAll
+  On Error GoTo 0
+  ReadCache = html
+End Function
+
+Function RateDevice(kind, ven, dev, name)
+  Call InitEnv()
+  Dim id, html, ksup, src, third, t, parts, mm, mmm, inKernel, bridge
+  id = ven & ":" & dev
+  For Each t In DriverTable()
+    parts = Split(t, "|")
+    If parts(0) = id Then
+      RateDevice = "C|needs out-of-tree driver (" & parts(2) & ") - staged to <USB>:\drivers\"
+      Exit Function
+    End If
+  Next
+  html = ReadCache(kind, ven, dev)
+  If html = "" Then
+    RateDevice = "U|no data (linux-hardware.org cache miss / unreachable)"
+    Exit Function
+  End If
+  name = RX("<h2 class='top'>Device '([^']+)'", html, 1)
+  ksup = RX("supported by kernel versions <a[^>]*>([^<]+)</a>", html, 1)
+  src  = RX("<td>([0-9.]+)&nbsp;-&nbsp;([0-9.]+)</td>\s*<td>([^<]+)</td>", html, 3)
+  third = RXAll("<li><a href=""https://github.com/([^""]+)""">", html)
+  If ksup = "" Then
+    If third <> "" Then
+      RateDevice = "U|no LKDDb entry - out-of-tree options: " & Replace(third, "|", ", ")
+    Else
+      RateDevice = "U|no LKDDb entry"
+    End If
+    Exit Function
+  End If
+  mm = 0 : mmm = 0
+  If RX("^([0-9]+)\.([0-9]+)", ksup, 1) <> "" Then
+    mm = CInt(RX("^([0-9]+)\.([0-9]+)", ksup, 1))
+    mmm = CInt(RX("^([0-9]+)\.([0-9]+)", ksup, 2))
+  End If
+  inKernel = (mm < 6) Or (mm = 6 And mmm <= 8)
+  bridge = (src <> "" And (InStr(1, src, "bcma") > 0 Or InStr(1, src, "bluetty") > 0 _
+    Or InStr(1, src, "usb/class") > 0 Or InStr(1, src, "host_pci") > 0 Or InStr(1, src, "pci-bridge") > 0))
+  If inKernel And Not bridge Then
+    RateDevice = "A|in-kernel since " & ksup & " (" & src & ") - no action needed"
+  ElseIf inKernel And bridge Then
+    RateDevice = "D|LKDDb entry is only " & src & " - no real driver for this function"
+  Else
+    If third <> "" Then
+      RateDevice = "C|needs kernel " & ksup & "+ (ISO has 6.8) - out-of-tree: " & Replace(third, "|", ", ")
+    Else
+      RateDevice = "C|needs kernel " & ksup & "+ (ISO has 6.8)"
+    End If
+  End If
+End Function
+
+Sub ScanHardware()
+  Call InitEnv()
+  Dim wmi, col, d, pnp, kind, ven, dev, classes, cls, keep, id, nm
+  Dim r, parts, line, rep, cA, cC, cD, cU, opt
+  document.getElementById("devs").length = 0
+  rep = ""
+  cA = 0 : cC = 0 : cD = 0 : cU = 0
+  On Error Resume Next
+  Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+  Set col = wmi.ExecQuery("SELECT Name,PNPDeviceID,PNPClass FROM Win32_PnPEntity")
+  On Error GoTo 0
+  If wmi Is Nothing Or col Is Nothing Then
+    document.getElementById("compat").value = "WMI unavailable - cannot read PnP hardware."
+    Exit Sub
+  End If
+  For Each d In col
+    pnp = "" & d.PNPDeviceID
+    If ParsePnp(pnp, kind, ven, dev) Then
+      cls = "" & d.PNPClass
+      keep = False
+      For Each classes In RatableClasses()
+        If cls = classes Then keep = True
+      Next
+      If keep Then
+        nm = "" & d.Name
+        id = ven & ":" & dev
+        r = RateDevice(kind, ven, dev, nm)
+        parts = Split(r, "|", 2)
+        If parts(0) = "A" Then cA = cA + 1
+        If parts(0) = "C" Then cC = cC + 1
+        If parts(0) = "D" Then cD = cD + 1
+        If parts(0) = "U" Then cU = cU + 1
+        line = "[" & parts(0) & "] " & nm & " (" & id & ")  - " & parts(1)
+        rep = rep & line & vbCrLf
+        Set opt = document.createElement("option")
+        opt.value = LCase(kind) & ":" & LCase(ven) & "-" & LCase(dev)
+        opt.text = cls & " - " & nm & " (" & id & ")"
+        document.getElementById("devs").options.add opt
+      End If
+    End If
+  Next
+  document.getElementById("compat").value = _
+    "Summary: A=" & cA & " (in-kernel)  C=" & cC & " (out-of-tree)  D=" & cD & " (no driver)  U=" & cU & " (unknown)" & vbCrLf & vbCrLf & rep
+  Log("Hardware scan done. A=" & cA & " C=" & cC & " D=" & cD & " U=" & cU & ".")
+End Sub
+
+Sub LookupSelected()
+  Call InitEnv()
+  Dim v, url
+  v = document.getElementById("devs").value
+  If v = "" Then Log("Scan hardware first, then pick a device.") : Exit Sub
+  url = "https://linux-hardware.org/?id=" & v
+  Log("Opening browser: " & url & "  (browser does TLS 1.2)")
+  oWSH.Run url
+End Sub
+
+Sub ScanISOs()
+  Call InitEnv()
+  Dim dirs(5), i, dd, f, html, any
+  dirs(0) = oWSH.SpecialFolders("Desktop")
+  dirs(1) = oWSH.SpecialFolders("MyDocuments") & "\Downloads"
+  dirs(2) = oWSH.SpecialFolders("MyDocuments")
+  dirs(3) = Env("USERPROFILE") & "\Downloads"
+  dirs(4) = Env("SystemDrive") & "\"
+  dirs(5) = Env("USERPROFILE")
+  html = ""
+  any = False
+  For i = 0 To UBound(dirs)
+    dd = dirs(i)
+    If oFSO.FolderExists(dd) Then
+      For Each f In oFSO.GetFolder(dd).Files
+        If LCase(oFSO.GetExtensionName(f.Name)) = "iso" Then
+          any = True
+          html = html & "<label><input type='radio' name='iso' value='" _
+            & Replace(f.Path, "'", "") & "'>" & f.Path & "</label><br>"
+        End If
+      Next
+    End If
+  Next
+  If Not any Then html = "<i>No .iso found in Desktop / My Documents / Downloads. Browse or download one.</i>"
+  document.getElementById("isoList").innerHTML = html
+End Sub
+
+Function SelectedISO()
+  Call InitEnv()
+  Dim el, els
+  Set els = document.getElementsByTagName("input")
+  For Each el In els
+    If el.Name = "iso" And el.Checked Then SelectedISO = el.Value : Exit Function
+  Next
+  SelectedISO = ""
+End Function
+
+Sub BrowseISO()
+  Call InitEnv()
+  Dim sa, f
+  Set sa = CreateObject("Shell.Application")
+  Set f = sa.BrowseForFolder(0, "Select an ISO image", 0, 0)
+  If Not f Is Nothing Then
+    document.getElementById("isoList").innerHTML = _
+      "<label><input type='radio' name='iso' value='" & f.Self.Path & "' checked>" _
+      & f.Self.Path & "</label><br>"
+  End If
+End Sub
+
+Sub Download()
+  Call InitEnv()
+  Dim url, dest, cmd, rc, q
+  url = document.getElementById("url").value
+  dest = oWSH.SpecialFolders("MyDocuments") & "\Downloads\" & oFSO.GetFileName(url)
+  If LCase(Left(url, 8)) = "https://" Then
+    Log("BITS on XP caps at TLS 1.0; use Open in browser & watch Downloads for https URLs.")
+    Exit Sub
+  End If
+  q = Chr(34)
+  cmd = "bitsadmin /transfer lsl /download /priority normal " & q & url & q & " " & q & dest & q
+  Log("BITS: " & cmd)
+  rc = oWSH.Run(cmd, 1, True)
+  If rc = 0 And oFSO.FileExists(dest) Then
+    document.getElementById("isoList").innerHTML = _
+      "<label><input type='radio' name='iso' value='" & dest & "' checked>" & dest & "</label><br>"
+    Log("Downloaded to " & dest)
+  Else
+    Log("BITS failed (rc=" & rc & "). Try the browser button instead.")
+  End If
+End Sub
+
+Sub DownloadInBrowser()
+  Call InitEnv()
+  Dim url
+  url = document.getElementById("url").value
+  Log("Opening browser: " & url & "  (browser handles TLS 1.2; we watch Downloads)")
+  oWSH.Run url
+  watchBase = Array( _
+    oWSH.SpecialFolders("MyDocuments") & "\Downloads", _
+    Env("USERPROFILE") & "\Downloads", _
+    oWSH.SpecialFolders("Desktop"), _
+    oWSH.SpecialFolders("MyDocuments"))
+  watchName = ""
+  watchTimer = window.setInterval("WatchDownloads", 2000)
+End Sub
+
+Sub WatchDownloads()
+  Call InitEnv()
+  Dim i, dd, f, newest, ntime
+  On Error Resume Next
+  newest = "" : ntime = 0
+  For i = 0 To UBound(watchBase)
+    dd = watchBase(i)
+    If oFSO.FolderExists(dd) Then
+      For Each f In oFSO.GetFolder(dd).Files
+        If LCase(oFSO.GetExtensionName(f.Name)) = "iso" Or _
+           LCase(oFSO.GetExtensionName(f.Name)) = "part" Then
+          If f.DateLastModified > ntime Then ntime = f.DateLastModified : newest = f.Path
+        End If
+      Next
+    End If
+  Next
+  On Error GoTo 0
+  If newest <> "" Then
+    document.getElementById("dlStatus").innerText = "Watching: " & newest
+    If LCase(oFSO.GetExtensionName(newest)) = "iso" Then
+      window.clearInterval watchTimer
+      document.getElementById("isoList").innerHTML = _
+        "<label><input type='radio' name='iso' value='" & newest & "' checked>" & newest & "</label><br>"
+      document.getElementById("dlStatus").innerText = "Detected: " & newest
+      Log("Download detected in Downloads: " & newest)
+    End If
+  End If
+End Sub
+
+Sub AutoRufus()
+  Call InitEnv()
+  Dim p
+  On Error Resume Next
+  p = oWSH.ExpandEnvironmentStrings("%SystemDrive%") & "\rufus.exe"
+  If Not oFSO.FileExists(p) Then p = oWSH.Exec("cmd /c where rufus.exe").StdOut.ReadLine
+  On Error GoTo 0
+  If p <> "" Then document.getElementById("rufus").value = p
+End Sub
+
+Sub BrowseRufus()
+  Call InitEnv()
+  Dim sa, f
+  Set sa = CreateObject("Shell.Application")
+  Set f = sa.BrowseForFolder(0, "Select rufus.exe", 0, 0)
+  If Not f Is Nothing Then document.getElementById("rufus").value = f.Self.Path
+End Sub
+
+Sub LaunchRufus()
+  Call InitEnv()
+  Dim iso, ru, cmd, q
+  iso = SelectedISO()
+  If iso = "" Then Log("Pick or download an ISO first.") : Exit Sub
+  ru = document.getElementById("rufus").value
+  If Not oFSO.FileExists(ru) Then Log("Rufus not found: " & ru) : Exit Sub
+  q = Chr(34)
+  cmd = q & ru & q & " -i " & q & iso & q
+  Log("Launching Rufus: " & cmd)
+  oWSH.Run cmd, 1, False
+End Sub
+</script>
+</body>
+</html>

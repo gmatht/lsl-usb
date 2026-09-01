@@ -1,0 +1,52 @@
+#!/bin/bash
+# LSL-USB: delegate to real nix; log imperative commands under ~/.local/state/lsl/ (home.btrfs on HDD).
+set -euo pipefail
+
+REAL="${REAL_NIX:-/usr/bin/nix}"
+if [ ! -x "$REAL" ]; then
+    REAL="$(command -v nix 2>/dev/null || true)"
+fi
+if [ -z "$REAL" ] || [ ! -x "$REAL" ]; then
+    echo "lsl-usb nix wrapper: real nix not found (set REAL_NIX)" >&2
+    exit 127
+fi
+
+lsl_nix_log_line() {
+    local logdir="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/lsl"
+    mkdir -p "$logdir" 2>/dev/null || true
+    local logf="$logdir/nix-imperative.log"
+    printf '%s\t%s\t%s\t%s\n' "$(date -Iseconds 2>/dev/null || date)" "${USER:-?}" "${PWD:-?}" "$1" >>"$logf" 2>/dev/null || true
+}
+
+# Log subcommands that change profiles, channels, or registry (recoverable intent after cache loss).
+lsl_nix_should_log() {
+    case "${1-}" in
+        profile)
+            case "${2-}" in
+                install|remove|upgrade|rollback|wipe-history) return 0 ;;
+            esac
+            return 1
+            ;;
+        channel)
+            case "${2-}" in
+                add|remove|update) return 0 ;;
+            esac
+            return 1
+            ;;
+        registry)
+            case "${2-}" in
+                add|remove|pin) return 0 ;;
+            esac
+            return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+if lsl_nix_should_log "$@"; then
+    lsl_nix_log_line "nix $(printf '%q ' "$@")"
+fi
+
+exec "$REAL" "$@"

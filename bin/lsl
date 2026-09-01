@@ -2,8 +2,150 @@
 # lsl - Linux Services for Linux - WSL emulator
 # Mounts VHDX files and chroots into WSL distributions
 
-WSL_REPORT="/tmp/wsl"
+WSL_REPORT="${WSL_REPORT:-/tmp/wsl}"
 LSL_MOUNT_BASE="/tmp/lsl_mounts"
+LSL_SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=/dev/null
+. "$LSL_SCRIPT_DIR/lsl-common.sh"
+
+run_privileged() {
+    if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+        "$@"
+        return $?
+    fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+        return $?
+    fi
+
+    return 1
+}
+
+LSL_SHARED_MOUNT_DIR=""
+LSL_SHARED_MOUNT_PIN=""
+LSL_SHARED_SESSION_ATTACHED=false
+
+lsl_mount_state_id() {
+    local mount_point="$1"
+    local abs hash
+    abs="$(readlink -f "$mount_point" 2>/dev/null || echo "$mount_point")"
+    if command -v md5sum >/dev/null 2>&1; then
+        hash="$(printf '%s' "$abs" | md5sum | awk '{print $1}')"
+    else
+        hash="$(printf '%s' "$abs" | cksum | awk '{print $1}')"
+    fi
+    printf '%s\n' "$hash"
+}
+
+lsl_shared_mount_state_dir() {
+    local mount_point="$1"
+    printf '%s/%s\n' "$(lsl_mount_state_base)" "$(lsl_mount_state_id "$mount_point")"
+}
+
+lsl_shared_mount_prune_stale_pins() {
+    local state_dir="$1"
+    local pin base pid
+    shopt -s nullglob
+    for pin in "$state_dir"/pins/*.pin; do
+        base="$(basename "$pin")"
+        pid="${base%%-*}"
+        if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$pin" 2>/dev/null || true
+        fi
+    done
+    shopt -u nullglob
+}
+
+lsl_shared_mount_attach() {
+    local mount_point="$1"
+    local state_dir lock_file fd
+    [ "${LSL_OVERLAY_DISK:-false}" = true ] && return 0
+    [ -n "$mount_point" ] || return 1
+
+    state_dir="$(lsl_shared_mount_state_dir "$mount_point")"
+    mkdir -p "$state_dir/pins" 2>/dev/null || true
+    lock_file="$state_dir/lock"
+
+    exec {fd}>"$lock_file" || return 1
+    flock "$fd" || {
+        exec {fd}>&-
+        return 1
+    }
+
+    lsl_shared_mount_prune_stale_pins "$state_dir"
+    LSL_SHARED_MOUNT_PIN="$state_dir/pins/$$-$RANDOM.pin"
+    printf 'pid=%s\nmount=%s\n' "$$" "$mount_point" >"$LSL_SHARED_MOUNT_PIN" 2>/dev/null || :
+    LSL_SHARED_MOUNT_DIR="$state_dir"
+    LSL_SHARED_SESSION_ATTACHED=true
+
+    flock -u "$fd" || true
+    exec {fd}>&-
+    return 0
+}
+
+lsl_shared_mount_detach() {
+    local fd pins_count=0 lock_file
+    [ "$LSL_SHARED_SESSION_ATTACHED" = true ] || return 1
+    [ -n "$LSL_SHARED_MOUNT_DIR" ] || return 1
+
+    lock_file="$LSL_SHARED_MOUNT_DIR/lock"
+    exec {fd}>"$lock_file" || return 1
+    flock "$fd" || {
+        exec {fd}>&-
+        return 1
+    }
+
+    if [ -n "$LSL_SHARED_MOUNT_PIN" ]; then
+        rm -f "$LSL_SHARED_MOUNT_PIN" 2>/dev/null || true
+    fi
+    lsl_shared_mount_prune_stale_pins "$LSL_SHARED_MOUNT_DIR"
+    shopt -s nullglob
+    local pins=("$LSL_SHARED_MOUNT_DIR"/pins/*.pin)
+    pins_count="${#pins[@]}"
+    shopt -u nullglob
+
+    flock -u "$fd" || true
+    exec {fd}>&-
+
+    LSL_SHARED_MOUNT_PIN=""
+    LSL_SHARED_MOUNT_DIR=""
+    LSL_SHARED_SESSION_ATTACHED=false
+
+    if [ "$pins_count" -eq 0 ]; then
+        return 0
+    fi
+    return 2
+}
+
+# Function to ensure WSL report exists by running detect-wsl if needed
+ensure_wsl_report() {
+    if [ ! -f "$WSL_REPORT" ] || [ ! -s "$WSL_REPORT" ] || grep -q "No WSL distributions found" "$WSL_REPORT" 2>/dev/null; then
+        # Prefer mounting Windows volumes (C:, D:) and then detecting.
+        if command -v wsl-boot-setup >/dev/null 2>&1; then
+            echo "WSL report missing/empty. Running wsl-boot-setup..." >&2
+            run_privileged wsl-boot-setup >/dev/null 2>&1 || true
+        elif [ -n "${LSL_SCRIPT_DIR:-}" ] && [ -x "$LSL_SCRIPT_DIR/wsl-boot-setup" ]; then
+            echo "WSL report missing/empty. Running wsl-boot-setup..." >&2
+            run_privileged "$LSL_SCRIPT_DIR/wsl-boot-setup" >/dev/null 2>&1 || true
+        elif [ -x "/cdrom/bin/wsl-boot-setup" ]; then
+            echo "WSL report missing/empty. Running wsl-boot-setup..." >&2
+            run_privileged /cdrom/bin/wsl-boot-setup >/dev/null 2>&1 || true
+        fi
+
+        # Fallback: just run detect-wsl if available
+        if command -v detect-wsl >/dev/null 2>&1; then
+            echo "WSL report missing/empty. Running detect-wsl..." >&2
+            run_privileged detect-wsl >/dev/null 2>&1 || true
+        elif [ -n "${LSL_SCRIPT_DIR:-}" ] && [ -x "$LSL_SCRIPT_DIR/detect-wsl" ]; then
+            echo "WSL report missing/empty. Running detect-wsl..." >&2
+            run_privileged "$LSL_SCRIPT_DIR/detect-wsl" >/dev/null 2>&1 || true
+        elif [ -x "/cdrom/bin/detect-wsl" ]; then
+            echo "WSL report missing/empty. Running detect-wsl..." >&2
+            run_privileged /cdrom/bin/detect-wsl >/dev/null 2>&1 || true
+        fi
+    fi
+}
 
 # Function to ensure WSL report exists by running detect-wsl if needed
 ensure_wsl_report() {
@@ -22,7 +164,17 @@ ensure_wsl_report() {
 # Parse command line arguments
 DISTRO=""
 LIST_ONLY=false
+LIST_VHDX=false
+CHOOSE_VHDX=false
 COMMAND=""
+VHDX_OVERRIDE=""
+LSL_OVERLAY_DISK=false
+
+opt_pause() {
+	if [ "${PAUSE_ON_QUIT:-false}" = true ]; then
+		read
+	fi
+}
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -30,26 +182,94 @@ while [[ $# -gt 0 ]]; do
             DISTRO="$2"
             shift 2
             ;;
+        -v|--vhdx)
+            VHDX_OVERRIDE="$2"
+            shift 2
+            ;;
+        --overlay-disk|--tmpfs-overlay)
+            LSL_OVERLAY_DISK=true
+            shift
+            ;;
         -l|--list)
             LIST_ONLY=true
             shift
             ;;
+        --list-vhdx)
+            LIST_VHDX=true
+            shift
+            ;;
+        --choose)
+            CHOOSE_VHDX=true
+            shift
+            ;;
+        --find)
+            # Search the Everything EFU index (host-side, not in the chroot).
+            shift
+            if [ -x /cdrom/bin/lsl-find ]; then
+                exec /cdrom/bin/lsl-find "$@"
+            elif command -v lsl-find >/dev/null 2>&1; then
+                exec lsl-find "$@"
+            else
+                echo "lsl-find not found (run the Windows installer with the Everything export option)" >&2
+                exit 1
+            fi
+            ;;
+        --efu)
+            # Rich EFU view: filename + size (alias for lsl-find -l).
+            shift
+            if [ -x /cdrom/bin/lsl-find ]; then
+                exec /cdrom/bin/lsl-find -l "$@"
+            elif command -v lsl-find >/dev/null 2>&1; then
+                exec lsl-find -l "$@"
+            else
+                echo "lsl-find not found (run the Windows installer with the Everything export option)" >&2
+                exit 1
+            fi
+            ;;
+	--pause-on-quit)
+	    PAUSE_ON_QUIT=true
+	    shift
+	    ;;
         -h|--help)
             echo "Usage: lsl [OPTIONS] [COMMAND]"
             echo ""
             echo "Options:"
             echo "  -d, --distribution NAME  Specify WSL distribution name"
+            echo "  -v, --vhdx FILE          Specify a VHDX file to mount (bypasses detection)"
+            echo "      --overlay-disk       qcow2 copy-on-write layer on the VHDX (session writes; parent image unchanged)"
             echo "  -l, --list               List available WSL distributions"
+            echo "      --list-vhdx          List VHDX paths saved from lsl-gui (one path per line)"
+            echo "      --choose             Choose a VHDX from find_*.zstd / find_everything.efu catalogs (terminal: list + letter/number)"
+            echo "      --find [PATTERN]     Search the Everything EFU index (lsl-find; interactive with fzf)"
+            echo "      --efu [PATTERN]      Rich EFU view: filename + size (lsl-find -l)"
+	    echo "      --pause-on-quit      Wait for user to press enter before quitting"
             echo "  -h, --help               Show this help message"
+            echo ""
+            echo "Environment (optional):"
+            echo "  LSL_CHOOSE_LETTER=a-z   Mount dir suffix basename_LETTER; use with -v to match a prior --choose row"
             echo ""
             echo "Examples:"
             echo "  lsl                      Enter default WSL distribution"
             echo "  lsl -d Ubuntu            Enter Ubuntu distribution"
+            echo "  lsl --vhdx /path/to/ext4.vhdx   Enter a VHDX directly"
+            echo "  sudo lsl --overlay-disk --vhdx /path/disk.vhdx   Writable session over VHDX (no writes to image)"
+            echo "  lsl /path/to/disk.vhdx   Same if the path exists (convenience)"
             echo "  lsl -l                   List all available distributions"
+            echo "  lsl --list-vhdx          Print saved VHDX paths"
+            echo "  lsl --choose             Pick a VHDX from find_*.zstd / find_everything.efu indexes"
+            echo "  lsl --find vhdx          Search the Everything EFU index for 'vhdx'"
             echo "  lsl bash                 Run bash in default distribution"
+	    opt_pause
             exit 0
             ;;
         *)
+            # A lone existing *.vhdx path is the image to mount, not a shell command.
+            if [ -z "$COMMAND" ] && [ -n "$1" ] && [[ "$1" == *.vhdx ]] && [ -f "$1" ]; then
+                VHDX_OVERRIDE="$1"
+                shift
+                [ $# -gt 0 ] && COMMAND="$*"
+                break
+            fi
             if [ -z "$COMMAND" ]; then
                 COMMAND="$*"
             fi
@@ -58,55 +278,96 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Function to parse WSL report and extract VHDX/distro mappings
+# LSL_CHOOSE_LETTER (a–z): optional mount-dir suffix. Set by `lsl --choose` for rows 1–26.
+# For `lsl -v PATH` without --choose, unset unless you export LSL_CHOOSE_LETTER to reuse the
+# same tag (e.g. match a prior choose). Otherwise the dir is basename_<md5-of-path>.
+
+# Function to parse WSL report and extract VHDX/distro mappings (merges lsl-gui–saved VHDX paths).
 parse_wsl_report() {
     local vhdx_file=""
     local rootfs_path=""
     local distro_name=""
-    
-    # Ensure report exists (will try to run detect-wsl if needed)
+    local registry_name=""
+
     ensure_wsl_report
-    
-    if [ ! -f "$WSL_REPORT" ] || [ ! -s "$WSL_REPORT" ]; then
-        echo "Error: WSL report not found at $WSL_REPORT" >&2
-        echo "Could not detect WSL distributions. Please ensure Windows partitions are mounted." >&2
-        return 1
+
+    local report_ok=0
+    if [ -f "$WSL_REPORT" ] && [ -s "$WSL_REPORT" ] && ! grep -q "No WSL distributions found" "$WSL_REPORT" 2>/dev/null; then
+        report_ok=1
     fi
-    
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^Found\ ext4\.vhdx:\ (.+)$ ]]; then
-            vhdx_file="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^Found\ vhdx:\ (.+)$ ]]; then
-            vhdx_file="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^WSL\ (Distro|Custom|LXSS)\ rootfs:\ (.+)$ ]]; then
-            rootfs_path="${BASH_REMATCH[2]}"
-            # Extract distro name from path
-            if [[ "$rootfs_path" =~ Packages/([^/]+)/LocalState/rootfs ]]; then
-                distro_name="${BASH_REMATCH[1]}"
-            elif [[ "$rootfs_path" =~ /([^/]+)/rootfs$ ]]; then
-                distro_name="${BASH_REMATCH[1]}"
-            elif [[ "$rootfs_path" =~ distros/([^/]+) ]]; then
-                distro_name="${BASH_REMATCH[1]}"
-            else
-                distro_name=$(basename "$(dirname "$rootfs_path")")
-            fi
-            
-            # Output entry if we have either VHDX or rootfs
-            if [ -n "$vhdx_file" ] && [ -f "$vhdx_file" ]; then
-                echo "$distro_name|$vhdx_file|$rootfs_path"
-            elif [ -n "$rootfs_path" ] && [ -d "$rootfs_path" ]; then
-                # Fallback: use rootfs directly if VHDX not available
-                echo "$distro_name||$rootfs_path"
-            fi
-            vhdx_file=""
-            rootfs_path=""
-            distro_name=""
-        elif [[ "$line" == "---" ]]; then
-            vhdx_file=""
-            rootfs_path=""
-            distro_name=""
+
+    flush_entry() {
+        local name=""
+
+        if [ -n "$registry_name" ]; then
+            name="$registry_name"
         fi
-    done < "$WSL_REPORT"
+
+        if [ -n "$rootfs_path" ]; then
+            if [[ "$rootfs_path" =~ Packages/([^/]+)/LocalState/rootfs$ ]]; then
+                name="${BASH_REMATCH[1]}"
+            elif [[ "$rootfs_path" =~ /([^/]+)/rootfs$ ]]; then
+                name="${BASH_REMATCH[1]}"
+            elif [[ "$rootfs_path" =~ distros/([^/]+) ]]; then
+                name="${BASH_REMATCH[1]}"
+            else
+                name="$(basename "$(dirname "$rootfs_path")")"
+            fi
+        elif [ -n "$vhdx_file" ]; then
+            if [[ "$vhdx_file" =~ Packages/([^/]+)/LocalState/ ]]; then
+                name="${BASH_REMATCH[1]}"
+            else
+                name="$(basename "$vhdx_file")"
+            fi
+        fi
+
+        if [ -z "$name" ]; then
+            return 0
+        fi
+
+        # Emit even when paths are missing on disk (list -l / GUI show unavailable).
+        if [ -n "$vhdx_file" ]; then
+            echo "$name|$vhdx_file|$rootfs_path"
+            return 0
+        fi
+
+        if [ -n "$rootfs_path" ]; then
+            echo "$name||$rootfs_path"
+            return 0
+        fi
+
+        return 0
+    }
+
+    {
+        if [ "$report_ok" -eq 1 ]; then
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^Found\ ext4\.vhdx:\ (.+)$ ]]; then
+                    vhdx_file="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ ^Found\ vhdx:\ (.+)$ ]]; then
+                    vhdx_file="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ ^WSL\ (Distro|Custom|LXSS)\ vhdx:\ (.+)$ ]]; then
+                    vhdx_file="${BASH_REMATCH[2]}"
+                elif [[ "$line" =~ ^WSL\ Registry\ vhdx:\ (.+)$ ]]; then
+                    vhdx_file="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ ^WSL\ Registry\ name:\ (.+)$ ]]; then
+                    registry_name="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ ^WSL\ Registry\ rootfs:\ (.+)$ ]]; then
+                    rootfs_path="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ ^WSL\ (Distro|Custom|LXSS)\ rootfs:\ (.+)$ ]]; then
+                    rootfs_path="${BASH_REMATCH[2]}"
+                elif [[ "$line" == "---" ]]; then
+                    flush_entry
+                    vhdx_file=""
+                    rootfs_path=""
+                    distro_name=""
+                    registry_name=""
+                fi
+            done <"$WSL_REPORT"
+            flush_entry
+        fi
+        lsl_vhdx_saved_distro_lines
+    } | lsl_dedupe_distro_lines
 }
 
 # Function to list available distributions
@@ -131,8 +392,30 @@ list_distros() {
     done < <(parse_wsl_report)
     
     if [ $count -eq 0 ]; then
-        echo "No WSL distributions found."
-        return 1
+        # Try to refresh the report and retry once.
+        ensure_wsl_report
+        while IFS='|' read -r name vhdx rootfs; do
+            count=$((count + 1))
+            echo "  $count. $name"
+            if [ -n "$vhdx" ] && [ -f "$vhdx" ]; then
+                echo "     VHDX: $vhdx"
+            else
+                echo "     VHDX: (not available)"
+            fi
+            if [ -n "$rootfs" ] && [ -d "$rootfs" ]; then
+                echo "     Rootfs: $rootfs"
+            else
+                echo "     Rootfs: (not available)"
+            fi
+            echo ""
+        done < <(parse_wsl_report)
+
+        if [ $count -eq 0 ]; then
+            echo "No WSL distributions found."
+            echo "Tried mounting Windows partitions automatically and rerunning detection." >&2
+            echo "If this still fails, set LSL_WIN_C_DEV (and optionally LSL_WIN_D_DEV) and run: wsl-boot-setup" >&2
+            return 1
+        fi
     fi
     return 0
 }
@@ -160,53 +443,525 @@ get_first_vhdx() {
     return 1
 }
 
+lsl_normalize_catalog_vhdx_path() {
+    local input="$1"
+    input="${input//$'\r'/}"
+    [ -n "$input" ] || return 1
+
+    if [[ "$input" == /mnt/* ]]; then
+        printf '%s\n' "$input"
+        return 0
+    fi
+
+    if [[ "$input" =~ ^([A-Za-z]):\\(.+)$ ]]; then
+        local drive="${BASH_REMATCH[1],,}"
+        local rest="${BASH_REMATCH[2]}"
+        rest="${rest//\\//}"
+        printf '/mnt/%s/%s\n' "$drive" "$rest"
+        return 0
+    fi
+
+    return 1
+}
+
+lsl_catalog_vhdx_paths() {
+    if ! command -v zstd >/dev/null 2>&1; then
+        echo "Error: zstd is required for --choose (install package: zstd)." >&2
+        return 2
+    fi
+
+    local data_dir zst raw norm
+    local -a catalogs=()
+    data_dir="$(lsl_resolve_data_dir)"
+
+    shopt -s nullglob
+    for zst in "$data_dir"/find_*.zstd /mnt/d/Users/lsl-usb/find_*.zstd; do
+        catalogs+=("$zst")
+    done
+    # The Everything EFU export (Windows-side index, CSV) - same catalog data.
+    for efu in /cdrom/find_everything.efu "$data_dir"/find_everything.efu; do
+        [ -f "$efu" ] && catalogs+=("$efu")
+    done
+    shopt -u nullglob
+
+    if [ "${#catalogs[@]}" -eq 0 ]; then
+        echo "Error: no find_*.zstd / find_everything.efu catalogs found in $data_dir, /mnt/d/Users/lsl-usb, or /cdrom." >&2
+        return 1
+    fi
+
+    for zst in "${catalogs[@]}"; do
+        if [[ "$zst" == *.efu ]]; then
+            # EFU: CSV with quoted filenames - extract the first quoted field.
+            while IFS= read -r raw; do
+                norm="$(lsl_normalize_catalog_vhdx_path "$raw" || true)"
+                [ -n "$norm" ] || continue
+                [ -f "$norm" ] || continue
+                printf '%s\n' "$norm"
+            done < <(sed -n 's/^"\([^"]*\)".*/\1/p' "$zst" | grep -i '\.vhdx$' | grep -vi '/[Tt]emp/')
+        else
+            while IFS= read -r raw; do
+                norm="$(lsl_normalize_catalog_vhdx_path "$raw" || true)"
+                [ -n "$norm" ] || continue
+                [ -f "$norm" ] || continue
+                printf '%s\n' "$norm"
+            done < <(zstd -d -c -- "$zst" 2>/dev/null | strings | grep -i '\.vhdx$' | grep -vi '/[Tt]emp/')
+        fi
+    done | sort -u
+}
+
+# Stable unique directory name under LSL_MOUNT_BASE: basename_letter from --choose when idx<26, else basename_<8 hex of md5(path)>.
+lsl_set_choose_letter_from_index() {
+    local idx="$1"
+    local letters="abcdefghijklmnopqrstuvwxyz"
+    if [ "$idx" -ge 0 ] && [ "$idx" -lt 26 ]; then
+        LSL_CHOOSE_LETTER="${letters:$idx:1}"
+    else
+        unset LSL_CHOOSE_LETTER
+    fi
+}
+
+lsl_vhdx_mount_dir_name() {
+    local vhdx_file="$1"
+    local base abs hash
+    base="$(basename "$vhdx_file" .vhdx)"
+    base="${base//[^a-zA-Z0-9._-]/_}"
+    [ -n "$base" ] || base="vhdx"
+    abs="$(readlink -f "$vhdx_file" 2>/dev/null || echo "$vhdx_file")"
+    if command -v md5sum >/dev/null 2>&1; then
+        hash="$(printf '%s' "$abs" | md5sum | awk '{print substr($1,1,8)}')"
+    else
+        hash="$(printf '%s' "$abs" | cksum | awk '{print $1}')"
+        hash="${hash:0:8}"
+    fi
+    local tag="${LSL_CHOOSE_LETTER,,}"
+    if [ "${#tag}" -eq 1 ] && [[ "$tag" =~ ^[a-z]$ ]]; then
+        printf '%s\n' "${base}_${tag}"
+    else
+        printf '%s\n' "${base}_${hash}"
+    fi
+}
+
+# Create stable aliases between basename_<letter> and basename_<hash>.
+# This lets direct -v (hash) reuse the choose letter mount dir (and vice versa).
+lsl_maybe_link_mount_aliases() {
+    local vhdx_file="$1"
+    local mount_dir="$2"
+    local base abs hash tag letter_dir hash_dir
+
+    base="$(basename "$vhdx_file" .vhdx)"
+    base="${base//[^a-zA-Z0-9._-]/_}"
+    [ -n "$base" ] || base="vhdx"
+    abs="$(readlink -f "$vhdx_file" 2>/dev/null || echo "$vhdx_file")"
+    if command -v md5sum >/dev/null 2>&1; then
+        hash="$(printf '%s' "$abs" | md5sum | awk '{print substr($1,1,8)}')"
+    else
+        hash="$(printf '%s' "$abs" | cksum | awk '{print $1}')"
+        hash="${hash:0:8}"
+    fi
+
+    tag="${LSL_CHOOSE_LETTER,,}"
+    if [ "${#tag}" -eq 1 ] && [[ "$tag" =~ ^[a-z]$ ]]; then
+        letter_dir="${LSL_MOUNT_BASE}/${base}_${tag}"
+        hash_dir="${LSL_MOUNT_BASE}/${base}_${hash}"
+        # Prefer linking hash -> letter when we just chose a letter.
+        if [ -d "$letter_dir" ] && [ ! -e "$hash_dir" ]; then
+            ln -s "$(basename "$letter_dir")" "$hash_dir" 2>/dev/null || true
+        elif [ -d "$hash_dir" ] && [ ! -e "$letter_dir" ]; then
+            ln -s "$(basename "$hash_dir")" "$letter_dir" 2>/dev/null || true
+        fi
+    else
+        # No letter: still link the other way if a letter dir exists and hash dir doesn't (rare).
+        hash_dir="${LSL_MOUNT_BASE}/${base}_${hash}"
+        # If mount_dir is a letter dir, treat it as such.
+        case "$mount_dir" in
+            "${LSL_MOUNT_BASE}/${base}_"?) letter_dir="$mount_dir" ;;
+            *) letter_dir="" ;;
+        esac
+        if [ -n "$letter_dir" ] && [ -d "$letter_dir" ] && [ ! -e "$hash_dir" ]; then
+            ln -s "$(basename "$letter_dir")" "$hash_dir" 2>/dev/null || true
+        fi
+    fi
+}
+
+lsl_choose_vhdx_letter_menu() {
+    local -a paths=("$@")
+    local n i letter letters="abcdefghijklmnopqrstuvwxyz" reply num idx o
+    n="${#paths[@]}"
+    echo "VHDX files from find catalogs - pick one:" >/dev/tty
+    echo "" >/dev/tty
+    for i in "${!paths[@]}"; do
+        num=$((i + 1))
+        if [ "$i" -lt 26 ]; then
+            letter="${letters:$i:1}"
+            printf '  %s)  %s\n' "$letter" "${paths[$i]}" >/dev/tty
+        else
+            printf '  %2d)  %s\n' "$num" "${paths[$i]}" >/dev/tty
+        fi
+    done
+    echo "" >/dev/tty
+    if [ "$n" -le 26 ]; then
+        local last_letter="${letters:$((n - 1)):1}"
+        echo "Type a letter (a-$last_letter) or a number (1-$n), then Enter." >/dev/tty
+    else
+        echo "Type a letter (a-z) for rows a-z, or a number (1-$n), then Enter." >/dev/tty
+    fi
+    read -r reply </dev/tty
+    reply="${reply//[$'\t\r\n']/}"
+    reply="${reply// /}"
+
+    if [[ "$reply" =~ ^[0-9]+$ ]]; then
+        if [ "$reply" -ge 1 ] && [ "$reply" -le "$n" ]; then
+            idx=$((reply - 1))
+            lsl_set_choose_letter_from_index "$idx"
+            LSL_CHOOSE_OUTPUT_PATH="${paths[$idx]}"
+            return 0
+        fi
+        echo "Invalid number: $reply (need 1-$n)" >/dev/tty
+        return 10
+    fi
+
+    if [ "${#reply}" -eq 1 ] && [[ "$reply" =~ ^[a-zA-Z]$ ]]; then
+        reply="${reply,,}"
+        printf -v o '%d' "'$reply"
+        idx=$((o - 97))
+        if [ "$idx" -ge 0 ] && [ "$idx" -lt 26 ] && [ "$idx" -lt "$n" ]; then
+            lsl_set_choose_letter_from_index "$idx"
+            LSL_CHOOSE_OUTPUT_PATH="${paths[$idx]}"
+            return 0
+        fi
+    fi
+
+    echo "Invalid choice: $reply" >/dev/tty
+    return 10
+}
+
+lsl_choose_vhdx_from_catalog() {
+    local -a paths=()
+    local rc=0 selected selected_id idx
+    unset LSL_CHOOSE_LETTER
+    LSL_CHOOSE_OUTPUT_PATH=""
+    mapfile -t paths < <(lsl_catalog_vhdx_paths) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        return "$rc"
+    fi
+    if [ "${#paths[@]}" -eq 0 ]; then
+        echo "Error: no existing .vhdx files found in find catalogs." >&2
+        return 1
+    fi
+
+    # Use /dev/tty for interactive selection; sets LSL_CHOOSE_OUTPUT_PATH and LSL_CHOOSE_LETTER.
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        lsl_choose_vhdx_letter_menu "${paths[@]}"
+        return $?
+    fi
+
+    if command -v zenity >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
+        local i
+        local list_rows=""
+        for i in "${!paths[@]}"; do
+            list_rows+="$((i + 1))|$(basename "${paths[$i]}")|${paths[$i]}"$'\n'
+        done
+        selected="$(printf '%s' "$list_rows" | zenity --list \
+            --title="Choose VHDX" \
+            --text="Select a VHDX from find catalogs" \
+            --column="ID" --column="File" --column="Path" \
+            --hide-column=1 \
+            --width=1000 --height=450 2>/dev/null || true)"
+        [ -n "$selected" ] || return 10
+        selected_id="${selected%%|*}"
+        if [[ "$selected_id" =~ ^[0-9]+$ ]] && [ "$selected_id" -ge 1 ] && [ "$selected_id" -le "${#paths[@]}" ]; then
+            idx=$((selected_id - 1))
+            lsl_set_choose_letter_from_index "$idx"
+            LSL_CHOOSE_OUTPUT_PATH="${paths[$idx]}"
+            return 0
+        fi
+        return 10
+    fi
+
+    if command -v dialog >/dev/null 2>&1; then
+        local -a items=()
+        local i
+        for i in "${!paths[@]}"; do
+            items+=("$((i + 1))" "${paths[$i]}")
+        done
+        selected="$(dialog --menu "Select a VHDX from find catalogs" 22 110 14 "${items[@]}" 2>&1 >/dev/tty)" || return 10
+        if [[ "$selected" =~ ^[0-9]+$ ]] && [ "$selected" -ge 1 ] && [ "$selected" -le "${#paths[@]}" ]; then
+            idx=$((selected - 1))
+            lsl_set_choose_letter_from_index "$idx"
+            LSL_CHOOSE_OUTPUT_PATH="${paths[$idx]}"
+            return 0
+        fi
+        return 10
+    fi
+
+    if command -v whiptail >/dev/null 2>&1; then
+        local -a items=()
+        local i
+        for i in "${!paths[@]}"; do
+            items+=("$((i + 1))" "${paths[$i]}")
+        done
+        selected="$(whiptail --menu "Select a VHDX from find catalogs" 22 110 14 "${items[@]}" 3>&1 1>&2 2>&3)" || return 10
+        if [[ "$selected" =~ ^[0-9]+$ ]] && [ "$selected" -ge 1 ] && [ "$selected" -le "${#paths[@]}" ]; then
+            idx=$((selected - 1))
+            lsl_set_choose_letter_from_index "$idx"
+            LSL_CHOOSE_OUTPUT_PATH="${paths[$idx]}"
+            return 0
+        fi
+        return 10
+    fi
+
+    unset LSL_CHOOSE_LETTER
+    LSL_CHOOSE_OUTPUT_PATH="${paths[0]}"
+    return 0
+}
+
+# True if path looks like a Linux root (WSL often uses ./rootfs/).
+lsl_is_linux_root() {
+    local r="$1"
+    [ -d "$r" ] || return 1
+    if [ ! -f "$r/etc/os-release" ] && [ ! -f "$r/usr/lib/os-release" ]; then
+        return 1
+    fi
+    if [ ! -e "$r/bin/bash" ] && [ ! -e "$r/usr/bin/bash" ]; then
+        return 1
+    fi
+    return 0
+}
+
+# Print absolute root path for chroot (may be .../rootfs).
+lsl_resolve_linux_root() {
+    local base="$1"
+    if lsl_is_linux_root "$base"; then
+        echo "$base"
+        return 0
+    fi
+    if [ -d "$base/rootfs" ] && lsl_is_linux_root "$base/rootfs"; then
+        echo "$base/rootfs"
+        return 0
+    fi
+    if [ -d "$base/root" ] && lsl_is_linux_root "$base/root"; then
+        echo "$base/root"
+        return 0
+    fi
+    return 1
+}
+
+# Prefer Linux data partitions over EFI (p1 is often vfat on multi-part images).
+lsl_nbd_partition_candidates() {
+    local nbd="$1"
+    local p t
+    local -a pref=() rest=()
+    shopt -s nullglob
+    for p in "${nbd}"p*; do
+        [ -b "$p" ] || continue
+        t="$(blkid -o value -s TYPE "$p" 2>/dev/null || true)"
+        case "$t" in
+            ext4|btrfs|xfs) pref+=("$p") ;;
+            *) rest+=("$p") ;;
+        esac
+    done
+    shopt -u nullglob
+    printf '%s\n' "${pref[@]}" "${rest[@]}"
+}
+
+# Mount VHDX: try default appliance, then LIBGUESTFS_BACKEND=direct, then sudo (supermin often fails without KVM).
+lsl_mount_vhdx() {
+    local vhdx_file="$1"
+    local mount_point="$2"
+    local part
+
+    if guestmount -a "$vhdx_file" -i "$mount_point" -o allow_other 2>/dev/null; then
+        return 0
+    fi
+    if LIBGUESTFS_BACKEND=direct guestmount -a "$vhdx_file" -i "$mount_point" -o allow_other 2>/dev/null; then
+        echo "(guestmount: used LIBGUESTFS_BACKEND=direct)" >&2
+        return 0
+    fi
+    if run_privileged guestmount -a "$vhdx_file" -i "$mount_point -o allow_other " 2>/dev/null; then
+        echo "(guestmount: used sudo)" >&2
+        return 0
+    fi
+    if run_privileged env LIBGUESTFS_BACKEND=direct guestmount -a "$vhdx_file" -i "$mount_point" 2>/dev/null; then
+        echo "(guestmount: used sudo + LIBGUESTFS_BACKEND=direct)" >&2
+        return 0
+    fi
+
+    for part in /dev/sda1 /dev/sda2; do
+        if guestmount -a "$vhdx_file" -m "$part" "$mount_point"  -o allow_other 2>/dev/null; then
+            echo "Mounted partition $part" >&2
+            return 0
+        fi
+        if LIBGUESTFS_BACKEND=direct guestmount -a "$vhdx_file" -m "$part" "$mount_point" -o allow_other 2>/dev/null; then
+            echo "Mounted partition $part (direct)" >&2
+            return 0
+        fi
+        if run_privileged guestmount -a "$vhdx_file" -m "$part" "$mount_point" -o allow_other 2>/dev/null; then
+            echo "Mounted partition $part (sudo)" >&2
+            return 0
+        fi
+        if run_privileged env LIBGUESTFS_BACKEND=direct guestmount -a "$vhdx_file" -m "$part" "$mount_point" -o allow_other 2>/dev/null; then
+            echo "Mounted partition $part (sudo+direct)" >&2
+            return 0
+        fi
+    done
+
+    # No libguestfs appliance (supermin often breaks without KVM): use qemu-nbd + mount.
+    if lsl_mount_vhdx_qemu_nbd "$vhdx_file" "$mount_point"; then
+        return 0
+    fi
+    return 1
+}
+
+# qemu-img cannot create a child VHDX with a backing file; qcow2-on-VHDX is the usual QEMU COW equivalent.
+lsl_qemu_disk_format() {
+    case "$1" in
+        *.qcow2|*.qcow) printf '%s\n' qcow2 ;;
+        *.vhdx) printf '%s\n' vhdx ;;
+        *) printf '%s\n' vhdx ;;
+    esac
+}
+
+# Mount disk image via qemu-nbd (no libguestfs). Requires qemu-utils, nbd module, and root/sudo.
+lsl_mount_vhdx_qemu_nbd() {
+    local disk_file="$1"
+    local mount_point="$2"
+    local nbd part fmt
+
+    command -v qemu-nbd >/dev/null 2>&1 || return 1
+    run_privileged modprobe nbd max_part=16 2>/dev/null || true
+    fmt="$(lsl_qemu_disk_format "$disk_file")"
+
+    for nbd in /dev/nbd{0..15}; do
+        [ -b "$nbd" ] || continue
+        if run_privileged qemu-nbd --connect="$nbd" -f "$fmt" "$disk_file" 2>/dev/null; then
+            run_privileged partprobe "$nbd" 2>/dev/null || true
+            sleep 0.3
+            local try_parts
+            try_parts="$(lsl_nbd_partition_candidates "$nbd")"
+            if [ -z "$try_parts" ] && [ -b "$nbd" ]; then
+                try_parts="$nbd"
+            fi
+            while IFS= read -r part; do
+                [ -n "$part" ] || continue
+                [ -b "$part" ] || continue
+                run_privileged mount "$part" "$mount_point" 2>/dev/null || continue
+                if lsl_resolve_linux_root "$mount_point" >/dev/null 2>&1; then
+                    echo "(mounted via qemu-nbd: $part)" >&2
+                    return 0
+                fi
+                run_privileged umount "$mount_point" 2>/dev/null || true
+            done <<<"$try_parts"
+            run_privileged qemu-nbd --disconnect="$nbd" 2>/dev/null || run_privileged qemu-nbd -d "$nbd" 2>/dev/null || true
+        fi
+    done
+    return 1
+}
+
+# True if the filesystem containing PATH is mounted read-only.
+lsl_path_is_readonly() {
+    local opts
+    opts="$(findmnt -n -o OPTIONS -T "$1" 2>/dev/null)" || return 1
+    case ",$opts," in
+        *,ro,*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Function to mount VHDX and chroot
 mount_and_chroot() {
     local vhdx_file="$1"
     local rootfs_path="$2"
     local root_fs=""
-    
-    # If VHDX file is provided, mount it
+    local vhdx_mounted=""
+    local image_to_mount=""
+    local mount_point=""
+    local cleanup_done=0
+    local received_signal=0
+
+    LSL_COW_SESSION_IMG=""
+    LSL_VHDX_SESSION_MOUNT=""
+
+    # If VHDX file is provided, mount it (--overlay-disk: qcow2 COW on parent; qemu-img cannot create child VHDX with -b)
     if [ -n "$vhdx_file" ] && [ -f "$vhdx_file" ]; then
-        local mount_point="$LSL_MOUNT_BASE/$(basename "$vhdx_file" .vhdx)"
-        
-        # Create mount point
+        if [ "${LSL_OVERLAY_DISK:-false}" = true ]; then
+            mkdir -p "$LSL_MOUNT_BASE" || return 1
+            local parent_abs
+            parent_abs="$(readlink -f "$vhdx_file")" || parent_abs="$vhdx_file"
+            if ! command -v qemu-img >/dev/null 2>&1; then
+                echo "Error: qemu-img required for --overlay-disk (qemu-utils)." >&2
+                return 1
+            fi
+            LSL_COW_SESSION_IMG="$LSL_MOUNT_BASE/lsl_cow_${RANDOM}_$$.qcow2"
+            if ! run_privileged qemu-img create -f qcow2 -F vhdx -b "$parent_abs" "$LSL_COW_SESSION_IMG"; then
+                echo "Error: qemu-img create failed (qcow2 overlay on VHDX)." >&2
+                rm -f "$LSL_COW_SESSION_IMG" 2>/dev/null || true
+                LSL_COW_SESSION_IMG=""
+                return 1
+            fi
+            image_to_mount="$LSL_COW_SESSION_IMG"
+            mount_point="$LSL_MOUNT_BASE/lsl_sess_${RANDOM}_$$"
+        else
+            image_to_mount="$vhdx_file"
+            mount_point="$LSL_MOUNT_BASE/$(lsl_vhdx_mount_dir_name "$vhdx_file")"
+            unset LSL_CHOOSE_LETTER
+        fi
+
+        # If mount_point is a symlink (hash->letter or letter->hash), follow it.
+        if [ -L "$mount_point" ]; then
+            mount_point="$(readlink -f "$mount_point" 2>/dev/null || echo "$mount_point")"
+        fi
+
         mkdir -p "$mount_point"
-        
-        # Check if already mounted
-        if mountpoint -q "$mount_point" 2>/dev/null; then
+        # Make alias symlinks so -v and --choose converge.
+        lsl_maybe_link_mount_aliases "$vhdx_file" "$mount_point"
+
+        if [ "${LSL_OVERLAY_DISK:-false}" != true ] && mountpoint -q "$mount_point" 2>/dev/null; then
             echo "VHDX already mounted at $mount_point"
             root_fs="$mount_point"
+            vhdx_mounted="$mount_point"
         else
-            # Mount VHDX using guestmount
-            echo "Mounting VHDX: $vhdx_file"
-            
-            # Try to auto-detect and mount filesystem
-            if guestmount -a "$vhdx_file" -i "$mount_point" 2>/dev/null; then
-                echo "Successfully mounted at $mount_point (auto-detected)"
+            echo "Mounting: $image_to_mount"
+            if lsl_mount_vhdx "$image_to_mount" "$mount_point"; then
+                echo "Successfully mounted at $mount_point"
                 root_fs="$mount_point"
-            elif guestmount -a "$vhdx_file" -m /dev/sda1 "$mount_point" 2>/dev/null; then
-                echo "Successfully mounted at $mount_point (/dev/sda1)"
-                root_fs="$mount_point"
-            elif guestmount -a "$vhdx_file" -m /dev/sda2 "$mount_point" 2>/dev/null; then
-                echo "Successfully mounted at $mount_point (/dev/sda2)"
-                root_fs="$mount_point"
+                vhdx_mounted="$mount_point"
+                if [ -n "$LSL_COW_SESSION_IMG" ]; then
+                    LSL_VHDX_SESSION_MOUNT="$mount_point"
+                    echo "overlay-disk: qcow2 copy-on-write on $(basename "$vhdx_file"); parent VHDX unchanged; session layer removed on exit." >&2
+                fi
             else
-                echo "Error: Failed to mount VHDX file" >&2
-                echo "Inspecting partitions..." >&2
-                guestfish -a "$vhdx_file" -i list-filesystems 2>&1 | head -20 || true
-                echo ""
+                echo "Error: Failed to mount disk image (libguestfs and qemu-nbd)" >&2
+                echo "Image info (no libguestfs):" >&2
+                if command -v qemu-img >/dev/null 2>&1; then
+                    run_privileged qemu-img info "$image_to_mount" 2>&1 | head -35 || true
+                fi
+                file "$image_to_mount" 2>/dev/null || true
+                echo "" >&2
+                echo "Ensure: sudo modprobe nbd; qemu-nbd and qemu-img (qemu-utils); disk not in use by WSL/Hyper-V." >&2
+                echo "If libguestfs alone fails (supermin), lsl now tries qemu-nbd automatically — use: sudo lsl -v \"$vhdx_file\"" >&2
+                if [ -n "$LSL_COW_SESSION_IMG" ]; then
+                    rm -f "$LSL_COW_SESSION_IMG" 2>/dev/null || true
+                    LSL_COW_SESSION_IMG=""
+                fi
                 echo "Falling back to rootfs path if available..." >&2
-                # Fall through to try rootfs_path
             fi
         fi
-        
-        # Find the root filesystem in the mounted VHDX
+
+        # Resolve WSL layout (./rootfs) and ensure we have a real Linux root
         if [ -n "$root_fs" ]; then
-            if [ -d "$root_fs/rootfs" ]; then
-                root_fs="$root_fs/rootfs"
-            elif [ -d "$root_fs/root" ]; then
-                root_fs="$root_fs/root"
+            local resolved=""
+            if resolved="$(lsl_resolve_linux_root "$root_fs")"; then
+                root_fs="$resolved"
+            else
+                echo "Error: Mounted image has no usable Linux root (need /etc/os-release and bash; try another partition or WSL layout under rootfs/)." >&2
+                if [ -n "$LSL_COW_SESSION_IMG" ]; then
+                    command -v guestunmount >/dev/null 2>&1 && guestunmount "$mount_point" 2>/dev/null || true
+                    run_privileged umount "$mount_point" 2>/dev/null || true
+                    rm -f "$LSL_COW_SESSION_IMG" 2>/dev/null || true
+                    LSL_COW_SESSION_IMG=""
+                    LSL_VHDX_SESSION_MOUNT=""
+                fi
+                return 1
             fi
         fi
     fi
@@ -215,56 +970,190 @@ mount_and_chroot() {
     if [ -z "$root_fs" ] && [ -n "$rootfs_path" ] && [ -d "$rootfs_path" ]; then
         echo "Using rootfs path directly: $rootfs_path"
         root_fs="$rootfs_path"
+        local resolved=""
+        if resolved="$(lsl_resolve_linux_root "$root_fs")"; then
+            root_fs="$resolved"
+        fi
     fi
     
     if [ -z "$root_fs" ] || [ ! -d "$root_fs" ]; then
         echo "Error: Could not determine root filesystem location" >&2
         return 1
     fi
-    
-    # Verify it's a Linux filesystem
-    if [ ! -d "$root_fs/etc" ] && [ ! -d "$root_fs/usr" ] && [ ! -d "$root_fs/bin" ]; then
-        echo "Warning: Filesystem doesn't appear to be a Linux rootfs" >&2
+
+    if [ -n "$vhdx_mounted" ] && [ "${LSL_OVERLAY_DISK:-false}" != true ] && lsl_path_is_readonly "$root_fs"; then
+        echo "" >&2
+        echo "Note: This VHDX is mounted read-only — the disk image will not be written." >&2
+        echo "For a writable copy-on-write session (parent VHDX unchanged), run:" >&2
+        echo "  sudo lsl --overlay-disk --vhdx \"$vhdx_file\"" >&2
+        echo "" >&2
     fi
-    
+
+    if ! lsl_is_linux_root "$root_fs"; then
+        echo "Warning: Root may be incomplete (missing etc/os-release or bash)" >&2
+    fi
+
+    # Bind-mount Windows drive mounts (if present) into chroot.
+    # Only bind non-empty /mnt/<letter> directories (c..z) to avoid clutter.
+    local -a bound_mnts=()
+    local d target
+    local i
+    local detach_rc=2
+    local shared_mode=false
+
+    if [ -n "$vhdx_mounted" ] && [ "${LSL_OVERLAY_DISK:-false}" != true ]; then
+        lsl_shared_mount_attach "$vhdx_mounted" || {
+            echo "Warning: shared mount tracking unavailable; falling back to per-session cleanup." >&2
+        }
+        if [ "$LSL_SHARED_SESSION_ATTACHED" = true ]; then
+            shared_mode=true
+        fi
+    fi
+
+    mount_and_chroot_cleanup() {
+        [ "$cleanup_done" -eq 1 ] && return
+        cleanup_done=1
+
+        if [ "$received_signal" -eq 0 ] && [ "$LSL_SHARED_SESSION_ATTACHED" = true ]; then
+            lsl_shared_mount_detach
+            detach_rc=$?
+        fi
+
+        if [ "$shared_mode" != true ] || [ "$detach_rc" -eq 0 ] || [ "${LSL_OVERLAY_DISK:-false}" = true ]; then
+            for (( i=${#bound_mnts[@]}-1; i>=0; i-- )); do
+                umount "${bound_mnts[$i]}" 2>/dev/null || true
+            done
+            umount "$root_fs/proc" 2>/dev/null || true
+            umount "$root_fs/dev/pts" 2>/dev/null || true
+            umount "$root_fs/dev" 2>/dev/null || true
+            umount "$root_fs/sys" 2>/dev/null || true
+        fi
+
+        if [ -n "${LSL_VHDX_SESSION_MOUNT:-}" ]; then
+            if command -v guestunmount >/dev/null 2>&1; then
+                guestunmount "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || run_privileged guestunmount "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || true
+            fi
+            run_privileged umount "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || true
+            rmdir "$LSL_VHDX_SESSION_MOUNT" 2>/dev/null || true
+            LSL_VHDX_SESSION_MOUNT=""
+        elif [ "$detach_rc" -eq 0 ] && [ -n "$vhdx_mounted" ] && [ "${LSL_OVERLAY_DISK:-false}" != true ]; then
+            if command -v guestunmount >/dev/null 2>&1; then
+                guestunmount "$vhdx_mounted" 2>/dev/null || run_privileged guestunmount "$vhdx_mounted" 2>/dev/null || true
+            fi
+            run_privileged umount "$vhdx_mounted" 2>/dev/null || true
+        fi
+
+        if [ -n "${LSL_COW_SESSION_IMG:-}" ]; then
+            run_privileged rm -f "$LSL_COW_SESSION_IMG" 2>/dev/null || true
+            LSL_COW_SESSION_IMG=""
+        fi
+    }
+
+    on_mount_and_chroot_signal() {
+        received_signal=1
+        if [ "$LSL_SHARED_SESSION_ATTACHED" = true ]; then
+            lsl_shared_mount_detach >/dev/null 2>&1 || true
+        fi
+        mount_and_chroot_cleanup
+        trap - INT TERM HUP
+        kill -s INT "$$" 2>/dev/null || exit 130
+    }
+
+    trap on_mount_and_chroot_signal INT TERM HUP
+
     # Setup bind mounts for chroot
     mount --bind /proc "$root_fs/proc" 2>/dev/null
     mount --bind /dev "$root_fs/dev" 2>/dev/null
     mount --bind /sys "$root_fs/sys" 2>/dev/null
     mount --bind /dev/pts "$root_fs/dev/pts" 2>/dev/null
-    
+
+    for d in /mnt/{c..z}; do
+        [ -d "$d" ] || continue
+        if ! ls -A "$d" >/dev/null 2>&1; then
+            continue
+        fi
+        target="$root_fs$d"
+        mkdir -p "$target" 2>/dev/null || true
+        if mountpoint -q "$target" 2>/dev/null; then
+            continue
+        fi
+        mount --bind "$d" "$target" 2>/dev/null || true
+        if mountpoint -q "$target" 2>/dev/null; then
+            bound_mnts+=("$target")
+        fi
+    done
+
     # Copy resolv.conf for network
     if [ -f /etc/resolv.conf ]; then
         cp /etc/resolv.conf "$root_fs/etc/resolv.conf" 2>/dev/null || true
     fi
     
-    # Chroot and execute command
+    # Chroot and execute command (prefer /usr/bin/bash — some roots only have that)
     if [ -n "$COMMAND" ]; then
         chroot "$root_fs" $COMMAND
     else
-        # Interactive shell
         echo "Entering WSL distribution..."
         echo "Type 'exit' to leave"
-        chroot "$root_fs" /bin/bash -l || chroot "$root_fs" /bin/sh -l
+        if [ -x "$root_fs/usr/bin/bash" ]; then
+            chroot "$root_fs" /usr/bin/bash -l
+        elif [ -x "$root_fs/bin/bash" ]; then
+            chroot "$root_fs" /bin/bash -l
+        elif [ -x "$root_fs/usr/bin/sh" ]; then
+            chroot "$root_fs" /usr/bin/sh -l
+        else
+            chroot "$root_fs" /bin/sh -l
+        fi
     fi
-    
     local exit_code=$?
-    
-    # Cleanup bind mounts
-    umount "$root_fs/proc" 2>/dev/null || true
-    umount "$root_fs/dev/pts" 2>/dev/null || true
-    umount "$root_fs/dev" 2>/dev/null || true
-    umount "$root_fs/sys" 2>/dev/null || true
-    
-    # Optionally unmount VHDX (comment out to keep mounted)
-    # guestunmount "$mount_point" 2>/dev/null || umount "$mount_point" 2>/dev/null || true
-    
+    trap - INT TERM HUP
+    mount_and_chroot_cleanup
+
     return $exit_code
 }
 
 # Main execution
+lsl_load_config 2>/dev/null || true
+if [ "$LIST_VHDX" = true ]; then
+    lsl_vhdx_paths_stdout
+    opt_pause
+    exit 0
+fi
+
 if [ "$LIST_ONLY" = true ]; then
     list_distros
+    opt_pause
+    exit $?
+fi
+
+if [ "$CHOOSE_VHDX" = true ]; then
+    choose_rc=0
+    LSL_CHOOSE_OUTPUT_PATH=""
+    lsl_choose_vhdx_from_catalog || choose_rc=$?
+    if [ "$choose_rc" -eq 10 ]; then
+        opt_pause
+        exit 0
+    fi
+    if [ "$choose_rc" -ne 0 ]; then
+        opt_pause
+        exit "$choose_rc"
+    fi
+    if [ -z "${LSL_CHOOSE_OUTPUT_PATH:-}" ]; then
+        opt_pause
+        exit 0
+    fi
+    VHDX_OVERRIDE="$LSL_CHOOSE_OUTPUT_PATH"
+fi
+
+# Direct VHDX mount mode (bypass detection/report)
+if [ -n "$VHDX_OVERRIDE" ]; then
+    if [ ! -f "$VHDX_OVERRIDE" ]; then
+	opt_pause
+        echo "Error: VHDX file not found: $VHDX_OVERRIDE" >&2
+	opt_pause
+        exit 1
+    fi
+    mount_and_chroot "$VHDX_OVERRIDE" ""
+    opt_pause
     exit $?
 fi
 
@@ -276,6 +1165,7 @@ if [ -n "$DISTRO" ]; then
         echo "Error: Distribution '$DISTRO' not found" >&2
         echo ""
         list_distros
+	opt_pause
         exit 1
     fi
 else
@@ -283,6 +1173,7 @@ else
     if [ -z "$VHDX_INFO" ]; then
         echo "Error: No WSL distributions found" >&2
         echo "Run onboot.sh first to detect WSL distributions" >&2
+	opt_pause
         exit 1
     fi
 fi
@@ -292,6 +1183,7 @@ IFS='|' read -r VHDX_FILE ROOTFS_PATH <<< "$VHDX_INFO"
 # Validate that we have either VHDX or rootfs
 if [ -z "$VHDX_FILE" ] && [ -z "$ROOTFS_PATH" ]; then
     echo "Error: No valid VHDX or rootfs found" >&2
+    opt_pause
     exit 1
 fi
 

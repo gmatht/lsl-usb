@@ -1,0 +1,39 @@
+name: release
+
+# Builds the Windows installer bundle (dist/lsl-usb-win.zip) and publishes it as
+# a GitHub Release asset, so install.bat can auto-fetch the latest bundle via the
+# GitHub API (no hardcoded download URL needed on the user's machine).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish under (must already exist)'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mksquashfs-tools zip pwsh shellcheck
+
+      - name: Build the Windows installer bundle
+        run: bash build.sh
+
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist/lsl-usb-win.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

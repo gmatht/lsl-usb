@@ -1,0 +1,20 @@
+[Unit]
+Description=lsl-usb first-boot setup (one-shot, per-install)
+# onboot.service connects wifi and mounts drives; the script waits for the
+# network itself as a safety net.
+After=network-online.target onboot.service
+Wants=network-online.target
+# Cap any rapid crash loop (the script already rate-limits its own retries via
+# RestartSec + MAX_ATTEMPTS, this is a belt-and-braces backstop).
+StartLimitBurst=10
+StartLimitIntervalSec=600
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lsl-firstboot.sh
+Restart=on-failure
+RestartSec=300
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

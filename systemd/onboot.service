@@ -1,0 +1,14 @@
+[Unit]
+Description=On Boot
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# onboot.sh backgrounds the nix-users retry loop; keep it alive after the main
+# script exits instead of killing the whole cgroup (the default KillMode).
+KillMode=process
+ExecStart=/cdrom/onboot.sh
+
+[Install]
+WantedBy=multi-user.target

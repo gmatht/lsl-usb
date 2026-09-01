@@ -1,0 +1,43 @@
+#!/bin/bash
+# lsl-find - instant file search over the Everything EFU exports on /cdrom.
+#
+# The Windows installer exports Everything's index to /cdrom/find_everything.efu
+# (CSV: Filename,Size,Date Modified,Date Created,Attributes). This searches it -
+# the Linux equivalent of Everything for the Windows drives: no scanning, the
+# index is already on the USB.
+#
+# Usage:
+#   lsl-find <pattern>          grep the index (case-insensitive, first 100 hits)
+#   lsl-find                    interactive (fzf) if fzf is installed
+#   LSL_FIND_MAX=N lsl-find x   limit results
+set -euo pipefail
+
+EFU="${LSL_EFU:-/cdrom/find_everything.efu}"
+MAX="${LSL_FIND_MAX:-100}"
+
+[ -f "$EFU" ] || {
+    echo "no $EFU - run the Windows installer with the 'Export Everything index' option" >&2
+    exit 1
+}
+
+# Extract the first quoted CSV field (the filename). The header line is
+# unquoted, so it is skipped naturally.
+extract_names() {
+    sed -n 's/^"\([^"]*\)".*/\1/p'
+}
+
+if [ $# -eq 0 ]; then
+    if command -v fzf >/dev/null 2>&1; then
+        extract_names < "$EFU" | fzf
+    else
+        echo "usage: lsl-find <pattern>  (or install fzf for interactive search)" >&2
+        exit 1
+    fi
+elif [ "$1" = "-l" ]; then
+    # Long format: filename + size (the EFU also has dates, in Windows FILETIME).
+    shift
+    [ $# -gt 0 ] || { echo "usage: lsl-find -l <pattern>" >&2; exit 1; }
+    grep -i "$1" "$EFU" | sed -n 's/^"\([^"]*\)",\([0-9]*\).*/\1  \2 bytes/p' | head -n "$MAX"
+else
+    grep -i "$1" "$EFU" | extract_names | head -n "$MAX"
+fi

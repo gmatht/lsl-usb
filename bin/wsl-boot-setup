@@ -1,0 +1,190 @@
+#!/bin/bash
+set -euo pipefail
+
+log() { echo "[wsl-boot-setup] $*" >&2; }
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+WIN_C_MOUNT="/mnt/c"
+WIN_D_MOUNT="/mnt/d"
+
+mkdir -p "$WIN_C_MOUNT" "$WIN_D_MOUNT"
+
+is_mounted() {
+    local m="$1"
+    mountpoint -q "$m" 2>/dev/null
+}
+
+mount_ro() {
+    local dev="$1"
+    local mnt="$2"
+    local fstype="${3:-}"
+
+    if is_mounted "$mnt"; then
+        return 0
+    fi
+
+    mkdir -p "$mnt"
+
+    if [ -n "$fstype" ]; then
+        mount -o ro -t "$fstype" "$dev" "$mnt" 2>/dev/null && return 0
+    fi
+
+    # Try common Windows filesystems first; fall back to auto.
+    mount -o ro -t ntfs3 "$dev" "$mnt" 2>/dev/null && return 0
+    mount -o ro -t ntfs "$dev" "$mnt" 2>/dev/null && return 0
+    mount -o ro "$dev" "$mnt" 2>/dev/null && return 0
+
+    return 1
+}
+
+# True if device should be probed as a possible Windows C: (NTFS system volume).
+# Excludes vfat/exfat (ESP / recovery), and obvious non-NTFS types when blkid knows them.
+should_probe_ntfs_for_c() {
+    local dev="$1"
+    local ls_t blk_t
+    ls_t="$(lsblk -dn -o FSTYPE "$dev" 2>/dev/null | head -1)"
+    case "$ls_t" in
+        ntfs|ntfs3) return 0 ;;
+    esac
+    blk_t="$(blkid -o value -s TYPE "$dev" 2>/dev/null)"
+    case "$blk_t" in
+        ntfs|ntfs3) return 0 ;;
+        ext4|btrfs|xfs|f2fs|vfat|exfat|swap|crypto_LUKS*|LVM2_member) return 1 ;;
+    esac
+    # Unprobed or unknown: try mount (e.g. lsblk/blkid not yet filled on some live setups).
+    [ -z "$ls_t" ] || [ -z "$blk_t" ]
+}
+
+# True when mounted root looks like a Windows system volume (NTFS with a Windows tree).
+is_windows_system_volume() {
+    local mp="$1"
+    [ -d "$mp/Windows" ] || return 1
+    # Stronger than Windows/ alone: avoid matching stray empty folders.
+    [ -d "$mp/Windows/System32" ] || [ -f "$mp/Windows/explorer.exe" ] || [ -d "$mp/Windows/SysWOW64" ]
+}
+
+pick_partitions() {
+    # Outputs: "C_DEV|D_DEV" (either may be empty)
+    local c_dev="${LSL_WIN_C_DEV:-}"
+    local d_dev="${LSL_WIN_D_DEV:-}"
+
+    if [ -n "$c_dev" ] || [ -n "$d_dev" ]; then
+        echo "${c_dev}|${d_dev}"
+        return 0
+    fi
+
+    # Auto-detect by probing candidate partitions.
+    # C: — only NTFS (and unknown-type partitions we may mount as NTFS); require a Windows directory tree.
+    # D: — may be NTFS/exfat/vfat (games, secondary volumes).
+    local probe_base="/tmp/wsl-mount-probe"
+    mkdir -p "$probe_base"
+
+    local ntfs_c_candidates=()
+    local d_candidates=()
+    local dev ls_fstype
+    while IFS=$'\t' read -r dev ls_fstype; do
+        [ -z "$dev" ] && continue
+        if should_probe_ntfs_for_c "$dev"; then
+            ntfs_c_candidates+=("$dev")
+        fi
+        if [ "$ls_fstype" = "ntfs" ] || [ "$ls_fstype" = "ntfs3" ] || [ "$ls_fstype" = "exfat" ] || [ "$ls_fstype" = "vfat" ]; then
+            d_candidates+=("$dev")
+        fi
+    done < <(lsblk -prno NAME,FSTYPE,TYPE 2>/dev/null | awk '$3=="part" {print $1 "\t" $2}')
+
+    local mp
+    for dev in "${ntfs_c_candidates[@]}"; do
+        mp="$probe_base/c-$(basename "$dev")"
+        mkdir -p "$mp"
+
+        if ! mount_ro "$dev" "$mp"; then
+            rmdir "$mp" 2>/dev/null || true
+            continue
+        fi
+
+        if [ -z "$c_dev" ] && is_windows_system_volume "$mp"; then
+            c_dev="$dev"
+        fi
+
+        umount "$mp" 2>/dev/null || true
+        rmdir "$mp" 2>/dev/null || true
+        [ -n "$c_dev" ] && break
+    done
+
+    for dev in "${d_candidates[@]}"; do
+        [ "$dev" = "$c_dev" ] && continue
+        mp="$probe_base/d-$(basename "$dev")"
+        mkdir -p "$mp"
+
+        if ! mount_ro "$dev" "$mp"; then
+            rmdir "$mp" 2>/dev/null || true
+            continue
+        fi
+
+        # Heuristic for D: (often holds games/steam libraries) if present.
+        if [ -z "$d_dev" ] && { [ -d "$mp/SteamLibrary" ] || [ -d "$mp/Games" ]; }; then
+            d_dev="$dev"
+        fi
+
+        umount "$mp" 2>/dev/null || true
+        rmdir "$mp" 2>/dev/null || true
+        [ -n "$d_dev" ] && break
+    done
+
+    # If we found C: but not D:, pick another partition that isn't C: (prefer typed game/data volumes, then any other NTFS probe candidate).
+    if [ -n "$c_dev" ] && [ -z "$d_dev" ]; then
+        for dev in "${d_candidates[@]}"; do
+            [ "$dev" = "$c_dev" ] && continue
+            d_dev="$dev"
+            break
+        done
+    fi
+    if [ -n "$c_dev" ] && [ -z "$d_dev" ]; then
+        for dev in "${ntfs_c_candidates[@]}"; do
+            [ "$dev" = "$c_dev" ] && continue
+            d_dev="$dev"
+            break
+        done
+    fi
+
+    echo "${c_dev}|${d_dev}"
+}
+
+main() {
+    local picked
+    picked="$(pick_partitions)"
+    local c_dev d_dev
+    IFS='|' read -r c_dev d_dev <<< "$picked"
+
+    if [ -n "$c_dev" ] && ! is_mounted "$WIN_C_MOUNT"; then
+        log "Mounting C: $c_dev -> $WIN_C_MOUNT (ro)"
+        if ! mount_ro "$c_dev" "$WIN_C_MOUNT"; then
+            log "Warning: failed to mount C: device $c_dev"
+        fi
+    fi
+
+    if [ -n "$d_dev" ] && ! is_mounted "$WIN_D_MOUNT"; then
+        log "Mounting D: $d_dev -> $WIN_D_MOUNT (ro)"
+        if ! mount_ro "$d_dev" "$WIN_D_MOUNT"; then
+            log "Warning: failed to mount D: device $d_dev"
+        fi
+    fi
+
+    # Run detect-wsl to generate /tmp/wsl (best-effort)
+    if [ -x "$SCRIPT_DIR/detect-wsl" ]; then
+        log "Running $SCRIPT_DIR/detect-wsl"
+        "$SCRIPT_DIR/detect-wsl" || true
+    elif command -v detect-wsl >/dev/null 2>&1; then
+        log "Running detect-wsl from PATH"
+        detect-wsl || true
+    elif [ -x /cdrom/bin/detect-wsl ]; then
+        log "Running /cdrom/bin/detect-wsl"
+        /cdrom/bin/detect-wsl || true
+    else
+        log "Warning: detect-wsl not found"
+        return 0
+    fi
+}
+
+main "$@"

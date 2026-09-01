@@ -1,0 +1,549 @@
+# ---------------------------------------------------------------------------
+# Top ~100 most common hardware device IDs for the bundled linux-hardware.org
+# LKDDb cache (linux-hardware.org/?id=<id>).
+#
+# Format:  <type>:<vendor>-<device>   # short description
+#   type   = pci  (PCI/PCIe) or usb (USB)
+#   vendor = 4-digit hex Vendor ID
+#   device = 4-digit hex Device ID
+#
+# Used by tools/build-hw-cache.ps1 to pre-fetch pages into lsl-hw-cache/.
+# The installed tool (install.ps1) reads that folder so common hardware is
+# rated with no per-device network request.
+#
+# The dev machine's own IDs are marked [DEV] so we can verify a fully-offline
+# rating: 8086:2723, 10EC:2600, 10DE:1E91, 144D:A808, 1BB1:5013, 04F3:0C11,
+# 13D3:56A2, 8086:9BC4, 8087:0029.
+# ---------------------------------------------------------------------------
+
+# --- WiFi (PCIe / NGFF) ---------------------------------------------------
+pci:8086-2723  # Intel Wi-Fi 6 AX200 [DEV]
+pci:8086-2725  # Intel Wi-Fi 6 AX210
+pci:8086-06F0  # Intel Wi-Fi 6 AX201 (CNVio2)
+pci:8086-24FD  # Intel Dual Band Wireless-AC 8265
+pci:8086-24FB  # Intel Dual Band Wireless-AC 3168
+pci:8086-08B1  # Intel Wireless 7260
+pci:8086-095A  # Intel Wireless 7265
+pci:8086-3165  # Intel Wireless 3165
+pci:10EC-C821  # Realtek RTL8821CE
+pci:10EC-C822  # Realtek RTL8822CE
+pci:10EC-A85A  # Realtek RTL8852AE
+pci:10EC-B852  # Realtek RTL8852BE
+pci:14E4-4727  # Broadcom BCM4313
+pci:14E4-4365  # Broadcom BCM43142 [DEV-family]
+pci:14E4-43A0  # Broadcom BCM4360
+pci:14E4-43B1  # Broadcom BCM4352
+pci:168C-003E  # Qualcomm Atheros QCA6174
+pci:168C-0042  # Qualcomm Atheros QCA9377
+pci:168C-0032  # Atheros AR9485
+pci:168C-002B  # Atheros AR9285
+pci:168C-0030  # Atheros AR93xx
+
+# --- Ethernet (PCI) ------------------------------------------------------
+pci:10EC-8168  # Realtek RTL8111/8168
+pci:10EC-8125  # Realtek RTL8125 2.5GbE
+pci:10EC-8136  # Realtek RTL8101E
+pci:10EC-2600  # Realtek Killer E2600 GbE [DEV]
+pci:10EC-2502  # Realtek Killer E2500 GbE
+pci:10EC-3000  # Realtek Killer E3000 2.5GbE
+pci:10EC-8169  # Realtek RTL8169
+pci:8086-15FC  # Intel I219-LM
+pci:8086-15F3  # Intel I219-V
+pci:8086-1539  # Intel I211 GbE
+pci:8086-1533  # Intel I210 GbE
+pci:8086-10EA  # Intel 82577LM
+pci:1969-1091  # Qualcomm Atheros AR8161
+pci:1969-E0A1  # Qualcomm Atheros AR8171/8172
+pci:14E4-165F  # Broadcom NetXtreme BCM5761
+pci:14E4-16B1  # Broadcom NetXtreme II BCM5709
+
+# --- GPUs (PCI) ----------------------------------------------------------
+pci:10DE-1F82  # NVIDIA TU117 [GeForce GTX 1650]
+pci:10DE-1F08  # NVIDIA TU106 [GeForce RTX 2060]
+pci:10DE-1E91  # NVIDIA TU104 [GeForce RTX 2070] [DEV]
+pci:10DE-1C82  # NVIDIA GP107 [GeForce GTX 1050 Ti]
+pci:10DE-1C03  # NVIDIA GP106 [GeForce GTX 1060]
+pci:10DE-2486  # NVIDIA GA104 [GeForce RTX 3070]
+pci:10DE-2504  # NVIDIA GA106 [GeForce RTX 3060]
+pci:10DE-2786  # NVIDIA AD104 [GeForce RTX 4070]
+pci:10DE-2704  # NVIDIA AD103 [GeForce RTX 4080]
+pci:10DE-2204  # NVIDIA AD102 [GeForce RTX 4090]
+pci:10DE-13C2  # NVIDIA GM204 [GeForce GTX 970]
+pci:10DE-1B80  # NVIDIA GP102 [GeForce GTX 1080 Ti]
+pci:1002-67DF  # AMD Polaris 10 [Radeon RX 580]
+pci:1002-699F  # AMD Polaris 12 [Radeon RX 550]
+pci:1002-731F  # AMD Navi 10 [Radeon RX 5700]
+pci:1002-73BF  # AMD Navi 21 [Radeon RX 6800/6900]
+pci:1002-73DF  # AMD Navi 22 [Radeon RX 6700 XT]
+pci:1002-743F  # AMD Navi 24 [Radeon RX 6400]
+pci:1002-164E  # AMD Raphael [Ryzen 7000 iGPU]
+pci:8086-3E9B  # Intel UHD Graphics 630
+pci:8086-9BC4  # Intel CometLake-U GT2 [UHD] [DEV]
+pci:8086-9A49  # Intel Iris Xe
+pci:8086-46A6  # Intel AlderLake-P GT2
+pci:8086-4680  # Intel AlderLake-S GT1
+pci:8086-5917  # Intel UHD Graphics 620
+
+# --- NVMe SSDs (PCI) -----------------------------------------------------
+pci:144D-A808  # Samsung PM981/SM981 [DEV]
+pci:144D-A809  # Samsung 980 PRO
+pci:144D-A80A  # Samsung 990 PRO
+pci:1BB1-5013  # Seagate BarraCuda Q5 [DEV]
+pci:2646-500F  # Kingston A2000
+pci:1CC1-8201  # ADATA XPG SX8200
+pci:1C5C-174A  # SK hynix BC501/PC601
+pci:C0A9-540A  # Crucial P1/P2
+pci:1987-5012  # Phison E12
+pci:15B7-5007  # SanDisk WD Black SN750
+
+# --- USB controllers (PCI) -----------------------------------------------
+pci:1B21-1242  # ASMedia ASM1142
+pci:1B21-2142  # ASMedia ASM2142
+pci:1106-3483  # VIA VL805/806
+
+# --- Bluetooth (USB) ----------------------------------------------------
+usb:8087-0025  # Intel AX210 Bluetooth
+usb:8087-0029  # Intel AX200 Bluetooth [DEV]
+usb:0BDA-8771  # Realtek Bluetooth Radio
+usb:0A5C-21E8  # Broadcom BCM20702
+usb:0CF3-E300  # Qualcomm Atheros QCA61x4
+usb:13D3-3549  # IMC Networks Bluetooth
+usb:0489-E0A2  # Foxconn / Lite-On Bluetooth
+
+# --- Audio (PCI) ---------------------------------------------------------
+pci:10EC-0256  # Realtek ALC256
+pci:10EC-0287  # Realtek ALC287
+pci:10EC-0295  # Realtek ALC295
+pci:10EC-0245  # Realtek ALC245
+pci:10EC-0269  # Realtek ALC269
+pci:8086-9DC8  # Intel Cannon Point HD Audio
+pci:8086-A170  # Intel Sunrise Point HD Audio
+pci:8086-51C8  # Intel AlderLake HD Audio
+pci:1022-15E3  # AMD Raven/Renoir HD Audio
+pci:1022-1487  # AMD Starship/Matisse HD Audio
+pci:1002-AA80  # AMD GPU HDMI Audio
+
+# --- Webcams (USB) ------------------------------------------------------
+usb:13D3-56A2  # IMC Networks USB2.0 HD UVC WebCam [DEV]
+usb:0BDA-5687  # Realtek HD WebCam
+usb:04F2-B6BB  # Chicony Electronics HD WebCam
+usb:1BCF-2883  # Sunplus Innovation WebCam
+
+# --- Touchpad / Fingerprint (USB) ---------------------------------------
+usb:04F3-0C11  # Elan Microelectronics fingerprint [DEV]
+usb:06CB-00BD  # Synaptics TouchPad
+usb:044E-1216  # Alps Electric TouchPad
+
+# --- Card readers (PCI / USB) -------------------------------------------
+pci:10EC-5227  # Realtek RTS5227
+pci:10EC-5229  # Realtek RTS5229
+pci:10EC-525A  # Realtek RTS525A
+pci:10EC-5287  # Realtek RTS5287
+pci:1217-8520  # O2 Micro SD/MMC
+usb:058F-6366  # Alcor Micro Card Reader
+
+# --- PCIconf Top-50: Storage (AHCI/NVMe/RAID) (data-driven, by frequency) ---
+pci:1022-7901  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 965 machine dumps
+pci:8086-8c02  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 559 machine dumps
+pci:8086-31e3  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 451 machine dumps
+pci:8086-9d03  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 385 machine dumps
+pci:1022-7801  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 371 machine dumps
+pci:8086-a102  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 269 machine dumps
+pci:8086-1c02  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 249 machine dumps
+pci:8086-0f23  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 241 machine dumps
+pci:8086-22a3  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 236 machine dumps
+pci:8086-1e03  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 215 machine dumps
+pci:8086-a352  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 200 machine dumps
+pci:8086-4dd3  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 199 machine dumps
+pci:8086-a282  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 152 machine dumps
+pci:8086-9c83  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 152 machine dumps
+pci:8086-5ae3  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 145 machine dumps
+pci:8086-9c03  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 136 machine dumps
+pci:1b21-0612  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 130 machine dumps
+pci:8086-1e02  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 129 machine dumps
+pci:1022-43c8  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 125 machine dumps
+pci:126f-2263  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 118 machine dumps
+pci:8086-1c03  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 115 machine dumps
+pci:8086-3a22  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 112 machine dumps
+pci:1002-4391  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 112 machine dumps
+pci:144d-a804  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 106 machine dumps
+pci:8086-2822  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 102 machine dumps
+pci:8086-27c0  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 101 machine dumps
+pci:15b7-5006  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 97 machine dumps
+pci:8086-02d3  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 91 machine dumps
+pci:1022-43eb  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 90 machine dumps
+pci:8086-27df  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 89 machine dumps
+pci:11ab-6121  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 84 machine dumps
+pci:8086-1d02  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 79 machine dumps
+pci:8086-282a  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 75 machine dumps
+pci:8086-8d02  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 74 machine dumps
+pci:8086-2850  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 70 machine dumps
+pci:8086-8d62  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 67 machine dumps
+pci:1000-0072  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 67 machine dumps
+pci:1022-7800  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 67 machine dumps
+pci:8086-43d2  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 65 machine dumps
+pci:1002-439c  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 65 machine dumps
+pci:8086-3b22  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 62 machine dumps
+pci:15b7-5009  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 58 machine dumps
+pci:8086-27c1  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 58 machine dumps
+pci:8086-2829  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 56 machine dumps
+pci:8086-1f32  # PCIconf top-50 Storage (AHCI/NVMe/RAID): seen in 53 machine dumps
+
+# --- PCIconf Top-50: Network (Ethernet/WiFi) (data-driven, by frequency) ---
+pci:8086-1521  # PCIconf top-50 Network (Ethernet/WiFi): seen in 1525 machine dumps
+pci:8086-10d3  # PCIconf top-50 Network (Ethernet/WiFi): seen in 992 machine dumps
+pci:8086-157b  # PCIconf top-50 Network (Ethernet/WiFi): seen in 915 machine dumps
+pci:8086-150c  # PCIconf top-50 Network (Ethernet/WiFi): seen in 748 machine dumps
+pci:8086-150e  # PCIconf top-50 Network (Ethernet/WiFi): seen in 616 machine dumps
+pci:8086-125c  # PCIconf top-50 Network (Ethernet/WiFi): seen in 522 machine dumps
+pci:8086-10bc  # PCIconf top-50 Network (Ethernet/WiFi): seen in 460 machine dumps
+pci:8086-1502  # PCIconf top-50 Network (Ethernet/WiFi): seen in 391 machine dumps
+pci:8086-105e  # PCIconf top-50 Network (Ethernet/WiFi): seen in 372 machine dumps
+pci:8086-1528  # PCIconf top-50 Network (Ethernet/WiFi): seen in 322 machine dumps
+pci:14e4-1639  # PCIconf top-50 Network (Ethernet/WiFi): seen in 288 machine dumps
+pci:8086-10fb  # PCIconf top-50 Network (Ethernet/WiFi): seen in 273 machine dumps
+pci:8086-1f41  # PCIconf top-50 Network (Ethernet/WiFi): seen in 228 machine dumps
+pci:14e4-1657  # PCIconf top-50 Network (Ethernet/WiFi): seen in 226 machine dumps
+pci:8086-153a  # PCIconf top-50 Network (Ethernet/WiFi): seen in 212 machine dumps
+pci:8086-10c9  # PCIconf top-50 Network (Ethernet/WiFi): seen in 202 machine dumps
+pci:8086-10e8  # PCIconf top-50 Network (Ethernet/WiFi): seen in 166 machine dumps
+pci:1022-1458  # PCIconf top-50 Network (Ethernet/WiFi): seen in 166 machine dumps
+pci:8086-1572  # PCIconf top-50 Network (Ethernet/WiFi): seen in 128 machine dumps
+pci:8086-1563  # PCIconf top-50 Network (Ethernet/WiFi): seen in 127 machine dumps
+pci:8086-15e5  # PCIconf top-50 Network (Ethernet/WiFi): seen in 120 machine dumps
+pci:10ec-8161  # PCIconf top-50 Network (Ethernet/WiFi): seen in 119 machine dumps
+pci:8086-1522  # PCIconf top-50 Network (Ethernet/WiFi): seen in 118 machine dumps
+pci:8086-15b7  # PCIconf top-50 Network (Ethernet/WiFi): seen in 112 machine dumps
+pci:11ab-4364  # PCIconf top-50 Network (Ethernet/WiFi): seen in 103 machine dumps
+pci:14e4-163b  # PCIconf top-50 Network (Ethernet/WiFi): seen in 90 machine dumps
+pci:8086-24f3  # PCIconf top-50 Network (Ethernet/WiFi): seen in 89 machine dumps
+pci:8086-10d6  # PCIconf top-50 Network (Ethernet/WiFi): seen in 88 machine dumps
+pci:11ab-4320  # PCIconf top-50 Network (Ethernet/WiFi): seen in 85 machine dumps
+pci:8086-2526  # PCIconf top-50 Network (Ethernet/WiFi): seen in 84 machine dumps
+pci:8086-15bc  # PCIconf top-50 Network (Ethernet/WiFi): seen in 80 machine dumps
+pci:168c-0036  # PCIconf top-50 Network (Ethernet/WiFi): seen in 72 machine dumps
+pci:8086-0082  # PCIconf top-50 Network (Ethernet/WiFi): seen in 70 machine dumps
+pci:8086-15e4  # PCIconf top-50 Network (Ethernet/WiFi): seen in 70 machine dumps
+pci:8086-15b8  # PCIconf top-50 Network (Ethernet/WiFi): seen in 69 machine dumps
+pci:14e4-168e  # PCIconf top-50 Network (Ethernet/WiFi): seen in 68 machine dumps
+pci:8086-02f0  # PCIconf top-50 Network (Ethernet/WiFi): seen in 68 machine dumps
+
+# --- PCIconf Top-50: Display (GPU) (data-driven, by frequency) ---
+pci:8086-3185  # PCIconf top-50 Display (GPU): seen in 397 machine dumps
+pci:1a03-2000  # PCIconf top-50 Display (GPU): seen in 337 machine dumps
+pci:8086-0f31  # PCIconf top-50 Display (GPU): seen in 249 machine dumps
+pci:8086-0412  # PCIconf top-50 Display (GPU): seen in 244 machine dumps
+pci:8086-22b1  # PCIconf top-50 Display (GPU): seen in 240 machine dumps
+pci:8086-4e61  # PCIconf top-50 Display (GPU): seen in 181 machine dumps
+pci:8086-5916  # PCIconf top-50 Display (GPU): seen in 170 machine dumps
+pci:8086-1912  # PCIconf top-50 Display (GPU): seen in 167 machine dumps
+pci:102b-0532  # PCIconf top-50 Display (GPU): seen in 140 machine dumps
+pci:8086-0166  # PCIconf top-50 Display (GPU): seen in 139 machine dumps
+pci:8086-5a85  # PCIconf top-50 Display (GPU): seen in 134 machine dumps
+pci:8086-0402  # PCIconf top-50 Display (GPU): seen in 134 machine dumps
+pci:8086-0152  # PCIconf top-50 Display (GPU): seen in 126 machine dumps
+pci:8086-1616  # PCIconf top-50 Display (GPU): seen in 116 machine dumps
+pci:8086-3e92  # PCIconf top-50 Display (GPU): seen in 105 machine dumps
+pci:8086-0102  # PCIconf top-50 Display (GPU): seen in 104 machine dumps
+pci:8086-0a16  # PCIconf top-50 Display (GPU): seen in 104 machine dumps
+pci:8086-9b41  # PCIconf top-50 Display (GPU): seen in 98 machine dumps
+pci:1002-1636  # PCIconf top-50 Display (GPU): seen in 95 machine dumps
+pci:8086-1916  # PCIconf top-50 Display (GPU): seen in 93 machine dumps
+pci:8086-5912  # PCIconf top-50 Display (GPU): seen in 82 machine dumps
+pci:8086-9bc8  # PCIconf top-50 Display (GPU): seen in 82 machine dumps
+pci:8086-041e  # PCIconf top-50 Display (GPU): seen in 82 machine dumps
+pci:1002-1638  # PCIconf top-50 Display (GPU): seen in 81 machine dumps
+pci:1002-15d8  # PCIconf top-50 Display (GPU): seen in 80 machine dumps
+pci:8086-3ea0  # PCIconf top-50 Display (GPU): seen in 77 machine dumps
+pci:8086-0126  # PCIconf top-50 Display (GPU): seen in 77 machine dumps
+pci:10de-1d01  # PCIconf top-50 Display (GPU): seen in 76 machine dumps
+pci:102b-0522  # PCIconf top-50 Display (GPU): seen in 74 machine dumps
+pci:102b-0534  # PCIconf top-50 Display (GPU): seen in 70 machine dumps
+pci:8086-2e32  # PCIconf top-50 Display (GPU): seen in 67 machine dumps
+pci:10de-128b  # PCIconf top-50 Display (GPU): seen in 60 machine dumps
+pci:8086-3184  # PCIconf top-50 Display (GPU): seen in 60 machine dumps
+pci:1002-68f9  # PCIconf top-50 Display (GPU): seen in 60 machine dumps
+pci:1002-9833  # PCIconf top-50 Display (GPU): seen in 58 machine dumps
+pci:8086-a001  # PCIconf top-50 Display (GPU): seen in 57 machine dumps
+pci:1002-9851  # PCIconf top-50 Display (GPU): seen in 56 machine dumps
+pci:8086-a002  # PCIconf top-50 Display (GPU): seen in 55 machine dumps
+pci:1002-6841  # PCIconf top-50 Display (GPU): seen in 55 machine dumps
+pci:1002-15dd  # PCIconf top-50 Display (GPU): seen in 52 machine dumps
+pci:1002-515e  # PCIconf top-50 Display (GPU): seen in 51 machine dumps
+pci:8086-3e91  # PCIconf top-50 Display (GPU): seen in 47 machine dumps
+pci:8086-0416  # PCIconf top-50 Display (GPU): seen in 47 machine dumps
+pci:102b-0533  # PCIconf top-50 Display (GPU): seen in 45 machine dumps
+pci:8086-0162  # PCIconf top-50 Display (GPU): seen in 44 machine dumps
+pci:8086-191b  # PCIconf top-50 Display (GPU): seen in 44 machine dumps
+
+# --- PCIconf Top-50: Multimedia (audio/AV) (data-driven, by frequency) ---
+pci:8086-8c20  # PCIconf top-50 Multimedia (audio/AV): seen in 426 machine dumps
+pci:8086-3198  # PCIconf top-50 Multimedia (audio/AV): seen in 410 machine dumps
+pci:8086-0c0c  # PCIconf top-50 Multimedia (audio/AV): seen in 393 machine dumps
+pci:8086-1e20  # PCIconf top-50 Multimedia (audio/AV): seen in 370 machine dumps
+pci:8086-9d71  # PCIconf top-50 Multimedia (audio/AV): seen in 289 machine dumps
+pci:8086-1c20  # PCIconf top-50 Multimedia (audio/AV): seen in 277 machine dumps
+pci:1022-780d  # PCIconf top-50 Multimedia (audio/AV): seen in 246 machine dumps
+pci:8086-4dc8  # PCIconf top-50 Multimedia (audio/AV): seen in 219 machine dumps
+pci:1022-15e2  # PCIconf top-50 Multimedia (audio/AV): seen in 219 machine dumps
+pci:8086-a348  # PCIconf top-50 Multimedia (audio/AV): seen in 217 machine dumps
+pci:1002-1637  # PCIconf top-50 Multimedia (audio/AV): seen in 211 machine dumps
+pci:8086-2284  # PCIconf top-50 Multimedia (audio/AV): seen in 210 machine dumps
+pci:1002-9840  # PCIconf top-50 Multimedia (audio/AV): seen in 208 machine dumps
+pci:8086-0f04  # PCIconf top-50 Multimedia (audio/AV): seen in 168 machine dumps
+pci:1022-1457  # PCIconf top-50 Multimedia (audio/AV): seen in 146 machine dumps
+pci:8086-27d8  # PCIconf top-50 Multimedia (audio/AV): seen in 143 machine dumps
+pci:8086-160c  # PCIconf top-50 Multimedia (audio/AV): seen in 139 machine dumps
+pci:8086-9c20  # PCIconf top-50 Multimedia (audio/AV): seen in 137 machine dumps
+pci:8086-0a0c  # PCIconf top-50 Multimedia (audio/AV): seen in 136 machine dumps
+pci:8086-a2f0  # PCIconf top-50 Multimedia (audio/AV): seen in 136 machine dumps
+pci:8086-9ca0  # PCIconf top-50 Multimedia (audio/AV): seen in 133 machine dumps
+pci:1002-15de  # PCIconf top-50 Multimedia (audio/AV): seen in 125 machine dumps
+pci:8086-5a98  # PCIconf top-50 Multimedia (audio/AV): seen in 120 machine dumps
+pci:8086-3a3e  # PCIconf top-50 Multimedia (audio/AV): seen in 119 machine dumps
+pci:8086-02c8  # PCIconf top-50 Multimedia (audio/AV): seen in 109 machine dumps
+pci:1002-4383  # PCIconf top-50 Multimedia (audio/AV): seen in 108 machine dumps
+pci:8086-9d70  # PCIconf top-50 Multimedia (audio/AV): seen in 96 machine dumps
+pci:8086-a0c8  # PCIconf top-50 Multimedia (audio/AV): seen in 87 machine dumps
+pci:8086-3b56  # PCIconf top-50 Multimedia (audio/AV): seen in 87 machine dumps
+pci:10de-0e0f  # PCIconf top-50 Multimedia (audio/AV): seen in 82 machine dumps
+pci:8086-06c8  # PCIconf top-50 Multimedia (audio/AV): seen in 76 machine dumps
+pci:10de-0fb8  # PCIconf top-50 Multimedia (audio/AV): seen in 76 machine dumps
+pci:8086-293e  # PCIconf top-50 Multimedia (audio/AV): seen in 73 machine dumps
+pci:1002-aa90  # PCIconf top-50 Multimedia (audio/AV): seen in 73 machine dumps
+pci:1002-aa68  # PCIconf top-50 Multimedia (audio/AV): seen in 68 machine dumps
+pci:10de-0fb9  # PCIconf top-50 Multimedia (audio/AV): seen in 62 machine dumps
+pci:1002-aaf0  # PCIconf top-50 Multimedia (audio/AV): seen in 54 machine dumps
+pci:8086-1d20  # PCIconf top-50 Multimedia (audio/AV): seen in 53 machine dumps
+pci:10de-10fa  # PCIconf top-50 Multimedia (audio/AV): seen in 52 machine dumps
+pci:10de-0be3  # PCIconf top-50 Multimedia (audio/AV): seen in 51 machine dumps
+pci:8086-284b  # PCIconf top-50 Multimedia (audio/AV): seen in 50 machine dumps
+pci:10de-1aeb  # PCIconf top-50 Multimedia (audio/AV): seen in 49 machine dumps
+pci:8086-a3f0  # PCIconf top-50 Multimedia (audio/AV): seen in 44 machine dumps
+pci:10de-0ac0  # PCIconf top-50 Multimedia (audio/AV): seen in 43 machine dumps
+pci:1002-1308  # PCIconf top-50 Multimedia (audio/AV): seen in 41 machine dumps
+pci:10de-0bea  # PCIconf top-50 Multimedia (audio/AV): seen in 37 machine dumps
+
+# --- PCIconf Top-50: Serial bus (USB xHCI / SMBus) (data-driven, by frequency) ---
+pci:1022-790b  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 862 machine dumps
+pci:1022-7808  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 815 machine dumps
+pci:8086-8c22  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 648 machine dumps
+pci:8086-8c2d  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 644 machine dumps
+pci:8086-8c26  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 644 machine dumps
+pci:8086-8c31  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 625 machine dumps
+pci:1022-149c  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 607 machine dumps
+pci:1022-7807  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 480 machine dumps
+pci:8086-9d2f  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 474 machine dumps
+pci:8086-9d23  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 474 machine dumps
+pci:1022-7814  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 464 machine dumps
+pci:8086-31a8  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 457 machine dumps
+pci:8086-31d4  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 457 machine dumps
+pci:1022-780b  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 457 machine dumps
+pci:1022-1639  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 448 machine dumps
+pci:8086-1c26  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 417 machine dumps
+pci:8086-1c2d  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 416 machine dumps
+pci:8086-1e2d  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 397 machine dumps
+pci:8086-1e26  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 397 machine dumps
+pci:8086-1c22  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 393 machine dumps
+pci:1002-4397  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 382 machine dumps
+pci:1002-4396  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 382 machine dumps
+pci:8086-1e31  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 353 machine dumps
+pci:8086-1e22  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 334 machine dumps
+pci:8086-a12f  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 327 machine dumps
+pci:8086-a123  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 327 machine dumps
+pci:8086-a36d  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 273 machine dumps
+pci:8086-a324  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 273 machine dumps
+pci:8086-a323  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 266 machine dumps
+pci:8086-0f12  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 251 machine dumps
+pci:8086-22b5  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 242 machine dumps
+pci:8086-2292  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 238 machine dumps
+pci:8086-4ded  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 220 machine dumps
+pci:8086-4da3  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 220 machine dumps
+pci:8086-4da4  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 220 machine dumps
+pci:8086-0f35  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 203 machine dumps
+pci:8086-3a34  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 186 machine dumps
+pci:8086-3a35  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 186 machine dumps
+pci:8086-3a36  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 186 machine dumps
+pci:8086-3a3a  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 186 machine dumps
+pci:8086-27c8  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 183 machine dumps
+pci:8086-27c9  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 183 machine dumps
+pci:8086-27cc  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 183 machine dumps
+pci:8086-27ca  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 179 machine dumps
+pci:8086-3a39  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 179 machine dumps
+pci:8086-27cb  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 176 machine dumps
+pci:8086-a2af  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 166 machine dumps
+pci:8086-a2a3  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 166 machine dumps
+pci:8086-27da  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 163 machine dumps
+pci:8086-3a37  # PCIconf top-50 Serial bus (USB xHCI / SMBus): seen in 161 machine dumps
+
+# --- PCIconf Top-170 across functional classes (global frequency) ---
+pci:8086-9ca2  # PCIconf top-170 (global): seen in 156 machine dumps
+pci:8086-9cb1  # PCIconf top-170 (global): seen in 155 machine dumps
+pci:1022-15e0  # PCIconf top-170 (global): seen in 147 machine dumps
+pci:1022-15e1  # PCIconf top-170 (global): seen in 147 machine dumps
+pci:1002-4385  # PCIconf top-170 (global): seen in 145 machine dumps
+pci:8086-9c22  # PCIconf top-170 (global): seen in 141 machine dumps
+pci:8086-9c31  # PCIconf top-170 (global): seen in 138 machine dumps
+pci:1022-145f  # PCIconf top-170 (global): seen in 137 machine dumps
+pci:8086-3a38  # PCIconf top-170 (global): seen in 134 machine dumps
+pci:8086-3a3c  # PCIconf top-170 (global): seen in 134 machine dumps
+pci:8086-9ca6  # PCIconf top-170 (global): seen in 132 machine dumps
+pci:8086-5aa8  # PCIconf top-170 (global): seen in 131 machine dumps
+pci:8086-5ad4  # PCIconf top-170 (global): seen in 131 machine dumps
+pci:8086-3a30  # PCIconf top-170 (global): seen in 126 machine dumps
+pci:8086-9c26  # PCIconf top-170 (global): seen in 126 machine dumps
+pci:8086-3b34  # PCIconf top-170 (global): seen in 122 machine dumps
+pci:8086-2934  # PCIconf top-170 (global): seen in 120 machine dumps
+pci:8086-293a  # PCIconf top-170 (global): seen in 120 machine dumps
+pci:8086-3b3c  # PCIconf top-170 (global): seen in 120 machine dumps
+pci:1002-4399  # PCIconf top-170 (global): seen in 120 machine dumps
+pci:8086-2935  # PCIconf top-170 (global): seen in 119 machine dumps
+pci:8086-2937  # PCIconf top-170 (global): seen in 118 machine dumps
+pci:8086-293c  # PCIconf top-170 (global): seen in 118 machine dumps
+pci:8086-2938  # PCIconf top-170 (global): seen in 117 machine dumps
+pci:8086-a368  # PCIconf top-170 (global): seen in 116 machine dumps
+pci:8086-2936  # PCIconf top-170 (global): seen in 116 machine dumps
+pci:11c1-5811  # PCIconf top-170 (global): seen in 116 machine dumps
+pci:8086-4de8  # PCIconf top-170 (global): seen in 115 machine dumps
+pci:8086-3b30  # PCIconf top-170 (global): seen in 115 machine dumps
+pci:8086-02ed  # PCIconf top-170 (global): seen in 114 machine dumps
+pci:8086-02a3  # PCIconf top-170 (global): seen in 114 machine dumps
+pci:8086-02a4  # PCIconf top-170 (global): seen in 114 machine dumps
+pci:8086-2939  # PCIconf top-170 (global): seen in 111 machine dumps
+pci:8086-4dea  # PCIconf top-170 (global): seen in 105 machine dumps
+pci:8086-2930  # PCIconf top-170 (global): seen in 104 machine dumps
+pci:8086-9ded  # PCIconf top-170 (global): seen in 100 machine dumps
+pci:8086-9da4  # PCIconf top-170 (global): seen in 100 machine dumps
+pci:1022-43d5  # PCIconf top-170 (global): seen in 100 machine dumps
+pci:8086-9da3  # PCIconf top-170 (global): seen in 98 machine dumps
+pci:8086-a0ed  # PCIconf top-170 (global): seen in 91 machine dumps
+pci:8086-a0a3  # PCIconf top-170 (global): seen in 91 machine dumps
+pci:8086-a0a4  # PCIconf top-170 (global): seen in 91 machine dumps
+pci:8086-0f34  # PCIconf top-170 (global): seen in 90 machine dumps
+pci:8086-9a13  # PCIconf top-170 (global): seen in 83 machine dumps
+pci:1033-0194  # PCIconf top-170 (global): seen in 80 machine dumps
+pci:8086-06ed  # PCIconf top-170 (global): seen in 78 machine dumps
+pci:8086-06a3  # PCIconf top-170 (global): seen in 78 machine dumps
+pci:8086-06a4  # PCIconf top-170 (global): seen in 78 machine dumps
+pci:8086-43ed  # PCIconf top-170 (global): seen in 72 machine dumps
+pci:8086-43a3  # PCIconf top-170 (global): seen in 72 machine dumps
+pci:8086-43a4  # PCIconf top-170 (global): seen in 72 machine dumps
+pci:8086-1d2d  # PCIconf top-170 (global): seen in 71 machine dumps
+pci:8086-1d26  # PCIconf top-170 (global): seen in 71 machine dumps
+pci:8086-a0e8  # PCIconf top-170 (global): seen in 70 machine dumps
+pci:8086-2830  # PCIconf top-170 (global): seen in 64 machine dumps
+pci:8086-2836  # PCIconf top-170 (global): seen in 64 machine dumps
+pci:8086-a369  # PCIconf top-170 (global): seen in 64 machine dumps
+pci:1002-4398  # PCIconf top-170 (global): seen in 64 machine dumps
+pci:8086-2831  # PCIconf top-170 (global): seen in 63 machine dumps
+pci:8086-15bb  # PCIconf top-170 (global): seen in 62 machine dumps
+pci:1b21-1042  # PCIconf top-170 (global): seen in 62 machine dumps
+pci:1022-43ee  # PCIconf top-170 (global): seen in 62 machine dumps
+pci:8086-1d22  # PCIconf top-170 (global): seen in 62 machine dumps
+pci:1022-145c  # PCIconf top-170 (global): seen in 60 machine dumps
+pci:8086-2834  # PCIconf top-170 (global): seen in 58 machine dumps
+pci:8086-283a  # PCIconf top-170 (global): seen in 58 machine dumps
+pci:8086-9de8  # PCIconf top-170 (global): seen in 58 machine dumps
+pci:10ec-816c  # PCIconf top-170 (global): seen in 58 machine dumps
+pci:10ec-816d  # PCIconf top-170 (global): seen in 58 machine dumps
+pci:8086-0085  # PCIconf top-170 (global): seen in 58 machine dumps
+pci:8086-2835  # PCIconf top-170 (global): seen in 57 machine dumps
+pci:8086-2832  # PCIconf top-170 (global): seen in 56 machine dumps
+pci:1912-0015  # PCIconf top-170 (global): seen in 56 machine dumps
+pci:8086-06e8  # PCIconf top-170 (global): seen in 55 machine dumps
+pci:1b21-1142  # PCIconf top-170 (global): seen in 55 machine dumps
+pci:8086-283e  # PCIconf top-170 (global): seen in 54 machine dumps
+pci:8086-02e8  # PCIconf top-170 (global): seen in 54 machine dumps
+pci:8086-9a1b  # PCIconf top-170 (global): seen in 53 machine dumps
+pci:8086-8d22  # PCIconf top-170 (global): seen in 52 machine dumps
+pci:8086-9dd3  # PCIconf top-170 (global): seen in 51 machine dumps
+pci:8086-8d31  # PCIconf top-170 (global): seen in 50 machine dumps
+pci:8086-8d2d  # PCIconf top-170 (global): seen in 50 machine dumps
+pci:8086-8d26  # PCIconf top-170 (global): seen in 50 machine dumps
+pci:8086-a3af  # PCIconf top-170 (global): seen in 50 machine dumps
+pci:8086-a3a3  # PCIconf top-170 (global): seen in 50 machine dumps
+pci:8086-a370  # PCIconf top-170 (global): seen in 49 machine dumps
+pci:10de-1aec  # PCIconf top-170 (global): seen in 49 machine dumps
+pci:10de-1aed  # PCIconf top-170 (global): seen in 49 machine dumps
+pci:8086-9df0  # PCIconf top-170 (global): seen in 48 machine dumps
+pci:8086-2922  # PCIconf top-170 (global): seen in 47 machine dumps
+pci:8086-31dc  # PCIconf top-170 (global): seen in 47 machine dumps
+pci:8086-15d7  # PCIconf top-170 (global): seen in 47 machine dumps
+pci:8086-10a7  # PCIconf top-170 (global): seen in 46 machine dumps
+pci:1912-0014  # PCIconf top-170 (global): seen in 46 machine dumps
+pci:1180-0832  # PCIconf top-170 (global): seen in 46 machine dumps
+pci:8086-a382  # PCIconf top-170 (global): seen in 45 machine dumps
+pci:8086-2929  # PCIconf top-170 (global): seen in 45 machine dumps
+pci:8086-8c03  # PCIconf top-170 (global): seen in 45 machine dumps
+pci:8086-a0d3  # PCIconf top-170 (global): seen in 44 machine dumps
+pci:8086-15e3  # PCIconf top-170 (global): seen in 43 machine dumps
+pci:1002-9831  # PCIconf top-170 (global): seen in 43 machine dumps
+pci:8086-156f  # PCIconf top-170 (global): seen in 43 machine dumps
+pci:10de-0aa2  # PCIconf top-170 (global): seen in 43 machine dumps
+pci:10de-0aa5  # PCIconf top-170 (global): seen in 43 machine dumps
+pci:10de-0aa6  # PCIconf top-170 (global): seen in 43 machine dumps
+pci:8086-08b3  # PCIconf top-170 (global): seen in 42 machine dumps
+pci:1b21-1343  # PCIconf top-170 (global): seen in 42 machine dumps
+pci:8086-15f2  # PCIconf top-170 (global): seen in 42 machine dumps
+pci:8086-37d0  # PCIconf top-170 (global): seen in 42 machine dumps
+pci:8086-154d  # PCIconf top-170 (global): seen in 42 machine dumps
+pci:8086-15be  # PCIconf top-170 (global): seen in 42 machine dumps
+pci:1987-5016  # PCIconf top-170 (global): seen in 41 machine dumps
+pci:1022-780c  # PCIconf top-170 (global): seen in 41 machine dumps
+pci:10de-0aa7  # PCIconf top-170 (global): seen in 41 machine dumps
+pci:10de-0aa9  # PCIconf top-170 (global): seen in 41 machine dumps
+pci:168c-002a  # PCIconf top-170 (global): seen in 40 machine dumps
+pci:1022-7809  # PCIconf top-170 (global): seen in 40 machine dumps
+pci:8086-a0f0  # PCIconf top-170 (global): seen in 40 machine dumps
+pci:8086-10b9  # PCIconf top-170 (global): seen in 40 machine dumps
+pci:8086-a0e9  # PCIconf top-170 (global): seen in 40 machine dumps
+pci:8086-43e8  # PCIconf top-170 (global): seen in 40 machine dumps
+pci:8086-0046  # PCIconf top-170 (global): seen in 40 machine dumps
+pci:10de-0ab9  # PCIconf top-170 (global): seen in 40 machine dumps
+pci:11c1-5901  # PCIconf top-170 (global): seen in 39 machine dumps
+pci:8086-9de9  # PCIconf top-170 (global): seen in 38 machine dumps
+pci:10de-0ab0  # PCIconf top-170 (global): seen in 38 machine dumps
+pci:8086-5906  # PCIconf top-170 (global): seen in 37 machine dumps
+pci:8086-1503  # PCIconf top-170 (global): seen in 37 machine dumps
+pci:8086-153b  # PCIconf top-170 (global): seen in 37 machine dumps
+pci:8086-a353  # PCIconf top-170 (global): seen in 37 machine dumps
+pci:8086-088e  # PCIconf top-170 (global): seen in 36 machine dumps
+pci:10de-10f1  # PCIconf top-170 (global): seen in 36 machine dumps
+pci:1022-43bc  # PCIconf top-170 (global): seen in 36 machine dumps
+pci:1022-43b8  # PCIconf top-170 (global): seen in 36 machine dumps
+pci:8086-0438  # PCIconf top-170 (global): seen in 36 machine dumps
+pci:168c-0034  # PCIconf top-170 (global): seen in 35 machine dumps
+pci:104c-8241  # PCIconf top-170 (global): seen in 35 machine dumps
+pci:14e4-432b  # PCIconf top-170 (global): seen in 35 machine dumps
+pci:15b7-5002  # PCIconf top-170 (global): seen in 35 machine dumps
+pci:8086-9a1d  # PCIconf top-170 (global): seen in 35 machine dumps
+pci:1002-1314  # PCIconf top-170 (global): seen in 35 machine dumps
+pci:8086-0116  # PCIconf top-170 (global): seen in 35 machine dumps
+pci:8086-7ae0  # PCIconf top-170 (global): seen in 34 machine dumps
+pci:8086-7aa3  # PCIconf top-170 (global): seen in 34 machine dumps
+pci:8086-7aa4  # PCIconf top-170 (global): seen in 34 machine dumps
+pci:1022-7812  # PCIconf top-170 (global): seen in 34 machine dumps
+pci:8086-1c00  # PCIconf top-170 (global): seen in 33 machine dumps
+pci:8086-1c08  # PCIconf top-170 (global): seen in 33 machine dumps
+pci:1002-aae0  # PCIconf top-170 (global): seen in 33 machine dumps
+pci:8086-3166  # PCIconf top-170 (global): seen in 33 machine dumps
+pci:14e4-4359  # PCIconf top-170 (global): seen in 33 machine dumps
+pci:1002-131c  # PCIconf top-170 (global): seen in 33 machine dumps
+pci:1002-164c  # PCIconf top-170 (global): seen in 33 machine dumps
+pci:8086-a103  # PCIconf top-170 (global): seen in 33 machine dumps
+pci:8086-8cb1  # PCIconf top-170 (global): seen in 32 machine dumps
+pci:8086-8ca2  # PCIconf top-170 (global): seen in 32 machine dumps
+pci:10de-0fba  # PCIconf top-170 (global): seen in 32 machine dumps
+pci:8086-7ae2  # PCIconf top-170 (global): seen in 32 machine dumps
+pci:8086-43c8  # PCIconf top-170 (global): seen in 32 machine dumps
+pci:10de-06e4  # PCIconf top-170 (global): seen in 32 machine dumps
+pci:8086-15a2  # PCIconf top-170 (global): seen in 32 machine dumps
+pci:8086-4e71  # PCIconf top-170 (global): seen in 31 machine dumps
+pci:8086-02c5  # PCIconf top-170 (global): seen in 31 machine dumps
+pci:8086-7ad0  # PCIconf top-170 (global): seen in 31 machine dumps
+pci:10de-03f6  # PCIconf top-170 (global): seen in 31 machine dumps
+pci:1002-aab0  # PCIconf top-170 (global): seen in 31 machine dumps
+pci:1d79-2263  # PCIconf top-170 (global): seen in 31 machine dumps
+pci:8086-8d20  # PCIconf top-170 (global): seen in 31 machine dumps
+pci:8086-1626  # PCIconf top-170 (global): seen in 31 machine dumps
+pci:8086-4555  # PCIconf top-170 (global): seen in 30 machine dumps

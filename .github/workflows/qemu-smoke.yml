@@ -1,0 +1,42 @@
+name: qemu-boot-smoke
+
+# Opt-in only: real-hardware-free boot test. Run manually (Actions -> qemu-boot-smoke
+# -> Run workflow) and supply an ISO URL/path. Never triggered automatically so it
+# does not block the main CI. Requires a runner with KVM (Larger runners, or a
+# self-hosted runner with /dev/kvm).
+on:
+  workflow_dispatch:
+    inputs:
+      iso_url:
+        description: 'URL or path to a Linux Mint 22.x ISO (leave empty to skip)'
+        required: false
+        default: ''
+
+jobs:
+  boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build + boot dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf libguestfs-tools \
+            mksquashfs-tools zip pwsh shellcheck dosfstools fdisk unzip
+
+      - name: Build the bundle
+        run: bash build.sh
+
+      - name: Acquire ISO
+        if: ${{ inputs.iso_url != '' }}
+        run: |
+          ISO="${{ inputs.iso_url }}"
+          if [ -f "$ISO" ]; then echo "Using local ISO $ISO"; echo "ISO=$ISO" >>"$GITHUB_ENV"; fi
+          if [ ! -f "$ISO" ]; then
+            wget -O /tmp/mint.iso "$ISO"
+            echo "ISO=/tmp/mint.iso" >>"$GITHUB_ENV"
+          fi
+
+      - name: Boot smoke test
+        if: ${{ inputs.iso_url != '' }}
+        run: sudo bash tests/qemu-boot-test.sh "$ISO"

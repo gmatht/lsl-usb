@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=lsl-usb first boot progress
+Comment=Shows progress of the one-time first-boot setup
+Exec=/usr/local/bin/lsl-firstboot-progress.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true

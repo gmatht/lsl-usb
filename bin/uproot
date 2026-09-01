@@ -3,44 +3,522 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/lsl-common.sh"
+
+on_error() {
+    local ec="$?"
+    local line="$1"
+    echo "uproot failed at line ${line} (exit ${ec})."
+    if [ -n "${build_log:-}" ] && [ -f "${build_log:-}" ]; then
+        echo "See log: ${build_log}"
+    fi
+}
+trap 'on_error $LINENO' ERR
+
+# --auto-append: non-interactive mode for lsl-firstboot.sh. Skips all prompts
+# and the interactive-chroot fallback; runs squashfs_config.sh (if present) and
+# appends a new layer capturing only the changes.
+auto_append=0
+for arg in "$@"; do
+    case "$arg" in
+        --auto-append) auto_append=1 ;;
+        *) echo "Unknown option: $arg" >&2; exit 1 ;;
+    esac
+done
+
 echo "Updating filesystem.squashfs..."
 
-# Remount /cdrom as read-write
-mount /cdrom -o remount,rw
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root (e.g. sudo bin/uproot)"
+    exit 1
+fi
+
+ts="$(date +%Y%m%d%H%M%S)"
+
+# Remount /cdrom as read-write when available (best effort), before deciding
+# where logs can live.
+if mountpoint -q /cdrom 2>/dev/null; then
+    mount /cdrom -o remount,rw || echo "Warning: could not remount /cdrom read-write; continuing."
+else
+    echo "Warning: /cdrom is not mounted; writing output/logs may fail."
+fi
+
+if mountpoint -q /persist 2>/dev/null; then
+    usb_log_dir="/persist/casper/uproot-logs"
+else
+    usb_log_dir="/cdrom/casper/uproot-logs"
+fi
+# mkdir -p alone is not enough: on a read-only filesystem it succeeds when the
+# directory already exists, and tee -a then fails. Verify we can actually write.
+if ! mkdir -p "$usb_log_dir" 2>/dev/null || ! touch "$usb_log_dir/.write-test" 2>/dev/null; then
+    usb_log_dir=/tmp
+fi
+rm -f "$usb_log_dir/.write-test" 2>/dev/null || true
+build_log="${usb_log_dir}/uproot-${ts}.log"
+
+log() {
+    echo "[$(date +%F' '%T)] $*" | tee -a "$build_log" >/dev/null
+}
+
+human_gb() {
+    python3 - "$1" <<'PY'
+import sys
+b=int(sys.argv[1])
+print(f"{b/1024/1024/1024:.1f} GB")
+PY
+}
+
+get_live_root_lowerdir() {
+    # Extract lowerdir=... from the live / overlay mount (casper)
+    local opts
+    opts="$(awk '$2=="/" && $3=="overlay" {print $4; exit}' /proc/mounts 2>/dev/null || true)"
+    [ -n "$opts" ] || return 1
+    printf "%s" "$opts" | tr ',' '\n' | sed -n 's/^lowerdir=//p' | head -n 1
+}
+
+MOUNTED_LOWER_TARGETS=()
+
+check_overlay_support() {
+    if ! awk '$1=="nodev" && $2=="overlay" {found=1} END{exit(found?0:1)}' /proc/filesystems 2>/dev/null; then
+        echo "Error: overlayfs is not available in this kernel namespace."
+        return 1
+    fi
+}
+
+validate_lowerdirs() {
+    local lower_csv="$1"
+    local d
+    IFS=':' read -r -a _lowerdirs <<< "$lower_csv"
+    for d in "${_lowerdirs[@]}"; do
+        if [ ! -d "$d" ]; then
+            echo "Error: lowerdir entry is not a directory: $d"
+            return 1
+        fi
+    done
+}
+
+resolve_live_lowerdirs() {
+    local lower_csv="$1"
+    local entry base squashfs_file mnt
+    local warned_missing=0
+    local -a resolved=()
+
+    mkdir -p /tmp/squashfs/lower
+    IFS=':' read -r -a _lowerdirs <<< "$lower_csv"
+    for entry in "${_lowerdirs[@]}"; do
+        [ -n "$entry" ] || continue
+        if [ -d "$entry" ]; then
+            resolved+=("$entry")
+            continue
+        fi
+
+        base="$(basename "$entry")"
+        if [ "$base" = "filesystem.squashfs" ] && mountpoint -q /rofs 2>/dev/null; then
+            resolved+=("/rofs")
+            continue
+        fi
+
+        squashfs_file="/cdrom/casper/$base"
+        if [ -f "$squashfs_file" ]; then
+            mnt="/tmp/squashfs/lower/$base"
+            mkdir -p "$mnt"
+            if ! mountpoint -q "$mnt" 2>/dev/null; then
+                mount -t squashfs -o loop,ro "$squashfs_file" "$mnt"
+                MOUNTED_LOWER_TARGETS+=("$mnt")
+            fi
+            resolved+=("$mnt")
+            continue
+        fi
+
+        # Non-live/degraded environments may not expose every casper layer path.
+        # Keep going with what we can resolve (typically /rofs).
+        echo "Warning: could not resolve lowerdir entry: $entry" >&2
+        echo "         looked for: $squashfs_file" >&2
+        warned_missing=1
+    done
+
+    if [ "${#resolved[@]}" -eq 0 ]; then
+        echo "Error: could not resolve any usable lowerdir from: $lower_csv" >&2
+        return 1
+    fi
+    if [ "$warned_missing" -eq 1 ]; then
+        echo "Warning: proceeding with partial lowerdir stack: $(IFS=':'; echo "${resolved[*]}")" >&2
+    fi
+    (IFS=':'; echo "${resolved[*]}")
+}
+
+prompt_choice() {
+    local ans=""
+    echo "" >&2
+    echo "Persist these root changes to the USB image?" >&2
+    echo "1) Append new squashfs layer (stacking; fast; may confuse dpkg if you keep many layers)" >&2
+    echo "2) Merge into a single filesystem.squashfs (slower; keeps dpkg consistent)" >&2
+    echo "3) Skip (do nothing)" >&2
+    read -r -p "Choose (1-3): " ans || true
+    case "$ans" in
+        1) echo "append" ;;
+        2) echo "merge" ;;
+        *) echo "skip" ;;
+    esac
+}
+
+write_append_layer() {
+    local ts layer meta need sz
+    ts="$(date +%Y%m%d%H%M%S)"
+    # Naming: make it sort LAST in /cdrom/casper/*.squashfs so casper's reverse-order logic
+    # gives it HIGHEST precedence (first in lowerdir=...).
+    layer="/cdrom/casper/filesystem_z${ts}.squashfs"
+    meta="/cdrom/casper/filesystem_z${ts}.sh"
+    # Free-space guard: avoid a cryptic mksquashfs failure on a full FAT partition.
+    sz="$(du -sm /tmp/squashfs/upper 2>/dev/null | awk '{print $1}')"; sz="${sz:-0}"
+    need="$(( sz + 64 ))"
+    if ! lsl_ensure_cdrom_space "$need"; then
+        echo "ERROR: /cdrom has less than ${need} MiB free; cannot write $layer." >&2
+        log "Refusing to write layer: only $(lsl_cdrom_free_mib) MiB free on /cdrom (need ~${need})."
+        return 1
+    fi
+    # FAT32 file-size ceiling: a squashfs written to a vfat /cdrom may not exceed
+    # ~4 GiB. Refuse up front (with a clear message) instead of failing mid-write.
+    if lsl_cdrom_is_vfat; then
+        local fatcap; fatcap="$(lsl_fat32_max_bytes)"
+        if [ "${upper_bytes:-0}" -gt "$fatcap" ] 2>/dev/null; then
+            echo "ERROR: the layer (~${upper_bytes} bytes of changes) would exceed the FAT32 4 GiB file limit on /cdrom." >&2
+            echo "       Use smaller, more frequent appends, or move the data dir to an HDD (LSL_DATA_DIR)." >&2
+            log "Refusing to write layer: ${upper_bytes} bytes exceeds FAT32 limit ${fatcap}."
+            return 1
+        fi
+    fi
+    echo "Writing new layer squashfs: $layer"
+    mksquashfs /tmp/squashfs/upper "$layer" -comp zstd -Xcompression-level 22
+    if [ -n "${squashfs_config_used_host:-}" ] && [ -f "$squashfs_config_used_host" ]; then
+        cp -a "$squashfs_config_used_host" "$meta"
+        echo "Saved config script snapshot: $meta"
+        log "Companion config copy: $meta (from $squashfs_config_used_host)"
+    else
+        echo "No squashfs_config.sh path recorded; skipping ${meta##*/}"
+    fi
+    echo "Layer written. Reboot to have casper include it."
+}
+
+cleanup_mounts() {
+    local i
+    for (( i=${#MOUNTED_LOWER_TARGETS[@]}-1; i>=0; i-- )); do
+        umount "${MOUNTED_LOWER_TARGETS[$i]}" 2>/dev/null || true
+    done
+    umount /tmp/squashfs/root/var/cache/apt/archives 2>/dev/null || true
+    umount /tmp/squashfs/root/home 2>/dev/null || true
+    umount /tmp/squashfs/root/proc 2>/dev/null || true
+    umount /tmp/squashfs/root/dev 2>/dev/null || true
+    umount /tmp/squashfs/root/sys 2>/dev/null || true
+    umount /tmp/squashfs/root/cdrom 2>/dev/null || true
+    umount /tmp/squashfs/root/ 2>/dev/null || true
+}
+trap cleanup_mounts EXIT
+
+clear_mount_tree() {
+    local target="$1"
+    [ -n "$target" ] || return 0
+    if ! mountpoint -q "$target" 2>/dev/null; then
+        return 0
+    fi
+    echo "Cleaning stale mount tree at $target ..."
+    # Prefer recursive unmount to avoid stale bind mounts from prior runs.
+    if ! umount -R "$target" 2>/dev/null; then
+        # Fallback for systems where -R is unavailable or partially fails.
+        umount "$target/var/cache/apt/archives" 2>/dev/null || true
+        umount "$target/home" 2>/dev/null || true
+        umount "$target/proc" 2>/dev/null || true
+        umount "$target/dev" 2>/dev/null || true
+        umount "$target/sys" 2>/dev/null || true
+        umount "$target/cdrom" 2>/dev/null || true
+        umount "$target" 2>/dev/null || true
+    fi
+    if mountpoint -q "$target" 2>/dev/null; then
+        echo "Error: failed to unmount stale mount tree at $target"
+        return 1
+    fi
+}
+
+prompt_unmount_existing_overlay() {
+    local ans=""
+    if ! mountpoint -q /tmp/squashfs/root/ 2>/dev/null; then
+        return 1
+    fi
+    echo ""
+    echo "An existing overlay is already mounted at /tmp/squashfs/root."
+    read -r -p "Unmount it and start fresh? (y/N): " ans || true
+    case "${ans:-}" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -x "$SCRIPT_DIR/persist-wifi.sh" ]; then
+    "$SCRIPT_DIR/persist-wifi.sh" || true
+fi
 
 # Create overlay filesystem directories
 mkdir -p /tmp/squashfs/upper/ /tmp/squashfs/work/ /tmp/squashfs/root/
 
-# Mount overlay filesystem (unmount first if already mounted)
+# Mount overlay filesystem (or continue with existing mounted one).
+reuse_existing_overlay=0
 if mountpoint -q /tmp/squashfs/root/ 2>/dev/null; then
-    echo "Unmounting existing overlay..."
-    umount /tmp/squashfs/root/ || true
+    if prompt_unmount_existing_overlay; then
+        clear_mount_tree /tmp/squashfs/root/
+    else
+        echo "Keeping existing mounted overlay at /tmp/squashfs/root."
+        reuse_existing_overlay=1
+    fi
 fi
 
-mount -t overlay overlay -o upperdir=/tmp/squashfs/upper/,lowerdir=/rofs,workdir=/tmp/squashfs/work/ /tmp/squashfs/root/
+# Use the same lowerdir stack as the live / overlay, not just /rofs.
+lowerdir="$(get_live_root_lowerdir || true)"
+if [ -z "${lowerdir:-}" ]; then
+    echo "Warning: could not determine live lowerdir stack; falling back to /rofs only."
+    lowerdir="/rofs"
+fi
+lowerdir="$(resolve_live_lowerdirs "$lowerdir")"
+
+log "lowerdir=${lowerdir}"
+if [ "$reuse_existing_overlay" -eq 0 ]; then
+    check_overlay_support
+    validate_lowerdirs "$lowerdir"
+    overlay_opts="upperdir=/tmp/squashfs/upper/,lowerdir=${lowerdir},workdir=/tmp/squashfs/work/"
+    echo -- mount -t overlay none /tmp/squashfs/root/ -o "$overlay_opts"
+    mount -t overlay none /tmp/squashfs/root/ -o "$overlay_opts"
+else
+    echo "Reusing currently mounted overlay at /tmp/squashfs/root."
+fi
 
 # Bind mount apt cache for package installations
 mount --bind /var/cache/apt/archives/ /tmp/squashfs/root/var/cache/apt/archives/ || true
-
-# Copy resolv.conf for network access
-cp /etc/resolv.conf /tmp/squashfs/root/etc/resolv.conf || true
-
-# Backup existing filesystem.squashfs
-#if [ -f /cdrom/casper/filesystem.squashfs ]; then
-#    mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_$(date +%Y%m%d%H%M%S).squashfs
+mount --bind /home/ /tmp/squashfs/root/home || true
+mkdir -p /tmp/squashfs/root/cdrom
+mount --bind /cdrom /tmp/squashfs/root/cdrom || true
+#mkdir -p /tmp/squashfs/root/persist
+#if mountpoint -q /persist 2>/dev/null; then
+#    mount --bind /persist /tmp/squashfs/root/persist || true
 #fi
 
-#is empty /tmp/squashfs/upper/
-if [ -z "$(ls -A /tmp/squashfs/upper/)" ]; then
-    echo "Upper directory is empty, skipping filesystem.squashfs update"
+# Give the chroot working DNS. The live /etc/resolv.conf is usually a
+# systemd-resolved stub (127.0.0.53) or an NM-managed file; neither resolves
+# inside the chroot (no systemd-resolved there), so use the real upstream
+# nameservers instead. (This was previously commented out, which broke apt in
+# the chroot with "Could not resolve <repo>" - caught by qemu-boot-test.sh.)
+resolv_src=""
+for f in /run/systemd/resolve/resolv.conf /run/NetworkManager/resolv.conf /etc/resolv.conf; do
+    [ -f "$f" ] && resolv_src="$f" && break
+done
+if [ -n "$resolv_src" ]; then
+    rm -f /tmp/squashfs/root/etc/resolv.conf
+    grep -E '^nameserver' "$resolv_src" > /tmp/squashfs/root/etc/resolv.conf 2>/dev/null \
+        || cp "$resolv_src" /tmp/squashfs/root/etc/resolv.conf 2>/dev/null || true
+fi
+
+# Make chroot usable for apt/dpkg tooling.
+mount --bind /proc /tmp/squashfs/root/proc 2>/dev/null || true
+mount --bind /dev /tmp/squashfs/root/dev 2>/dev/null || true
+mount --bind /sys /tmp/squashfs/root/sys 2>/dev/null || true
+
+log "Entering chroot. Session logs under: ${usb_log_dir}"
+chroot_typescript="${usb_log_dir}/chroot-${ts}.typescript"
+chroot_history="${usb_log_dir}/chroot-${ts}.history"
+chroot_cast="${usb_log_dir}/chroot-${ts}.cast"
+auto_log="${usb_log_dir}/squashfs-config-${ts}.log"
+interactive="${UPROOT_INTERACTIVE:-0}"
+
+# Config script path inside chroot: only /cdrom/... exists there if the USB image has bin/.
+# Repo checkout lives on the host FS — copy into chroot /tmp for that case.
+config_host=""
+if [ -n "${UPROOT_SQUASHFS_CONFIG:-}" ] && [ -f "$UPROOT_SQUASHFS_CONFIG" ]; then
+    config_host="$UPROOT_SQUASHFS_CONFIG"
+elif [ -f "/tmp/squashfs/root/cdrom/bin/squashfs_config.sh" ]; then
+    config_host="/cdrom/bin/squashfs_config.sh"
+elif [ -f "$SCRIPT_DIR/squashfs_config.sh" ]; then
+    config_host="$SCRIPT_DIR/squashfs_config.sh"
+fi
+# Snapshot source for companion .sh next to append layers (same basename as .squashfs).
+squashfs_config_used_host="${config_host:-}"
+
+config_in_chroot=""
+if [ -n "$config_host" ]; then
+    if [[ "$config_host" == /cdrom/* ]] && [ -f "/tmp/squashfs/root$config_host" ]; then
+        config_in_chroot="$config_host"
+    else
+        mkdir -p /tmp/squashfs/root/tmp
+        install -m 755 "$config_host" /tmp/squashfs/root/tmp/run-squashfs_config.sh
+        config_in_chroot="/tmp/run-squashfs_config.sh"
+        log "Using host script (not on USB): $config_host -> $config_in_chroot"
+    fi
+fi
+
+if [ -n "$config_in_chroot" ]; then
+    log "Running ${config_in_chroot} non-interactively (log: $(basename "$auto_log"))."
+    echo ""
+    echo "=== squashfs_config.sh (live output; also: $auto_log) ==="
+    chroot /tmp/squashfs/root /usr/bin/env \
+        DEBIAN_FRONTEND=noninteractive \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        /bin/bash -lc "set -e; /bin/bash '${config_in_chroot}'" 2>&1 | tee "$auto_log"
+    squashfs_config_rc="${PIPESTATUS[0]}"
+    echo "=== squashfs_config.sh finished (exit $squashfs_config_rc) ==="
+    echo ""
+    if [ "$squashfs_config_rc" -ne 0 ]; then
+        echo "Non-interactive run failed: ${config_in_chroot}"
+        echo "See log: $auto_log"
+        log "Non-interactive run failed."
+        if [ "$auto_append" -eq 1 ]; then
+            echo "Auto-append mode: no interactive fallback; aborting (retry on next boot)."
+            exit 1
+        fi
+        echo "Falling back to interactive chroot."
+        interactive=1
+    fi
+else
+    log "No squashfs_config.sh found (UPROOT_SQUASHFS_CONFIG, /cdrom/bin/, or $SCRIPT_DIR/squashfs_config.sh)."
+fi
+
+if [ "$interactive" = "1" ]; then
+    if chroot /tmp/squashfs/root /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -lc 'command -v asciinema >/dev/null 2>&1'; then
+        # Prefer asciinema if available (cleaner, searchable playback).
+        log "Recording chroot session to $(basename "$chroot_cast") (asciinema)"
+        chroot /tmp/squashfs/root /usr/bin/env \
+            HISTFILE="${chroot_history}" \
+            HISTSIZE=200000 \
+            HISTFILESIZE=200000 \
+            ASCIINEMA_REC=1 \
+            asciinema rec -q "${chroot_cast}" -c "/bin/bash -i"
+    elif chroot /tmp/squashfs/root /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -lc 'command -v script >/dev/null 2>&1'; then
+        # Fallback: util-linux script(1) transcript.
+        log "Recording chroot transcript to $(basename "$chroot_typescript") (script)"
+        echo "Entering interactive chroot shell now. Type 'exit' when done to continue."
+        script -q -f "$chroot_typescript" -c "chroot /tmp/squashfs/root /usr/bin/env HISTFILE='${chroot_history}' HISTSIZE=200000 HISTFILESIZE=200000 /bin/bash -i"
+    else
+        # Fallback: no transcript tool, but still persist bash history to USB.
+        log "No asciinema/script found in chroot; recording history only to $(basename "$chroot_history")"
+        chroot /tmp/squashfs/root /usr/bin/env \
+            HISTFILE="${chroot_history}" \
+            HISTSIZE=200000 \
+            HISTFILESIZE=200000 \
+            /bin/bash -i
+    fi
+fi
+
+upper_bytes="$(du -sb /tmp/squashfs/upper 2>/dev/null | awk '{print $1}' || echo 0)"
+if [ "${upper_bytes:-0}" -eq 0 ]; then
+    echo "Upper directory is empty, skipping persistence."
+    df -h /cdrom || true
+    log "No overlay changes; exiting."
     exit 0
 fi
 
-# Create new filesystem.squashfs
-mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem_new.squashfs -comp zstd -Xcompression-level 22
+echo ""
+echo "Unsaved root changes:"
+echo "- Upperdir size: $(human_gb "$upper_bytes")"
+if [ -f /cdrom/casper/filesystem.squashfs ]; then
+    cur_bytes="$(stat -c '%s' /cdrom/casper/filesystem.squashfs 2>/dev/null || echo 0)"
+    echo "- Current filesystem.squashfs size: $(human_gb "$cur_bytes")"
+fi
+df -h /cdrom 2>/dev/null || true
 
-mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_`date +%Y%m%d%H%M%S`.squashfs
-mv /cdrom/casper/filesystem_new.squashfs /cdrom/casper/filesystem.squashfs
-
-
-echo "filesystem.squashfs updated successfully!"
+if [ "$auto_append" -eq 1 ]; then
+    log "Auto-append mode selected."
+    choice="append"
+else
+    choice="$(prompt_choice)"
+fi
+case "$choice" in
+    append)
+        # Append a new layer from the overlay upperdir only.
+        log "User selected: append"
+        if ! write_append_layer; then
+            echo "Append failed (see log). Not persisting." >&2
+            exit 1
+        fi
+        ;;
+    merge)
+        # Merge into a single filesystem.squashfs by squashing the merged view.
+        log "User selected: merge"
+        new="/cdrom/casper/filesystem_new.squashfs"
+        backup="/cdrom/casper/filesystem_${ts}.squashfs"
+        # Free-space guard before the (large) merge write.
+        need="$(( ( ${cur_bytes:-0} / 1048576 ) + ( upper_bytes / 1048576 ) + 128 ))"
+        if ! lsl_ensure_cdrom_space "$need"; then
+            echo "ERROR: not enough free space on /cdrom to merge (need ~${need} MiB). Use append instead." >&2
+            log "Merge skipped: insufficient space on /cdrom (need ~${need} MiB)."
+            exit 1
+        fi
+        # FAT32 file-size ceiling for the merged image (base + changes).
+        if lsl_cdrom_is_vfat; then
+            fatcap="$(lsl_fat32_max_bytes)"
+            est="$(( ${cur_bytes:-0} + upper_bytes ))"
+            if [ "$est" -gt "$fatcap" ] 2>/dev/null; then
+                echo "ERROR: the merged image (~${est} bytes) would exceed the FAT32 4 GiB file limit on /cdrom." >&2
+                echo "       Use append instead (smaller, incremental layers)." >&2
+                log "Merge skipped: ${est} bytes exceeds FAT32 limit ${fatcap}."
+                exit 1
+            fi
+        fi
+        # Drop apt caches/lists from the layer so it stays small (and under the
+        # FAT32 limit). The apt archives are bind-mounted from the host, but
+        # /var/lib/apt/lists lives in the overlay and would otherwise be baked in.
+        chroot /tmp/squashfs/root apt-get clean >/dev/null 2>&1 || true
+        rm -rf /tmp/squashfs/root/var/lib/apt/lists/* 2>/dev/null || true
+        echo "Building merged filesystem.squashfs..."
+        merge_log="${usb_log_dir}/merge-${ts}.log"
+        if ! (cd /tmp/squashfs/root && mksquashfs . "$new" \
+            -comp zstd -Xcompression-level 22 \
+            -one-file-system \
+            -wildcards -e "home/*" "var/cache/apt/archives/*" "var/lib/apt/lists/*") >"$merge_log" 2>&1; then
+            echo "Merge failed."
+            log "Merge failed (see $(basename "$merge_log"))."
+            if grep -qiE "no space left on device|file too large|File too large" "$merge_log" 2>/dev/null; then
+                echo "It looks like the USB filesystem ran out of space or hit the ~4GB file limit."
+                echo "You can fall back to appending a new squashfs layer instead."
+                read -r -p "Try append now? (y/N): " yn || true
+                case "${yn:-}" in
+                    y|Y|yes|YES)
+                        log "Fallback: append after merge failure"
+                        if ! write_append_layer; then
+                            echo "Append also failed (space?). Not persisting." >&2
+                        fi
+                        exit 0
+                        ;;
+                esac
+            else
+                echo "See log: $merge_log"
+            fi
+            exit 1
+        fi
+        if [ -f /cdrom/casper/filesystem.squashfs ]; then
+            mv /cdrom/casper/filesystem.squashfs "$backup"
+            echo "Backup saved: $backup"
+            log "Backup saved: $(basename "$backup")"
+        fi
+        if ! mv "$new" /cdrom/casper/filesystem.squashfs 2>>"$merge_log"; then
+            if grep -qiE "no space left on device|file too large|File too large" "$merge_log" 2>/dev/null; then
+                echo "Renaming merged image failed due to space/size limits."
+                echo "Try append instead (and keep $new as-is), or free space and retry."
+                read -r -p "Try append now? (y/N): " yn || true
+                case "${yn:-}" in
+                    y|Y|yes|YES)
+                        log "Fallback: append after final mv failure"
+                        write_append_layer
+                        exit 0
+                        ;;
+                esac
+            fi
+            echo "Merge failed during final move. See log: $merge_log"
+            exit 1
+        fi
+        echo "filesystem.squashfs updated successfully!"
+        log "filesystem.squashfs updated successfully (merged)."
+        ;;
+    skip)
+        echo "Skipping persistence."
+        log "User selected: skip"
+        ;;
+esac

@@ -1,0 +1,20 @@
+# 32-bit (i686) Rust CLI tools for lsl-usb - the antiX 32-bit x86 live variant.
+#
+# Format: name<TAB>owner/repo<TAB>asset-substring<TAB>binary-name<TAB>windows-equiv
+#
+# Unlike bin/rusttools.list (x86_64, downloaded from GitHub at install time),
+# these five are produced LOCALLY by tools/build-rusttools.sh into
+# dist/rusttools-i686/{rg,fd,bat,eza,zoxide}. The asset-substring column is the
+# i686-musl release asset; lsl-rusttools.sh prefers the prebuilt local copy when
+# present (so a 32-bit image can be built fully offline) and otherwise fetches
+# the matching upstream tarball.
+#
+# Notes:
+#   * ripgrep/eza have NO upstream 32-bit Linux asset -> they are cross-compiled
+#     by build-rusttools.sh (ripgrep pure-Rust; eza --no-default-features).
+#   * fd/bat/zoxide DO publish i686-unknown-linux-musl assets -> downloaded.
+rg	BurntSushi/ripgrep	i686-unknown-linux-musl	rg	ripgrep (VS Code search)
+fd	sharkdp/fd	i686-unknown-linux-musl	fd	find alternative
+bat	sharkdp/bat	i686-unknown-linux-musl	bat	cat alternative
+eza	eza-community/eza	i686-unknown-linux-musl	eza	ls alternative
+zoxide	ajeetdsouza/zoxide	i686-unknown-linux-musl	zoxide	cd alternative

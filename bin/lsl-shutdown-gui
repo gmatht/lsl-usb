@@ -1,0 +1,402 @@
+#!/bin/bash
+# lsl-shutdown-gui - Prompt to save home then shut down
+
+set -u
+
+# TODO: Add an option to also persist system changes ("save root") via `uproot`,
+# but be careful to avoid baking transient hardware-detection / live-boot changes
+# under `/` into the squashfs image.
+
+run_privileged() {
+    if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+        "$@"
+        return $?
+    fi
+
+    if command -v pkexec >/dev/null 2>&1; then
+        pkexec "$@"
+        return $?
+    fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+        return $?
+    fi
+
+    return 1
+}
+
+pre_shutdown_cleanup() {
+    # Best-effort: reduce risk of VFAT (/cdrom) corruption.
+    # VFAT is fragile; leaving it rw + dirty buffers at poweroff is a common cause of fsck errors.
+    sync || true
+
+    # Unmount persist image if mounted
+    if mountpoint -q /persist 2>/dev/null; then
+        run_privileged umount /persist || true
+    fi
+
+    # Unmount any uproot staging mounts if present
+    if mountpoint -q /tmp/squashfs/root/var/cache/apt/archives 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/var/cache/apt/archives || true
+    fi
+    if mountpoint -q /tmp/squashfs/root/home 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/home || true
+    fi
+    if mountpoint -q /tmp/squashfs/root/proc 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/proc || true
+    fi
+    if mountpoint -q /tmp/squashfs/root/dev 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/dev || true
+    fi
+    if mountpoint -q /tmp/squashfs/root/sys 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/sys || true
+    fi
+    if mountpoint -q /tmp/squashfs/root/cdrom 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/cdrom || true
+    fi
+    if mountpoint -q /tmp/squashfs/root/ 2>/dev/null; then
+        run_privileged umount /tmp/squashfs/root/ || true
+    fi
+
+    if [ -f /cdrom/bin/lsl-common.sh ]; then
+        # shellcheck source=/dev/null
+        . /cdrom/bin/lsl-common.sh
+        lsl_load_config
+        if ! lsl_is_usb_mode; then
+            if mountpoint -q /home/mint/.cache 2>/dev/null; then
+                run_privileged umount /home/mint/.cache || true
+            fi
+            if mountpoint -q /var/cache 2>/dev/null; then
+                run_privileged umount /var/cache || true
+            fi
+            if mountpoint -q /nix/store 2>/dev/null; then
+                run_privileged umount /nix/store || true
+            fi
+            if mountpoint -q /nix/var 2>/dev/null; then
+                run_privileged umount /nix/var || true
+            fi
+            if mountpoint -q /mnt/lsl-cache 2>/dev/null; then
+                run_privileged umount /mnt/lsl-cache || true
+            fi
+            if mountpoint -q /home 2>/dev/null; then
+                run_privileged umount /home || true
+            fi
+        fi
+    fi
+
+    sync || true
+
+    # Try to leave /cdrom cleanly mounted read-only.
+    if mountpoint -q /cdrom 2>/dev/null; then
+        run_privileged mount /cdrom -o remount,ro 2>/dev/null || true
+    fi
+    sync || true
+}
+
+# Update /cdrom/wifi.sh so the next boot uses the currently connected Wi‑Fi (same idea as install.sh).
+run_persist_wifi() {
+    local script=""
+    if [ -x /cdrom/bin/persist-wifi.sh ]; then
+        script=/cdrom/bin/persist-wifi.sh
+    elif [ -x "$(dirname -- "${BASH_SOURCE[0]}")/persist-wifi.sh" ]; then
+        script="$(dirname -- "${BASH_SOURCE[0]}")/persist-wifi.sh"
+    fi
+    [ -n "$script" ] || return 0
+    run_privileged "$script" || true
+}
+
+GUI_TOOL=""
+if command -v zenity >/dev/null 2>&1; then
+    GUI_TOOL="zenity"
+elif command -v dialog >/dev/null 2>&1; then
+    GUI_TOOL="dialog"
+elif command -v whiptail >/dev/null 2>&1; then
+    GUI_TOOL="whiptail"
+fi
+
+show_error() {
+    local message="$1"
+    if [ "$GUI_TOOL" = "zenity" ]; then
+        zenity --error --text="$message" --title="Shutdown" 2>/dev/null || true
+    else
+        echo "Error: $message" >&2
+    fi
+}
+
+upper_summary() {
+    local upper_dir="/tmp/squashfs/upper"
+    local out=""
+
+    if [ ! -d "$upper_dir" ]; then
+        return 0
+    fi
+
+    if [ -z "$(ls -A "$upper_dir" 2>/dev/null || true)" ]; then
+        return 0
+    fi
+
+    local size=""
+    size="$(du -sh "$upper_dir" 2>/dev/null | awk '{print $1}' || true)"
+
+    local count=""
+    count="$(find "$upper_dir" -mindepth 1 -print 2>/dev/null | wc -l | tr -d ' ' || true)"
+
+    local examples=""
+    examples="$(cd "$upper_dir" 2>/dev/null && find . -mindepth 1 -maxdepth 3 -print 2>/dev/null | head -n 20 || true)"
+
+    out+="Unsaved system changes detected in $upper_dir\n"
+    if [ -n "$size" ] || [ -n "$count" ]; then
+        out+="(approx size: ${size:-?}, paths: ${count:-?})\n"
+    fi
+    out+="These may be lost on reboot unless you save root.\n"
+    out+="\nExamples:\n"
+    out+="${examples:-  (could not list examples)}"
+
+    printf "%b" "$out"
+}
+
+remount_ro() {
+    for f in /home /cdrom /mnt/*; do
+        [ -d "$f" ] || continue
+        run_privileged mount -o ro,remount "$f" 2>/dev/null || true
+    done
+    sync
+}
+
+
+confirm_and_run() {
+    local save_mode="$1"
+    local power_mode="$2"
+    local uphome_cmd=""
+    local save_msg="Saving home snapshot to /cdrom/home.sfs…"
+
+    if [ -f /cdrom/bin/lsl-common.sh ]; then
+        # shellcheck source=/dev/null
+        . /cdrom/bin/lsl-common.sh
+        lsl_load_config
+        if ! lsl_is_usb_mode; then
+            save_msg="Syncing btrfs home and cache…"
+        fi
+    fi
+
+    if command -v uphome >/dev/null 2>&1; then
+        uphome_cmd="$(command -v uphome)"
+    elif [ -x "/cdrom/bin/uphome" ]; then
+        uphome_cmd="/cdrom/bin/uphome"
+    fi
+
+    if [ "$save_mode" = "save" ]; then
+        if [ -z "$uphome_cmd" ]; then
+            show_error "Could not find 'uphome' (needed to save home)."
+            return 1
+        fi
+
+        if [ "$GUI_TOOL" = "zenity" ]; then
+            (
+                echo "10"
+                echo "# $save_msg"
+                if ! run_privileged "$uphome_cmd" >/tmp/uphome.log 2>&1; then
+                    echo "100"
+                    exit 1
+                fi
+                echo "100"
+            ) | zenity --progress --title="Shutdown" --text="Saving home…" --auto-close --no-cancel 2>/dev/null
+
+            if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+                show_error "Saving home failed.\n\nDetails:\n$(tail -n 50 /tmp/uphome.log 2>/dev/null)"
+                return 1
+            fi
+        else
+            if ! run_privileged "$uphome_cmd"; then
+                show_error "Saving home failed (uphome exited non-zero)."
+                return 1
+            fi
+        fi
+    fi
+
+    run_persist_wifi
+    pre_shutdown_cleanup
+
+    case "$power_mode" in
+        reboot_usb)
+            # If booted via UEFI, use current boot entry as BootNext to bypass boot menu.
+            if command -v efibootmgr >/dev/null 2>&1; then
+                local current_entry=""
+                current_entry="$(efibootmgr 2>/dev/null | awk '/^BootCurrent:/ {print $2; exit}' || true)"
+                if [ -n "$current_entry" ]; then
+                    run_privileged efibootmgr -n "$current_entry" >/dev/null 2>&1 || true
+                fi
+            fi
+            if command -v systemctl >/dev/null 2>&1; then
+		remount_ro
+                run_privileged systemctl reboot
+                return $?
+            fi
+            if command -v shutdown >/dev/null 2>&1; then
+		remount_ro
+                run_privileged shutdown -r now
+                return $?
+            fi
+            show_error "No reboot command found (systemctl/shutdown)."
+            return 1
+            ;;
+        reboot)
+            if command -v systemctl >/dev/null 2>&1; then
+		remount_ro
+                run_privileged systemctl reboot
+                return $?
+            fi
+            if command -v shutdown >/dev/null 2>&1; then
+		remount_ro
+                run_privileged shutdown -r now
+                return $?
+            fi
+            show_error "No reboot command found (systemctl/shutdown)."
+            return 1
+            ;;
+        shutdown)
+            if command -v systemctl >/dev/null 2>&1; then
+		remount_ro
+                run_privileged systemctl poweroff
+                return $?
+            fi
+            if command -v shutdown >/dev/null 2>&1; then
+		remount_ro
+                run_privileged shutdown -h now
+                return $?
+            fi
+            show_error "No shutdown command found (systemctl/shutdown)."
+            return 1
+            ;;
+        *)
+            show_error "Invalid power action: $power_mode"
+            return 1
+            ;;
+    esac
+}
+
+main() {
+    local selected=""
+    local save_mode=""
+    local power_mode=""
+    local upper_msg=""
+    upper_msg="$(upper_summary || true)"
+
+    if [ "$GUI_TOOL" = "zenity" ]; then
+        if [ -n "$upper_msg" ]; then
+            zenity --info --title="Shutdown" --width=700 --height=420 --text="$upper_msg" 2>/dev/null || true
+        fi
+        selected="$(zenity --list --radiolist \
+            --title="Shutdown" \
+            --text="Choose action:" \
+            --column="" --column="Action" \
+            TRUE "Save home + Reboot to USB" \
+            FALSE "Save home + Normal reboot" \
+            FALSE "Save home + Shutdown" \
+            FALSE "Reboot to USB (no save)" \
+            FALSE "Normal reboot (no save)" \
+            FALSE "Shutdown (no save)" \
+            FALSE "Load to RAM + remove USB (persistence to USB stops)" \
+            FALSE "Cancel" \
+            --width=620 --height=360 2>/dev/null || true)"
+    elif [ "$GUI_TOOL" = "dialog" ]; then
+        if [ -n "$upper_msg" ]; then
+            dialog --msgbox "$upper_msg" 22 80 2>&1 >/dev/tty || true
+        fi
+        selected="$(dialog --menu "Shutdown options" 16 72 8 \
+            1 "Save home + Reboot to USB" \
+            2 "Save home + Normal reboot" \
+            3 "Save home + Shutdown" \
+            4 "Reboot to USB (no save)" \
+            5 "Normal reboot (no save)" \
+            6 "Shutdown (no save)" \
+            7 "Load to RAM + remove USB (persistence to USB stops)" \
+            8 "Cancel" 2>&1 >/dev/tty || true)"
+    elif [ "$GUI_TOOL" = "whiptail" ]; then
+        if [ -n "$upper_msg" ]; then
+            whiptail --msgbox "$upper_msg" 22 80 3>&1 1>&2 2>&3 || true
+        fi
+        selected="$(whiptail --menu "Shutdown options" 16 72 8 \
+            1 "Save home + Reboot to USB" \
+            2 "Save home + Normal reboot" \
+            3 "Save home + Shutdown" \
+            4 "Reboot to USB (no save)" \
+            5 "Normal reboot (no save)" \
+            6 "Shutdown (no save)" \
+            7 "Load to RAM + remove USB (persistence to USB stops)" \
+            8 "Cancel" 3>&1 1>&2 2>&3 || true)"
+    else
+        if [ -n "$upper_msg" ]; then
+            echo ""
+            printf "%b\n" "$upper_msg"
+            echo ""
+        fi
+        echo "Shutdown options:"
+        echo "1) Save home + Reboot to USB"
+        echo "2) Save home + Normal reboot"
+        echo "3) Save home + Shutdown"
+        echo "4) Reboot to USB (no save)"
+        echo "5) Normal reboot (no save)"
+        echo "6) Shutdown (no save)"
+        echo "7) Load to RAM + remove USB (persistence to USB stops)"
+        echo "8) Cancel"
+        read -r -p "Choose (1-8): " selected || true
+    fi
+
+    selected="${selected//$'\r'/}"
+
+    case "$selected" in
+        "Save home + Reboot to USB"|"1")
+            save_mode="save"
+            power_mode="reboot_usb"
+            ;;
+        "Save home + Normal reboot"|"2")
+            save_mode="save"
+            power_mode="reboot"
+            ;;
+        "Save home + Shutdown"|"3")
+            save_mode="save"
+            power_mode="shutdown"
+            ;;
+        "Reboot to USB (no save)"|"4")
+            save_mode="nosave"
+            power_mode="reboot_usb"
+            ;;
+        "Normal reboot (no save)"|"5")
+            save_mode="nosave"
+            power_mode="reboot"
+            ;;
+        "Shutdown (no save)"|"6")
+            save_mode="nosave"
+            power_mode="shutdown"
+            ;;
+        "Load to RAM + remove USB"|"7")
+            # Copy the session to RAM and pivot, so the USB can be removed.
+            if [ -x /cdrom/bin/lsl-toram.sh ]; then
+                if run_privileged /cdrom/bin/lsl-toram.sh; then
+                    if [ "$GUI_TOOL" = "zenity" ]; then
+                        zenity --info --title="lsl-usb" --text="Session is now running from RAM. You can remove the USB stick." 2>/dev/null || true
+                    else
+                        echo "Session is now running from RAM. You can remove the USB stick."
+                    fi
+                else
+                    show_error "lsl-toram failed - the USB is still required."
+                fi
+            else
+                show_error "lsl-toram.sh not found on /cdrom."
+            fi
+            exit 0
+            ;;
+        ""|"Cancel"|"8")
+            exit 0
+            ;;
+        *)
+            exit 0
+            ;;
+    esac
+
+    confirm_and_run "$save_mode" "$power_mode"
+}
+
+main "$@"

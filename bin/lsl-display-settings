@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Save / restore Cinnamon display configuration (monitor layout and scaling).
+# Primary source: ~/.config/cinnamon-monitors.xml (<scale> is UI scale: 2 = 200%, 1.5 = 150%).
+#
+# Usage:
+#   lsl-display-settings save
+#   lsl-display-settings restore [--apply]
+#   lsl-display-settings set-scale <percent> [--all] [--apply]
+#
+# Env:
+#   LSL_DISPLAY_BACKUP_DIR  Override backup directory (default: XDG_STATE_HOME/lsl-usb/display-backup).
+#
+set -euo pipefail
+
+MONITORS_XML="${HOME}/.config/cinnamon-monitors.xml"
+BACKUP_DIR="${LSL_DISPLAY_BACKUP_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/lsl-usb/display-backup}"
+
+die() { echo "lsl-display-settings: $*" >&2; exit 1; }
+
+require_monitors_file() {
+    [[ -f "$MONITORS_XML" ]] || die "missing $MONITORS_XML (configure displays in Cinnamon first)"
+}
+
+cinnamon_replace() {
+    if [[ "${DISPLAY:-}" == "" ]] && [[ "${WAYLAND_DISPLAY:-}" == "" ]]; then
+        echo "lsl-display-settings: no DISPLAY; start a graphical session or log out and back in to apply." >&2
+        return 0
+    fi
+    if command -v cinnamon >/dev/null 2>&1; then
+        echo "lsl-display-settings: restarting Cinnamon to apply (desktop may flicker briefly)..." >&2
+        nohup cinnamon --replace >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    else
+        echo "lsl-display-settings: cinnamon not in PATH; log out and back in to apply." >&2
+    fi
+}
+
+save() {
+    [[ $# -eq 0 ]] || die "save takes no arguments"
+    require_monitors_file
+    mkdir -p "$BACKUP_DIR"
+    cp -a -- "$MONITORS_XML" "$BACKUP_DIR/cinnamon-monitors.xml"
+    if command -v dconf >/dev/null 2>&1; then
+        dconf dump /org/cinnamon/desktop/interface/ >"$BACKUP_DIR/dconf-interface.txt" 2>/dev/null || true
+        dconf dump /org/cinnamon/control-center/display/ >"$BACKUP_DIR/dconf-display.txt" 2>/dev/null || true
+    fi
+    echo "lsl-display-settings: saved to $BACKUP_DIR"
+}
+
+restore() {
+    local apply=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --apply) apply=1 ;;
+            -h|--help) die "usage: lsl-display-settings restore [--apply]" ;;
+            *) die "unknown option: $1" ;;
+        esac
+        shift
+    done
+    [[ -f "$BACKUP_DIR/cinnamon-monitors.xml" ]] || die "no backup at $BACKUP_DIR/cinnamon-monitors.xml (run save first)"
+    mkdir -p "$(dirname "$MONITORS_XML")"
+    cp -a -- "$BACKUP_DIR/cinnamon-monitors.xml" "$MONITORS_XML"
+    if command -v dconf >/dev/null 2>&1; then
+        [[ -s "$BACKUP_DIR/dconf-interface.txt" ]] && dconf load /org/cinnamon/desktop/interface/ <"$BACKUP_DIR/dconf-interface.txt" || true
+        [[ -s "$BACKUP_DIR/dconf-display.txt" ]] && dconf load /org/cinnamon/control-center/display/ <"$BACKUP_DIR/dconf-display.txt" || true
+    fi
+    echo "lsl-display-settings: restored from $BACKUP_DIR"
+    if [[ "$apply" -eq 1 ]]; then
+        cinnamon_replace
+    else
+        echo "lsl-display-settings: run with --apply to restart Cinnamon, or log out and back in." >&2
+    fi
+}
+
+# Convert percent (e.g. 150) to scale string (1.5) for cinnamon-monitors.xml.
+percent_to_scale_str() {
+    local p="$1"
+    awk -v p="$p" 'BEGIN {
+        if (p < 50 || p > 400) exit 1
+        s = p / 100.0
+        printf "%g", s
+    }' || die "percent must be between 50 and 400"
+}
+
+set_scale() {
+    local apply=0
+    local mode="from200"
+    local percent=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --apply) apply=1 ;;
+            --all) mode="all" ;;
+            -h|--help) die "usage: lsl-display-settings set-scale <percent> [--all] [--apply]" ;;
+            *)
+                [[ -z "$percent" ]] || die "unexpected argument: $1"
+                percent="$1"
+                ;;
+        esac
+        shift
+    done
+    [[ -n "$percent" ]] || die "usage: lsl-display-settings set-scale <percent> [--all] [--apply]"
+
+    require_monitors_file
+    local target
+    target="$(percent_to_scale_str "$percent")"
+    local tmp
+    tmp="$(mktemp)"
+    cp -a -- "$MONITORS_XML" "$tmp"
+
+    if [[ "$mode" == "all" ]]; then
+        perl -0777 -i -pe 's/<scale>[^<]*<\/scale>/<scale>'"$target"'<\/scale>/g' "$tmp" \
+            || die "perl is required to edit $MONITORS_XML"
+    else
+        # Default: only change monitors currently at 200% (scale 2) to the target (e.g. 150%).
+        if ! grep -q '<scale>2</scale>' "$tmp"; then
+            rm -f "$tmp"
+            die "no <scale>2</scale> found; use --all to set every monitor to ${percent}%"
+        fi
+        perl -0777 -i -pe 's/<scale>2<\/scale>/<scale>'"$target"'<\/scale>/g' "$tmp" \
+            || die "perl is required to edit $MONITORS_XML"
+    fi
+
+    mv -f -- "$tmp" "$MONITORS_XML"
+    echo "lsl-display-settings: set scale to ${percent}% (${target}) in $MONITORS_XML"
+    if [[ "$apply" -eq 1 ]]; then
+        cinnamon_replace
+    else
+        echo "lsl-display-settings: run with --apply to restart Cinnamon, or log out and back in." >&2
+    fi
+}
+
+usage() {
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+case "${1:-}" in
+    save) shift; save "$@" ;;
+    restore) shift; restore "$@" ;;
+    set-scale) shift; set_scale "$@" ;;
+    -h|--help|help) usage ;;
+    "")
+        die "usage: lsl-display-settings {save|restore|set-scale} ..."
+        ;;
+    *)
+        die "unknown command: $1 (try --help)"
+        ;;
+esac

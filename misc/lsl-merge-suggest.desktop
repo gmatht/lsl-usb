@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=lsl-usb merge suggestion
+Comment=Suggests merging squashfs layers when it would help
+Exec=/usr/local/bin/lsl-merge-suggest.sh
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

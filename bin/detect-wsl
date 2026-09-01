@@ -1,111 +1,274 @@
 #!/bin/bash
-# detect-wsl - Detect WSL distributions and VHDX files on Windows partitions
-# Creates /tmp/wsl report file for use by lsl and lsl-gui
+# detect-wsl - Detect WSL rootfs directories on mounted Windows partitions
+# Creates /tmp/wsl report file for use by lsl and lsl-gui (VHDX paths come from lsl-gui browse / lsl state, not scanning).
 
-WSL_REPORT="/tmp/wsl"
+WSL_REPORT="${WSL_REPORT:-/tmp/wsl}"
+# Windows installer writes Windows-side VHDX paths here (one per line);
+# overridable for testing.
+VHDX_CONF="${LSL_WSL_VHDX_CONF:-/cdrom/lsl-wsl-vhdx.conf}"
+
+# Live-session desktop user (mint on Mint, zorin on Zorin, ...) - used for the
+# /media/<user>/ auto-mount path.
+LSL_DESKTOP_USER="$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)"
+[ -n "$LSL_DESKTOP_USER" ] || LSL_DESKTOP_USER="$(ls -1 /home 2>/dev/null | head -n1 || true)"
+[ -n "$LSL_DESKTOP_USER" ] || LSL_DESKTOP_USER="mint"
 
 # Clear existing report
 > "$WSL_REPORT"
 
-# Function to find and report WSL distributions
+win_path_to_linux() {
+    # Convert a Windows path like C:\Foo\Bar to /mnt/c/Foo/Bar.
+    # Accepts both single backslashes (plain Windows paths, e.g. from the
+    # Windows installer's lsl-wsl-vhdx.conf) and doubled backslashes
+    # (hivexregedit export escaping).
+    local win="$1"
+
+    # Collapse doubled backslashes to single.
+    win="${win//\\\\/\\}"
+
+    if [[ "$win" =~ ^([A-Za-z]):\\(.*)$ ]]; then
+        local drive="${BASH_REMATCH[1],,}"
+        local rest="${BASH_REMATCH[2]}"
+        rest="${rest//\\//}"
+        echo "/mnt/$drive/$rest"
+        return 0
+    fi
+
+    if [[ "$win" =~ ^([A-Za-z]):/(.*)$ ]]; then
+        local drive="${BASH_REMATCH[1],,}"
+        local rest="${BASH_REMATCH[2]}"
+        echo "/mnt/$drive/$rest"
+        return 0
+    fi
+
+    return 1
+}
+
+detect_wsl_from_ntuser() {
+    local ntuser="$1"
+
+    if command -v hivexregedit >/dev/null 2>&1; then
+        local distro_name=""
+        local base_path=""
+
+        hivexregedit --export "$ntuser" '\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss' 2>/dev/null | while IFS= read -r line; do
+            if [[ "$line" =~ ^\"DistributionName\"= ]]; then
+                distro_name="${line#*=}"
+                distro_name="${distro_name#\"}"
+                distro_name="${distro_name%\"}"
+            elif [[ "$line" =~ ^\"BasePath\"= ]]; then
+                base_path="${line#*=}"
+                base_path="${base_path#\"}"
+                base_path="${base_path%\"}"
+
+                if [ -n "$base_path" ]; then
+                    local linux_base=""
+                    linux_base="$(win_path_to_linux "$base_path" 2>/dev/null || true)"
+
+                    if [ -n "$linux_base" ] && [ -d "$linux_base/rootfs" ]; then
+                        if [ -n "$distro_name" ]; then
+                            echo "WSL Registry name: $distro_name" >> "$WSL_REPORT"
+                        fi
+                        echo "WSL Registry rootfs: $linux_base/rootfs" >> "$WSL_REPORT"
+                        echo "---" >> "$WSL_REPORT"
+                    fi
+                fi
+
+                distro_name=""
+                base_path=""
+            fi
+        done
+
+        return 0
+    fi
+
+    command -v strings >/dev/null 2>&1 || return 0
+
+    local distro_name=""
+    local base_path=""
+    local want_name=0
+    local want_base=0
+
+    strings -el "$ntuser" 2>/dev/null | while IFS= read -r s; do
+        if [ "$s" = "DistributionName" ]; then
+            want_name=1
+            continue
+        fi
+        if [ "$s" = "BasePath" ]; then
+            want_base=1
+            continue
+        fi
+
+        if [ "$want_name" -eq 1 ]; then
+            distro_name="$s"
+            want_name=0
+            continue
+        fi
+
+        if [ "$want_base" -eq 1 ]; then
+            base_path="$s"
+            want_base=0
+
+            if [[ "$base_path" =~ ^[A-Za-z]:\\ ]] || [[ "$base_path" =~ ^[A-Za-z]:/ ]]; then
+                local linux_base=""
+                linux_base="$(win_path_to_linux "$base_path" 2>/dev/null || true)"
+
+                if [ -n "$linux_base" ] && [ -d "$linux_base/rootfs" ]; then
+                    if [ -n "$distro_name" ]; then
+                        echo "WSL Registry name: $distro_name" >> "$WSL_REPORT"
+                    fi
+                    echo "WSL Registry rootfs: $linux_base/rootfs" >> "$WSL_REPORT"
+                    echo "---" >> "$WSL_REPORT"
+                fi
+            fi
+
+            distro_name=""
+            base_path=""
+        fi
+    done
+}
+
 detect_wsl_on_partition() {
     local base_path="$1"
     local users_dir="$base_path/Users"
-    
+
     if [ ! -d "$users_dir" ]; then
         return 0
     fi
-    
-    # Find all user directories
+
     find "$users_dir" -maxdepth 1 -type d -name "*" 2>/dev/null | while read -r user_dir; do
         [ "$user_dir" = "$users_dir" ] && continue
-        
+
         local appdata="$user_dir/AppData/Local"
         if [ ! -d "$appdata" ]; then
             continue
         fi
-        
-        # Modern WSL2: Packages/*/LocalState/rootfs and ext4.vhdx
+
+        if [ -f "$user_dir/NTUSER.DAT" ]; then
+            detect_wsl_from_ntuser "$user_dir/NTUSER.DAT"
+        fi
+
         find "$appdata/Packages" -type d -path "*/LocalState/rootfs" 2>/dev/null | while read -r rootfs_path; do
-            local localstate_dir=$(dirname "$rootfs_path")
-            local vhdx_file=""
+            local localstate_dir
+            localstate_dir="$(dirname "$rootfs_path")"
             local distro_type="Distro"
-            
-            # Look for ext4.vhdx in LocalState directory
-            if [ -f "$localstate_dir/ext4.vhdx" ]; then
-                vhdx_file="$localstate_dir/ext4.vhdx"
-                echo "Found ext4.vhdx: $vhdx_file" >> "$WSL_REPORT"
-            elif [ -f "$localstate_dir/rootfs.vhdx" ]; then
-                vhdx_file="$localstate_dir/rootfs.vhdx"
-                echo "Found vhdx: $vhdx_file" >> "$WSL_REPORT"
-            fi
-            
-            # Determine distro type from package name
-            if [[ "$localstate_dir" =~ Packages/([^/]+)/LocalState ]]; then
+
+            if [[ "$localstate_dir" =~ Packages/([^/]+)/LocalState$ ]]; then
                 local package_name="${BASH_REMATCH[1]}"
-                if [[ "$package_name" =~ ^CanonicalGroupLimited ]]; then
-                    distro_type="Distro"
-                elif [[ "$package_name" =~ ^Microsoft\.WindowsSubsystemLinux ]]; then
+                if [[ "$package_name" =~ ^CanonicalGroupLimited ]] || [[ "$package_name" =~ ^Microsoft\.WindowsSubsystemLinux ]]; then
                     distro_type="Distro"
                 else
                     distro_type="Custom"
                 fi
             fi
-            
+
             echo "WSL $distro_type rootfs: $rootfs_path" >> "$WSL_REPORT"
             echo "---" >> "$WSL_REPORT"
         done
-        
-        # Older WSL1: lxss/rootfs
+
         if [ -d "$appdata/lxss/rootfs" ]; then
             echo "WSL LXSS rootfs: $appdata/lxss/rootfs" >> "$WSL_REPORT"
             echo "---" >> "$WSL_REPORT"
         fi
-        
-        # Check for WSL distributions in other locations
-        # Some distributions might be in distros/ subdirectories
+
         find "$appdata" -type d -path "*/distros/*/rootfs" 2>/dev/null | while read -r distro_rootfs; do
-            local distro_dir=$(dirname "$distro_rootfs")
-            local vhdx_file=""
-            
-            # Look for VHDX in the distro directory
-            if [ -f "$distro_dir/ext4.vhdx" ]; then
-                vhdx_file="$distro_dir/ext4.vhdx"
-                echo "Found ext4.vhdx: $vhdx_file" >> "$WSL_REPORT"
-            elif [ -f "$distro_dir/rootfs.vhdx" ]; then
-                vhdx_file="$distro_dir/rootfs.vhdx"
-                echo "Found vhdx: $vhdx_file" >> "$WSL_REPORT"
-            fi
-            
             echo "WSL Custom rootfs: $distro_rootfs" >> "$WSL_REPORT"
             echo "---" >> "$WSL_REPORT"
         done
     done
 }
 
-# Scan common Windows partition mount points
+detect_wsl_vhdx_conf() {
+    [ -f "$VHDX_CONF" ] || return 0
+
+    echo "Reading WSL VHDX paths from $VHDX_CONF..."
+    while IFS= read -r win_path; do
+        [ -z "$win_path" ] && continue
+        case "$win_path" in
+            \#*) continue ;;
+        esac
+        local linux_path
+        if linux_path="$(win_path_to_linux "$win_path")"; then
+            echo "WSL Distro vhdx: $linux_path" >> "$WSL_REPORT"
+            echo "---" >> "$WSL_REPORT"
+        else
+            echo "Warning: could not convert Windows path: $win_path" >&2
+        fi
+    done < "$VHDX_CONF"
+}
+
+print_shortnames() {
+    if [ ! -s "$WSL_REPORT" ]; then
+        return 0
+    fi
+
+    awk '
+        /^WSL Registry name: / { sub(/^WSL Registry name: /,""); n=$0; next }
+        /^WSL (Distro|Custom|LXSS) rootfs: / { sub(/^WSL (Distro|Custom|LXSS) rootfs: /,""); r=$0; next }
+        /^WSL Registry rootfs: / { sub(/^WSL Registry rootfs: /,""); r=$0; next }
+        /^---$/ {
+            name=""
+            if (n != "") name=n
+            else if (r != "") {
+                if (index(r, "/Packages/") > 0 && index(r, "/LocalState/") > 0) {
+                    split(r, a, "/Packages/");
+                    if (length(a) >= 2) {
+                        split(a[2], b, "/");
+                        if (length(b) >= 1 && b[1] != "") name=b[1];
+                    }
+                }
+                if (name == "") {
+                    name=r
+                    sub(/^.*\//, "", name);
+                }
+            }
+            if (name != "") names[name]=1
+            n=""
+            r=""
+            next
+        }
+        END {
+            name=""
+            if (n != "") name=n
+            else if (r != "") {
+                name=r
+                sub(/^.*\//, "", name);
+            }
+            if (name != "") names[name]=1
+            for (k in names) print k
+        }
+    ' "$WSL_REPORT" | sort
+}
+
 echo "Detecting WSL distributions..."
 
-# Check /media/mint/Windows (from onboot.sh)
-if [ -d "/media/mint/Windows" ]; then
-    echo "Scanning /media/mint/Windows..."
-    detect_wsl_on_partition "/media/mint/Windows"
-fi
-
-# Also check other common Windows mount points
-for mount_point in /media/*/Windows /mnt/*/Windows /media/*/C /mnt/*/C; do
-    if [ -d "$mount_point" ] && [ "$mount_point" != "/media/mint/Windows" ]; then
+for mount_point in /mnt/c /mnt/d; do
+    if [ -d "$mount_point" ]; then
         echo "Scanning $mount_point..."
         detect_wsl_on_partition "$mount_point"
     fi
 done
 
-# Check if we found anything
-if [ ! -s "$WSL_REPORT" ]; then
-    echo "No WSL distributions found." > "$WSL_REPORT"
-    echo "No WSL distributions detected."
-else
-    count=$(grep -c "WSL.*rootfs:" "$WSL_REPORT" 2>/dev/null || echo "0")
-    echo "Found $count WSL distribution(s). Report written to $WSL_REPORT"
+if [ -d "/media/$LSL_DESKTOP_USER/Windows" ]; then
+    echo "Scanning /media/$LSL_DESKTOP_USER/Windows..."
+    detect_wsl_on_partition "/media/$LSL_DESKTOP_USER/Windows"
 fi
 
+for mount_point in /media/*/Windows /mnt/*/Windows /media/*/C /mnt/*/C /media/*/D /mnt/*/D; do
+    if [ -d "$mount_point" ] && [ "$mount_point" != "/media/$LSL_DESKTOP_USER/Windows" ]; then
+        echo "Scanning $mount_point..."
+        detect_wsl_on_partition "$mount_point"
+    fi
+done
+
+detect_wsl_vhdx_conf
+
+if [ ! -s "$WSL_REPORT" ]; then
+    echo "No WSL distributions found." >"$WSL_REPORT"
+    echo "No WSL distributions detected."
+else
+    count=$(grep -cE "WSL.*(rootfs|vhdx):" "$WSL_REPORT" 2>/dev/null || echo "0")
+    echo "Found $count WSL distribution(s). Report written to $WSL_REPORT"
+    echo "WSL distro shortnames:"
+    print_shortnames
+fi

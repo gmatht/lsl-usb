@@ -1,0 +1,68 @@
+#!/bin/bash
+# Idle watcher: flush USB /home overlay to home.sfs after LSL_HOME_IDLE_SEC of inactivity.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/lsl-common.sh"
+
+lsl_load_config
+
+if ! lsl_is_usb_mode; then
+    exit 0
+fi
+
+UPPER="${LSL_HOME_UPPER:-/run/lsl-home-overlay/upper}"
+IDLE_SEC="${LSL_HOME_IDLE_SEC:-300}"
+
+wait_for_home() {
+    while true; do
+        if mountpoint -q /home 2>/dev/null && [ -d "$UPPER" ]; then
+            return 0
+        fi
+        sleep 2
+    done
+}
+
+latest_upper_mtime() {
+    if [ ! -d "$UPPER" ]; then
+        echo 0
+        return
+    fi
+    if [ -z "$(ls -A "$UPPER" 2>/dev/null)" ]; then
+        echo 0
+        return
+    fi
+    find "$UPPER" -printf '%T@\n' 2>/dev/null | sort -n | tail -1 || echo 0
+}
+
+wait_for_home
+
+echo "lsl-home-flushd: watching $UPPER (idle ${IDLE_SEC}s)…"
+
+while sleep 30; do
+    if ! mountpoint -q /home 2>/dev/null; then
+        continue
+    fi
+    if ! lsl_is_usb_mode; then
+        exit 0
+    fi
+
+    lm="$(latest_upper_mtime)"
+    if [ "$(echo "$lm" | awk '{ print ($1 > 0) }')" != 1 ]; then
+        continue
+    fi
+
+    now="$(date +%s)"
+    # mtime is fractional from find %T@
+    idle="$(awk -v n="$now" -v lm="$lm" 'BEGIN { printf "%.0f", n - lm }')"
+
+    if [ "$idle" -ge "$IDLE_SEC" ]; then
+        echo "lsl-home-flushd: idle ${idle}s ≥ ${IDLE_SEC}s, flushing…"
+        if "$SCRIPT_DIR/lsl-flush-home.sh"; then
+            echo "lsl-home-flushd: flush OK"
+        else
+            echo "lsl-home-flushd: flush failed (will retry)" >&2
+        fi
+    fi
+done

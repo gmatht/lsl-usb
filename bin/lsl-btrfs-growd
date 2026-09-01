@@ -1,0 +1,120 @@
+#!/bin/bash
+# Periodically grow loop-backed home.btrfs on HDD when free space is low.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/lsl-common.sh"
+
+lsl_load_config
+
+if lsl_is_usb_mode; then
+    exit 0
+fi
+
+MIN_PCT="${LSL_BTRFS_MIN_FREE_PCT:-10}"
+CHUNK_MIB="${LSL_BTRFS_GROW_CHUNK_MIB:-1024}"
+
+# Args: mountpoint image_path label
+free_pct() {
+    if ! mountpoint -q "$1" 2>/dev/null; then
+        echo ""
+        return 1
+    fi
+    df -P "$1" 2>/dev/null | awk 'NR==2 { gsub(/%/,"",$5); print 100 - $5 }'
+}
+
+try_grow() {
+    local mp="$1" img="$2" label="$3"
+    local fp
+    [ -f "$img" ] || return 0
+    mountpoint -q "$mp" 2>/dev/null || return 0
+    fp="$(free_pct "$mp")" || return 0
+    case "$fp" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    if [ "$fp" -gt "$MIN_PCT" ]; then
+        return 0
+    fi
+
+    echo "lsl-btrfs-growd: low free space on ${label} (${fp}% <= ${MIN_PCT}%), growing ${img} by ${CHUNK_MIB}MiB…"
+    btrfs filesystem sync "$mp" 2>/dev/null || true
+
+    if ! truncate -s "+${CHUNK_MIB}M" "$img"; then
+        echo "lsl-btrfs-growd: truncate failed (${label})" >&2
+        return 0
+    fi
+
+    # Locate the live loop device backing this mount. Prefer findmnt (gives the
+    # actual /dev/loopN for the mountpoint) over losetup -j, which can miss the
+    # device when the backing-file path is a symlink or was resolved differently.
+    local loop_dev new_size loop_size
+    loop_dev="$(findmnt -n -o SOURCE "$mp" 2>/dev/null | grep -E '^/dev/loop' | head -1)"
+
+    # PRIMARY (online): make the live loop device pick up the new file size with
+    # losetup -c. No unmount needed, so this works even while /home is busy.
+    if [ -n "$loop_dev" ] && [ -b "$loop_dev" ]; then
+        losetup -c "$loop_dev" 2>/dev/null || true
+    fi
+
+    # Grow the btrfs filesystem to fill the (now larger) device. This is the step
+    # that actually changes the usable space on a busy mount.
+    if ! btrfs filesystem resize max "$mp"; then
+        echo "lsl-btrfs-growd: btrfs resize failed (${label}); a reboot may be required to apply the growth." >&2
+    fi
+
+    # Verify the loop device reflects the grown file. Some kernels silently
+    # ignore losetup -c; if so we try a re-loop, but only when the filesystem can
+    # be unmounted - otherwise leave a clear "reboot needed" note (online growth
+    # of a busy loop-backed FS is fundamentally limited).
+    if [ -n "$loop_dev" ] && [ -b "$loop_dev" ] && command -v blockdev >/dev/null 2>&1; then
+        new_size="$(stat -c %s "$img" 2>/dev/null || echo 0)"
+        loop_size="$(blockdev --getsize64 "$loop_dev" 2>/dev/null || echo 0)"
+        if [ "$loop_size" != "$new_size" ] && [ "$loop_size" -gt 0 ] 2>/dev/null; then
+            echo "lsl-btrfs-growd: loop device did not pick up new size ($loop_size != $new_size); re-looping ${img}." >&2
+            if mountpoint -q "$mp" 2>/dev/null && umount "$mp" 2>/dev/null; then
+                losetup -d "$loop_dev" 2>/dev/null || true
+                loop_dev="$(losetup -f --show "$img" 2>/dev/null || true)"
+                if [ -n "$loop_dev" ]; then
+                    mount -o loop,compress=zstd:3,relatime "$img" "$mp" 2>/dev/null || true
+                    btrfs filesystem resize max "$mp" 2>/dev/null || true
+                fi
+            else
+                echo "lsl-btrfs-growd: cannot remount busy ${label}; a reboot is required to grow it." >&2
+            fi
+        fi
+    fi
+
+    # Re-check: did the usable space actually increase? On kernels that silently
+    # ignore losetup -c AND with a busy mount, the resize cannot take effect
+    # online. Report that clearly and leave a persistent marker so the user
+    # knows a reboot (or unmount) is the only fix.
+    after_fp="$(free_pct "$mp")" || after_fp=""
+    case "$after_fp" in
+        ''|*[!0-9]*) after_fp="$fp" ;;
+    esac
+    if [ "$after_fp" -le "$MIN_PCT" ]; then
+        echo "lsl-btrfs-growd: WARNING: ${label} still at ${after_fp}% after grow attempt." >&2
+        echo "lsl-btrfs-growd:   online growth is not supported by this kernel while ${label} is busy." >&2
+        echo "lsl-btrfs-growd:   reboot (or unmount ${label}) to apply the grown backing file." >&2
+        # Persistent note so it survives the session and is visible on next boot.
+        local datadir
+        datadir="$(lsl_resolve_data_dir 2>/dev/null || true)"
+        if [ -n "$datadir" ] && [ -d "$datadir" ]; then
+            echo "$(date -Iseconds) ${label}: online grow attempted but kernel did not apply (busy loop device); reboot to apply." \
+                >> "$datadir/lsl-btrfs-grow.log" 2>/dev/null || true
+        fi
+    fi
+
+    df -h "$mp" 2>/dev/null || true
+}
+
+while true; do
+    lsl_load_config
+    if lsl_is_usb_mode; then
+        exit 0
+    fi
+    try_grow /home "$(lsl_home_btrfs_path)" home
+    try_grow "${LSL_CACHE_MOUNT:-/mnt/lsl-cache}" "$(lsl_cache_btrfs_path)" cache
+    sleep "${LSL_BTRFS_GROW_INTERVAL_SEC:-60}"
+done
