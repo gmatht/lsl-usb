@@ -90,11 +90,22 @@ param(
     [switch]$NoGui,
     [switch]$DryRun,
     [switch]$RateHardware,
-    [switch]$NoElevation
+    [switch]$NoElevation,
+    [switch]$PreloadRustTools
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+# Windows PowerShell 5.1 does not define the $IsWindows/$IsLinux/$IsMacOS
+# automatic variables (they were introduced in PowerShell Core 6). install.bat
+# may resolve to Windows PowerShell 5.1 when pwsh is not on PATH, so define them
+# when missing. Under PowerShell Core they already exist and are left untouched.
+if (-not (Test-Path Variable:IsWindows)) {
+    $IsWindows = $env:OS -eq 'Windows_NT'
+    $IsLinux   = ($env:OS -ne 'Windows_NT') -and (Test-Path '/proc')
+    $IsMacOS   = $false
+}
 # PS 5.1 defaults to TLS 1.0/1.1, which modern mirrors reject. Prefer 1.2+1.3;
 # fall back to 1.2 alone on .NET Framework builds without the Tls13 enum.
 try {
@@ -161,6 +172,17 @@ function Test-SecureBootEnabled {
     } catch {
         return $false
     }
+}
+
+function Get-SecureBootStatus {
+    # Returns 'Enabled', 'Disabled', or 'Unknown' (could not query - e.g. BIOS
+    # firmware or an OS without Confirm-SecureBootUEFI).
+    if (-not $IsWindows) { return 'Unknown' }
+    try {
+        $v = Confirm-SecureBootUEFI -ErrorAction Stop
+        if ($v) { return 'Enabled' } else { return 'Disabled' }
+    } catch { }
+    return 'Unknown'
 }
 
 function Confirm-SecureBoot {
@@ -360,6 +382,11 @@ function Find-EverythingIsos {
     if ($LASTEXITCODE -ne 0) { return ,@() }   # Everything index not available
     $paths = @($raw | Where-Object { $_ -match '^[A-Za-z]:\\' -and $_ -match '\.iso$' } |
         Select-Object -First 20)
+    # Drop empty (0-byte) ISOs - they are partial/corrupt downloads and can never
+    # boot, so never offer or auto-select them as the default.
+    $paths = @($paths | Where-Object {
+        (Test-Path $_ -PathType Leaf) -and ((Get-Item $_ -ErrorAction SilentlyContinue).Length -gt 0)
+    })
     return ,$paths
 }
 
@@ -612,13 +639,27 @@ function Wait-UsbReady {
 # Wifi: extract Windows' saved profiles via netsh, emit wifi.sh lines.
 # ---------------------------------------------------------------------------
 function Get-WifiProfileNames {
-    # Windows' saved wifi profile names (for the GUI picker).
+    # Windows' saved wifi profile names (for the GUI picker / dry-run report).
     if (-not (Get-Command netsh -ErrorAction SilentlyContinue)) { return ,@() }
-    $names = netsh wlan show profiles |
-        Select-String -Pattern ':\s*([^:\r\n]+)$' |
-        ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() } |
-        Where-Object { $_ }
-    return ,@($names | Select-Object -Unique)
+    $raw = & netsh wlan show profiles 2>$null
+    # netsh's output can be buffered by PowerShell as one multi-line string or as
+    # an array of lines depending on the host - normalise to individual lines so
+    # we never collapse every profile name into a single space-joined string.
+    $lines = if ($raw -is [string]) { $raw -split "`r?`n" } else { @($raw) }
+    $names = @()
+    foreach ($line in $lines) {
+        # Each profile line looks like: '    All User Profile     : <name>'.
+        # Split on the first colon only, so profile names that themselves contain
+        # a colon are kept intact.
+        if ($line -match 'All User Profile') {
+            $parts = $line -split ':', 2
+            if ($parts.Count -eq 2) {
+                $n = $parts[1].Trim()
+                if ($n) { $names += $n }
+            }
+        }
+    }
+    return @($names | Sort-Object -Unique)
 }
 
 function Get-WifiLines {
@@ -888,15 +929,19 @@ function Get-LhwPage {
 function Get-LhwDevicePage {
     # Resolve the linux-hardware.org device page for a device ID like
     # 'pci:10ec-c821' or 'usb:0bda-b720'. Look-up order:
-    #   1) per-user runtime cache in %TEMP% (freshest, from a prior live fetch)
+    #   1) the persistent per-user cache (%LOCALAPPDATA%\lsl-usb\lsl-hw-cache,
+    #      freshest, from a prior live fetch - survives install.bat runs)
     #   2) the snapshot cache bundled with the tool ($BundleDir/lsl-hw-cache),
     #      so common hardware is rated with no network request at all
-    #   3) a live (polite) fetch, which is then cached in %TEMP%
+    #   3) a live (polite) fetch, which is then cached in the per-user cache
     # Returns the HTML, or '' on failure (failures are not cached, so a later
     # run retries).
     param([string]$Id)
     $fileName = "lsl-lhw-" + ($Id -replace '[:]', '-') + '.html'
-    $userCache = Join-Path $env:TEMP $fileName
+    $cacheRoot = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'lsl-usb' } else { $env:TEMP }
+    $cacheDir = Join-Path $cacheRoot 'lsl-hw-cache'
+    if (-not (Test-Path $cacheDir)) { try { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null } catch { } }
+    $userCache = Join-Path $cacheDir $fileName
     if (Test-Path $userCache) {
         try { return Get-Content $userCache -Raw } catch { }
     }
@@ -1448,19 +1493,38 @@ function Show-DryRunReport {
         if (Test-Path $p) { Write-Info "  OK       $item" } else { Write-Warn2 "  MISSING  $item" }
     }
     Write-Info "Bundle dir: $BundleDir"
-}
+
     WriteStep '32-bit Rust CLI tools (would be downloaded to <USB>:\bin)'
     if ($PreloadRustTools) {
         Write-Info '  Would download fd / bat / zoxide (i686-unknown-linux-musl) directly from GitHub and drop to <USB>:\bin.'
     } else {
         Write-Info '  Skipped (-PreloadRustTools to enable).'
     }
-
+}
 
 # ---------------------------------------------------------------------------
 # WinForms installer GUI: starts FIRST, runs the ISO download/verify in a
 # background runspace, and collects configuration while the user waits.
 # ---------------------------------------------------------------------------
+# Custom ListView sorter for the hardware-compatibility page (click a heading to sort).
+class HwSorter : System.Collections.IComparer {
+    [int]$Col = 0
+    [int]$Dir = 1
+    [int] Compare($x, $y) {
+        if ($this.Col -eq 1) {
+            $rx = [string]$x.SubItems[1].Tag; $ry = [string]$y.SubItems[1].Tag
+            $order = @{ 'A' = 0; 'C' = 1; 'D' = 2; 'U' = 3 }
+            $a = if ($order.ContainsKey($rx)) { $order[$rx] } else { 99 }
+            $b = if ($order.ContainsKey($ry)) { $order[$ry] } else { 99 }
+            if ($a -ne $b) { return $this.Dir * ($a - $b) }
+            return $this.Dir * [string]::Compare($x.SubItems[1].Text, $y.SubItems[1].Text)
+        }
+        $a = $x.SubItems[$this.Col].Text
+        $b = $y.SubItems[$this.Col].Text
+        return $this.Dir * [string]::Compare($a, $b)
+    }
+}
+
 function Show-InstallerGui {
     param(
         [string]$IsoPath,
@@ -1477,10 +1541,15 @@ function Show-InstallerGui {
     if ($foundIsos.Count -eq 0) {
         $dir = if ($DownloadDir) { $DownloadDir } else { Get-UserDownloadsDir }
         $foundIsos = @(Get-ChildItem $dir -Filter *.iso -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -gt 100MB } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 10 |
             ForEach-Object { $_.FullName })
     }
-    $foundIsos = @($foundIsos | Select-Object -First 10)
+    # Drop stale/zero-byte/stub entries (Everything's index can list files that
+    # are gone or still being written) so a 0 GB stub never beats a real ISO.
+    $foundIsos = @($foundIsos | Where-Object {
+        (Test-Path $_ -PathType Leaf) -and (Get-Item $_ -ErrorAction SilentlyContinue).Length -gt 100MB
+    } | Select-Object -First 10)
     $exactName = "linuxmint-$MintVersion-cinnamon-64bit.iso"
     $defaultIso = $foundIsos | Where-Object { [System.IO.Path]::GetFileName($_) -eq $exactName } | Select-Object -First 1
     if (-not $defaultIso) {
@@ -1491,11 +1560,39 @@ function Show-InstallerGui {
         Phase = 'iso'; Percent = 0; Message = 'Starting...'
         Done = $false; Error = ''; IsoPath = ''; EtaSec = -1
         CancelDownload = $false; ChosenIso = $defaultIso; ReuseUsb = ''
+        EverythingRequested = $false
+        DownloadUrl = "https://mirrors.kernel.org/linuxmint/stable/$MintVersion/linuxmint-$MintVersion-cinnamon-64bit.iso"
+        DownloadName = "linuxmint-$MintVersion-cinnamon-64bit.iso"
     })
+
+    # Recommended distro for the fresh-download default (Mint >=2GB, Lubuntu
+    # 1-2GB, antiX otherwise). Computed early so the background download job
+    # starts with the right target; page 1 reuses these values for the text.
+    $is64 = [Environment]::Is64BitOperatingSystem
+    $ramBytes = 0
+    try { $ramBytes = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory } catch { }
+    $ramGB = [math]::Round($ramBytes / 1GB, 1)
+    if (-not $is64 -or $ramGB -lt 1) {
+        $state.DownloadUrl = 'https://antixlinux.com/download/'
+        $state.DownloadName = 'downloaded.iso'
+    } elseif ($ramGB -lt 2) {
+        $state.DownloadUrl = 'https://cdimage.ubuntu.com/lubuntu/releases/24.04/release/'
+        $state.DownloadName = 'downloaded.iso'
+    } else {
+        $state.DownloadUrl = "https://mirrors.kernel.org/linuxmint/stable/$MintVersion/linuxmint-$MintVersion-cinnamon-64bit.iso"
+        $state.DownloadName = "linuxmint-$MintVersion-cinnamon-64bit.iso"
+    }
+
+    # Shared UI state (hashtable so event handlers can mutate it). Defined early
+    # because the ISO background job (below) is stored on it so it can be
+    # restarted when the user picks a different ISO on page 1.
+    $ui = @{ Page = 0; FlatpakDone = $false; VhdxDone = $false; Checks = @()
+        HwStarted = $false; HwDone = $false; HwPending = $null; HwCounts = @{ A = 0; C = 0; D = 0; U = 0 }
+        Ps = $null; Handle = $null; IsoReady = $false }
 
     # --- runspace: ISO download/verify (starts immediately) ---
     $runspaceScript = @'
-param($state, $IsoPath, $MintVersion, $DownloadDir)
+param($state, $IsoPath, $MintVersion, $DownloadDir, $DownloadUrl, $DownloadName)
 $ErrorActionPreference = 'Stop'
 # The runspace is a separate PowerShell instance: it does not inherit the
 # script's TLS 1.2 setting, and mirrors.kernel.org rejects older TLS.
@@ -1572,63 +1669,89 @@ try {
         $state.Done = $true
         return
     }
-    $isoName = "linuxmint-$MintVersion-cinnamon-64bit.iso"
+    $isoName = $DownloadName
     if (-not $DownloadDir) { $DownloadDir = Get-UserDownloadsDir }
     $dest = Join-Path $DownloadDir $isoName
-    $base = "https://mirrors.kernel.org/linuxmint/stable/$MintVersion"
-    if (-not (Test-Path $dest)) {
-        New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
-        $state.Message = "Downloading $isoName ..."
-        $wc = New-Object System.Net.WebClient
-        $resp = $wc.OpenRead("$base/$isoName")
-        $fs = [System.IO.File]::Create($dest)
-        $buf = New-Object byte[] (1048576)
-        $total = $resp.ContentLength
-        $read = 0
-        $t0 = [DateTime]::UtcNow
-        while (($n = $resp.Read($buf, 0, $buf.Length)) -gt 0) {
-            if ($state.CancelDownload) {
-                $fs.Close(); $resp.Close()
-                Remove-Item $dest -Force -ErrorAction SilentlyContinue
-                $state.IsoPath = $state.ChosenIso
-                $state.Message = "Using selected ISO: $($state.ChosenIso)"
-                $state.Percent = 100
-                $state.Done = $true
-                return
+    if ($DownloadUrl -match '\.iso$') {
+        # Direct ISO URL: download it (Mint is SHA-256 verified; others are not).
+        $base = $DownloadUrl.Substring(0, $DownloadUrl.LastIndexOf('/'))
+        if (-not (Test-Path $dest)) {
+            New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
+            $state.Message = "Downloading $isoName ..."
+            $wc = New-Object System.Net.WebClient
+            $resp = $wc.OpenRead($DownloadUrl)
+            $fs = [System.IO.File]::Create($dest)
+            $buf = New-Object byte[] (1048576)
+            $total = $resp.ContentLength
+            $read = 0
+            $t0 = [DateTime]::UtcNow
+            while (($n = $resp.Read($buf, 0, $buf.Length)) -gt 0) {
+                if ($state.CancelDownload) {
+                    $fs.Close(); $resp.Close()
+                    Remove-Item $dest -Force -ErrorAction SilentlyContinue
+                    $state.IsoPath = $state.ChosenIso
+                    $state.Message = "Using selected ISO: $($state.ChosenIso)"
+                    $state.Percent = 100
+                    $state.Done = $true
+                    return
+                }
+                $fs.Write($buf, 0, $n)
+                $read += $n
+                if ($total -gt 0) { $state.Percent = [int]($read * 100 / $total) }
+                $state.Message = "Downloading: $([math]::Round($read/1GB,2)) / $([math]::Round($total/1GB,2)) GB"
+                $el = ([DateTime]::UtcNow - $t0).TotalSeconds
+                if ($el -gt 1 -and $read -gt 0) {
+                    $rate = $read / $el
+                    $state.EtaSec = [int](($total - $read) / $rate)
+                }
             }
-            $fs.Write($buf, 0, $n)
-            $read += $n
-            if ($total -gt 0) { $state.Percent = [int]($read * 100 / $total) }
-            $state.Message = "Downloading: $([math]::Round($read/1GB,2)) / $([math]::Round($total/1GB,2)) GB"
-            $el = ([DateTime]::UtcNow - $t0).TotalSeconds
-            if ($el -gt 1 -and $read -gt 0) {
-                $rate = $read / $el
-                $state.EtaSec = [int](($total - $read) / $rate)
-            }
+            $fs.Close(); $resp.Close()
+        } else {
+            $state.Message = "ISO already present: $dest"
         }
-        $fs.Close(); $resp.Close()
+        $state.IsoPath = $dest
+        if ($DownloadName -like 'linuxmint-*') {
+            $state.Percent = 0
+            $state.Message = 'Verifying SHA-256 ...'
+            $expected = Get-ExpectedChecksum -base $base -isoName $isoName -state $state -cacheDir $DownloadDir
+            if (-not $expected) { throw "No checksum entry for $isoName" }
+            Verify-Sha256 -path $dest -expected $expected -state $state
+            $state.Message = 'SHA-256 verified.'
+        } else {
+            $state.Message = "Downloaded $isoName (SHA-256 not verified for this distro)."
+        }
+        $state.Percent = 100
+        $state.Done = $true
     } else {
-        $state.Message = "ISO already present: $dest"
+        # Page/directory URL (Lubuntu/Xubuntu/antiX/Zorin): open it in the
+        # browser so the user picks the latest ISO there, then use the
+        # local-ISO section.
+        Start-Process $DownloadUrl
+        $state.Message = "Opened $DownloadUrl in your browser - pick the ISO there, then use the local-ISO section."
+        $state.Percent = 100
+        $state.Done = $true
     }
-    $state.IsoPath = $dest
-    $state.Percent = 0
-    $state.Message = 'Verifying SHA-256 ...'
-    $expected = Get-ExpectedChecksum -base $base -isoName $isoName -state $state -cacheDir $DownloadDir
-    if (-not $expected) { throw "No checksum entry for $isoName" }
-    Verify-Sha256 -path $dest -expected $expected -state $state
-    $state.Message = 'SHA-256 verified.'
-    $state.Percent = 100
-    $state.Done = $true
 } catch {
     $state.Error = $_.Exception.Message
     $state.Done = $true
 }
 '@
 
-    $ps = [powershell]::Create()
-    [void]$ps.AddScript($runspaceScript)
-    [void]$ps.AddArgument($state).AddArgument($IsoPath).AddArgument($MintVersion).AddArgument($DownloadDir)
-    $handle = $ps.BeginInvoke()
+    $ui.Ps = [powershell]::Create()
+    [void]$ui.Ps.AddScript($runspaceScript)
+    [void]$ui.Ps.AddArgument($state).AddArgument($IsoPath).AddArgument($MintVersion).AddArgument($DownloadDir).AddArgument($state.DownloadUrl).AddArgument($state.DownloadName)
+    $ui.Handle = $ui.Ps.BeginInvoke()
+
+    # Restart the ISO download/verify job (used when the user picks a different
+    # ISO on page 1, so the "Verifying..." status resets for the new file).
+    $restartIsoJob = {
+        try { $ui.Ps.Stop() } catch { }
+        try { $ui.Ps.Dispose() } catch { }
+        $ui.Ps = [powershell]::Create()
+        [void]$ui.Ps.AddScript($runspaceScript)
+        [void]$ui.Ps.AddArgument($state).AddArgument($IsoPath).AddArgument($MintVersion).AddArgument($DownloadDir).AddArgument($state.DownloadUrl).AddArgument($state.DownloadName)
+        $ui.Handle = $ui.Ps.BeginInvoke()
+    }
 
     # --- background runspaces for the slow discovery (form appears fast) ---
     $flatpakScript = {
@@ -1681,7 +1804,7 @@ try {
         $ver = (Get-Content $verFile -Raw).Trim()
         if ($ver) { $form.Text = "lsl-usb installer $ver" }
     }
-    $form.ClientSize = New-Object System.Drawing.Size(640, 760)
+    $form.ClientSize = New-Object System.Drawing.Size(860, 760)
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
@@ -1707,7 +1830,7 @@ try {
     # --- page 1: ISO selection ---
     $page1 = New-Object System.Windows.Forms.Panel
     $page1.Location = New-Object System.Drawing.Point(12, 88)
-    $page1.Size = New-Object System.Drawing.Size(600, 630)
+    $page1.Size = New-Object System.Drawing.Size(836, 630)
     $form.Controls.Add($page1)
 
     $lblIso = New-Object System.Windows.Forms.Label
@@ -1723,24 +1846,106 @@ try {
     $lblRec.Font = New-Object System.Drawing.Font($lblRec.Font, [System.Drawing.FontStyle]::Bold)
     $page1.Controls.Add($lblRec)
 
+    # Non-bold helper text below the recommendation, based on this machine's
+    # 64-bit support and RAM (the machine that boots the USB may differ).
+    # ($is64 / $ramGB were computed above, before the download job started.)
+    if (-not $is64) {
+        $lblRec.Text = 'antiX 26 is the recommended option.'
+        $recHelp = "Your machine does not support 64-bit and will not be able to run Cinnamon. We recommend antiX 26, which runs on old hardware that doesn't support 64-bit and has as little as 0.25 GB of RAM."
+    } elseif ($ramGB -ge 4) {
+        $lblRec.Text = 'Linux Mint Cinnamon is the recommended option.'
+        $recHelp = "Your machine supports 64-bit and has $($ramGB) GB of RAM, meeting Cinnamon's recommended 4 GB spec. There is no need to use the minimalist 0.25 GB antiX."
+    } elseif ($ramGB -ge 2) {
+        $lblRec.Text = 'Linux Mint Cinnamon is the recommended option.'
+        $recHelp = "Your machine supports 64-bit and has $($ramGB) GB of RAM, meeting Cinnamon's minimum requirements of 2 GB, but not the recommended 4 GB. Consider enabling the experimental pagefile.sys swap. Your machine may be slow, but we still recommend Cinnamon over the minimalist 0.25 GB antiX."
+    } elseif ($ramGB -ge 1) {
+        $lblRec.Text = 'Lubuntu 24.04 is the recommended option (Xubuntu 24.04 also viable).'
+        $recHelp = "Your machine supports 64-bit and has $($ramGB) GB of RAM (1-2 GB). We recommend Lubuntu 24.04, which is light enough for 1 GB. Xubuntu 24.04 is also a viable option on 1 GB, but it is a bit heavier and should still run."
+    } else {
+        $lblRec.Text = 'antiX 26 is the recommended option.'
+        $recHelp = "Your machine supports 64-bit, but only has $($ramGB) GB of RAM. We recommend the minimalist 0.25 GB antiX distro."
+    }
+    $lblRecHelp = New-Object System.Windows.Forms.Label
+    $lblRecHelp.Text = $recHelp
+    $lblRecHelp.Location = New-Object System.Drawing.Point(10, 50)
+    $lblRecHelp.Size = New-Object System.Drawing.Size(560, 38)
+    $page1.Controls.Add($lblRecHelp)
+
     $isoPanel = New-Object System.Windows.Forms.Panel
-    $isoPanel.Location = New-Object System.Drawing.Point(0, 55)
-    $isoPanel.Size = New-Object System.Drawing.Size(600, 560)
+    $isoPanel.Location = New-Object System.Drawing.Point(0, 92)
+    $isoPanel.Size = New-Object System.Drawing.Size(600, 528)
     $isoPanel.AutoScroll = $true
     $page1.Controls.Add($isoPanel)
 
     $y = 5
     $isoRadios = @()
-    $rbDownload = New-Object System.Windows.Forms.RadioButton
-    $rbDownload.Text = "Download linuxmint-$MintVersion Cinnamon (fresh)"
-    $rbDownload.Location = New-Object System.Drawing.Point(10, $y)
-    $rbDownload.Size = New-Object System.Drawing.Size(560, 20)
-    $rbDownload.Checked = -not $defaultIso
-    $rbDownload.Tag = ''
-    $isoPanel.Controls.Add($rbDownload)
-    $isoRadios += $rbDownload
-    $y += 24
+    # Fresh-download section: one radio per distro, with min/recommended RAM.
+    # The local-ISO radios below are a separate set in the same radio group.
+    $lblDistro = New-Object System.Windows.Forms.Label
+    $lblDistro.Text = 'Download Fresh (Ram required/recommend)'
+    $lblDistro.Location = New-Object System.Drawing.Point(10, 5)
+    $lblDistro.Size = New-Object System.Drawing.Size(560, 18)
+    $lblDistro.Font = New-Object System.Drawing.Font($lblDistro.Font, [System.Drawing.FontStyle]::Bold)
+    $isoPanel.Controls.Add($lblDistro)
+    $distroOptions = @(
+        @{ Name = 'Mint Cinnamon 22.x (64-bit)'; Ram = '(2GB/4GB)'; Url = "https://mirrors.kernel.org/linuxmint/stable/$MintVersion/linuxmint-$MintVersion-cinnamon-64bit.iso" },
+        @{ Name = 'Lubuntu 24.04 (64-bit, light)'; Ram = '(1GB/2GB)'; Url = 'https://cdimage.ubuntu.com/lubuntu/releases/24.04/release/' },
+        @{ Name = 'Xubuntu 24.04 (64-bit, light-ish)'; Ram = '(1GB/2GB)'; Url = 'https://cdimage.ubuntu.com/xubuntu/releases/24.04/release/' },
+        @{ Name = 'antiX 26 (i386 / 32-bit)'; Ram = '(0.25GB/1GB)'; Url = 'https://antixlinux.com/download/' },
+        @{ Name = 'Zorin OS (64-bit)'; Ram = '(2GB/4GB)'; Url = 'https://zorin.com/os/download/' },
+        @{ Name = 'Debian 13.6 live XFCE (64-bit)'; Ram = '(1GB/2GB)'; Url = 'https://cdimage.debian.org/cdimage/release/13.6.0-live/amd64/iso-cd/debian-live-13.6.0-amd64-xfce.iso' }
+    )
+    $distroRadios = @()
+    $dy = 25
+    foreach ($d in $distroOptions) {
+        $rb = New-Object System.Windows.Forms.RadioButton
+        $rb.Text = "$($d.Name) $($d.Ram)"
+        $rb.Location = New-Object System.Drawing.Point(10, $dy)
+        $rb.Size = New-Object System.Drawing.Size(560, 20)
+        $rb.Tag = $d
+        $rb.Add_CheckedChanged({
+            if ($this.Checked) {
+                $opt = $this.Tag
+                $state.DownloadUrl = $opt.Url
+                $state.DownloadName = [System.IO.Path]::GetFileName(($opt.Url -split '\?')[0])
+                if (-not $state.DownloadName -or $state.DownloadName -notmatch '\.iso$') { $state.DownloadName = 'downloaded.iso' }
+                $state.CancelDownload = $false
+                $state.ChosenIso = ''
+                $state.ReuseUsb = ''
+                if ($ui.IsoReady) {
+                    $state.Done = $false; $state.Error = ''; $state.Percent = 0
+                    $state.Message = "Downloading $($opt.Name) ..."
+                    & $restartIsoJob
+                }
+            }
+        })
+        $isoPanel.Controls.Add($rb)
+        $isoRadios += $rb
+        $distroRadios += $rb
+        $dy += 24
+    }
+    # Default the fresh-download radio to the recommended distro (Mint >=2GB,
+    # Lubuntu 1-2GB, antiX otherwise) unless a local ISO is the default.
+    if (-not $is64 -or $ramGB -lt 1) { $distroRadios[3].Checked = -not $defaultIso }
+    elseif ($ramGB -lt 2) { $distroRadios[1].Checked = -not $defaultIso }
+    else { $distroRadios[0].Checked = -not $defaultIso }
+    $y = 169
+    $lblLocalIso = New-Object System.Windows.Forms.Label
+    $lblLocalIso.Text = 'Use Already Downloaded ISO'
+    $lblLocalIso.Location = New-Object System.Drawing.Point(10, $y)
+    $lblLocalIso.Size = New-Object System.Drawing.Size(560, 18)
+    $lblLocalIso.Font = New-Object System.Drawing.Font($lblLocalIso.Font, [System.Drawing.FontStyle]::Bold)
+    $isoPanel.Controls.Add($lblLocalIso)
+    $y += 20
 
+    if ($foundIsos.Count -eq 0) {
+        $lblNone = New-Object System.Windows.Forms.Label
+        $lblNone.Text = '[None found]'
+        $lblNone.Location = New-Object System.Drawing.Point(10, $y)
+        $lblNone.Size = New-Object System.Drawing.Size(560, 18)
+        $isoPanel.Controls.Add($lblNone)
+        $y += 20
+    }
     foreach ($iso in $foundIsos) {
         $sz = ''
         if (Test-Path $iso -PathType Leaf) {
@@ -1756,6 +1961,12 @@ try {
             if ($this.Checked) {
                 $state.CancelDownload = $true
                 $state.ChosenIso = $this.Tag
+                $state.ReuseUsb = ''
+                if ($ui.IsoReady) {
+                    $state.Done = $false; $state.Error = ''; $state.Percent = 0
+                    $state.Message = "Using selected ISO: $($this.Tag)"
+                    & $restartIsoJob
+                }
             }
         })
         $isoPanel.Controls.Add($rb)
@@ -1764,52 +1975,81 @@ try {
     }
 
     # --- reuse an existing Mint live USB (skip Rufus) ---
+    # Separate panel = separate radio group, so picking an ISO (write via Rufus)
+    # and picking an existing USB (skip Rufus) don't fight each other. Picking an
+    # ISO always means "write it fresh via Rufus" - there is no separate toggle.
     $y += 10
+    $reusePanel = New-Object System.Windows.Forms.Panel
+    $reusePanel.Location = New-Object System.Drawing.Point(0, $y)
+    $reusePanel.Size = New-Object System.Drawing.Size(600, 200)
+    $isoPanel.Controls.Add($reusePanel)
+    $ry = 5
     $lblReuse = New-Object System.Windows.Forms.Label
-    $lblReuse.Text = 'Or use an existing Mint live USB (skip Rufus):'
-    $lblReuse.Location = New-Object System.Drawing.Point(10, $y)
+    $lblReuse.Text = 'Use an existing Live USB'
+    $lblReuse.Location = New-Object System.Drawing.Point(10, $ry)
     $lblReuse.Size = New-Object System.Drawing.Size(560, 18)
-    $isoPanel.Controls.Add($lblReuse)
-    $y += 20
-
-    $rbFresh = New-Object System.Windows.Forms.RadioButton
-    $rbFresh.Text = 'Write fresh via Rufus'
-    $rbFresh.Location = New-Object System.Drawing.Point(10, $y)
-    $rbFresh.Size = New-Object System.Drawing.Size(560, 20)
-    $rbFresh.Checked = $true
-    $rbFresh.Tag = ''
-    $rbFresh.Add_CheckedChanged({
-        if ($this.Checked) {
-            $state.ReuseUsb = ''
-            foreach ($r in $isoRadios) { $r.Visible = $true }
-        }
-    })
-    $isoPanel.Controls.Add($rbFresh)
-    $y += 24
+    $lblReuse.Font = New-Object System.Drawing.Font($lblReuse.Font, [System.Drawing.FontStyle]::Bold)
+    $reusePanel.Controls.Add($lblReuse)
+    $ry += 20
 
     $existingUsbs = @(Find-UsbVolumes -Label '')
+    if ($existingUsbs.Count -eq 0) {
+        $lblNone = New-Object System.Windows.Forms.Label
+        $lblNone.Text = '[None found]'
+        $lblNone.Location = New-Object System.Drawing.Point(10, $ry)
+        $lblNone.Size = New-Object System.Drawing.Size(560, 18)
+        $reusePanel.Controls.Add($lblNone)
+        $ry += 20
+    }
     foreach ($u in $existingUsbs) {
         $rb = New-Object System.Windows.Forms.RadioButton
         $rb.Text = "$($u.DriveLetter):  $($u.FileSystemLabel)  ($([math]::Round($u.Size/1GB,1)) GB)"
-        $rb.Location = New-Object System.Drawing.Point(10, $y)
+        $rb.Location = New-Object System.Drawing.Point(10, $ry)
         $rb.Size = New-Object System.Drawing.Size(560, 20)
         $rb.Tag = $u
         $rb.Add_CheckedChanged({
             if ($this.Checked -and $this.Tag) {
                 $state.ReuseUsb = $this.Tag
                 $state.CancelDownload = $true
-                # Reusing a USB: the ISO selection is irrelevant - hide it.
-                foreach ($r in $isoRadios) { $r.Visible = $false }
+                $state.ChosenIso = ''
+                # Reusing a USB: the ISO download/verify is irrelevant - stop it.
+                try { $ui.Ps.Stop() } catch { }
             }
         })
-        $isoPanel.Controls.Add($rb)
-        $y += 24
+        $reusePanel.Controls.Add($rb)
+        $ry += 24
     }
+    $ui.IsoReady = $true
+
+    # "Install Everything" (voidtools) lives on page 1 (moved from page 3) so its
+    # index can start building early and be ready for later pages and full-disk
+    # ISO search. Clicking it downloads/launches voidtools in the background.
+    $btnEverything = New-Object System.Windows.Forms.Button
+    $btnEverything.Text = 'Install Everything (voidtools) for full-disk search'
+    $btnEverything.Location = New-Object System.Drawing.Point(10, 600)
+    $btnEverything.Size = New-Object System.Drawing.Size(560, 24)
+    if (Get-EverythingPath) { $btnEverything.Text = 'Everything already installed (full-disk search ready)' }
+    $btnEverything.Add_Click({
+        if (Get-EverythingPath) { $btnEverything.Text = 'Everything already installed (full-disk search ready)'; return }
+        if ($state.EverythingRequested) { return }
+        $state.EverythingRequested = $true
+        $btnEverything.Enabled = $false
+        $btnEverything.Text = 'Installing Everything... (index building in background)'
+        try {
+            $es = Install-Everything
+            if ($es) { $btnEverything.Text = 'Everything installed - index building in background' }
+            else { $btnEverything.Text = 'Everything install failed - see log' }
+        } catch {
+            $btnEverything.Text = 'Everything install failed - see log'
+        }
+        $btnEverything.Enabled = $true
+    })
+    $page1.Controls.Add($btnEverything)
 
     # --- page 2: flatpaks (populated when the background job completes) ---
     $page2 = New-Object System.Windows.Forms.Panel
     $page2.Location = New-Object System.Drawing.Point(12, 88)
-    $page2.Size = New-Object System.Drawing.Size(600, 630)
+    $page2.Size = New-Object System.Drawing.Size(836, 630)
     $page2.Visible = $false
     $form.Controls.Add($page2)
 
@@ -1860,7 +2100,7 @@ try {
     # --- page 3: vhdx + data dir + wifi ---
     $page3 = New-Object System.Windows.Forms.Panel
     $page3.Location = New-Object System.Drawing.Point(12, 88)
-    $page3.Size = New-Object System.Drawing.Size(600, 630)
+    $page3.Size = New-Object System.Drawing.Size(836, 630)
     $page3.Visible = $false
     $form.Controls.Add($page3)
 
@@ -1872,24 +2112,24 @@ try {
     $txtVhdx = New-Object System.Windows.Forms.TextBox
     $txtVhdx.Multiline = $true
     $txtVhdx.Location = New-Object System.Drawing.Point(10, 30)
-    $txtVhdx.Size = New-Object System.Drawing.Size(560, 120)
+    $txtVhdx.Size = New-Object System.Drawing.Size(560, 100)
     $txtVhdx.ScrollBars = 'Vertical'
     $txtVhdx.Text = 'Detecting WSL VHDX paths...'
     $page3.Controls.Add($txtVhdx)
 
     $lblData = New-Object System.Windows.Forms.Label
     $lblData.Text = 'LSL_DATA_DIR (default /mnt/c/Users/lsl-usb):'
-    $lblData.Location = New-Object System.Drawing.Point(10, 170)
+    $lblData.Location = New-Object System.Drawing.Point(10, 140)
     $lblData.Size = New-Object System.Drawing.Size(560, 18)
     $page3.Controls.Add($lblData)
     $txtData = New-Object System.Windows.Forms.TextBox
-    $txtData.Location = New-Object System.Drawing.Point(10, 190)
+    $txtData.Location = New-Object System.Drawing.Point(10, 160)
     $txtData.Size = New-Object System.Drawing.Size(460, 22)
     if ($env:USERNAME) { $txtData.Text = "/mnt/c/Users/$($env:USERNAME)/lsl-usb" }
     $page3.Controls.Add($txtData)
     $btnBrowse = New-Object System.Windows.Forms.Button
     $btnBrowse.Text = 'Browse...'
-    $btnBrowse.Location = New-Object System.Drawing.Point(480, 189)
+    $btnBrowse.Location = New-Object System.Drawing.Point(480, 159)
     $btnBrowse.Size = New-Object System.Drawing.Size(90, 24)
     $btnBrowse.Add_Click({
         $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -1899,38 +2139,24 @@ try {
     })
     $page3.Controls.Add($btnBrowse)
 
-    $chkWifi = New-Object System.Windows.Forms.CheckBox
-    $chkWifi.Text = 'Copy Wifi Settings to LSL'
-    $chkWifi.Location = New-Object System.Drawing.Point(10, 230)
-    $chkWifi.Size = New-Object System.Drawing.Size(560, 20)
-    $chkWifi.Checked = $true
-    $page3.Controls.Add($chkWifi)
-
     $chkEfu = New-Object System.Windows.Forms.CheckBox
     $chkEfu.Text = 'Export Everything index for Linux file browsing (can be large)'
-    $chkEfu.Location = New-Object System.Drawing.Point(10, 252)
+    $chkEfu.Location = New-Object System.Drawing.Point(10, 190)
     $chkEfu.Size = New-Object System.Drawing.Size(560, 20)
     $chkEfu.Checked = $true
     $page3.Controls.Add($chkEfu)
-
-    $chkEverything = New-Object System.Windows.Forms.CheckBox
-    $chkEverything.Text = 'Install Everything (voidtools) if missing - enables full-disk search'
-    $chkEverything.Location = New-Object System.Drawing.Point(10, 274)
-    $chkEverything.Size = New-Object System.Drawing.Size(560, 20)
-    $chkEverything.Checked = $true
-    $page3.Controls.Add($chkEverything)
 
     # Network driver preload: detect this machine's chipsets (WMI is fast, so
     # this is synchronous like the netsh picker) and offer to stage the drivers.
     $drvNeeds = Resolve-DriverNeeds -Hardware (Get-NetworkHardware)
     $chkDrivers = New-Object System.Windows.Forms.CheckBox
     $chkDrivers.Text = 'Preload Linux drivers for this PC network hardware'
-    $chkDrivers.Location = New-Object System.Drawing.Point(10, 296)
+    $chkDrivers.Location = New-Object System.Drawing.Point(10, 212)
     $chkDrivers.Size = New-Object System.Drawing.Size(560, 20)
     $chkDrivers.Checked = $true
     $page3.Controls.Add($chkDrivers)
     $lblDrivers = New-Object System.Windows.Forms.Label
-    $lblDrivers.Location = New-Object System.Drawing.Point(10, 318)
+    $lblDrivers.Location = New-Object System.Drawing.Point(10, 234)
     $lblDrivers.Size = New-Object System.Drawing.Size(560, 20)
     if ($drvNeeds.Count -gt 0) {
         $lblDrivers.Text = 'Detected: ' + (($drvNeeds | ForEach-Object { "$($_.Table.Chip) ($($_.Hardware.Id))" }) -join ', ')
@@ -1942,7 +2168,7 @@ try {
     # Copy squashfs layers to the NTFS HDD for faster boot (offered in the wizard).
     $chkSfsHdd = New-Object System.Windows.Forms.CheckBox
     $chkSfsHdd.Text = 'Copy Linux squashfs layers to your NTFS drive for faster boot'
-    $chkSfsHdd.Location = New-Object System.Drawing.Point(10, 572)
+    $chkSfsHdd.Location = New-Object System.Drawing.Point(10, 256)
     $chkSfsHdd.Size = New-Object System.Drawing.Size(560, 20)
     $chkSfsHdd.Checked = $true
     $page3.Controls.Add($chkSfsHdd)
@@ -1950,18 +2176,19 @@ try {
     # Reclaim Windows pagefile.sys / WSL2 swapfile.vhdx as compressed swap (opt-in).
     $chkReclaim = New-Object System.Windows.Forms.CheckBox
     $chkReclaim.Text = 'Reclaim Windows pagefile.sys + WSL2 swapfile as compressed swap'
-    $chkReclaim.Location = New-Object System.Drawing.Point(10, 640)
+    $chkReclaim.Location = New-Object System.Drawing.Point(10, 320)
     $chkReclaim.Size = New-Object System.Drawing.Size(560, 20)
     $chkReclaim.Checked = $false   # experimental: renames Windows system files; opt in explicitly
     $page3.Controls.Add($chkReclaim)
     $lblReclaim = New-Object System.Windows.Forms.Label
-    $lblReclaim.Location = New-Object System.Drawing.Point(10, 662)
+    $lblReclaim.Location = New-Object System.Drawing.Point(10, 342)
     $lblReclaim.Size = New-Object System.Drawing.Size(560, 34)
-    $lblReclaim.Text = 'Renames pagefile.sys and each WSL2 swapfile.vhdx (after a clean-shutdown check) and uses that space as compressed swap. Safe only if Windows was shut down normally (no Fast Startup / hibernate).'
+    $lblReclaim.Text = 'Renames pagefile.sys and each WSL2 swapfile.vhdx (after a clean-shutdown check) and uses that space as compressed swap. Used only if Windows was shut down normally (no Fast Startup / hibernate) - otherwise the reclaim is skipped and nothing happens.',
     $page3.Controls.Add($lblReclaim)
-    $tip.SetToolTip($chkReclaim, 'Off by default. On a clean shutdown, renames Windows pagefile.sys / WSL2 swapfile.vhdx to temp files and uses them as zram backing (compressed swap). Temp files are deleted at Linux shutdown; a Windows task also deletes them on next boot.')
+    if (-not (Test-Path Variable:tip)) { $tip = New-Object System.Windows.Forms.ToolTip }
+    $tip.SetToolTip($chkReclaim, 'Off by default. On a clean shutdown (no Fast Startup / hibernate), renames Windows pagefile.sys / WSL2 swapfile.vhdx to temp files and uses them as zram backing (compressed swap). If Windows was not shut down cleanly, the reclaim is skipped entirely - safe because it only ever runs when nothing is using those files. Temp files are deleted at Linux shutdown; a Windows task also deletes them on next boot.')
     $lblSfsHdd = New-Object System.Windows.Forms.Label
-    $lblSfsHdd.Location = New-Object System.Drawing.Point(10, 594)
+    $lblSfsHdd.Location = New-Object System.Drawing.Point(10, 278)
     $lblSfsHdd.Size = New-Object System.Drawing.Size(560, 44)
     $ddRoot = if ($txtData.Text) { [System.IO.Path]::GetPathRoot($txtData.Text) } else { 'C:\' }
     $freeNote = ''
@@ -1974,19 +2201,39 @@ try {
     $lblSfsHdd.Text = "Copies the Linux root image (~1.5-3 GB) + home snapshot from the USB to the HDD so boots/precache read from the faster internal drive. $freeNote All NTFS drives: $($allFixed -join ', ')."
     $page3.Controls.Add($lblSfsHdd)
 
+    # --- wifi networks: kept as the very last section on the page ---
+    $hrule = New-Object System.Windows.Forms.Panel
+    $hrule.Location = New-Object System.Drawing.Point(10, 384)
+    $hrule.Size = New-Object System.Drawing.Size(560, 2)
+    $hrule.BackColor = [System.Drawing.SystemColors]::ControlDark
+    $page3.Controls.Add($hrule)
+
+    $wifiChecks = @()
+    $wifiNames = @(Get-WifiProfileNames)
+
+    # Master toggle for the wifi networks: checking it checks/unchecks all.
+    $chkWifi = New-Object System.Windows.Forms.CheckBox
+    $chkWifi.Text = 'Copy Wifi Settings to LSL'
+    $chkWifi.Location = New-Object System.Drawing.Point(10, 392)
+    $chkWifi.Size = New-Object System.Drawing.Size(560, 20)
+    $chkWifi.Font = New-Object System.Drawing.Font($chkWifi.Font, [System.Drawing.FontStyle]::Bold)
+    $chkWifi.Checked = $true
+    $chkWifi.Add_CheckedChanged({
+        foreach ($cb in $wifiChecks) { $cb.Checked = $this.Checked }
+    })
+    $page3.Controls.Add($chkWifi)
+
     # Per-network picker (pre-checked; netsh is fast so this is synchronous).
     $lblWifi = New-Object System.Windows.Forms.Label
     $lblWifi.Text = 'Networks to copy (checked = include in wifi.sh):'
-    $lblWifi.Location = New-Object System.Drawing.Point(10, 340)
+    $lblWifi.Location = New-Object System.Drawing.Point(10, 414)
     $lblWifi.Size = New-Object System.Drawing.Size(560, 18)
     $page3.Controls.Add($lblWifi)
     $wifiHost = New-Object System.Windows.Forms.Panel
-    $wifiHost.Location = New-Object System.Drawing.Point(0, 360)
-    $wifiHost.Size = New-Object System.Drawing.Size(600, 200)
+    $wifiHost.Location = New-Object System.Drawing.Point(0, 434)
+    $wifiHost.Size = New-Object System.Drawing.Size(600, 190)
     $wifiHost.AutoScroll = $true
     $page3.Controls.Add($wifiHost)
-    $wifiChecks = @()
-    $wifiNames = @(Get-WifiProfileNames)
     $wy = 5
     foreach ($wn in $wifiNames) {
         $cb = New-Object System.Windows.Forms.CheckBox
@@ -2006,36 +2253,163 @@ try {
         $wifiHost.Controls.Add($lbl)
     }
 
+    # --- page 0: hardware compatibility (Linux LKDDb rating) ---
+    $pageHw = New-Object System.Windows.Forms.Panel
+    $pageHw.Location = New-Object System.Drawing.Point(12, 88)
+    $pageHw.Size = New-Object System.Drawing.Size(836, 630)
+    $form.Controls.Add($pageHw)
+
+    $lblHw = New-Object System.Windows.Forms.Label
+    $lblHw.Text = 'Linux hardware compatibility (linux-hardware.org LKDDb):'
+    $lblHw.Location = New-Object System.Drawing.Point(10, 10)
+    $lblHw.Size = New-Object System.Drawing.Size(560, 18)
+    $pageHw.Controls.Add($lblHw)
+
+    $lblHwSummary = New-Object System.Windows.Forms.Label
+    $lblHwSummary.Location = New-Object System.Drawing.Point(10, 34)
+    $lblHwSummary.Size = New-Object System.Drawing.Size(580, 20)
+    $lblHwSummary.Text = 'Rating each detected device against the ISO kernel (linux-hardware.org LKDDb)...'
+    $pageHw.Controls.Add($lblHwSummary)
+
+    $sbStatus = Get-SecureBootStatus
+    $lblSb = New-Object System.Windows.Forms.Label
+    $lblSb.Location = New-Object System.Drawing.Point(10, 56)
+    $lblSb.Size = New-Object System.Drawing.Size(580, 20)
+    switch ($sbStatus) {
+        'Enabled' { $lblSb.Text = "Secure Boot: Enabled - Linux Mint's signed shim usually boots fine; you may see a one-time 'MOK management' screen on first boot (choose Enroll MOK)." }
+        'Disabled' { $lblSb.Text = 'Secure Boot: Disabled - no Secure Boot issues expected.' }
+        default   { $lblSb.Text = 'Secure Boot: Unknown - could not query (BIOS firmware or unsupported).' }
+    }
+    $pageHw.Controls.Add($lblSb)
+
+    $lvHw = New-Object System.Windows.Forms.ListView
+    $lvHw.View = 'Details'
+    $lvHw.FullRowSelect = $true
+    $lvHw.GridLines = $true
+    $lvHw.Location = New-Object System.Drawing.Point(10, 80)
+    $lvHw.Size = New-Object System.Drawing.Size(816, 530)
+    $lvHw.Anchor = 'Top,Left,Right,Bottom'
+    $lvHw.Columns.Add('Category', 100) | Out-Null
+    $lvHw.Columns.Add('Support', 140) | Out-Null
+    $lvHw.Columns.Add('Device', 190) | Out-Null
+    $lvHw.Columns.Add('ID', 80) | Out-Null
+    $lvHw.Columns.Add('www', 40) | Out-Null
+    # Support is the base width + ~3 characters; Device fills whatever the
+    # other columns leave over (www stays fixed for the globe), so widening
+    # Support shortens Device to balance. Recompute on resize and after the
+    # hardware scan finishes (when the vertical scrollbar may appear).
+    $updateDeviceCol = {
+        $supportW = 140 + [System.Windows.Forms.TextRenderer]::MeasureText('XXX', $lvHw.Font).Width
+        $lvHw.Columns[1].Width = $supportW
+        $fixed = $lvHw.Columns[0].Width + $supportW + $lvHw.Columns[3].Width + $lvHw.Columns[4].Width
+        $minDev = 190
+        $avail = $lvHw.ClientSize.Width - $fixed
+        if ($lvHw.Items.Count -gt 0) {
+            $rowH = $lvHw.Items[0].Bounds.Height
+            if ($rowH -gt 0 -and ($lvHw.Items.Count * $rowH) -gt $lvHw.ClientSize.Height) {
+                $avail -= [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth
+            }
+        }
+        if ($avail -lt $minDev) { $avail = $minDev }
+        $lvHw.Columns[2].Width = $avail
+    }
+    $lvHw.Add_Resize($updateDeviceCol)
+    & $updateDeviceCol
+    # Owner-draw the www column so the globe renders in blue: the native
+    # ListView draws emoji glyphs in black regardless of ForeColor, so we
+    # paint the cell ourselves with a blue brush (VS15 keeps it monochrome).
+    $lvHw.OwnerDraw = $true
+    $lvHw.Add_DrawColumnHeader({ param($sender, $e) $e.DrawDefault = $true })
+    $lvHw.Add_DrawItem({
+        param($sender, $e)
+        # Manual row drawing (DrawDefault would paint over the globe): draw the
+        # row background, every column's text, and the blue globe at the www
+        # column position. This works even where DrawSubItem is not raised.
+        $g = $e.Graphics
+        $r = $e.Bounds
+        if (($e.State -band [System.Windows.Forms.ListViewItemStates]::Selected) -ne 0) {
+            $g.FillRectangle([System.Drawing.Brushes]::Highlight, $r)
+        } else {
+            $g.FillRectangle([System.Drawing.Brushes]::White, $r)
+        }
+        $colX = 0
+        for ($c = 0; $c -lt 4; $c++) {
+            $sub = $e.Item.SubItems[$c]
+            $txt = [string]$sub.Text
+            if ($txt) {
+                $brush = [System.Drawing.Brushes]::Black
+                if (($e.State -band [System.Windows.Forms.ListViewItemStates]::Selected) -ne 0) { $brush = [System.Drawing.Brushes]::White }
+                $sz = $g.MeasureString($txt, $sub.Font)
+                $g.DrawString($txt, $sub.Font, $brush, $r.X + $colX + 2, $r.Y + [int](($r.Height - $sz.Height) / 2))
+            }
+            $colX += $lvHw.Columns[$c].Width
+        }
+        $size = [Math]::Min($r.Height - 4, 18)
+        if ($size -gt 4) {
+            $x = $r.X + $colX + 2
+            $y = $r.Y + [int](($r.Height - $size) / 2)
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $g.FillEllipse([System.Drawing.Brushes]::RoyalBlue, $x, $y, $size, $size)
+            $g.DrawEllipse([System.Drawing.Pens]::White, $x, $y, $size, $size)
+            $g.DrawLine([System.Drawing.Pens]::White, $x + $size/2, $y, $x + $size/2, $y + $size)
+            $g.DrawEllipse([System.Drawing.Pens]::White, $x, $y + $size/4, $size, $size/2)
+        }
+    })
+    $pageHw.Controls.Add($lvHw)
+
+    $hwSorter = [HwSorter]::new()
+    $lvHw.Add_ColumnClick({
+        param($sender, $e)
+        if ($hwSorter.Col -eq $e.Column) { $hwSorter.Dir *= -1 }
+        else { $hwSorter.Col = $e.Column; $hwSorter.Dir = 1 }
+        $lvHw.ListViewItemSorter = $hwSorter
+        $lvHw.Sort()
+    })
+    $lvHw.Add_MouseClick({
+        param($sender, $e)
+        $hit = $lvHw.HitTest($e.X, $e.Y)
+        if ($hit -and $hit.SubItem -ne $null) {
+            $cidx = $hit.Item.SubItems.IndexOf($hit.SubItem)
+            if ($cidx -eq 4 -and $hit.Item.Tag) { Start-Process $hit.Item.Tag }
+        }
+    })
+
     # --- buttons ---
     $btnBack = New-Object System.Windows.Forms.Button
     $btnBack.Text = '< Back'
     $btnBack.Enabled = $false
-    $btnBack.Location = New-Object System.Drawing.Point(340, 720)
+    $btnBack.Location = New-Object System.Drawing.Point(562, 720)
     $btnBack.Size = New-Object System.Drawing.Size(90, 28)
     $form.Controls.Add($btnBack)
 
     $btnNext = New-Object System.Windows.Forms.Button
     $btnNext.Text = 'Next >'
-    $btnNext.Location = New-Object System.Drawing.Point(440, 720)
+    $btnNext.Location = New-Object System.Drawing.Point(660, 720)
     $btnNext.Size = New-Object System.Drawing.Size(90, 28)
     $form.Controls.Add($btnNext)
 
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = 'Cancel'
-    $btnCancel.Location = New-Object System.Drawing.Point(536, 720)
+    $btnCancel.Location = New-Object System.Drawing.Point(758, 720)
     $btnCancel.Size = New-Object System.Drawing.Size(90, 28)
     $form.Controls.Add($btnCancel)
 
     # --- shared UI state (hashtable so event handlers can mutate it) ---
-    $ui = @{ Page = 1; FlatpakDone = $false; VhdxDone = $false; Checks = @() }
+    # initial page show (page 0 = hardware compatibility is the first page)
+    $pageHw.Visible = ($ui.Page -eq 0)
+    $page1.Visible  = ($ui.Page -eq 1)
+    $page2.Visible  = ($ui.Page -eq 2)
+    $page3.Visible  = ($ui.Page -eq 3)
+    $btnBack.Enabled = ($ui.Page -gt 0)
 
     $btnNext.Add_Click({
         if ($ui.Page -lt 3) {
             $ui.Page++
+            $pageHw.Visible = ($ui.Page -eq 0)
             $page1.Visible = ($ui.Page -eq 1)
             $page2.Visible = ($ui.Page -eq 2)
             $page3.Visible = ($ui.Page -eq 3)
-            $btnBack.Enabled = ($ui.Page -gt 1)
+            $btnBack.Enabled = ($ui.Page -gt 0)
             if ($ui.Page -eq 3) { $btnNext.Text = 'Install' }
         } else {
             if ($state.Done -and -not $state.Error) {
@@ -2046,12 +2420,14 @@ try {
         }
     })
     $btnBack.Add_Click({
-        if ($ui.Page -gt 1) {
+        if ($ui.Page -gt 0) {
             $ui.Page--
+            $pageHw.Visible = ($ui.Page -eq 0)
             $page1.Visible = ($ui.Page -eq 1)
             $page2.Visible = ($ui.Page -eq 2)
             $page3.Visible = ($ui.Page -eq 3)
-            $btnBack.Enabled = ($ui.Page -gt 1)
+            $btnBack.Enabled = ($ui.Page -gt 0)
+            $btnNext.Enabled = $true
             $btnNext.Text = 'Next >'
         }
     })
@@ -2062,11 +2438,10 @@ try {
     })
 
     # --- tooltips ---
-    $tip = New-Object System.Windows.Forms.ToolTip
+    if (-not (Test-Path Variable:tip)) { $tip = New-Object System.Windows.Forms.ToolTip }
     $tip.SetToolTip($status, 'Status of the ISO download/verification running in the background.')
     $tip.SetToolTip($progress, 'ISO download progress; marquee = verifying SHA-256.')
-    $tip.SetToolTip($rbDownload, 'Download the latest Mint Cinnamon ISO and verify its SHA-256.')
-    foreach ($rb in $isoRadios) { if ($rb.Tag) { $tip.SetToolTip($rb, "Use existing ISO: $($rb.Tag)") } }
+    foreach ($rb in $isoRadios) { if ($rb.Tag -is [string] -and $rb.Tag) { $tip.SetToolTip($rb, "Use existing ISO: $($rb.Tag)") } }
     $tip.SetToolTip($txtExtra, 'Extra flathub app IDs, comma-separated (e.g. org.mozilla.firefox).')
     $tip.SetToolTip($txtVhdx, 'WSL2 disk images to pass to Linux (detected automatically; add or remove).')
     $tip.SetToolTip($txtData, 'Where Linux stores persistent data (default /mnt/c/Users/lsl-usb).')
@@ -2075,12 +2450,54 @@ try {
     $tip.SetToolTip($btnNext, 'Next step; on the last page, installs once the ISO is ready.')
     $tip.ShowAlways = $true   # show tooltips even on disabled controls
     $tip.SetToolTip($btnCancel, 'Abort the install.')
-
     # --- timer: status/progress, page-3 gate, background-job polling ---
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 100
     $timer.Add_Tick({
         try {
+            # hardware compatibility scan: auto-load in the background, one device per tick
+            if (-not $ui.HwStarted) {
+                $ui.HwStarted = $true
+                try { $ui.HwPending = @(Get-CompatHardware | ForEach-Object { $_ }) } catch { $ui.HwPending = @() }
+                if ($ui.HwPending.Count -eq 0) {
+                    $ui.HwDone = $true
+                    $lblHwSummary.Text = 'No ratable devices found.'
+                } else {
+                    $lblHwSummary.Text = "Rating $($ui.HwPending.Count) device(s) against linux-hardware.org LKDDb..."
+                }
+            }
+            if (-not $ui.HwDone -and $ui.HwPending -and $ui.HwPending.Count -gt 0) {
+                $d = $ui.HwPending[0]
+                $ui.HwPending = @($ui.HwPending | Select-Object -Skip 1)
+                try { $r = Get-LinuxCompatRating -Device $d } catch { $r = $null }
+                if ($r) {
+                    switch ($r.Rating) { 'A' { $ui.HwCounts.A++ } 'C' { $ui.HwCounts.C++ } 'D' { $ui.HwCounts.D++ } 'U' { $ui.HwCounts.U++ } }
+                    $supportText = switch ($r.Rating) {
+                        'A' { 'in-kernel (works out of the box)' }
+                        'C' { 'needs out-of-tree driver' }
+                        'D' { 'no driver' }
+                        'U' { 'unknown (no data)' }
+                        default { $r.Rating }
+                    }
+                    $item = New-Object System.Windows.Forms.ListViewItem([string]$d.Class)
+                    $item.SubItems.Add([string]$supportText) | Out-Null
+                    $item.SubItems.Add([string]$r.Name) | Out-Null
+                    $item.SubItems.Add([string]$d.Id) | Out-Null
+                    # Globe (U+1F310) + VS15 (text presentation); the www
+                    # column is owner-drawn in blue (native ListView draws
+                    # emoji glyphs black).
+                    $item.SubItems.Add([string]::Format("{0}{1}{2}", [char]0xD83C, [char]0xDF10, [char]0xFE0E)) | Out-Null
+                    $item.SubItems[1].Tag = $r.Rating
+                    $item.Tag = "https://linux-hardware.org/?id=$($d.Kind.ToLowerInvariant()):$($d.Vendor.ToLowerInvariant())-$($d.Device.ToLowerInvariant())"
+                    $lvHw.Items.Add($item) | Out-Null
+                    if ($lvHw.ListViewItemSorter -ne $null) { $lvHw.Sort() }
+                }
+                if ($ui.HwPending.Count -eq 0) {
+                    $ui.HwDone = $true
+                    & $updateDeviceCol
+                    $lblHwSummary.Text = "Summary: A=$($ui.HwCounts.A) (in-kernel)  C=$($ui.HwCounts.C) (out-of-tree)  D=$($ui.HwCounts.D) (no driver)  U=$($ui.HwCounts.U) (unknown)"
+                }
+            }
             $status.Text = $state.Message
             if ($state.Percent -lt 0) {
                 $progress.Style = 'Marquee'
@@ -2096,6 +2513,10 @@ try {
                 } else {
                     $tip.SetToolTip($btnNext, "Waiting: $($state.Message)")
                 }
+            } else {
+                # On any other page Next is always available (it can get stuck
+                # disabled if the user backs out of the install page).
+                $btnNext.Enabled = $true
             }
             # ETA label
             if ($state.EtaSec -ge 0) {
@@ -2182,7 +2603,7 @@ try {
     # Cancel) so the ISO download does not keep running orphaned.
     $form.Add_FormClosing({
         $timer.Stop()
-        try { $ps.Stop() } catch { }
+        try { $ui.Ps.Stop() } catch { }
         try { $flatpakPs.Stop() } catch { }
         try { $flatpakPs.Dispose() } catch { }
         try { $vhdxPs.Stop() } catch { }
@@ -2191,11 +2612,11 @@ try {
 
     $result = $form.ShowDialog()
     if ($result -ne 'OK') {
-        $ps.Dispose()
+        $ui.Ps.Dispose()
         return $null
     }
-    try { $null = $ps.EndInvoke($handle) } catch { }
-    $ps.Dispose()
+    try { $null = $ui.Ps.EndInvoke($ui.Handle) } catch { }
+    $ui.Ps.Dispose()
 
     return @{
         IsoPath       = $state.IsoPath
@@ -2207,11 +2628,173 @@ try {
         WifiNetworks  = @($wifiChecks | Where-Object { $_.Checked } | ForEach-Object { $_.Text })
         Drivers       = $chkDrivers.Checked
         Efu           = $chkEfu.Checked
-        InstallEverything = $chkEverything.Checked
+        InstallEverything = $state.EverythingRequested -or (Get-EverythingPath)
         CopySfsHdd       = $chkSfsHdd.Checked
         ReclaimWinSwap   = $chkReclaim.Checked
         UseExistingUsb = $state.ReuseUsb
     }
+}
+
+# ---------------------------------------------------------------------------
+# Boot-menu key detection: map the motherboard vendor/model to its one-time
+# boot-menu key (F12/Del/Esc etc). Best-effort; returns '' when unknown so
+# callers fall back to the generic "F12/Del/Esc" hint.
+# ---------------------------------------------------------------------------
+function Get-BootMenuKey {
+    $manu = ''; $prod = ''
+    try {
+        $bb = Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue
+        if ($bb) { $manu = "$($bb.Manufacturer)"; $prod = "$($bb.Product)" }
+    } catch { }
+    if (-not $manu) {
+        try { $manu = "$((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Manufacturer)" } catch { }
+    }
+    $m = "$manu $prod"
+    $map = @(
+        @{ Match = 'dell';            Key = 'F12' },
+        @{ Match = 'hewlett-packard|^hp\b'; Key = 'F9' },
+        @{ Match = 'lenovo';          Key = 'F12' },
+        @{ Match = 'asus';            Key = 'F8' },
+        @{ Match = 'msi|micro-star';  Key = 'F11' },
+        @{ Match = 'gigabyte';        Key = 'F12' },
+        @{ Match = 'acer';            Key = 'F12' },
+        @{ Match = 'toshiba';         Key = 'F12' },
+        @{ Match = 'samsung';         Key = 'F2' },
+        @{ Match = 'sony';            Key = 'F11' },
+        @{ Match = 'intel';           Key = 'F10' },
+        @{ Match = 'asrock';          Key = 'F11' },
+        @{ Match = 'biostar';         Key = 'F9' },
+        @{ Match = 'fujitsu';         Key = 'F12' },
+        @{ Match = 'gateway';         Key = 'F12' },
+        @{ Match = 'medion';          Key = 'F11' },
+        @{ Match = 'razer';           Key = 'F12' },
+        @{ Match = 'framework';       Key = 'F12' },
+        @{ Match = 'system76';        Key = 'F7' }
+    )
+    foreach ($e in $map) {
+        if ($m -match $e.Match) { return $e.Key }
+    }
+    # Microsoft Surface only (generic boards also report "Microsoft Corporation").
+    if ($m -match 'microsoft' -and $m -match 'surface') { return 'F12' }
+    return ''
+}
+
+function Set-NextBootUsb {
+    # Best-effort: set the firmware one-time boot entry to the USB so the next
+    # boot goes straight to it (UEFI only; bcdedit is Vista+). Returns the
+    # matched entry description on success, or '' if it can't be done.
+    try { if ([Environment]::FirmwareType -ne 'Uefi') { return '' } } catch { return '' }
+    try {
+        $out = @(bcdedit /enum firmware 2>$null)
+        if ($out.Count -eq 0) { return '' }
+        $entries = @()
+        $cur = $null
+        foreach ($line in $out) {
+            if ($line -match '^\s*identifier\s+(\{[^}]+\})') {
+                if ($cur) { $entries += $cur }
+                $cur = [pscustomobject]@{ Id = $Matches[1]; Desc = '' }
+            } elseif ($cur -and $line -match '^\s*description\s+(.+)$') {
+                $cur.Desc = $Matches[1].Trim()
+            }
+        }
+        if ($cur) { $entries += $cur }
+        $usb = $entries | Where-Object { $_.Desc -match 'usb' } | Select-Object -First 1
+        if (-not $usb) { return '' }
+        $null = & bcdedit /set '{fwbootmgr}' bootsequence $usb.Id 2>$null
+        $check = @(bcdedit /enum '{fwbootmgr}' 2>$null) -join "`n"
+        if ($check -match [regex]::Escape($usb.Id)) { return $usb.Desc }
+    } catch { }
+    return ''
+}
+
+function Show-BootChoiceDialog {
+    # Custom dialog: how to boot the USB. Returns 'usb' (set one-time boot),
+    # 'adv' (advanced boot menu, shutdown /r /o), 'fw' (firmware boot menu,
+    # shutdown /r /fw), or 'none' (don't reboot).
+    param([bool]$Uefi, [string]$KeyHint)
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'lsl-usb - Boot from USB'
+    $f.ClientSize = New-Object System.Drawing.Size(540, 250)
+    $f.StartPosition = 'CenterScreen'
+    $f.FormBorderStyle = 'FixedDialog'
+    $f.MaximizeBox = $false
+    $f.MinimizeBox = $false
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = 'Install complete. How do you want to boot the lsl-usb USB?'
+    $lbl.Location = New-Object System.Drawing.Point(12, 12)
+    $lbl.Size = New-Object System.Drawing.Size(516, 20)
+    $f.Controls.Add($lbl)
+
+    $choice = @{ Value = 'none' }
+    $btns = @()
+    if ($Uefi) {
+        $btns += @{ Text = 'Boot USB now (set one-time boot entry)'; Tag = 'usb' }
+    }
+    $btns += @{ Text = 'Advanced boot menu (shutdown /r /o)'; Tag = 'adv' }
+    $btns += @{ Text = if ($Uefi) { 'Firmware boot menu (shutdown /r /fw)' } else { 'Restart (press the boot-menu key during POST)' }; Tag = 'fw' }
+    $btns += @{ Text = "Don't reboot"; Tag = 'none' }
+
+    $y = 40
+    foreach ($b in $btns) {
+        $btn = New-Object System.Windows.Forms.Button
+        $btn.Text = $b.Text
+        $btn.Tag = $b.Tag
+        $btn.Location = New-Object System.Drawing.Point(12, $y)
+        $btn.Size = New-Object System.Drawing.Size(516, 30)
+        $btn.Add_Click({
+            $choice.Value = $this.Tag
+            $f.Close()
+        })
+        $f.Controls.Add($btn)
+        $y += 36
+    }
+
+    $note = New-Object System.Windows.Forms.Label
+    $note.Location = New-Object System.Drawing.Point(12, ($y + 4))
+    $note.Size = New-Object System.Drawing.Size(516, 40)
+    $note.Text = "Side note: if none of these work, $KeyHint to open the boot menu and select the USB."
+    $f.Controls.Add($note)
+
+    [void]$f.ShowDialog()
+    return $choice.Value
+}
+
+# ---------------------------------------------------------------------------
+# Boot-from-USB shortcut: "LSL: Reboot to Select USB" on the Desktop and
+# Start Menu. On UEFI (Win8+) it reboots into the firmware one-time boot
+# menu (which appears automatically - the user just picks the USB); on BIOS
+# it does a plain restart and the user must press the boot-menu key.
+# ---------------------------------------------------------------------------
+function New-LslBootShortcut {
+    $sh = New-Object -ComObject WScript.Shell
+    $fw = ''
+    try { if ([Environment]::FirmwareType -eq 'Uefi') { $fw = '/fw ' } } catch { }
+    $args = "/r $fw/t 0"
+    if ($fw) {
+        $desc = 'Reboots into the firmware boot menu - use the arrow keys to select the lsl-usb USB and press Enter.'
+    } else {
+        $key = Get-BootMenuKey
+        $hint = if ($key) { "press $key during POST" } else { 'press F12/Del/Esc during POST' }
+        $desc = "Reboots - $hint to open the boot menu, then select the lsl-usb USB."
+    }
+    $created = @()
+    $dirs = @(
+        [Environment]::GetFolderPath('Desktop'),
+        (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs')
+    )
+    foreach ($dir in $dirs) {
+        if ($dir -and (Test-Path $dir)) {
+            $lnk = Join-Path $dir 'LSL - Reboot to Select USB.lnk'
+            $sc = $sh.CreateShortcut($lnk)
+            $sc.TargetPath = "$env:SystemRoot\System32\shutdown.exe"
+            $sc.Arguments = $args
+            $sc.Description = $desc
+            $sc.Save()
+            $created += $lnk
+        }
+    }
+    return ($created -join ', ')
 }
 
 # ---------------------------------------------------------------------------
@@ -2236,6 +2819,7 @@ Warn-LowRamWindows
 # background, and collects configuration while the user waits.
 $guiDataDir = ''
 $copyWifi = $true
+$copySfsHdd = $false
 $wifiNetworks = @()
 $doEfu = $true
 $installEverything = $true
@@ -2418,3 +3002,35 @@ if ($copyWifi) {
 WriteStep 'Done.'
 Write-Info 'Boot the USB. First boot runs the minimal layer script (installs packages, then persists a new layer).'
 Write-Info 'Set LSL_DATA_DIR in /cdrom/lsl-usb.env if you do not want the default (/mnt/c/Users/lsl-usb).'
+
+# Offer to reboot into the USB boot menu, and drop a "Reboot to Select USB"
+# shortcut on the Desktop and Start Menu for later.
+$bootLnk = New-LslBootShortcut
+if ($bootLnk) { Write-Info "Created 'LSL: Reboot to Select USB' shortcut(s): $bootLnk" }
+if (-not ('System.Windows.Forms.MessageBox' -as [type])) { Add-Type -AssemblyName System.Windows.Forms }
+$fw = ''
+try { if ([Environment]::FirmwareType -eq 'Uefi') { $fw = '/fw ' } } catch { }
+$key = Get-BootMenuKey
+$keyHint = if ($key) { "press $key during POST" } else { 'press F12/Del/Esc during POST' }
+$choice = Show-BootChoiceDialog -Uefi ([bool]$fw) -KeyHint $keyHint
+switch ($choice) {
+    'usb' {
+        $set = Set-NextBootUsb
+        if ($set) {
+            Write-Info "Set one-time boot to the USB ($set). Rebooting..."
+            Start-Process "$env:SystemRoot\System32\shutdown.exe" -ArgumentList '/r /t 0' -NoNewWindow
+        } else {
+            Write-Warn2 'Could not set the one-time boot entry - rebooting into the boot menu instead.'
+            Start-Process "$env:SystemRoot\System32\shutdown.exe" -ArgumentList "/r $fw/t 0" -NoNewWindow
+        }
+    }
+    'adv' {
+        Write-Info 'Rebooting into the advanced boot menu (shutdown /r /o)...'
+        Start-Process "$env:SystemRoot\System32\shutdown.exe" -ArgumentList '/r /o /f /t 0' -NoNewWindow
+    }
+    'fw' {
+        Write-Info "Rebooting into the firmware boot menu ($fw)..."
+        Start-Process "$env:SystemRoot\System32\shutdown.exe" -ArgumentList "/r $fw/t 0" -NoNewWindow
+    }
+    default { Write-Info 'Not rebooting.' }
+}

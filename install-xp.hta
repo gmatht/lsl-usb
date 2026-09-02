@@ -15,7 +15,18 @@
   #reco { background:#e8f0ff; border:1px solid #9bb; padding:6px; margin:6px 0; white-space:pre; }
   fieldset { margin:6px 0; padding:6px; }
   #log { width:100%; height:120px; font:9pt Consolas, monospace; }
-  #compat { width:100%; height:160px; font:9pt Consolas, monospace; }
+  #hwSummary { margin:2px 0 4px 0; font:9pt Consolas, monospace; white-space:pre; }
+  #hwTableWrap { max-height:240px; overflow:auto; border:1px solid #9bb; background:#fff; }
+  table.hwtable { border-collapse:collapse; width:100%; font:9pt Consolas, monospace; }
+  table.hwtable th, table.hwtable td { border:1px solid #ccd; padding:2px 5px; text-align:left; white-space:nowrap; }
+  table.hwtable th { background:#dde7ff; cursor:pointer; user-select:none; }
+  table.hwtable th:hover { background:#c7d6ff; }
+  table.hwtable th.asc::after { content:" \25B2"; }
+  table.hwtable th.desc::after { content:" \25BC"; }
+  table.hwtable tr:nth-child(even) td { background:#f7f9ff; }
+  table.hwtable td.lk { text-align:center; }
+  table.hwtable td.lk span.lkicon { display:inline-block; line-height:0; cursor:pointer; }
+  table.hwtable td.lk svg { vertical-align:middle; }
   button { font:10pt Tahoma; padding:3px 8px; }
   .row { margin:3px 0; }
   label { display:block; }
@@ -28,10 +39,24 @@
 <fieldset><legend>Linux hardware compatibility (linux-hardware.org LKDDb)</legend>
   <div class="row">
     <button onclick="ScanHardware()">Scan this PC's hardware</button>
-    <button onclick="LookupSelected()">Look up selected on linux-hardware.org (browser)</button>
   </div>
-  <div class="row"><select id="devs" size="1" style="width:100%"></select></div>
-  <div class="row"><textarea id="compat" readonly></textarea></div>
+  <div class="row" id="hwSummary">&nbsp;</div>
+  <div class="row" id="hwTableWrap">
+    <table id="devTable" class="hwtable">
+      <thead>
+        <tr>
+          <th onclick="sortTable(0)">Category</th>
+          <th onclick="sortTable(1)">Support</th>
+          <th onclick="sortTable(2)">Device</th>
+          <th onclick="sortTable(3)">ID</th>
+          <th onclick="sortTable(4)">Link</th>
+        </tr>
+      </thead>
+      <tbody id="devBody">
+        <tr><td colspan="5"><i>Click &quot;Scan this PC's hardware&quot; to list devices.</i></td></tr>
+      </tbody>
+    </table>
+  </div>
 </fieldset>
 
 <fieldset><legend>ISO image</legend>
@@ -43,6 +68,17 @@
 </fieldset>
 
 <fieldset><legend>Download (if you don't have an ISO)</legend>
+  <div class="row">Distro:
+    <select id="distro" onchange="SetDistroURL()">
+      <option value="">-- choose a distro --</option>
+      <option value="https://antixlinux.com/download/">antiX 26 (i386 / 32-bit)</option>
+      <option value="https://cdimage.ubuntu.com/lubuntu/releases/24.04/release/">Lubuntu 24.04 (64-bit, light)</option>
+      <option value="https://cdimage.ubuntu.com/xubuntu/releases/24.04/release/">Xubuntu 24.04 (64-bit, light-ish)</option>
+      <option value="https://mirrors.kernel.org/linuxmint/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso">Mint Cinnamon 22.x (64-bit)</option>
+      <option value="https://zorin.com/os/download/">Zorin OS (64-bit)</option>
+      <option value="https://cdimage.debian.org/cdimage/release/13.6.0-live/amd64/iso-cd/debian-live-13.6.0-amd64-xfce.iso">Debian 13.6 live XFCE (64-bit)</option>
+    </select>
+  </div>
   <div class="row">URL: <input id="url" size="72"></div>
   <div class="row">
     <button id="bDl" onclick="Download()">Download via BITS (http only)</button>
@@ -55,10 +91,12 @@
   <div class="row">
     Rufus: <input id="rufus" size="55">
     <button onclick="BrowseRufus()">Browse...</button>
+    <button onclick="DownloadRufus()">Download Rufus</button>
     <span id="rufusHint">(auto-detected if on PATH)</span>
   </div>
   <div class="row">
     <button id="bWrite" onclick="LaunchRufus()">Launch Rufus with selected ISO</button>
+    <button onclick="BootFromUsb()">Boot from USB (after writing)</button>
   </div>
   <div class="row">
     <label><input type='checkbox' id='chkReclaim'> Reclaim Windows pagefile.sys / WSL2 swapfile.vhdx as compressed swap (renames them after a clean shutdown; needs LSL_RECLAIM_WIN_SWAP)</label>
@@ -104,12 +142,15 @@ Function RX(pat, src, grp)
   re.Pattern = pat
   re.IgnoreCase = True
   re.Global = False
+  On Error Resume Next
   Set m = re.Execute(src)
-  If m.Count > 0 And m(0).SubMatches.Count >= grp Then
+  If Err.Number = 0 And m.Count > 0 And m(0).SubMatches.Count >= grp Then
     RX = m(0).SubMatches(grp - 1)
   Else
     RX = ""
   End If
+  Err.Clear
+  On Error GoTo 0
 End Function
 
 Function RXAll(pat, src)
@@ -119,13 +160,52 @@ Function RXAll(pat, src)
   re.Pattern = pat
   re.IgnoreCase = True
   re.Global = True
+  On Error Resume Next
   Set m = re.Execute(src)
   out = ""
-  For Each c In m
-    If out = "" Then out = c.SubMatches(0) Else out = out & "|" & c.SubMatches(0)
-  Next
+  If Err.Number = 0 Then
+    For Each c In m
+      If out = "" Then out = c.SubMatches(0) Else out = out & "|" & c.SubMatches(0)
+    Next
+  End If
+  Err.Clear
+  On Error GoTo 0
   RXAll = out
 End Function
+
+Function HTMLEscape(s)
+  Call InitEnv()
+  HTMLEscape = "" & s
+  HTMLEscape = Replace(HTMLEscape, "&", "&amp;")
+  HTMLEscape = Replace(HTMLEscape, "<", "&lt;")
+  HTMLEscape = Replace(HTMLEscape, ">", "&gt;")
+  HTMLEscape = Replace(HTMLEscape, """", "&quot;")
+End Function
+
+Function GlobeIcon()
+  Call InitEnv()
+  Dim svg
+  svg = "<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 16 16'>" & _
+    "<circle cx='8' cy='8' r='6.5' fill='#e8f4ff' stroke='#2a6fbb' stroke-width='1'/>" & _
+    "<path d='M1.5 8h13 M8 1.5c3 3 3 10 0 13 M8 1.5c-3 3-3 10 0 13' fill='none' stroke='#2a6fbb' stroke-width='0.8'/></svg>"
+  svg = Replace(Replace(Replace(Replace(svg, " ", "%20"), "<", "%3C"), ">", "%3E"), "#", "%23")
+  GlobeIcon = "<span class='lkicon' title='Look up on linux-hardware.org'><img src='data:image/svg+xml," & svg & "' alt='web' width='14' height='14'></span>"
+End Function
+
+Sub AddCell(tr, key, html)
+  Dim td
+  Set td = tr.insertCell(-1)
+  td.setAttribute "data-sort", key
+  td.innerHTML = html
+End Sub
+
+Sub ClearBody()
+  Dim b
+  Set b = document.getElementById("devBody")
+  Do While b.rows.length > 0
+    b.deleteRow 0
+  Loop
+End Sub
 
 Sub Window_OnLoad()
   Call InitEnv()
@@ -133,12 +213,15 @@ Sub Window_OnLoad()
   Set oFSO = CreateObject("Scripting.FileSystemObject")
   Call Recommend()
   Call AutoRufus()
-  Call ScanISOs()
-  If is64 Then
+  If is64 And ramKB >= 2097152 Then
     document.getElementById("url").value = "https://mirrors.kernel.org/linuxmint/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso"
+  ElseIf is64 And ramKB >= 1048576 Then
+    document.getElementById("url").value = "https://cdimage.ubuntu.com/lubuntu/releases/24.04/release/"
   Else
     document.getElementById("url").value = "https://antixlinux.com/download/"
   End If
+  document.getElementById("distro").value = document.getElementById("url").value
+  Call ScanISOs()
   Log("Legacy mode ready. CPU/RAM gate: " & recoText & ".")
   document.body.style.visibility = "hidden"
   window.setTimeout "document.body.style.visibility='visible'", 0
@@ -162,6 +245,8 @@ Sub Recommend()
   On Error GoTo 0
   If is64 And ramKB >= 2097152 Then
     recoText = "Mint Cinnamon 22.3 (64-bit, >=2GB RAM)"
+  ElseIf is64 And ramKB >= 1048576 Then
+    recoText = "Lubuntu 24.04 (64-bit, 1-2GB RAM) - Xubuntu 24.04 also runs on 1GB but is heavier"
   Else
     recoText = "antiX 26 (i386 / antix26_386)"
   End If
@@ -170,7 +255,14 @@ Sub Recommend()
   document.getElementById("reco").innerText = _
     "Recommended for this PC: " & recoText & vbCrLf & _
     "  arch=" & arch & "  w6432=" & w6432 & "  RAM=" & ramStr & vbCrLf & _
-    "  (confirm/change your choice; pick any ISO below)"
+    "  (confirm/change your choice; pick any ISO below, or a distro in the Download section)"
+End Sub
+
+Sub SetDistroURL()
+  Call InitEnv()
+  Dim v
+  v = document.getElementById("distro").value
+  If v <> "" Then document.getElementById("url").value = v
 End Sub
 
 Function DriverTable()
@@ -243,7 +335,7 @@ Function RateDevice(kind, ven, dev, name)
   End If
   name = RX("<h2 class='top'>Device '([^']+)'", html, 1)
   ksup = RX("supported by kernel versions <a[^>]*>([^<]+)</a>", html, 1)
-  src  = RX("<td>([0-9.]+)&nbsp;-&nbsp;([0-9.]+)</td>\s*<td>([^<]+)</td>", html, 3)
+  src  = RX("<td>([0-9.]+)&nbsp;-&nbsp;([0-9.]+)</td>[ \t\r\n]*<td>([^<]+)</td>", html, 3)
   third = RXAll("<li><a href=""https://github.com/([^""]+)"">", html)
   If ksup = "" Then
     If third <> "" Then
@@ -274,21 +366,37 @@ Function RateDevice(kind, ven, dev, name)
   End If
 End Function
 
+Sub OnIconClick()
+  Dim el, url
+  On Error Resume Next
+  Set el = window.event.srcElement
+  Do While Not (el Is Nothing)
+    url = el.getAttribute("data-url")
+    If Not IsNull(url) And url <> "" Then Exit Do
+    Set el = el.parentNode
+  Loop
+  If Not (el Is Nothing) And Not IsNull(url) And url <> "" Then
+    Log("Opening browser: " & url & "  (browser does TLS 1.2)")
+    oWSH.Run url
+  End If
+End Sub
+
 Sub ScanHardware()
   Call InitEnv()
   Dim wmi, col, d, pnp, kind, ven, dev, classes, cls, keep, id, nm
-  Dim r, parts, line, rep, cA, cC, cD, cU, opt
-  document.getElementById("devs").length = 0
-  rep = ""
+  Dim r, parts, cA, cC, cD, cU, lurl, tr, td, tb
   cA = 0 : cC = 0 : cD = 0 : cU = 0
   On Error Resume Next
   Set wmi = GetObject("winmgmts:\\.\root\cimv2")
   Set col = wmi.ExecQuery("SELECT Name,PNPDeviceID,PNPClass FROM Win32_PnPEntity")
   On Error GoTo 0
   If wmi Is Nothing Or col Is Nothing Then
-    document.getElementById("compat").value = "WMI unavailable - cannot read PnP hardware."
+    document.getElementById("hwSummary").innerText = "WMI unavailable - cannot read PnP hardware."
+    Call ClearBody()
     Exit Sub
   End If
+  Set tb = document.getElementById("devBody")
+  Call ClearBody()
   For Each d In col
     pnp = "" & d.PNPDeviceID
     If ParsePnp(pnp, kind, ven, dev) Then
@@ -306,39 +414,48 @@ Sub ScanHardware()
         If parts(0) = "C" Then cC = cC + 1
         If parts(0) = "D" Then cD = cD + 1
         If parts(0) = "U" Then cU = cU + 1
-        line = "[" & parts(0) & "] " & nm & " (" & id & ")  - " & parts(1)
-        rep = rep & line & vbCrLf
-        Set opt = document.createElement("option")
-        opt.value = LCase(kind) & ":" & LCase(ven) & "-" & LCase(dev)
-        opt.text = cls & " - " & nm & " (" & id & ")"
-        document.getElementById("devs").add opt
+        lurl = "https://linux-hardware.org/?id=" & LCase(kind) & ":" & LCase(ven) & "-" & LCase(dev)
+        Set tr = tb.insertRow(-1)
+        Call AddCell(tr, LCase(cls), HTMLEscape(cls))
+        Call AddCell(tr, parts(0), parts(0))
+        Call AddCell(tr, LCase(nm), HTMLEscape(nm))
+        Call AddCell(tr, id, id)
+        Set td = tr.insertCell(-1)
+        td.className = "lk"
+        td.setAttribute "data-sort", lurl
+        td.setAttribute "data-url", lurl
+        td.innerHTML = GlobeIcon()
+        td.onclick = GetRef("OnIconClick")
       End If
     End If
   Next
-  document.getElementById("compat").value = _
-    "Summary: A=" & cA & " (in-kernel)  C=" & cC & " (out-of-tree)  D=" & cD & " (no driver)  U=" & cU & " (unknown)" & vbCrLf & vbCrLf & rep
+  If tb.rows.length = 0 Then
+    Set tr = tb.insertRow(-1)
+    Set td = tr.insertCell(-1)
+    td.colSpan = 5
+    td.innerHTML = "<i>No ratable devices found.</i>"
+  End If
+  document.getElementById("hwSummary").innerText = _
+    "Summary: A=" & cA & " (in-kernel)  C=" & cC & " (out-of-tree)  D=" & cD & " (no driver)  U=" & cU & " (unknown)"
   Log("Hardware scan done. A=" & cA & " C=" & cC & " D=" & cD & " U=" & cU & ".")
-End Sub
-
-Sub LookupSelected()
-  Call InitEnv()
-  Dim v, url
-  v = document.getElementById("devs").value
-  If v = "" Then Log("Scan hardware first, then pick a device.") : Exit Sub
-  url = "https://linux-hardware.org/?id=" & v
-  Log("Opening browser: " & url & "  (browser does TLS 1.2)")
-  oWSH.Run url
 End Sub
 
 Sub ScanISOs()
   Call InitEnv()
-  Dim dirs(5), i, dd, f, html, any
+  Dim dirs(5), i, dd, f, html, any, recUrl, recName, p, chk
   dirs(0) = oWSH.SpecialFolders("Desktop")
   dirs(1) = oWSH.SpecialFolders("MyDocuments") & "\Downloads"
   dirs(2) = oWSH.SpecialFolders("MyDocuments")
   dirs(3) = Env("USERPROFILE") & "\Downloads"
   dirs(4) = Env("SystemDrive") & "\"
   dirs(5) = Env("USERPROFILE")
+  ' Auto-select the recommended ISO when it already exists locally.
+  recUrl = document.getElementById("url").value
+  recName = ""
+  If recUrl <> "" Then
+    p = InStrRev(recUrl, "/")
+    If p > 0 Then recName = Mid(recUrl, p + 1)
+  End If
   html = ""
   any = False
   For i = 0 To UBound(dirs)
@@ -347,8 +464,10 @@ Sub ScanISOs()
       For Each f In oFSO.GetFolder(dd).Files
         If LCase(oFSO.GetExtensionName(f.Name)) = "iso" Then
           any = True
+          chk = ""
+          If LCase(f.Name) = LCase(recName) Then chk = " checked"
           html = html & "<label><input type='radio' name='iso' value='" _
-            & Replace(f.Path, "'", "") & "'>" & f.Path & "</label><br>"
+            & Replace(f.Path, "'", "") & "'" & chk & ">" & f.Path & "</label><br>"
         End If
       Next
     End If
@@ -468,6 +587,12 @@ Sub BrowseRufus()
   If Not f Is Nothing Then document.getElementById("rufus").value = f.Self.Path
 End Sub
 
+Sub DownloadRufus()
+  Call InitEnv()
+  Log("Opening Rufus download page in your browser (https, not BITS-capable on XP): https://rufus.akeo.ie/")
+  oWSH.Run "https://rufus.akeo.ie/"
+End Sub
+
 Function ReplaceEnvLine(content, key, val)
   Dim lines, i, out, done, ln
   lines = Split(content, vbCrLf)
@@ -537,6 +662,159 @@ Sub LaunchRufus()
     Log("Reclaim option checked: will set LSL_RECLAIM_WIN_SWAP=1 on the LSL USB once it appears.")
   End If
 End Sub
+
+Function BootMenuKey()
+  Call InitEnv()
+  Dim wmi, col, bb, manu, prod, m, key
+  key = ""
+  manu = ""
+  prod = ""
+  On Error Resume Next
+  Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+  Set col = wmi.ExecQuery("SELECT Manufacturer,Product FROM Win32_BaseBoard")
+  For Each bb In col
+    manu = "" & bb.Manufacturer
+    prod = "" & bb.Product
+    Exit For
+  Next
+  If manu = "" Then
+    Set col = wmi.ExecQuery("SELECT Manufacturer FROM Win32_ComputerSystem")
+    For Each bb In col
+      manu = "" & bb.Manufacturer
+      Exit For
+    Next
+  End If
+  On Error GoTo 0
+  m = LCase(manu & " " & prod)
+  If InStr(m, "dell") > 0 Then
+    key = "F12"
+  ElseIf InStr(m, "hewlett-packard") > 0 Or Left(m, 2) = "hp" Then
+    key = "F9"
+  ElseIf InStr(m, "lenovo") > 0 Then
+    key = "F12"
+  ElseIf InStr(m, "asus") > 0 Then
+    key = "F8"
+  ElseIf InStr(m, "msi") > 0 Or InStr(m, "micro-star") > 0 Then
+    key = "F11"
+  ElseIf InStr(m, "gigabyte") > 0 Then
+    key = "F12"
+  ElseIf InStr(m, "acer") > 0 Then
+    key = "F12"
+  ElseIf InStr(m, "toshiba") > 0 Then
+    key = "F12"
+  ElseIf InStr(m, "samsung") > 0 Then
+    key = "F2"
+  ElseIf InStr(m, "sony") > 0 Then
+    key = "F11"
+  ElseIf InStr(m, "intel") > 0 Then
+    key = "F10"
+  ElseIf InStr(m, "asrock") > 0 Then
+    key = "F11"
+  ElseIf InStr(m, "biostar") > 0 Then
+    key = "F9"
+  ElseIf InStr(m, "fujitsu") > 0 Then
+    key = "F12"
+  ElseIf InStr(m, "gateway") > 0 Then
+    key = "F12"
+  ElseIf InStr(m, "medion") > 0 Then
+    key = "F11"
+  ElseIf InStr(m, "razer") > 0 Then
+    key = "F12"
+  ElseIf InStr(m, "framework") > 0 Then
+    key = "F12"
+  ElseIf InStr(m, "system76") > 0 Then
+    key = "F7"
+  ElseIf InStr(m, "microsoft") > 0 And InStr(m, "surface") > 0 Then
+    key = "F12"
+  End If
+  BootMenuKey = key
+End Function
+
+Sub BootFromUsb()
+  Call InitEnv()
+  Dim sh, sc, lnk, fw, args, rc, desc, hint, k
+  Set sh = CreateObject("WScript.Shell")
+  fw = ""
+  If OSVersion() >= 6.2 Then fw = "/fw "   ' UEFI one-time boot menu (Win8+)
+  args = "/r " & fw & "/t 0"
+  If fw <> "" Then
+    desc = "Reboots into the firmware boot menu - use the arrow keys to select the lsl-usb USB and press Enter."
+    hint = "Windows will reboot into the firmware boot menu." & vbCrLf & _
+      "Use the arrow keys to select the lsl-usb USB and press Enter."
+  Else
+    k = BootMenuKey()
+    If k <> "" Then
+      desc = "Reboots - press " & k & " during POST to open the boot menu, then select the lsl-usb USB."
+      hint = "Press " & k & " during POST to open the boot menu, then select the lsl-usb USB."
+    Else
+      desc = "Reboots - press F12/Del/Esc during POST to open the boot menu, then select the lsl-usb USB."
+      hint = "Press F12/Del/Esc during POST to open the boot menu, then select the lsl-usb USB."
+    End If
+  End If
+  ' Desktop shortcut
+  lnk = sh.SpecialFolders("Desktop") & "\LSL - Reboot to Select USB.lnk"
+  Set sc = sh.CreateShortcut(lnk)
+  sc.TargetPath = oWSH.ExpandEnvironmentStrings("%SystemRoot%") & "\System32\shutdown.exe"
+  sc.Arguments = args
+  sc.Description = desc
+  sc.Save
+  ' Start Menu shortcut
+  lnk = sh.SpecialFolders("StartMenu") & "\Programs\LSL - Reboot to Select USB.lnk"
+  Set sc = sh.CreateShortcut(lnk)
+  sc.TargetPath = oWSH.ExpandEnvironmentStrings("%SystemRoot%") & "\System32\shutdown.exe"
+  sc.Arguments = args
+  sc.Description = desc
+  sc.Save
+  Log("Created 'LSL: Reboot to Select USB' on the Desktop and Start Menu.")
+  rc = MsgBox("Install complete. Reboot now to select the USB in the boot menu?" & vbCrLf & vbCrLf & hint, vbYesNo + vbQuestion, "Boot from USB")
+  If rc = vbYes Then
+    Log("Rebooting now...")
+    sh.Run "shutdown " & args, 0, False
+  End If
+End Sub
+
+Function OSVersion()
+  Dim wmi, col, d, v, parts
+  OSVersion = 0
+  On Error Resume Next
+  Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+  Set col = wmi.ExecQuery("SELECT Version FROM Win32_OperatingSystem")
+  For Each d In col
+    v = d.Version
+    parts = Split(v, ".")
+    If UBound(parts) >= 1 Then
+      If IsNumeric(parts(0)) And IsNumeric(parts(1)) Then OSVersion = CDbl(parts(0) & "." & parts(1))
+    End If
+  Next
+  On Error GoTo 0
+End Function
+</script>
+<script language="JScript">
+// Sortable hardware table. Clicking a <th> reorders <tbody> rows on that column.
+/* exported sortTable */ // called from the <th onclick> handlers in the HTML
+var _hwSortCol = -1, _hwSortDir = 1;
+function sortTable(col) {
+  var tbody = document.getElementById("devBody");
+  if (!tbody) return;
+  var rows = [];
+  for (var i = 0; i < tbody.rows.length; i++) rows.push(tbody.rows[i]);
+  if (_hwSortCol === col) { _hwSortDir = -_hwSortDir; }
+  else { _hwSortCol = col; _hwSortDir = 1; }
+  rows.sort(function (a, b) {
+    var ac = a.cells[col], bc = b.cells[col];
+    var av = (ac && ac.getAttribute("data-sort") != null) ? ac.getAttribute("data-sort") : (ac ? ac.innerText : "");
+    var bv = (bc && bc.getAttribute("data-sort") != null) ? bc.getAttribute("data-sort") : (bc ? bc.innerText : "");
+    av = (av == null) ? "" : String(av);
+    bv = (bv == null) ? "" : String(bv);
+    var c = (av < bv) ? -1 : (av > bv) ? 1 : 0;
+    return c * _hwSortDir;
+  });
+  for (var j = 0; j < rows.length; j++) tbody.appendChild(rows[j]);
+  var ths = document.getElementById("devTable").tHead.rows[0].cells;
+  for (var k = 0; k < ths.length; k++) {
+    ths[k].className = (k === col) ? (_hwSortDir === 1 ? "asc" : "desc") : "";
+  }
+}
 </script>
 </body>
 </html>
