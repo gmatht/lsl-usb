@@ -1,0 +1,18 @@
+[package]
+name = "nwg-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+native-windows-gui = "1.0"
+
+[profile.dev]
+# Unwind support needs at least VC8 (VS2005)
+panic = "abort"
+
+[profile.release]
+lto = true
+codegen-units = 1
+debug = 2
+# Unwind support needs at least VC8 (VS2005)
+panic = "abort"
