@@ -33,6 +33,14 @@ Jokes aside: this project turns a Linux Mint LiveUSB into a WSL-like workflow fo
 
 ## Quickstart
 
+If you are currently running windows, it is recommended that you install LSL directly from Windows.
+We support a GUI (on WinXP SP2+) to guide you through the initial configuration
+and installation of LSL.
+
+### Install (from windows)  
+
+Download and run [install.bat](https://raw.githubusercontent.com/gmatht/lsl-usb/refs/heads/main/install.bat)
+
 ### Install (from a booted Mint LiveUSB session)
 
 ```bash
