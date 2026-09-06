@@ -71,5 +71,16 @@ function Get-InstalledWindowsApps {
             Where-Object { $_ -and $_.PSObject.Properties['DisplayName'] -and $_.PSObject.Properties['DisplayName'].Value } |
             ForEach-Object { $_.PSObject.Properties['DisplayName'].Value }
     }
+    # Microsoft Store / MSIX apps (e.g. GIMP) are not in the Uninstall registry
+    # keys - surface their package names too (the flatpak map matches substrings
+    # like 'GIMP' against 'GIMP.43237F745459'). Skip if the cmdlet is absent
+    # (non-Windows or a PowerShell build without the Appx module).
+    if (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue) {
+        try {
+            $names += Get-AppxPackage -ErrorAction SilentlyContinue |
+                Where-Object { $_ -and $_.Name } |
+                ForEach-Object { $_.Name }
+        } catch { }
+    }
     return ,@($names | Select-Object -Unique | Sort-Object)
 }

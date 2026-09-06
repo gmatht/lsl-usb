@@ -1,0 +1,16 @@
+[Unit]
+Description=Release reclaimed Windows swap files (swapoff + delete temp files)
+# Run during shutdown, before the Windows NTFS volumes are unmounted, so the
+# loop-backed swap can be detached cleanly and the renamed temp files deleted
+# (returning the space to Windows before it boots).
+DefaultDependencies=no
+After=local-fs.target
+Before=shutdown.target umount.target
+
+[Service]
+Type=oneshot
+TimeoutSec=120
+ExecStart=/bin/bash /cdrom/bin/lsl-reclaim-win-swap.sh --release
+
+[Install]
+WantedBy=shutdown.target

@@ -80,6 +80,9 @@ bash "$REPO_ROOT/tests/lsl-merge-suggest.tests.sh" || echo "  (merge-suggestion 
 echo "Running btrfs online-grow (lsl-btrfs-growd) test..."
 bash "$REPO_ROOT/tests/btrfs-growd.tests.sh" || echo "  (btrfs-growd test skipped or failed - non-fatal)"
 
+echo "Running reclaim-Windows-swap unit tests..."
+bash "$REPO_ROOT/tests/lsl-reclaim-win-swap.tests.sh" || echo "  (reclaim-win-swap test failed - non-fatal)"
+
 # --- 1) minimal first-boot layer -------------------------------------------
 LAYER="$STAGE/layer"
 mkdir -p "$LAYER/usr/local/sbin" "$LAYER/usr/local/bin" \
