@@ -1,0 +1,2 @@
+// RT_MANIFEST = 24 (defined inline: no SDK headers needed for llvm-rc)
+1 24 "lsl-install.manifest"

@@ -1,0 +1,39 @@
+[package]
+name = "lsl-install"
+version = "0.1.0"
+edition = "2024"
+
+# Full reimplementation of lsl-usb's install.ps1 as a native Windows
+# executable. Built with the rust9x toolchain (i686-rust9x-windows-msvc) so
+# the same binary runs on Windows 95 -> 11; every feature that needs a newer
+# Windows is behind a runtime capability check with a graceful fallback.
+
+[dependencies]
+native-windows-gui = "1.0"
+winapi = { version = "0.3", features = [
+    "combaseapi", "consoleapi", "errhandlingapi", "fileapi", "handleapi", "ioapiset", "libloaderapi", "minwinbase", "namedpipeapi", "memoryapi",
+    "objbase", "objidl", "processenv", "processthreadsapi", "shellapi",
+    "shobjidl", "shobjidl_core", "synchapi", "sysinfoapi", "winbase", "wincon", "winerror", "winioctl",
+    "softpub", "winnt", "winreg", "winuser", "wintrust", "impl-default",
+] }
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+# Win95-compatible vendored copy of native-windows-gui 1.0.13 (see
+# ../nwg-test/vendor/native-windows-gui/README-WIN95.md).
+[patch.crates-io]
+native-windows-gui = { path = "../nwg-test/vendor/native-windows-gui" }
+
+[profile.dev]
+# Unwind support needs at least VC8 (VS2005); we link the VC6 CRT.
+panic = "abort"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = 2
+opt-level = "z"
+# Unwind support needs at least VC8 (VS2005); we link the VC6 CRT.
+panic = "abort"
