@@ -5,6 +5,12 @@ edition = "2024"
 
 [dependencies]
 native-windows-gui = "1.0"
+winapi = { version = "0.3", features = ["winuser", "objbase"] }
+
+# Win95-compatible vendored copy of native-windows-gui 1.0.13 (see
+# vendor/native-windows-gui/README-WIN95.md for the API patches).
+[patch.crates-io]
+native-windows-gui = { path = "vendor/native-windows-gui" }
 
 [profile.dev]
 # Unwind support needs at least VC8 (VS2005)
