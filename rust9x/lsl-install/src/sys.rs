@@ -15,9 +15,9 @@ use std::os::windows::ffi::OsStringExt;
 use std::sync::OnceLock;
 
 use winapi::um::fileapi::{
-    CreateDirectoryW, CreateFileW, DeleteFileW, FindClose, FindFirstFileW, FindNextFileW,
+    CreateDirectoryW, FindClose, FindFirstFileW, FindNextFileW,
     GetDiskFreeSpaceExW, GetDriveTypeW, GetFileAttributesW, GetLogicalDriveStringsW, GetTempPathW,
-    GetVolumeInformationW, SetEndOfFile, SetFilePointer, OPEN_EXISTING,
+    GetVolumeInformationW,
 };
 use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
 use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress, LoadLibraryA};
@@ -25,22 +25,21 @@ use winapi::um::namedpipeapi::CreatePipe;
 use winapi::um::processenv::GetStdHandle;
 use winapi::um::winbase::STD_OUTPUT_HANDLE;
 use winapi::um::processthreadsapi::{
-    CreateProcessW, GetExitCodeProcess, GetCurrentProcess, TerminateProcess, PROCESS_INFORMATION,
+    CreateProcessW, GetExitCodeProcess, GetCurrentProcess, PROCESS_INFORMATION,
     STARTUPINFOW,
 };
 use winapi::um::synchapi::WaitForSingleObject;
 use winapi::um::shellapi::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteA, ShellExecuteExW};
-use winapi::um::sysinfoapi::{GetVersionExW, MEMORYSTATUSEX};
+use winapi::um::sysinfoapi::GetVersionExW;
 use winapi::um::winbase::{
-    CopyFileW, GlobalMemoryStatus, DRIVE_CDROM, DRIVE_REMOVABLE, STARTF_USESTDHANDLES,
+    CopyFileW, STARTF_USESTDHANDLES,
 };
-use winapi::um::wincon::ATTACH_PARENT_PROCESS;
 use winapi::shared::minwindef::HKEY;
 use winapi::um::winreg::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
-    RegSetValueExW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
 };
-use winapi::um::winnt::{FILE_ATTRIBUTE_DIRECTORY, GENERIC_READ, HANDLE, REG_SZ, VER_PLATFORM_WIN32_NT};
+use winapi::um::winnt::{FILE_ATTRIBUTE_DIRECTORY, HANDLE, REG_SZ};
 
 pub const GB: u64 = 1024 * 1024 * 1024;
 pub const MB: u64 = 1024 * 1024;
@@ -661,8 +660,8 @@ pub fn list_volumes() -> Vec<Volume> {
                 &mut totalq,
                 std::ptr::null_mut(),
             );
-            let free = unsafe { *freeq.QuadPart() } as u64;
-            let total = unsafe { *totalq.QuadPart() } as u64;
+            let free = *freeq.QuadPart() as u64;
+            let total = *totalq.QuadPart() as u64;
             let letter: String = drive.chars().next().map(|c| c.to_string()).unwrap_or_default();
             out.push(Volume {
                 letter,
@@ -682,7 +681,9 @@ unsafe fn vol_info(root: &str) -> (String, String) {
     let mut wroot = wide_nul(root);
     let mut label = [0u16; 261];
     let mut fs = [0u16; 64];
-    let ok = GetVolumeInformationW(
+    // explicit block: unsafe ops in an unsafe-fn body need one on this toolchain
+    let ok = unsafe {
+        GetVolumeInformationW(
         wroot.as_mut_ptr(),
         label.as_mut_ptr(),
         label.len() as u32,
@@ -691,7 +692,7 @@ unsafe fn vol_info(root: &str) -> (String, String) {
         std::ptr::null_mut(),
         fs.as_mut_ptr(),
         fs.len() as u32,
-    );
+    )};
     if ok == 0 {
         (String::new(), String::new())
     } else {
@@ -838,11 +839,6 @@ impl Child {
             } else {
                 None
             }
-        }
-    }
-    pub fn kill(&self) {
-        unsafe {
-            TerminateProcess(self.handle, 1);
         }
     }
 }
@@ -1039,13 +1035,17 @@ pub fn open_url(what: &str) -> String {
         sei.lpVerb = wop.as_ptr();
         sei.lpFile = wwhat.as_ptr();
         sei.nShow = SW2;
+        // E0133 demands the block, unused_unsafe calls it unnecessary:
+        // both lints are satisfied only with the block + targeted allow.
+        #[allow(unused_unsafe)]
         let ok = unsafe { ShellExecuteExW(&mut sei) };
+        #[allow(unused_unsafe)]
         let gle = unsafe { winapi::um::errhandlingapi::GetLastError() };
         log.push_str(&format!(
             "exw(ok={ok} hinst={} gle={gle}) ",
-            unsafe { sei.hInstApp } as usize
+            sei.hInstApp as usize
         ));
-        if ok != 0 && (unsafe { sei.hInstApp } as usize) > 32 {
+        if ok != 0 && sei.hInstApp as usize > 32 {
             return log;
         }
     }
@@ -1314,7 +1314,7 @@ pub mod out {
         let mut lock = stdout.lock();
         let _ = writeln!(lock);
         if color_supported() {
-            set_color(0x0B);
+            set_color(FG_CYAN);
             let _ = writeln!(lock, "==> {}", msg);
             set_color(0x07);
         } else {
@@ -1350,7 +1350,7 @@ pub mod out {
 // ---------------------------------------------------------------------------
 // Registry (W registry APIs are supported on Win9x; advapi32 is always linked)
 // ---------------------------------------------------------------------------
-use winapi::um::winnt::{KEY_READ, KEY_SET_VALUE};
+use winapi::um::winnt::{KEY_READ};
 
 pub struct RegKey(pub HKEY);
 
@@ -1444,34 +1444,6 @@ impl Drop for RegKey {
     }
 }
 
-pub fn reg_set_string(root: HKEY, path: &str, name: &str, value: &str) -> SysResult<()> {
-    let wpath = wide(path);
-    let wname = wide(name);
-    let mut wval = wide_nul(value);
-    unsafe {
-        let mut h: HKEY = std::ptr::null_mut();
-        if RegCreateKeyExW(root, wpath.as_ptr(), 0, std::ptr::null_mut(), 0, KEY_SET_VALUE,
-            std::ptr::null_mut(), &mut h, std::ptr::null_mut()) != 0 {
-            return Err(last_err());
-        }
-        let r = RegSetValueExW(h, wname.as_ptr(), 0, REG_SZ,
-            wval.as_mut_ptr() as *const u8, ((wval.len()) * 2) as u32);
-        RegCloseKey(h);
-        if r != 0 {
-            return Err(SysErr::Win(r as u32));
-        }
-    }
-    Ok(())
-}
-
-pub fn reg_delete_value(root: HKEY, path: &str, name: &str) {
-    if let Some(k) = RegKey::open(root, path) {
-        unsafe {
-            RegDeleteValueW(k.0, wide(name).as_ptr());
-        }
-    }
-}
-
 pub fn hkcu() -> HKEY {
     HKEY_CURRENT_USER
 }
@@ -1479,6 +1451,9 @@ pub fn hklm() -> HKEY {
     HKEY_LOCAL_MACHINE
 }
 
+// winapi-style alias (mirrors winapi::ctypes::c_void); the lowercase name
+// is deliberate, hence the allow.
+#[allow(non_camel_case_types)]
 pub type c_void = winapi::ctypes::c_void;
 
 // ---------------------------------------------------------------------------

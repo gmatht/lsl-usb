@@ -5,7 +5,7 @@
 //! treat failure as a graceful "manual download needed" result, which the
 //! callers surface with the exact URL and destination path.
 
-use crate::sys::{c_void, DynLib, SysErr, SysResult};
+use crate::sys::{c_void, DynLib};
 use std::sync::OnceLock;
 
 const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
@@ -120,15 +120,13 @@ fn split_url(url: &str) -> (bool, String, u16, String) {
     (secure, host, port, path.to_string())
 }
 
-pub struct ProgressCb<'a>(pub &'a mut dyn FnMut(u64, u64));
-
 /// GET a URL fully into memory. Small payloads only (API JSON, checksums).
 pub fn get(url: &str, user_agent: &str) -> Result<HttpResult, HttpErr> {
     let wh = winhttp().ok_or(HttpErr::NoTransport)?;
     get_with(wh, url, user_agent, &mut |_, _| {})
 }
 
-pub fn get_with(
+fn get_with(
     wh: &WinHttp,
     url: &str,
     user_agent: &str,
@@ -407,5 +405,3 @@ pub fn has_transport() -> bool {
 pub fn user_agent() -> &'static str {
     "lsl-usb-installer/1.0"
 }
-
-pub type NetResult<T> = Result<T, SysErr>;

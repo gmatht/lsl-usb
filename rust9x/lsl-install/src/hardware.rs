@@ -267,7 +267,6 @@ pub fn compat_hardware() -> Vec<Device> {
 // ---------------------------------------------------------------------------
 pub struct DriverEntry {
     pub id: &'static str,
-    pub kind: &'static str,
     pub chip: &'static str,
     pub pkg: &'static str,
     pub source: &'static str, // "ubuntu" | "github"
@@ -275,19 +274,21 @@ pub struct DriverEntry {
     pub component: &'static str,
     pub repo: &'static str,
     pub branch: &'static str,
+    // per-entry documentation (why the override exists); not read by code.
+    #[allow(dead_code)]
     pub note: &'static str,
 }
 
 pub fn driver_table() -> &'static [DriverEntry] {
     &[
-        DriverEntry { id: "0BDA:8812", kind: "USB", chip: "Realtek RTL8812AU", pkg: "rtl8812au-dkms", source: "ubuntu", suite: "noble-updates", component: "universe", repo: "", branch: "", note: "in-kernel only since 6.14" },
-        DriverEntry { id: "0BDA:881A", kind: "USB", chip: "Realtek RTL8814AU", pkg: "rtl8814au", source: "github", suite: "", component: "", repo: "morrownr/8814au", branch: "main", note: "in-kernel only since 6.14" },
-        DriverEntry { id: "0BDA:8179", kind: "USB", chip: "Realtek RTL8188EU", pkg: "rtl8188eu", source: "github", suite: "", component: "", repo: "lwfinger/rtl8188eu", branch: "master", note: "kernel has only a staging driver" },
-        DriverEntry { id: "0BDA:B720", kind: "USB", chip: "Realtek RTL8723BU", pkg: "rtl8723bu", source: "github", suite: "", component: "", repo: "lwfinger/rtl8723bu", branch: "master", note: "LKDDb entry is the bluetooth function only" },
-        DriverEntry { id: "14E4:4365", kind: "PCI", chip: "Broadcom BCM43142", pkg: "broadcom-sta-dkms", source: "ubuntu", suite: "noble-updates", component: "restricted", repo: "", branch: "", note: "wl driver; LKDDb entry is the bcma bus bridge only" },
-        DriverEntry { id: "14E4:43A0", kind: "PCI", chip: "Broadcom BCM4360", pkg: "broadcom-sta-dkms", source: "ubuntu", suite: "noble-updates", component: "restricted", repo: "", branch: "", note: "wl driver; LKDDb entry is the bcma bus bridge only" },
-        DriverEntry { id: "14E4:43B1", kind: "PCI", chip: "Broadcom BCM4352", pkg: "broadcom-sta-dkms", source: "ubuntu", suite: "noble-updates", component: "restricted", repo: "", branch: "", note: "wl driver; LKDDb entry is the bcma bus bridge only" },
-        DriverEntry { id: "14E4:4727", kind: "PCI", chip: "Broadcom BCM4313", pkg: "broadcom-sta-dkms", source: "ubuntu", suite: "noble-updates", component: "restricted", repo: "", branch: "", note: "wl driver; LKDDb entry is the bcma bus bridge only" },
+        DriverEntry { id: "0BDA:8812", chip: "Realtek RTL8812AU", pkg: "rtl8812au-dkms", source: "ubuntu", suite: "noble-updates", component: "universe", repo: "", branch: "", note: "in-kernel only since 6.14" },
+        DriverEntry { id: "0BDA:881A", chip: "Realtek RTL8814AU", pkg: "rtl8814au", source: "github", suite: "", component: "", repo: "morrownr/8814au", branch: "main", note: "in-kernel only since 6.14" },
+        DriverEntry { id: "0BDA:8179", chip: "Realtek RTL8188EU", pkg: "rtl8188eu", source: "github", suite: "", component: "", repo: "lwfinger/rtl8188eu", branch: "master", note: "kernel has only a staging driver" },
+        DriverEntry { id: "0BDA:B720", chip: "Realtek RTL8723BU", pkg: "rtl8723bu", source: "github", suite: "", component: "", repo: "lwfinger/rtl8723bu", branch: "master", note: "LKDDb entry is the bluetooth function only" },
+        DriverEntry { id: "14E4:4365", chip: "Broadcom BCM43142", pkg: "broadcom-sta-dkms", source: "ubuntu", suite: "noble-updates", component: "restricted", repo: "", branch: "", note: "wl driver; LKDDb entry is the bcma bus bridge only" },
+        DriverEntry { id: "14E4:43A0", chip: "Broadcom BCM4360", pkg: "broadcom-sta-dkms", source: "ubuntu", suite: "noble-updates", component: "restricted", repo: "", branch: "", note: "wl driver; LKDDb entry is the bcma bus bridge only" },
+        DriverEntry { id: "14E4:43B1", chip: "Broadcom BCM4352", pkg: "broadcom-sta-dkms", source: "ubuntu", suite: "noble-updates", component: "restricted", repo: "", branch: "", note: "wl driver; LKDDb entry is the bcma bus bridge only" },
+        DriverEntry { id: "14E4:4727", chip: "Broadcom BCM4313", pkg: "broadcom-sta-dkms", source: "ubuntu", suite: "noble-updates", component: "restricted", repo: "", branch: "", note: "wl driver; LKDDb entry is the bcma bus bridge only" },
     ]
 }
 
@@ -459,7 +460,7 @@ fn lhw_fetch_page(id: &str, bundle_dir: &str) -> String {
     }
     // Politeness: robots.txt Crawl-delay 10s between live requests.
     {
-        let mut st = LHW.lock().unwrap();
+        let st = LHW.lock().unwrap();
         if let Some(t) = st.last {
             let elapsed = t.elapsed().as_secs();
             if elapsed < LHW_DELAY_SECS {
@@ -527,21 +528,11 @@ fn parse_lhw_html(html: &str) -> (String, String, String, Vec<String>) {
     (name, ksup, src, third)
 }
 
-fn html_attr(s: &str, pat: &str) -> Option<String> {
-    let i = s.find(pat)? + pat.len();
-    let rest = &s[i..];
-    let j = rest.find('"')?;
-    Some(rest[..j].to_string())
-}
-
 #[derive(Debug, Clone)]
 pub struct Rating {
     pub rating: char, // A / C / D / U
     pub name: String,
     pub reason: String,
-    pub kernel_support: String,
-    pub driver_source: String,
-    pub third_party: Vec<String>,
 }
 
 pub fn lhw_url(d: &Device) -> String {
@@ -581,9 +572,6 @@ pub fn linux_compat_rating(d: &Device, bundle_dir: &str, iso_kernel: (u32, u32))
             rating: 'C',
             name,
             reason: format!("needs out-of-tree driver ({}) - staged to <USB>:\\drivers\\", t.pkg),
-            kernel_support: ksup,
-            driver_source: src,
-            third_party: third,
         };
     }
     if !have_data {
@@ -591,9 +579,6 @@ pub fn linux_compat_rating(d: &Device, bundle_dir: &str, iso_kernel: (u32, u32))
             rating: 'U',
             name,
             reason: "no data (linux-hardware.org unreachable/rate-limited/TLS too old)".into(),
-            kernel_support: ksup,
-            driver_source: src,
-            third_party: third,
         };
     }
     if ksup.is_empty() {
@@ -606,9 +591,6 @@ pub fn linux_compat_rating(d: &Device, bundle_dir: &str, iso_kernel: (u32, u32))
             rating: 'U',
             name,
             reason: format!("no LKDDb entry{}", extra),
-            kernel_support: ksup,
-            driver_source: src,
-            third_party: third,
         };
     }
     // Parse the minimum kernel from '5.9 and newer' or '4.17 - 6.1'.
@@ -643,9 +625,6 @@ pub fn linux_compat_rating(d: &Device, bundle_dir: &str, iso_kernel: (u32, u32))
             rating: 'A',
             name,
             reason: format!("in-kernel since {} ({}) - no action needed", ksup, src),
-            kernel_support: ksup,
-            driver_source: src,
-            third_party: third,
         };
     }
     if in_kernel && bridge_only {
@@ -653,9 +632,6 @@ pub fn linux_compat_rating(d: &Device, bundle_dir: &str, iso_kernel: (u32, u32))
             rating: 'D',
             name,
             reason: format!("LKDDb entry is only {} - no real driver for this function", src),
-            kernel_support: ksup,
-            driver_source: src,
-            third_party: third,
         };
     }
     let extra = if !third.is_empty() {
@@ -670,9 +646,6 @@ pub fn linux_compat_rating(d: &Device, bundle_dir: &str, iso_kernel: (u32, u32))
             "needs kernel {}+ (ISO has {}.{}){}",
             ksup, iso_kernel.0, iso_kernel.1, extra
         ),
-        kernel_support: ksup,
-        driver_source: src,
-        third_party: third,
     }
 }
 

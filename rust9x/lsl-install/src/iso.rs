@@ -126,7 +126,9 @@ impl Iso {
         let mut parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
         let fname = parts.pop().unwrap_or("").to_string();
         let dirpath = parts.join("/");
-        let dir = self.list_dir(&dirpath)?;
+        // validated for existence here; extents are re-read below
+        // (list_dir drops them), so the listing itself is discarded
+        self.list_dir(&dirpath)?;
         let entries = {
             // re-read the directory to get extents (list_dir drops them)
             let mut cur_extent = self.root_extent;
@@ -194,14 +196,13 @@ impl Iso {
 pub struct LiveIsoCheck {
     pub info: String,
     pub dists: Vec<String>,
-    pub sfs_size: Option<u64>,
 }
 
 /// Test-LiveIso equivalent (no mount needed).
 pub fn check_live_iso(path: &str) -> Result<LiveIsoCheck, String> {
     let mut iso = Iso::open(path).map_err(|e| format!("{}: {}", path, e))?;
-    let has_casper = iso
-        .file_size("casper/filesystem.squashfs")
+    // validates the squashfs exists (its size is not needed downstream)
+    iso.file_size("casper/filesystem.squashfs")
         .ok_or_else(|| "Not a casper/Ubuntu-family live image (no casper\\filesystem.squashfs).".to_string())?;
     let info = String::from_utf8_lossy(
         &iso.read_file(".disk/info", 4096).unwrap_or_default(),
@@ -212,7 +213,7 @@ pub fn check_live_iso(path: &str) -> Result<LiveIsoCheck, String> {
         .list_dir("dists")
         .map(|v| v.into_iter().filter(|(_, d)| *d).map(|(n, _)| n).collect())
         .unwrap_or_default();
-    Ok(LiveIsoCheck { info, dists, sfs_size: Some(has_casper) })
+    Ok(LiveIsoCheck { info, dists })
 }
 
 #[cfg(test)]

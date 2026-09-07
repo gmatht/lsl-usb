@@ -2,7 +2,8 @@
 //! controls via nwg, so the same wizard works on Windows 95 -> 11 (the PS
 //! version needs .NET WinForms).
 //!
-//! Mirrors the original wizard (now 5 pages; wifi split off system):
+//! Mirrors the original wizard (now 6 pages; wifi split off system, plus
+//! the INSTALL NOW page like install.ps1):
 //!   page 0  hardware compatibility (LKDDb ratings, streamed in by a
 //!           background thread so the 10s crawl-delay never blocks the UI)
 //!   page 1  ISO selection (fresh-download radios, local ISOs, USB reuse)
@@ -10,6 +11,8 @@
 //!   page 3  system: WSL VHDX, data dir, EFU, drivers, HDD cache, swap
 //!           reclaim
 //!   page 4  wifi networks (master switch + per-network list)
+//!   page 5  INSTALL NOW: USB write method (Rufus / built-in
+//!           non-destructive / skip) + target USB picker
 //! Heavy work (download, Rufus, file copy) runs on the console afterwards,
 //! and the boot-choice dialog finishes the flow.
 //!
@@ -19,7 +22,7 @@
 //! ~632x~413 after title bar + borders) gets a window that fits instead of
 //! running off-screen — and is fully resizable: WM_SIZE relayouts every
 //! page, and WM_GETMINMAXINFO clamps dragging/maximizing to the work area.
-//! Pages 1-4 scroll (page 0's ListView scrolls natively), so every size
+//! Pages 1-5 scroll (page 0's ListView scrolls natively), so every size
 //! works and enlarging the window genuinely shows more.
 
 use native_windows_gui as nwg;
@@ -57,7 +60,41 @@ pub struct GuiResult {
     pub distro_arch: Option<&'static str>,      // Some("i686"/"x86_64") when a fresh distro is selected
     pub download_iso: Option<(String, String)>, // (url, name) when fresh download chosen
     pub use_existing_usb: Option<String>,       // drive letter
-    pub write_mode: Option<String>,             // "rufus" | "nofmt" | "skip" (GUI radio choice)
+    pub write_mode: Option<String>,             // "rufus" | "nofmt" | "skip" (INSTALL-page radio choice)
+    pub target_usb: Option<String>,             // INSTALL-page target drive letter (nofmt copy)
+}
+
+/// Wizard pages: 0 hw, 1 iso, 2 flatpak, 3 system, 4 wifi, 5 install.
+/// The nav button reads "Next >" on every page BEFORE the install page and
+/// "Install" only on the install page itself - clicking it on page 5 runs
+/// the working phase (Rufus launch / built-in copy), never before.
+pub(crate) const INSTALL_PAGE: usize = 5;
+pub(crate) const NEXT_LABEL: &str = "Next >";
+pub(crate) const INSTALL_LABEL: &str = "Install";
+
+/// Nav-button caption for `page`: "Install" only on the INSTALL page.
+/// Pure helper so the caption rule is unit-testable (the live button is
+/// covered by the win-install-page GUI test).
+pub(crate) fn nav_label(page: usize) -> &'static str {
+    if page == INSTALL_PAGE {
+        INSTALL_LABEL
+    } else {
+        NEXT_LABEL
+    }
+}
+
+/// Map a write-method radio label to its mode ("rufus" | "nofmt" | "skip").
+/// Pure helper so the mapping is unit-testable (harvest itself needs live
+/// Win32 controls and is covered by the win-install-page GUI test).
+pub(crate) fn write_mode_from_label(t: &str) -> &'static str {
+    let tl = t.to_lowercase();
+    if tl.contains("non-destructive") {
+        "nofmt"
+    } else if tl.starts_with("skip") {
+        "skip"
+    } else {
+        "rufus"
+    }
 }
 
 /// Distro options (page 1 "Download Fresh" radios, from the PS GUI).
@@ -195,6 +232,11 @@ enum HwMsg {
         u: u32,
     },
     EverythingDone(bool),
+    /// A page/directory distro URL (Lubuntu/Xubuntu `.../release/`) resolved
+    /// to a direct ISO by the worker thread - the GUI thread starts the
+    /// real background download (the Rc<Vec<BgDl>> is !Send, so the entry
+    /// must be created here, not in the thread).
+    DistroResolved { url: String, name: String, dir: String },
 }
 
 #[derive(Clone)]
@@ -227,6 +269,28 @@ fn support_text(rating: char) -> &'static str {
 
 fn spawn_hw_rating(tx: mpsc::Sender<HwMsg>, bundle_dir: String) {
     std::thread::spawn(move || {
+        // Test hook: LSL_FAKE_HW=1 seeds a few fake rows so the www-globe
+        // rendering can be verified without real hardware (the win95 VM
+        // rates 0 devices, so the list would stay empty).
+        if std::env::var("LSL_FAKE_HW").as_deref() == Ok("1") {
+            for (class, rating, name, id) in [
+                ("Display", 'A', "UHD Graphics 630", "pci\u{8086}_3ea0"),
+                ("Ethernet", 'C', "RTL8111/8168 Gigabit", "pci\u{10ec}_8168"),
+                ("Wireless", 'D', "RTL8188CE WLAN", "pci\u{10ec}_8178"),
+                ("USB", 'A', "xHCI Host Controller", "pci\u{8086}_9d2f"),
+            ] {
+                let _ = tx.send(HwMsg::Row {
+                    class: class.into(),
+                    support: support_text(rating).to_string(),
+                    rating,
+                    name: name.into(),
+                    id: id.into(),
+                    url: format!("https://linux-hardware.org/?id={}", id),
+                });
+            }
+            let _ = tx.send(HwMsg::Done { a: 2, c: 1, d: 1, u: 0 });
+            return;
+        }
         let devices = crate::hardware::compat_hardware();
         if devices.is_empty() {
             let _ = tx.send(HwMsg::Progress("No ratable devices found.".into()));
@@ -284,8 +348,12 @@ fn lv_insert_column_direct(lv: &nwg::ListView, index: usize, text: &str, width: 
 }
 
 
-/// Custom-draw subclass for the hardware ListView: paints the www column
-/// (subitem 4) in royal blue, like install.ps1's owner-drawn globe.
+/// Custom-draw styling for the hardware ListView's www column (subitem 4):
+/// the cell text ("link") paints blue and underlined, like a hyperlink.
+/// The listview draws the text itself - the handler only supplies the color
+/// and selects an underlined font (CDRF_NEWFONT uses the font currently
+/// selected into the HDC). ANSI font APIs throughout: Win95's comctl32 has
+/// no W-message support (see nwg-test/vendor/.../README-WIN95.md).
 unsafe extern "system" fn hw_custom_draw_proc(
     hwnd: winapi::shared::windef::HWND,
     msg: winapi::shared::minwindef::UINT,
@@ -294,29 +362,60 @@ unsafe extern "system" fn hw_custom_draw_proc(
     _id: usize,
     _data: winapi::shared::basetsd::DWORD_PTR,
 ) -> winapi::shared::minwindef::LRESULT {
+    use winapi::shared::windef::HFONT;
     use winapi::um::commctrl::{
         CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT, CDRF_NEWFONT,
         CDRF_NOTIFYSUBITEMDRAW, NM_CUSTOMDRAW, NMLVCUSTOMDRAW,
     };
+    use winapi::um::wingdi::{
+        CreateFontIndirectA, GetCurrentObject, GetObjectA, SelectObject, LOGFONTA, OBJ_FONT,
+    };
     use winapi::um::commctrl::DefSubclassProc;
     use winapi::um::winuser::WM_NOTIFY;
     if msg == WM_NOTIFY {
-        let nmh = &*(l as *const winapi::um::winuser::NMHDR);
+        // explicit blocks: unsafe ops in an unsafe-fn body need them
+        // on this toolchain (E0133)
+        let nmh = unsafe { &*(l as *const winapi::um::winuser::NMHDR) };
         // Only handle notifications from the hardware listview itself (the
         // header control sends its own NM_CUSTOMDRAW that must be left alone)
         if nmh.hwndFrom as usize == *LV_HW_HWND.get().unwrap_or(&0) && nmh.code == NM_CUSTOMDRAW {
             // NOTE: CDDS_ITEMPREPAINT|CDDS_SUBITEM is the VALUE 0x30000 — it
             // must be compared, not used as an or-pattern (which would match
             // either constant alone and never the combined stage).
-            let nmcd = &*(l as *const NMLVCUSTOMDRAW);
+            let nmcd = unsafe { &*(l as *const NMLVCUSTOMDRAW) };
             let stage = nmcd.nmcd.dwDrawStage;
             if stage == CDDS_PREPAINT {
                 return CDRF_NOTIFYSUBITEMDRAW as _;
             }
             if stage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM) {
                 if nmcd.iSubItem == 4 {
-                    // RoyalBlue (COLORREF = 0x00BBGGRR)
-                    (*(l as *mut NMLVCUSTOMDRAW)).clrText = 0x00E1_6941;
+                    // Hyperlink look: blue text, underlined font. The
+                    // control paints the "link" cell text itself with
+                    // these attributes (CDRF_NEWFONT).
+                    unsafe { (*(l as *mut NMLVCUSTOMDRAW)).clrText = 0x00FF_0000; } // COLORREF = 0x00BBGGRR
+                    let hfont = *UNDERLINE_FONT.get_or_init(|| {
+                        // Derive from the listview's own font so size/DPI
+                        // track the control (ANSI APIs: Win95-safe).
+                        unsafe {
+                            let cur = GetCurrentObject(nmcd.nmcd.hdc, OBJ_FONT);
+                            let mut lf: LOGFONTA = std::mem::zeroed();
+                            let ok = GetObjectA(
+                                cur,
+                                std::mem::size_of::<LOGFONTA>() as i32,
+                                &mut lf as *mut LOGFONTA as *mut winapi::ctypes::c_void,
+                            );
+                            if ok == 0 {
+                                return 0;
+                            }
+                            lf.lfUnderline = 1;
+                            CreateFontIndirectA(&lf) as usize
+                        }
+                    }) as HFONT;
+                    if !hfont.is_null() {
+                        unsafe {
+                            SelectObject(nmcd.nmcd.hdc, hfont as *mut winapi::ctypes::c_void);
+                        }
+                    }
                     return CDRF_NEWFONT as _;
                 }
                 return CDRF_DODEFAULT as _;
@@ -329,10 +428,16 @@ unsafe extern "system" fn hw_custom_draw_proc(
             }
         }
     }
-    DefSubclassProc(hwnd, msg, w, l)
+    unsafe { DefSubclassProc(hwnd, msg, w, l) }
 }
 
 static LV_HW_HWND: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Underlined listview font for the www hyperlink cells, created once from
+/// the control's own font (stored as usize: raw HFONT is !Sync). Leaks one
+/// GDI object for the process lifetime by design - deleting it would need a
+/// hook after every paint.
+static UNDERLINE_FONT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 fn install_hw_custom_draw(lv: &nwg::ListView, frame: &nwg::Frame) {
     // NM_CUSTOMDRAW notifications are sent to the listview's PARENT (the
@@ -359,7 +464,7 @@ fn install_hw_custom_draw(lv: &nwg::ListView, frame: &nwg::Frame) {
 // WM_SIZE. Keep literals out of the page builders: any control's final
 // geometry is set by relayout, not by its builder.
 const MARGIN: i32 = 12; // window-side margin
-const NAV_H: i32 = 62; // bottom strip: gap + nav buttons (28) + margin
+const NAV_H: i32 = 66; // bottom strip: download-label band (20) + gaps + nav buttons (28) + margin
 const DEF_CW: i32 = 880; // default client size (the old fixed size)
 const DEF_CH: i32 = 760;
 const MIN_CW: i32 = 600; // smallest usable client (fits 640x480 boxes)
@@ -413,6 +518,24 @@ fn client_size(hwnd: winapi::shared::windef::HWND) -> (i32, i32) {
     }
 }
 
+/// Bottom-strip geometry from the client height: pages must end at or
+/// above `pages_end`, the "Downloading ..." label owns [label_y,
+/// label_y + label_h), and the progress bar sits inside the button row.
+/// Pure so the no-overlap rule is unit-testable (see
+/// bottom_bands_never_overlap); relayout applies it. The label gets a full
+/// 20px line (the codebase's own single-line metric is 18px) so descenders
+/// ('g', 'y', ...) never touch the rows above or below, at any font size
+/// the band layout supports.
+pub(crate) fn bottom_bands(ch: i32) -> (i32, i32, i32, i32, i32, i32, i32) {
+    let pages_end = ch - NAV_H;
+    let label_y = ch - NAV_H + 2;
+    let label_h = 20;
+    let btn_y = ch - MARGIN - 28;
+    let btn_h = 28;
+    let bar_y = btn_y + 7;
+    let bar_h = 14;
+    (pages_end, label_y, label_h, bar_y, bar_h, btn_y, btn_h)
+}
 /// Wrapped height for a label showing `text` in width `w` (~8 px per char
 /// at the system 8pt font — measured; 17 px per line). Must stay consistent
 /// with wrap_text's per-char estimate or the label will clip its last line.
@@ -459,6 +582,7 @@ enum PageCtl {
     Check(Box<nwg::CheckBox>, u8),
     Radio(Box<nwg::RadioButton>, u8),
     Edit(Box<nwg::TextBox>, u8),
+    EditLine(Box<nwg::TextInput>, u8),
     Btn(Box<nwg::Button>, u8),
 }
 
@@ -488,7 +612,7 @@ type PageItems = Rc<std::cell::RefCell<Vec<PageItem>>>;
 
 fn ctl_kind(ctl: &PageCtl) -> u8 {
     match ctl {
-        PageCtl::Lbl(_, k) | PageCtl::Check(_, k) | PageCtl::Radio(_, k) | PageCtl::Edit(_, k) | PageCtl::Btn(_, k) => *k,
+        PageCtl::Lbl(_, k) | PageCtl::Check(_, k) | PageCtl::Radio(_, k) | PageCtl::Edit(_, k) | PageCtl::EditLine(_, k) | PageCtl::Btn(_, k) => *k,
     }
 }
 
@@ -515,6 +639,7 @@ fn layout_page(items: &PageItems, fw: i32, off: i32, shift: i32, top: i32, bot_e
             PageCtl::Check(b, _) => place!(b),
             PageCtl::Radio(b, _) => place!(b),
             PageCtl::Edit(b, _) => place!(b),
+            PageCtl::EditLine(b, _) => place!(b),
             PageCtl::Btn(b, _) => place!(b),
         }
     }
@@ -539,6 +664,7 @@ fn ctl_hwnd(items: &PageItems, kind: u8) -> Option<usize> {
                 PageCtl::Check(b, _) => b.handle.hwnd(),
                 PageCtl::Radio(b, _) => b.handle.hwnd(),
                 PageCtl::Edit(b, _) => b.handle.hwnd(),
+                PageCtl::EditLine(b, _) => b.handle.hwnd(),
                 PageCtl::Btn(b, _) => b.handle.hwnd(),
             };
             return hwnd.map(|h| h as usize);
@@ -689,7 +815,7 @@ fn relayout_fp(fp: &PageItems, fp_content: &Cell<i32>, fw: i32, fh: i32) {
             it.x = 10;
             it.y = yb + 46;
             it.w = -20;
-            it.h = 22;
+            it.h = 76; // 4 lines deep
             max_y = max_y.max(it.y + it.h);
         }
     }
@@ -706,6 +832,7 @@ struct LayoutCtx<'a> {
     frame_fp: &'a nwg::Frame,
     frame_sys: &'a nwg::Frame,
     frame_wifi: &'a nwg::Frame,
+    frame_install: &'a nwg::Frame,
     lbl_hw: &'a nwg::Label,
     lv_hw: &'a nwg::ListView,
     lbl_rec: &'a nwg::Label,
@@ -716,29 +843,36 @@ struct LayoutCtx<'a> {
     sb_fp: &'a nwg::ScrollBar,
     sb_sys: &'a nwg::ScrollBar,
     sb_wifi: &'a nwg::ScrollBar,
+    sb_install: &'a nwg::ScrollBar,
     btn_everything: &'a nwg::Button,
     btn_back: &'a nwg::Button,
     btn_next: &'a nwg::Button,
     btn_cancel: &'a nwg::Button,
+    lbl_dl: &'a nwg::Label,
+    pb_dl: &'a nwg::ProgressBar,
     iso: &'a PageItems,
     fp: &'a PageItems,
     sys: &'a PageItems,
     wifi_items: &'a PageItems,
+    install: &'a PageItems,
     wifi: &'a std::cell::RefCell<Vec<Box<nwg::CheckBox>>>,
     fw: &'a Cell<i32>,
     iso_off: &'a Cell<i32>,
     fp_off: &'a Cell<i32>,
     sys_off: &'a Cell<i32>,
     wifi_off: &'a Cell<i32>,
+    install_off: &'a Cell<i32>,
     iso_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
     fp_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
     sys_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
     wifi_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
+    install_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
     fp_content: &'a Cell<i32>,
     guard: &'a Cell<bool>,
     iso_content: i32,
     sys_content: i32,
     wifi_content: i32,
+    install_content: i32,
 }
 
 /// The one pass that positions EVERY control from the client size (cw, ch).
@@ -759,19 +893,38 @@ fn relayout(c: &LayoutCtx, cw: i32, ch: i32) {
     c.lbl_sb.set_text(&wrap_text(c.sb_text, sb_per_line));
     c.lbl_sb.set_position(MARGIN, 10);
     c.lbl_sb.set_size(fw as u32, sb_h as u32);
-    for f in [c.frame_hw, c.frame_iso, c.frame_fp, c.frame_sys, c.frame_wifi] {
+    for f in [c.frame_hw, c.frame_iso, c.frame_fp, c.frame_sys, c.frame_wifi, c.frame_install] {
         f.set_position(MARGIN, top);
         f.set_size(fw as u32, fh.max(60) as u32);
     }
 
-    // nav strip: Next bottom-right, Back left of it, Cancel left of Back
-    let ny = ch - MARGIN - 28;
+    // nav strip: Next bottom-right, Back left of it, Cancel bottom-left;
+    // the "Downloading ..." label + bar share the strip in their own
+    // bands (bottom_bands: unit-tested no-overlap, descender-safe).
+    let (_pages_end, label_y, label_h, bar_y, bar_h, ny, _btn_h) = bottom_bands(ch);
     c.btn_next.set_position(cw - MARGIN - 96, ny);
     c.btn_next.set_size(96, 28);
     c.btn_back.set_position(cw - MARGIN - 96 - 96, ny);
     c.btn_back.set_size(90, 28);
-    c.btn_cancel.set_position(cw - MARGIN - 96 - 96 - 96, ny);
+    //c.btn_cancel.set_position(cw - MARGIN - 96 - 96 - 96, ny);
+    c.btn_cancel.set_position(8, ny);
     c.btn_cancel.set_size(90, 28);
+
+    // persistent download progress ("Downloading {}-..." label + bar):
+    // owned bands that touch neither the scrollable pages above nor the
+    // buttons below, at ANY window size - geometry comes from bottom_bands
+    // (unit-tested no-overlap). The label gets the full-width band to
+    // itself (long file names clip instead of overlapping); the bar rides
+    // the button row in the free middle between Cancel (left) and Back.
+    c.lbl_dl.set_position(MARGIN, label_y);
+    c.lbl_dl.set_size(fw as u32, label_h as u32);
+    let bar_x0 = MARGIN + 90 + 12;
+    let bar_x1 = cw - MARGIN - 96 - 96 - 10;
+    // MIN_CW guarantees room, but clamp anyway so a sub-minimum window
+    // can only clip the bar, never push it under a button.
+    let bar_w = (bar_x1 - bar_x0).max(50);
+    c.pb_dl.set_position(bar_x0, bar_y);
+    c.pb_dl.set_size(bar_w as u32, bar_h as u32);
 
     // page 0 (hardware): the ListView scrolls natively, so it just fills
     c.lbl_hw.set_position(10, 6);
@@ -801,20 +954,25 @@ fn relayout(c: &LayoutCtx, cw: i32, ch: i32) {
     c.btn_everything.set_size(400, 26);
 
 
-    // scrollable pages 1-4: geometry, scrollbar, items
+    // scrollable pages 1-5: geometry, scrollbar, items
     // (top = fixed strip above the scroll area, bot = fixed strip below)
     let iso_top = (22 + rec_h + 10).max(72);
     let iso_shift = (iso_top - 72).max(0); // push items below a taller help text
     let pages = [
         (c.sb_iso, c.iso, c.iso_off, c.iso_geom, c.iso_content, iso_top, iso_bot, iso_shift),
-        (c.sb_fp, c.fp, c.fp_off, c.fp_geom, c.fp_content.get(), 30, 12, 0),
-        (c.sb_sys, c.sys, c.sys_off, c.sys_geom, c.sys_content, 4, 12, 0),
-        (c.sb_wifi, c.wifi_items, c.wifi_off, c.wifi_geom, c.wifi_content, 4, 12, 0),
+        (c.sb_fp, c.fp, c.fp_off, c.fp_geom, c.fp_content.get(), 30, 32, 0),
+        (c.sb_sys, c.sys, c.sys_off, c.sys_geom, c.sys_content, 4, 32, 0),
+        (c.sb_wifi, c.wifi_items, c.wifi_off, c.wifi_geom, c.wifi_content, 4, 32, 0),
+        (c.sb_install, c.install, c.install_off, c.install_geom, c.install_content, 4, 32, 0),
     ];
     for (sb, items, off, geom, content, top, bot, shift) in pages {
         let (vis, max_off, top, bot_edge, shift) = page_geom(fh, top, bot, content, shift);
         geom.set((vis, max_off, top, bot_edge, shift));
         off.set(off.get().min(max_off));
+        // Only show the vertical scrollbar when the page doesn't fit
+        // vertically (max_off > 0); otherwise hide it so the content uses
+        // the full width.
+        sb.set_visible(max_off > 0);
         let units = (((max_off as f64) / 20.0).ceil() as usize).max(1);
         sb.set_range(0..units);
         sb.set_size(18, (fh - 8).max(20) as u32);
@@ -857,7 +1015,6 @@ fn find_matching_local_iso(name: &str, min_bytes: u64) -> Option<String> {
 /// the file downloads while the user configures the remaining pages, and
 /// the console step after "Install" just waits for it to finish).
 struct BgDl {
-    url: String,
     dest: String,
     prog: std::sync::Arc<std::sync::atomic::AtomicU64>,
     total: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -866,8 +1023,43 @@ struct BgDl {
 }
 
 /// Start downloading `url` to <download_dir>\<name> in a background thread.
-/// No-ops when the ISO is already on disk or there is no HTTP transport.
+/// A page/directory URL (Lubuntu/Xubuntu `.../release/`) is resolved to the
+/// current desktop ISO first, on a worker thread so the listing fetch never
+/// blocks the UI; unresolvable pages (antiX/Zorin HTML) are left for the
+/// Install-time flow (browser + message) instead of dying here.
 fn start_bg_download(
+    bg: &Rc<std::cell::RefCell<Vec<BgDl>>>,
+    url: &str,
+    name: &str,
+    dir: &str,
+    tx: mpsc::Sender<HwMsg>,
+) {
+    if url.ends_with(".iso") {
+        start_direct_download(bg, url, name, dir);
+        return;
+    }
+    // Directory URL: resolve on a worker thread (the listing fetch must not
+    // block the UI), then hand the direct URL back to the GUI thread through
+    // the timer channel - the Rc<Vec<BgDl>> is !Send, so the download entry
+    // itself is created on the GUI thread (DistroResolved arm below).
+    let (url2, dir2) = (url.to_string(), dir.to_string());
+    std::thread::spawn(move || {
+        if let Some((real_url, real_name)) = crate::resolve_page_iso(&url2) {
+            let _ = tx.send(HwMsg::DistroResolved {
+                url: real_url,
+                name: real_name,
+                dir: dir2,
+            });
+        }
+        // unresolvable pages (antiX/Zorin HTML): the Install-time flow
+        // opens the browser + explains
+    });
+}
+
+/// Start downloading a direct `.iso` `url` to <download_dir>\<name> in a
+/// background thread. No-ops when the ISO is already on disk or there is no
+/// HTTP transport.
+fn start_direct_download(
     bg: &Rc<std::cell::RefCell<Vec<BgDl>>>,
     url: &str,
     name: &str,
@@ -885,11 +1077,7 @@ fn start_bg_download(
         sys::out::info(&format!("ISO already downloaded: {}", dest));
         return;
     }
-    // a directory/page URL (Lubuntu/Xubuntu/antiX/Zorin) is not directly
-    // downloadable - the console flow opens it in the browser instead
-    if !url.ends_with(".iso") {
-        return;
-    }
+    // (page/directory URLs are resolved to a direct .iso by the caller)
     // an up-to-date, right-sized local copy of the same ISO beats a
     // re-download (the console step picks it up via the harvest reuse)
     if let Some(existing) = find_matching_local_iso(name, MIN_ISO_SIZE) {
@@ -939,7 +1127,6 @@ fn start_bg_download(
         fin.store(true, std::sync::atomic::Ordering::Relaxed);
     });
     bg.borrow_mut().push(BgDl {
-        url: url.to_string(),
         dest,
         prog,
         total,
@@ -996,10 +1183,6 @@ impl WorkingUi {
             use winapi::um::winuser::DestroyWindow;
             unsafe { DestroyWindow(self.main as winapi::shared::windef::HWND) };
         }
-    }
-
-    fn is_open(&self) -> bool {
-        is_window(self.main)
     }
 
     /// Join any background ISO download started from the page-1 distro
@@ -1132,10 +1315,12 @@ pub fn run_gui(
     let fp_off: Rc<Cell<i32>> = Rc::new(Cell::new(0));
     let sys_off: Rc<Cell<i32>> = Rc::new(Cell::new(0));
     let wifi_off: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+    let install_off: Rc<Cell<i32>> = Rc::new(Cell::new(0));
     let iso_geom: Rc<Cell<(i32, i32, i32, i32, i32)>> = Rc::new(Cell::new((0, 0, 0, 0, 0)));
     let fp_geom: Rc<Cell<(i32, i32, i32, i32, i32)>> = Rc::new(Cell::new((0, 0, 0, 0, 0)));
     let sys_geom: Rc<Cell<(i32, i32, i32, i32, i32)>> = Rc::new(Cell::new((0, 0, 0, 0, 0)));
     let wifi_geom: Rc<Cell<(i32, i32, i32, i32, i32)>> = Rc::new(Cell::new((0, 0, 0, 0, 0)));
+    let install_geom: Rc<Cell<(i32, i32, i32, i32, i32)>> = Rc::new(Cell::new((0, 0, 0, 0, 0)));
     let fp_content: Rc<Cell<i32>> = Rc::new(Cell::new(0));
     // re-entrancy guard: resizing a CHILD during relayout makes nwg dispatch
     // Event::OnResize for that child straight back into our handler (nwg
@@ -1150,6 +1335,10 @@ pub fn run_gui(
     let mut window: nwg::Window = Default::default();
     let mut lbl_sb: nwg::Label = Default::default();
     let mut font_bold: nwg::Font = Default::default();
+    // nwg::Timer is deprecated upstream in favor of AnimationTimer, but the
+    // winapi timer's exact dispatch semantics are what the GUI pump relies
+    // on (Win95-vendored nwg; unmigratable without a Windows test rig).
+    #[allow(deprecated)]
     let mut timer: nwg::Timer = Default::default();
 
     // page 0: hardware
@@ -1181,6 +1370,14 @@ pub fn run_gui(
     let mut sb_wifi: nwg::ScrollBar = Default::default();
     let wifi_items: PageItems = Rc::new(std::cell::RefCell::new(Vec::new()));
 
+    // page 5: INSTALL NOW — USB write method + target USB picker.
+    // The Rufus / built-in choice lives HERE and only here: no
+    // write-method radio may appear on any earlier page (the
+    // win-install-page GUI test asserts that).
+    let mut frame_install: nwg::Frame = Default::default();
+    let mut sb_install: nwg::ScrollBar = Default::default();
+    let install_items: PageItems = Rc::new(std::cell::RefCell::new(Vec::new()));
+
     // nav
     let mut btn_back: nwg::Button = Default::default();
     let mut btn_next: nwg::Button = Default::default();
@@ -1203,6 +1400,7 @@ pub fn run_gui(
                 .unwrap_or_default()
         ))
         .build(&mut window);
+    #[allow(deprecated)]
     let _ = nwg::Timer::builder()
         .interval(120)
         .parent(&window)
@@ -1449,11 +1647,11 @@ pub fn run_gui(
     if existing_usbs.is_empty() {
         add_plain("(none found)", &mut y);
     }
-    add_label("USB write method (how the ISO gets onto the stick):", &mut y);
-    add_radio("Rufus (recommended - well tested, UEFI + BIOS; rewrites the stick)", write_mode_pre == "rufus", 3, true, &mut y);
-    add_radio("Built-in non-destructive (less tested - no reformat, keeps existing files; BIOS boot)", write_mode_pre == "nofmt", 3, false, &mut y);
-    add_radio("Skip - I will write the USB myself (like --skip-rufus)", write_mode_pre == "skip", 3, false, &mut y);
     let iso_content = y + 10;
+
+    // NOTE: the USB write-method radios used to live here; they moved to
+    // page 5 (INSTALL NOW) so the choice is made at install time, like
+    // install.ps1 - and so no Rufus radio appears before the INSTALL page.
 
     if let Err(e) = nwg::ScrollBar::builder()
         .flags(nwg::ScrollBarFlags::VERTICAL | nwg::ScrollBarFlags::VISIBLE)
@@ -1545,7 +1743,7 @@ pub fn run_gui(
         let mut e: Box<nwg::TextBox> = Box::default();
         let _ = nwg::TextBox::builder()
             .position((10, 290))
-            .size((560, 22))
+            .size((560, 76))   // 4 lines deep
             .text(&flatpak_extra.join(", "))
             .parent(&frame_fp)
             .build(&mut e);
@@ -1554,7 +1752,7 @@ pub fn run_gui(
             x: 10,
             y: 290,
             w: -20,
-            h: 22,
+            h: 76,
             idx: 0,
         });
     }
@@ -1632,14 +1830,14 @@ pub fn run_gui(
             "/mnt/c/Users/{}/lsl-usb",
             sys::env_var("USERNAME").unwrap_or_default()
         );
-        let mut data: Box<nwg::TextBox> = Box::default();
-        let _ = nwg::TextBox::builder()
+        let mut data: Box<nwg::TextInput> = Box::default();
+        let _ = nwg::TextInput::builder()
             .position((10, 212))
-            .size((300, 22))
+            .size((290, 22))
             .text(&default_data)
             .parent(&frame_sys)
             .build(&mut data);
-        sys.push(PageItem { ctl: PageCtl::Edit(data, 2), x: 10, y: 212, w: -114, h: 22, idx: 0 });
+        sys.push(PageItem { ctl: PageCtl::EditLine(data, 2), x: 10, y: 212, w: -134, h: 22, idx: 0 });
         let mut browse: Box<nwg::Button> = Box::default();
         let _ = nwg::Button::builder()
             .text("Browse...")
@@ -1647,7 +1845,7 @@ pub fn run_gui(
             .size((90, 24))
             .parent(&frame_sys)
             .build(&mut browse);
-        sys.push(PageItem { ctl: PageCtl::Btn(browse, 3), x: -104, y: 211, w: 90, h: 24, idx: 0 });
+        sys.push(PageItem { ctl: PageCtl::Btn(browse, 3), x: -124, y: 211, w: 90, h: 24, idx: 0 });
         push_check(&mut sys, "Export Everything index for Linux file browsing (can be large)", 10, 242, 4, true);
         push_check(&mut sys, "Preload Linux drivers for this PC network hardware", 10, 264, 5, true);
         let drv_needs = crate::hardware::resolve_driver_needs(&crate::hardware::network_hardware());
@@ -1746,6 +1944,130 @@ pub fn run_gui(
     }
     let wifi_content = WIFI_Y0 + (wifi_checks.borrow().len() as i32).max(1) * 20 + 10;
 
+    // ---- page 5: INSTALL NOW (USB write method + target USB picker) ----
+    let _ = nwg::Frame::builder()
+        .position((MARGIN, 88))
+        .size((DEF_CW - 2 * MARGIN, DEF_CH - 88 - NAV_H))
+        .parent(&window)
+        .build(&mut frame_install);
+    {
+        let mut items = install_items.borrow_mut();
+        let mut iy = 6i32;
+        // title (bold) - the win-install-page GUI test keys on this text
+        let mut title: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text("INSTALL NOW")
+            .position((10, iy))
+            .size((560, 24))
+            .parent(&frame_install)
+            .build(&mut title);
+        title.set_font(Some(&font_bold));
+        items.push(PageItem { ctl: PageCtl::Lbl(title, 0), x: 10, y: iy, w: -20, h: 24, idx: 0 });
+        iy += 28;
+        let mut help: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text("Choose how to write the live image to the USB, then click Install.")
+            .position((10, iy))
+            .size((560, 18))
+            .parent(&frame_install)
+            .build(&mut help);
+        items.push(PageItem { ctl: PageCtl::Lbl(help, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
+        iy += 26;
+        // write-method radios (kind 3): one group, exactly one checked
+        let methods = [
+            ("Rufus (recommended - well tested, UEFI + BIOS; rewrites the stick)", "rufus"),
+            ("Built-in non-destructive (less tested - no reformat, keeps existing files; BIOS boot)", "nofmt"),
+            ("Skip - I will write the USB myself (like --skip-rufus)", "skip"),
+        ];
+        for (n, (text, mode)) in methods.iter().enumerate() {
+            let mut rb: Box<nwg::RadioButton> = Box::default();
+            let _ = nwg::RadioButton::builder()
+                .flags(if n == 0 {
+                    nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
+                } else {
+                    nwg::RadioButtonFlags::VISIBLE
+                })
+                .text(*text)
+                .position((10, iy))
+                .size((780, 20))
+                .parent(&frame_install)
+                .build(&mut rb);
+            if write_mode_pre == *mode {
+                rb.set_check_state(nwg::RadioButtonState::Checked);
+            }
+            items.push(PageItem { ctl: PageCtl::Radio(rb, 3), x: 10, y: iy, w: -20, h: 20, idx: 0 });
+            iy += 24;
+        }
+        let mut note: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text("Rufus launches with the ISO pre-selected (you click START there). Built-in copies the image files with no format.")
+            .position((10, iy))
+            .size((560, 18))
+            .parent(&frame_install)
+            .build(&mut note);
+        items.push(PageItem { ctl: PageCtl::Lbl(note, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
+        iy += 26;
+        // target USB picker (kind 4): removable volumes, first pre-checked
+        let mut cap: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text("Target USB (for the non-destructive copy):")
+            .position((10, iy))
+            .size((560, 18))
+            .parent(&frame_install)
+            .build(&mut cap);
+        cap.set_font(Some(&font_bold));
+        items.push(PageItem { ctl: PageCtl::Lbl(cap, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
+        iy += 22;
+        let mut targets: Vec<sys::Volume> = sys::list_volumes()
+            .into_iter()
+            .filter(|v| v.removable && !v.cdrom && !v.letter.is_empty())
+            .collect();
+        targets.sort_by(|a, b| a.letter.cmp(&b.letter));
+        if targets.is_empty() {
+            let mut none: Box<nwg::Label> = Box::default();
+            let _ = nwg::Label::builder()
+                .text("[No removable USB drives detected]")
+                .position((26, iy))
+                .size((560, 20))
+                .parent(&frame_install)
+                .build(&mut none);
+            items.push(PageItem { ctl: PageCtl::Lbl(none, 0), x: 26, y: iy, w: -20, h: 20, idx: 0 });
+            iy += 24;
+        }
+        for (n, u) in targets.iter().enumerate() {
+            let mut rb: Box<nwg::RadioButton> = Box::default();
+            let _ = nwg::RadioButton::builder()
+                .flags(if n == 0 {
+                    nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
+                } else {
+                    nwg::RadioButtonFlags::VISIBLE
+                })
+                .text(&format!("{}:  {}  ({:.1} GB)", u.letter, u.label, u.size_gb()))
+                .position((10, iy))
+                .size((780, 20))
+                .parent(&frame_install)
+                .build(&mut rb);
+            if n == 0 {
+                rb.set_check_state(nwg::RadioButtonState::Checked);
+            }
+            items.push(PageItem { ctl: PageCtl::Radio(rb, 4), x: 10, y: iy, w: -20, h: 20, idx: 0 });
+            iy += 24;
+        }
+    }
+    let install_content = {
+        let items = install_items.borrow();
+        items.iter().map(|it| it.y + it.h).max().unwrap_or(0) + 10
+    };
+    if let Err(e) = nwg::ScrollBar::builder()
+        .flags(nwg::ScrollBarFlags::VERTICAL | nwg::ScrollBarFlags::VISIBLE)
+        .position((826, 4))
+        .size((18, 588))
+        .parent(&frame_install)
+        .build(&mut sb_install)
+    {
+        glog(&format!("scrollbar build error: {e:?}"));
+    }
+
     // ---- nav buttons ----
     let _ = nwg::Button::builder()
         .text("< Back")
@@ -1767,19 +2089,22 @@ pub fn run_gui(
         .parent(&window)
         .build(&mut btn_cancel);
 
-    // persistent ISO download progress: sits on the nav strip LEFT of the
-    // buttons, parented to the WINDOW so it is visible on every page
+    // persistent ISO download progress: the label owns the full-width band
+    // above the nav buttons, the bar rides the button row between Cancel
+    // and Back (see relayout, which positions both from the live client
+    // size so they never overlap the pages above or the buttons below).
+    // Parented to the WINDOW so the progress stays visible on every page.
     let mut lbl_dl: nwg::Label = Default::default();
     let mut pb_dl: nwg::ProgressBar = Default::default();
     let _ = nwg::Label::builder()
         .text("")
-        .position((14, 710))
-        .size((530, 14))
+        .position((12, 696))
+        .size((856, 20))
         .parent(&window)
         .build(&mut lbl_dl);
     let _ = nwg::ProgressBar::builder()
-        .position((14, 726))
-        .size((530, 8))
+        .position((114, 727))
+        .size((552, 14))
         .parent(&window)
         .build(&mut pb_dl);
     lbl_dl.set_visible(false);
@@ -1808,6 +2133,7 @@ pub fn run_gui(
             frame_fp: &frame_fp,
             frame_sys: &frame_sys,
             frame_wifi: &frame_wifi,
+            frame_install: &frame_install,
             lbl_hw: &lbl_hw,
             lv_hw: &lv_hw,
             lbl_rec: &lbl_rec,
@@ -1818,42 +2144,50 @@ pub fn run_gui(
             sb_fp: &sb_fp,
             sb_sys: &sb_sys,
             sb_wifi: &sb_wifi,
+            sb_install: &sb_install,
             btn_everything: &btn_everything,
             btn_back: &btn_back,
             btn_next: &btn_next,
             btn_cancel: &btn_cancel,
+            lbl_dl: &lbl_dl,
+            pb_dl: &pb_dl,
             iso: &iso_items,
             fp: &fp_items,
             sys: &sys_items,
             wifi_items: &wifi_items,
+            install: &install_items,
             wifi: &wifi_checks,
             fw: &fw_cell,
             iso_off: &iso_off,
             fp_off: &fp_off,
             sys_off: &sys_off,
             wifi_off: &wifi_off,
+            install_off: &install_off,
             iso_geom: &iso_geom,
             fp_geom: &fp_geom,
             sys_geom: &sys_geom,
             wifi_geom: &wifi_geom,
+            install_geom: &install_geom,
             fp_content: &fp_content,
             guard: &in_relayout,
             iso_content: iso_content,
             sys_content: sys_content,
             wifi_content: wifi_content,
+            install_content: install_content,
         },
         cw,
         ch,
     );
 
-    // Hide pages 1-4 only AFTER all controls exist (their children were built
+    // Hide pages 1-5 only AFTER all controls exist (their children were built
     // while the frame was visible, which wine requires). Only now, with all
-    // five pages positioned and four of them hidden, is the window shown -
+    // six pages positioned and five of them hidden, is the window shown -
     // so the user only ever sees page 0, never the build-time stack.
     frame_iso.set_visible(false);
     frame_fp.set_visible(false);
     frame_sys.set_visible(false);
     frame_wifi.set_visible(false);
+    frame_install.set_visible(false);
     window.set_visible(true);
 
     // ---- background hardware rating (starts immediately) ----
@@ -1909,6 +2243,15 @@ pub fn run_gui(
             wifi_off.clone(),
             fw_cell.clone(),
         ),
+        bind_page_scroll(
+            &frame_install,
+            0x4C56_05usize,
+            sb_install.handle.hwnd(),
+            install_items.clone(),
+            install_geom.clone(),
+            install_off.clone(),
+            fw_cell.clone(),
+        ),
     );
 
     // click-routing: HWND copies for controls living in the shared storage
@@ -1938,6 +2281,7 @@ pub fn run_gui(
         let fp_items = fp_items.clone();
         let sys_items = sys_items.clone();
         let wifi_items = wifi_items.clone();
+        let install_items = install_items.clone();
         let bg_downloads = bg_downloads.clone();
         let download_dir = download_dir.to_string();
         let distro_urls = distro_urls.clone();
@@ -1946,10 +2290,12 @@ pub fn run_gui(
         let fp_off = fp_off.clone();
         let sys_off = sys_off.clone();
         let wifi_off = wifi_off.clone();
+        let install_off = install_off.clone();
         let iso_geom = iso_geom.clone();
         let fp_geom = fp_geom.clone();
         let sys_geom = sys_geom.clone();
         let wifi_geom = wifi_geom.clone();
+        let install_geom = install_geom.clone();
         let fp_content = fp_content.clone();
         let in_relayout = in_relayout.clone();
         let sb_text_ref = sb_text.clone();
@@ -1971,6 +2317,7 @@ pub fn run_gui(
                         frame_fp: &frame_fp,
                         frame_sys: &frame_sys,
                         frame_wifi: &frame_wifi,
+                        frame_install: &frame_install,
                         lbl_hw: &lbl_hw,
                         lv_hw: &lv_hw,
                         lbl_rec: &lbl_rec,
@@ -1981,29 +2328,36 @@ pub fn run_gui(
                         sb_fp: &sb_fp,
                         sb_sys: &sb_sys,
                         sb_wifi: &sb_wifi,
+                        sb_install: &sb_install,
                         btn_everything: &btn_everything,
                         btn_back: &btn_back,
                         btn_next: &btn_next,
                         btn_cancel: &btn_cancel,
+                        lbl_dl: &lbl_dl,
+                        pb_dl: &pb_dl,
                         iso: &iso_items,
                         fp: &fp_items,
                         sys: &sys_items,
                         wifi_items: &wifi_items,
+                        install: &install_items,
                         wifi: &wifi_checks,
                         fw: &fw_cell,
                         iso_off: &iso_off,
                         fp_off: &fp_off,
                         sys_off: &sys_off,
                         wifi_off: &wifi_off,
+                        install_off: &install_off,
                         iso_geom: &iso_geom,
                         fp_geom: &fp_geom,
                         sys_geom: &sys_geom,
                         wifi_geom: &wifi_geom,
+                        install_geom: &install_geom,
                         fp_content: &fp_content,
                         guard: &in_relayout,
                         iso_content: iso_content,
                         sys_content: sys_content,
                         wifi_content: wifi_content,
+                        install_content: install_content,
                     }, cw, ch);
                 }
             }
@@ -2051,19 +2405,16 @@ pub fn run_gui(
                 if handle == btn_next.handle {
                     glog("click next");
                     let cur = p2.get();
-                    if cur < 4 {
+                    if cur < INSTALL_PAGE {
                         p2.set(cur + 1);
                         frame_hw.set_visible(p2.get() == 0);
                         frame_iso.set_visible(p2.get() == 1);
                         frame_fp.set_visible(p2.get() == 2);
                         frame_sys.set_visible(p2.get() == 3);
                         frame_wifi.set_visible(p2.get() == 4);
+                        frame_install.set_visible(p2.get() == INSTALL_PAGE);
                         btn_back.set_enabled(p2.get() > 0);
-                        if p2.get() == 4 {
-                            btn_next.set_text("Install");
-                        } else {
-                            btn_next.set_text("Next >");
-                        }
+                        btn_next.set_text(nav_label(p2.get()));
                     } else {
                         // ---- Install clicked: enter the working phase ----
                         // The window STAYS VISIBLE (status text + progress)
@@ -2080,6 +2431,7 @@ pub fn run_gui(
                             &fp_items,
                             &sys_items,
                             &wifi_items,
+                            &install_items,
                             &wifi_checks,
                         );
                         g_cell.replace(Some(g));
@@ -2088,10 +2440,12 @@ pub fn run_gui(
                         frame_fp.set_visible(false);
                         frame_sys.set_visible(false);
                         frame_wifi.set_visible(false);
+                        frame_install.set_visible(false);
                         sb_iso.set_visible(false);
                         sb_fp.set_visible(false);
                         sb_sys.set_visible(false);
                         sb_wifi.set_visible(false);
+                        sb_install.set_visible(false);
                         btn_back.set_enabled(false);
                         btn_next.set_enabled(false);
                         btn_cancel.set_enabled(false);
@@ -2121,9 +2475,10 @@ pub fn run_gui(
                         frame_fp.set_visible(p2.get() == 2);
                         frame_sys.set_visible(p2.get() == 3);
                         frame_wifi.set_visible(p2.get() == 4);
+                        frame_install.set_visible(p2.get() == INSTALL_PAGE);
                         btn_back.set_enabled(p2.get() > 0);
                         btn_next.set_enabled(true);
-                        btn_next.set_text(if p2.get() == 4 { "Install" } else { "Next >" });
+                        btn_next.set_text(nav_label(p2.get()));
                     }
                 } else if handle == btn_cancel.handle {
                     glog("click cancel");
@@ -2133,8 +2488,10 @@ pub fn run_gui(
                     // Folder picker -> convert to the /mnt/<drive>/... form
                     if let Some(wpath) = sys::browse_folder("Choose the LSL_DATA_DIR folder (a Windows path)") {
                         for it in browse_data_sys.borrow_mut().iter() {
-                            if let PageCtl::Edit(b, 2) = &it.ctl {
-                                b.set_text(&sys::win_to_wsl_path(&wpath));
+                            match &it.ctl {
+                                PageCtl::Edit(b, 2) => b.set_text(&sys::win_to_wsl_path(&wpath)),
+                                PageCtl::EditLine(b, 2) => b.set_text(&sys::win_to_wsl_path(&wpath)),
+                                _ => {}
                             }
                         }
                     }
@@ -2181,7 +2538,7 @@ pub fn run_gui(
                                 .filter(|s| s.ends_with(".iso"))
                                 .unwrap_or("downloaded.iso")
                                 .to_string();
-                            start_bg_download(&bg_downloads, url, &name, &download_dir);
+                            start_bg_download(&bg_downloads, url, &name, &download_dir, tx.clone());
                         }
                     }
                 }
@@ -2202,10 +2559,13 @@ pub fn run_gui(
                             let url = if url.is_empty() { String::new() } else { format!("https://linux-hardware.org/?id={}", url.split("id=").nth(1).unwrap_or("")) };
                             let row = HwRow { class, rating, support, name, id, url: url.clone() };
                             hw_rows.borrow_mut().push(row.clone());
-                            const GLOBE: &str = "\u{1F310}\u{FE0E}"; // globe + text-presentation selector
+                            // Plain-ASCII "link" text (Win95's ANSI listview
+                            // cannot carry the U+1F310 emoji); the custom-draw
+                            // handler paints it blue + underlined.
+                            let link = if url.is_empty() { String::new() } else { "link".to_string() };
                             lv_hw.insert_items_row(
                                 None,
-                                &[row.class, row.support, row.name, row.id, GLOBE.to_string()],
+                                &[row.class, row.support, row.name, row.id, link],
                             );
                         }
                         HwMsg::Progress(text) => {
@@ -2216,6 +2576,9 @@ pub fn run_gui(
                                 "Summary: A={} (in-kernel)  C={} (out-of-tree)  D={} (no driver)  U={} (unknown)",
                                 a, c, d, u
                             ));
+                        }
+                        HwMsg::DistroResolved { url, name, dir } => {
+                            start_direct_download(&bg_downloads, &url, &name, &dir);
                         }
                         HwMsg::EverythingDone(ok) => {
                             btn_everything.set_enabled(true);
@@ -2289,8 +2652,8 @@ pub fn run_gui(
                 lv_hw.clear();
                 let rows = hw_rows.borrow();
                 for r in rows.iter() {
-                    const GLOBE2: &str = "\u{1F310}\u{FE0E}";
-                    lv_hw.insert_items_row(None, &[r.class.clone(), r.support.clone(), r.name.clone(), r.id.clone(), if r.url.is_empty() { String::new() } else { GLOBE2.to_string() }]);
+                    // Same "link" text as the insert path above (sort repopulation).
+                    lv_hw.insert_items_row(None, &[r.class.clone(), r.support.clone(), r.name.clone(), r.id.clone(), if r.url.is_empty() { String::new() } else { "link".to_string() }]);
                 }
                 for c in 0..5 {
                     lv_hw.set_column_sort_arrow(c, None);
@@ -2344,6 +2707,7 @@ fn harvest_gui_result(
     fp_items: &PageItems,
     sys_items: &PageItems,
     wifi_items: &PageItems,
+    install_items: &PageItems,
     wifi_checks: &Rc<std::cell::RefCell<Vec<Box<nwg::CheckBox>>>>,
 ) -> GuiResult {
     // Checkbox precedence: existing USB > existing ISO > fresh download.
@@ -2451,7 +2815,7 @@ fn harvest_gui_result(
         flatpak_ids.push("io.github.cboxdoerfer.FSearch".to_string());
     }
     let extra: Vec<String> = extra_text
-        .split(',')
+        .split(|c| c == ',' || c == '\n' || c == '\r')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
@@ -2468,6 +2832,7 @@ fn harvest_gui_result(
         match &it.ctl {
             PageCtl::Edit(b, 1) => vhdx_text = b.text(),
             PageCtl::Edit(b, 2) => data_text = b.text(),
+            PageCtl::EditLine(b, 2) => data_text = b.text(),
             PageCtl::Check(b, k) => {
                 let on = b.check_state() == nwg::CheckBoxState::Checked;
                 match *k {
@@ -2524,11 +2889,11 @@ fn harvest_gui_result(
         download_iso,
         use_existing_usb: reuse_usb,
         write_mode: {
-            // the USB-write-method radio section (kind 3); exactly one is
-            // always selected, so the wizard always expresses a choice and
-            // the console never needs to re-ask
+            // the INSTALL page's write-method radio section (kind 3);
+            // exactly one is always selected, so the wizard always
+            // expresses a choice and the console never needs to re-ask
             let mut mode = String::from("rufus");
-            for it in iso_items.borrow().iter() {
+            for it in install_items.borrow().iter() {
                 if let PageCtl::Radio(rb, 3) = &it.ctl {
                     glog(&format!(
                         "harvest write-mode radio '{}' checked={}",
@@ -2536,20 +2901,90 @@ fn harvest_gui_result(
                         rb.check_state() == nwg::RadioButtonState::Checked
                     ));
                     if rb.check_state() == nwg::RadioButtonState::Checked {
-                        let t = rb.text();
-                        let tl = t.to_lowercase();
-                        mode = if tl.contains("non-destructive") {
-                            "nofmt".to_string()
-                        } else if tl.starts_with("skip") {
-                            "skip".to_string()
-                        } else {
-                            "rufus".to_string()
-                        };
+                        mode = write_mode_from_label(&rb.text()).to_string();
                         break;
                     }
                 }
             }
             Some(mode)
         },
+        target_usb: {
+            // the INSTALL page's target-USB radio section (kind 4);
+            // drive letter of the checked entry, if any stick is plugged in
+            let mut target: Option<String> = None;
+            for it in install_items.borrow().iter() {
+                if let PageCtl::Radio(rb, 4) = &it.ctl {
+                    if rb.check_state() == nwg::RadioButtonState::Checked {
+                        let letter = rb.text().split(':').next().unwrap_or("").trim().to_string();
+                        if !letter.is_empty() {
+                            target = Some(letter);
+                        }
+                        break;
+                    }
+                }
+            }
+            target
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bottom_bands_never_overlap() {
+        // the "Downloading ..." label band touches neither the scrollable
+        // pages above nor the button row below, at any client height -
+        // so no glyph (not even a 'g' descender) can paint over a neighbour.
+        // label_h stays a full 20px line (codebase single-line metric: 18).
+        for ch in [300, 380, 413, 500, 760, 900, 1200] {
+            let (pages_end, ly, lh, bary, barh, btny, btnh) = bottom_bands(ch);
+            assert!(pages_end <= ly, "pages above label @ ch={ch}");
+            assert!(ly + lh <= btny, "label above buttons @ ch={ch}");
+            assert!(
+                bary >= btny && bary + barh <= btny + btnh,
+                "bar inside button row @ ch={ch}"
+            );
+            assert!(lh >= 20, "label fits descenders @ ch={ch}");
+            assert!(ly >= pages_end + 2, "air above label @ ch={ch}");
+            assert!(btny >= ly + lh + 2, "air below label @ ch={ch}");
+        }
+    }
+
+    #[test]
+    fn nav_button_says_next_before_install_page() {
+        // the button LEADING to the install page must read "Next >", never
+        // "Install" (win-install-page GUI test asserts the live button)
+        for page in 0..INSTALL_PAGE {
+            assert_eq!(nav_label(page), "Next >", "page {}", page);
+        }
+    }
+
+    #[test]
+    fn nav_button_says_install_on_install_page() {
+        assert_eq!(nav_label(INSTALL_PAGE), INSTALL_LABEL);
+        assert_eq!(nav_label(INSTALL_PAGE), "Install");
+    }
+
+    #[test]
+    fn write_mode_labels_map() {
+        assert_eq!(
+            write_mode_from_label("Rufus (recommended - well tested, UEFI + BIOS; rewrites the stick)"),
+            "rufus"
+        );
+        assert_eq!(
+            write_mode_from_label("Built-in non-destructive (less tested - no reformat, keeps existing files; BIOS boot)"),
+            "nofmt"
+        );
+        assert_eq!(
+            write_mode_from_label("Skip - I will write the USB myself (like --skip-rufus)"),
+            "skip"
+        );
+        // case-insensitive, like the harvest path
+        assert_eq!(write_mode_from_label("SKIP everything"), "skip");
+        assert_eq!(write_mode_from_label("NON-DESTRUCTIVE copy"), "nofmt");
+        // unknown labels fall back to Rufus, never to an empty/invalid mode
+        assert_eq!(write_mode_from_label("???"), "rufus");
     }
 }

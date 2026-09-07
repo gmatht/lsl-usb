@@ -5,6 +5,8 @@
 use crate::net::{self, HttpErr};
 use crate::sys::{self, out, Child, DynLib};
 use crate::sys::{path_exists, Volume};
+// sha2 is only needed by the unit-test known-vector below
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 pub fn cache_dir() -> String {
@@ -182,7 +184,8 @@ fn verify_authenticode(path: &str, expect_subject: &str) -> Result<bool, String>
         data.fdwRevocationChecks = WTD_REVOKE_NONE;
         data.dwUnionChoice = WTD_CHOICE_FILE;
         data.dwStateAction = WTD_STATEACTION_VERIFY;
-        unsafe { *data.u.pFile_mut() = &mut file_info; }
+        // union write, covered by the outer unsafe block
+        *data.u.pFile_mut() = &mut file_info;
 
         let guid: winapi::shared::guiddef::GUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
         let status = f(0, &guid as *const _ as *const _, &mut data as *mut _ as *mut _);

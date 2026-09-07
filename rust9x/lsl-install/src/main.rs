@@ -10,8 +10,6 @@
 // generated and `cargo test` actually runs the #[test]s.
 #![cfg_attr(not(test), no_main)]
 
-#![no_main]
-
 mod boot;
 mod cli;
 mod detect;
@@ -27,10 +25,7 @@ mod rufus;
 mod sys;
 mod wifi;
 
-use std::io::Read;
 use sys::out;
-
-const ISO_KERNEL: (u32, u32) = (6, 8);
 
 /// Overrides the rustc `lang_start` shim (Win95: `std::rt` init hangs
 /// inside KERNEL32; the VC6 CRT startup calls `main` directly instead).
@@ -201,7 +196,7 @@ fn run() {
     let mut copy_wifi = true;
     let mut wifi_networks: Vec<String> = Vec::new();
     let mut do_efu = true;
-    let mut install_everything = true;
+    let install_everything = true;
     let mut preload_drivers = true;
     let mut copy_sfs_hdd = false;
     let mut reclaim_win_swap = false;
@@ -235,16 +230,10 @@ fn run() {
             Some(ui),
         ) {
             Ok(i) => i,
-            Err(e) => {
-                ui.close();
-                out::err(&e);
-                std::process::exit(1);
-            }
+            Err(e) => fatal_gui(&e, ui),
         };
         if let Err(e) = validate_live_iso(&iso) {
-            ui.close();
-            out::err(&e);
-            std::process::exit(1);
+            fatal_gui(&e, ui);
         }
         // the wizard's write-method radio is explicit by construction
         let mode = g.write_mode.clone().unwrap_or_else(|| "rufus".into());
@@ -255,7 +244,10 @@ fn run() {
                 );
                 ui.pump();
                 out::step("USB write method: built-in non-destructive (wizard choice).");
-                match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64) {
+                // the INSTALL page's target-USB radio wins; without a plugged-in
+                // stick (or --usb-letter) nofmt falls back to its own picker
+                let letter_hint = g.target_usb.as_deref().unwrap_or(opts.usb_letter.as_str());
+                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64) {
                     Ok(t) => {
                         ui.close();
                         gui::GuiWork {
@@ -266,11 +258,7 @@ fn run() {
                             nofmt_letter: Some(t.letter.clone()),
                         }
                     }
-                    Err(e) => {
-                        ui.close();
-                        out::err(&e);
-                        std::process::exit(1);
-                    }
+                    Err(e) => fatal_gui(&e, ui),
                 }
             }
             "skip" => {
@@ -292,11 +280,7 @@ fn run() {
                 out::info("In Rufus: pick the target USB stick, then click START (this is the one destructive confirmation).");
                 let rufus_exe = match rufus::get_rufus(&opts.rufus_path) {
                     Ok(p) => p,
-                    Err(e) => {
-                        ui.close();
-                        out::err(&e);
-                        std::process::exit(1);
-                    }
+                    Err(e) => fatal_gui(&e, ui),
                 };
                 let proc = rufus::launch(&rufus_exe, &iso).ok().flatten();
                 let known: Vec<String> = sys::list_volumes()
@@ -800,15 +784,6 @@ fn show_compat_notes() {
     out::info("                so the nmcli-based wifi tooling in onboot.sh / wifi.sh breaks).");
 }
 
-/// Quote one argument for a command line (simple: quote if it has spaces).
-fn quote_arg(a: &str) -> String {
-    if a.is_empty() || a.contains(' ') {
-        format!("\"{}\"", a)
-    } else {
-        a.to_string()
-    }
-}
-
 fn assert_admin(opts: &cli::Opts) {
     if opts.no_elevation {
         return;
@@ -915,6 +890,95 @@ fn select_existing_usb(label: &str) -> Option<sys::Volume> {
     None
 }
 
+/// Pick the desktop installer ISO out of an Ubuntu-flavor cdimage directory
+/// listing (Apache autoindex HTML). Returns (file_url, file_name), preferring
+/// the 64-bit desktop live image (`*-desktop-amd64.iso`, what the USB write
+/// paths expect) and falling back to the last `.iso` link. Manifest /
+/// metalink / torrent / zsync sidecar links are never ISOs and are skipped.
+pub(crate) fn pick_flavor_iso(listing: &str, base_url: &str) -> Option<(String, String)> {
+    let mut cands: Vec<String> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = listing[from..].find("href=\"") {
+        let s = from + rel + 6;
+        let rest = &listing[s..];
+        let end = rest.find('"')?;
+        let href = &rest[..end];
+        if href.ends_with(".iso") {
+            let lower = href.to_lowercase();
+            if !lower.contains("manifest")
+                && !lower.contains("metalink")
+                && !lower.contains("torrent")
+                && !lower.contains("zsync")
+            {
+                if let Some(base) = href.rsplit('/').next() {
+                    if !base.is_empty() && !cands.contains(&base.to_string()) {
+                        cands.push(base.to_string());
+                    }
+                }
+            }
+        }
+        from = s + end + 1;
+    }
+    cands.sort();
+    let pick = cands
+        .iter()
+        .filter(|n| n.contains("desktop") && n.contains("amd64"))
+        .last()
+        .or(cands.last())?;
+    let base = base_url.trim_end_matches('/');
+    Some((format!("{}/{}", base, pick), (*pick).clone()))
+}
+
+/// Resolve a page-1 "Download Fresh" URL to a directly-downloadable ISO.
+/// Direct `.iso` URLs pass through; Ubuntu-flavor cdimage *directory* URLs
+/// (Lubuntu/Xubuntu `.../release/`) are scraped for the current desktop ISO
+/// so Install keeps working instead of aborting to the browser flow.
+/// Returns None for real download *pages* (antiX/Zorin HTML pages), which
+/// still need the browser + manual pick.
+pub(crate) fn resolve_page_iso(url: &str) -> Option<(String, String)> {
+    if url.ends_with(".iso") {
+        let name = url
+            .rsplit('/')
+            .next()
+            .filter(|s| s.ends_with(".iso"))
+            .unwrap_or("downloaded.iso")
+            .to_string();
+        return Some((url.to_string(), name));
+    }
+    if url.contains("cdimage.ubuntu.com") {
+        match net::get(url, net::user_agent()) {
+            Ok(r) if r.status == 200 => {
+                return pick_flavor_iso(&String::from_utf8_lossy(&r.body), url);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Fatal error inside the Install working phase: the wizard window is still
+/// open, but the elevated child may own a different console (or none) than
+/// the one the user is watching - via ShellExecute "runas" the child gets
+/// its own console window, which vanishes on exit. Print to the console AND
+/// show a dialog with the reason, so a failure never looks like a silent
+/// abort with no explanation.
+fn fatal_gui(msg: &str, ui: &gui::WorkingUi) -> ! {
+    ui.close();
+    out::err(msg);
+    use winapi::um::winuser::{MB_ICONERROR, MB_OK, MessageBoxA};
+    let mut m: Vec<u8> = msg.bytes().collect();
+    m.push(0);
+    unsafe {
+        MessageBoxA(
+            0 as _,
+            m.as_ptr() as *const _,
+            b"lsl-install\0".as_ptr() as *const _,
+            MB_OK | MB_ICONERROR,
+        );
+    }
+    std::process::exit(1);
+}
+
 /// Resolve-Iso: provided path -> existing ISO picker -> download (Mint or the
 /// GUI-chosen distro URL).
 fn resolve_iso(
@@ -951,14 +1015,24 @@ fn resolve_iso(
     }
 
     let (url, iso_name) = match &gui_download {
-        Some((u, n)) if u.ends_with(".iso") => (u.clone(), n.clone()),
-        Some((u, n)) => {
-            // Page/directory URL (Lubuntu/Xubuntu/antiX/Zorin): open it in the
-            // browser so the user picks the latest ISO there.
-            out::info(&format!("Opening {} in your browser - pick the ISO there, then re-run and use the local-ISO section.", u));
-            sys::open_url(u);
-            return Err(format!("Pick the ISO from {} manually (saved as {}), then re-run.", u, n));
-        }
+        Some((u, _)) => match resolve_page_iso(u) {
+            Some((real_url, real_name)) => {
+                if !u.ends_with(".iso") {
+                    out::info(&format!(
+                        "Resolved {} to the current desktop ISO: {}",
+                        u, real_name
+                    ));
+                }
+                (real_url, real_name)
+            }
+            None => {
+                // Real download *page* (antiX/Zorin HTML): open it in the
+                // browser so the user picks the latest ISO there.
+                out::info(&format!("Opening {} in your browser - pick the ISO there, then re-run and use the local-ISO section.", u));
+                sys::open_url(u);
+                return Err(format!("Pick the ISO from {} manually, then re-run and choose it under 'Use Already Downloaded ISO'.", u));
+            }
+        },
         None => (
             format!(
                 "https://mirrors.kernel.org/linuxmint/stable/{}/linuxmint-{}-cinnamon-64bit.iso",
@@ -1248,5 +1322,62 @@ mod tests {
         assert_eq!(mint_version_from_name("debian-live-13.6.0.iso"), None);
         assert_eq!(mint_version_from_name("redox_desktop_i686.iso"), None);
         assert_eq!(mint_version_from_name("linuxmint-"), Some("".to_string()));
+    }
+
+    #[test]
+    fn pick_flavor_iso_prefers_latest_desktop_amd64() {
+        let listing = "<html><head><title>Index of /lubuntu/releases/24.04/release/</title></head><body>\
+<a href=\"?C=N;O=D\">Name</a>\
+<a href=\"/lubuntu/releases/24.04/\">Parent Directory</a>\
+<a href=\"lubuntu-24.04-desktop-amd64.iso\">lubuntu-24.04-desktop-amd64.iso</a>\
+<a href=\"lubuntu-24.04-desktop-amd64.iso.zsync\">zsync</a>\
+<a href=\"lubuntu-24.04-desktop-amd64.manifest\">manifest</a>\
+<a href=\"lubuntu-24.04.3-desktop-amd64.iso\">lubuntu-24.04.3-desktop-amd64.iso</a>\
+<a href=\"lubuntu-24.04.3-desktop-amd64.iso.torrent\">torrent</a>\
+<a href=\"SHA256SUMS\">SHA256SUMS</a>\
+</body></html>";
+        assert_eq!(
+            pick_flavor_iso(
+                listing,
+                "https://cdimage.ubuntu.com/lubuntu/releases/24.04/release/"
+            ),
+            Some((
+                "https://cdimage.ubuntu.com/lubuntu/releases/24.04/release/lubuntu-24.04.3-desktop-amd64.iso"
+                    .to_string(),
+                "lubuntu-24.04.3-desktop-amd64.iso".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn pick_flavor_iso_falls_back_to_any_iso() {
+        let listing = "<a href=\"custom-1.0-i386.iso\">x</a><a href=\"custom-1.1-i386.iso\">y</a>";
+        assert_eq!(
+            pick_flavor_iso(listing, "https://example.com/dir"),
+            Some((
+                "https://example.com/dir/custom-1.1-i386.iso".to_string(),
+                "custom-1.1-i386.iso".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn pick_flavor_iso_none_without_iso_links() {
+        let listing =
+            "<html><body><a href=\"SHA256SUMS\">sums</a><a href=\"/\">parent</a></body></html>";
+        assert_eq!(pick_flavor_iso(listing, "https://example.com/dir/"), None);
+    }
+
+    #[test]
+    fn resolve_page_iso_passes_direct_urls_through() {
+        assert_eq!(
+            resolve_page_iso("https://example.com/d/linuxmint-22.3-cinnamon-64bit.iso"),
+            Some((
+                "https://example.com/d/linuxmint-22.3-cinnamon-64bit.iso".to_string(),
+                "linuxmint-22.3-cinnamon-64bit.iso".to_string()
+            ))
+        );
+        // real download *pages* (no cdimage listing) still need the browser flow
+        assert_eq!(resolve_page_iso("https://antixlinux.com/download/"), None);
     }
 }

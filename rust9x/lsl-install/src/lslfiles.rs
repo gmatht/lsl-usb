@@ -44,15 +44,6 @@ pub fn env_file_set(path: &str, key: &str, value: &str) {
     let _ = std::fs::write(path, text);
 }
 
-pub fn env_file_get(path: &str, key: &str) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let prefix = format!("{}=", key);
-    content
-        .lines()
-        .find(|l| l.starts_with(&prefix))
-        .map(|l| l[prefix.len()..].to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Install-LslFiles
 // ---------------------------------------------------------------------------
