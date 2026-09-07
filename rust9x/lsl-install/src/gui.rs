@@ -41,6 +41,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::mpsc;
 
+#[derive(Clone)]
 pub struct GuiResult {
     pub iso_path: String,
     pub flatpak_ids: Vec<String>,
@@ -265,17 +266,20 @@ fn spawn_hw_rating(tx: mpsc::Sender<HwMsg>, bundle_dir: String) {
 /// 0) for an out-of-range index on real Windows, hanging the loop forever
 /// (works under wine only because wine returns 0). Insert columns directly.
 fn lv_insert_column_direct(lv: &nwg::ListView, index: usize, text: &str, width: i32) {
-    use winapi::um::commctrl::{LVM_INSERTCOLUMNW, LVCOLUMNW, LVCF_TEXT, LVCF_WIDTH};
-    use winapi::um::winuser::SendMessageW;
+    // (Patch-Win95) ANSI column insert: Win95 comctl32 has no W-message
+    // support and SendMessageW itself is a stub.
+    use winapi::um::commctrl::{LVM_INSERTCOLUMNA, LVCOLUMNA, LVCF_TEXT, LVCF_WIDTH};
+    use winapi::um::winuser::SendMessageA;
     let Some(hwnd) = lv.handle.hwnd() else { return };
-    let mut wtext = sys::wide(text);
-    let mut col: LVCOLUMNW = unsafe { std::mem::zeroed() };
+    let mut atext: Vec<u8> = text.bytes().collect();
+    atext.push(0);
+    let mut col: LVCOLUMNA = unsafe { std::mem::zeroed() };
     col.mask = LVCF_TEXT | LVCF_WIDTH;
     col.cx = width;
-    col.pszText = wtext.as_mut_ptr();
-    col.cchTextMax = wtext.len() as i32;
+    col.pszText = atext.as_mut_ptr() as *mut i8;
+    col.cchTextMax = atext.len() as i32;
     unsafe {
-        SendMessageW(hwnd, LVM_INSERTCOLUMNW, index as usize, &col as *const LVCOLUMNW as isize);
+        SendMessageA(hwnd, LVM_INSERTCOLUMNA, index as usize, &col as *const LVCOLUMNA as isize);
     }
 }
 
@@ -944,6 +948,152 @@ fn start_bg_download(
     });
 }
 
+// ---------------------------------------------------------------------------
+// Working phase: after the wizard's Install click the window STAYS VISIBLE
+// (big status text + the live download progress bar) while main() resolves
+// the ISO and launches Rufus. It used to vanish first and the console appeared
+// to stall until Rufus finally popped up. WorkingUi is a raw-handle facade
+// for that phase: it never touches nwg control objects (their Drop would
+// destroy the windows - see the ScrollBar note), it only sends messages to
+// already-owned HWNDs.
+// ---------------------------------------------------------------------------
+
+/// What the working phase (the Install-click callback in main()) did.
+pub struct GuiWork {
+    /// Resolved ISO path.
+    pub iso: String,
+    /// "rufus" | "nofmt" | "skip" - the wizard's USB-write choice.
+    pub mode: String,
+    /// Rufus child process when mode == "rufus" (main waits for the USB).
+    pub rufus_proc: Option<crate::sys::Child>,
+    /// Volumes visible before the Rufus write (wait_usb_ready baseline).
+    pub known: Vec<String>,
+    /// mode == "nofmt": target drive letter after the in-process write.
+    pub nofmt_letter: Option<String>,
+}
+
+/// Raw-HWND facade over the wizard window while the working phase runs.
+pub struct WorkingUi {
+    main: usize,
+    status: usize,
+    bg: Rc<std::cell::RefCell<Vec<BgDl>>>,
+}
+
+impl WorkingUi {
+    pub fn set_status(&self, text: &str) {
+        set_wnd_text(self.status, text);
+        repaint(self.status);
+    }
+
+    /// Dispatch all pending messages so the window keeps painting while
+    /// blocking work runs on this (the GUI) thread.
+    pub fn pump(&self) {
+        pump_pending(self.main);
+    }
+
+    pub fn close(&self) {
+        if is_window(self.main) {
+            use winapi::um::winuser::DestroyWindow;
+            unsafe { DestroyWindow(self.main as winapi::shared::windef::HWND) };
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        is_window(self.main)
+    }
+
+    /// Join any background ISO download started from the page-1 distro
+    /// radios, pumping the GUI (the progress bar keeps updating) while
+    /// waiting. Previously this join ran with plain sleeps AFTER the window
+    /// closed - the GUI vanished while the download was still going.
+    pub fn wait_downloads(&self) {
+        while let Some(b) = {
+            let mut bg = self.bg.borrow_mut();
+            bg.iter()
+                .position(|b| !b.finished.load(std::sync::atomic::Ordering::Relaxed))
+                .map(|i| bg.remove(i))
+        } {
+            let name = b.dest.rsplit('\\').next().unwrap_or("").to_string();
+            self.set_status(&format!(
+                "Downloading {} - the progress bar below stays live; the installer continues once it finishes.",
+                name
+            ));
+            loop {
+                match b.rx.try_recv() {
+                    Ok(Ok(())) => {
+                        sys::out::info(&format!("Downloaded: {}", b.dest));
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        sys::out::warn(&format!("Background download failed: {}", e));
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        sys::out::warn("Background download thread ended unexpectedly.");
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        pump_pending(self.main);
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn set_wnd_text(h: usize, text: &str) {
+    use winapi::um::winuser::SetWindowTextW;
+    if !is_window(h) {
+        return;
+    }
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        SetWindowTextW(h as winapi::shared::windef::HWND, wide.as_ptr());
+    }
+}
+
+fn repaint(h: usize) {
+    use winapi::um::winuser::{InvalidateRect, UpdateWindow};
+    if !is_window(h) {
+        return;
+    }
+    unsafe {
+        InvalidateRect(h as winapi::shared::windef::HWND, std::ptr::null(), 1);
+        UpdateWindow(h as winapi::shared::windef::HWND);
+    }
+}
+
+fn is_window(h: usize) -> bool {
+    use winapi::um::winuser::IsWindow;
+    h != 0 && unsafe { IsWindow(h as winapi::shared::windef::HWND) != 0 }
+}
+
+/// Dispatch pending messages, keeping WM_QUIT in the queue (re-post it):
+/// the outer nwg dispatch loop must still see it after the working phase
+/// closes the window, or run_gui would hang.
+fn pump_pending(main: usize) {
+    use winapi::um::processthreadsapi::GetCurrentThreadId;
+    use winapi::um::winuser::{
+        DispatchMessageW, PeekMessageW, PostThreadMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+    if !is_window(main) {
+        return;
+    }
+    const WM_QUIT: u32 = 0x0012;
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    unsafe {
+        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            if msg.message == WM_QUIT {
+                PostThreadMessageW(GetCurrentThreadId(), WM_QUIT, msg.wParam, msg.lParam);
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
 pub fn run_gui(
     wsl_vhdx_pre: &[String],
     flatpak_extra: &[String],
@@ -951,7 +1101,8 @@ pub fn run_gui(
     mint_version: &str,
     download_dir: &str,
     write_mode_pre: &str,
-) -> Option<GuiResult> {
+    on_confirm: &mut dyn FnMut(GuiResult, &WorkingUi) -> GuiWork,
+) -> Option<(GuiResult, GuiWork)> {
     // Must init common controls before building ANY control; otherwise the
     // builds fail silently (we `let _ =` them) and the first setter panics
     // with "not yet bound to a winapi object".
@@ -1634,6 +1785,19 @@ pub fn run_gui(
     lbl_dl.set_visible(false);
     pb_dl.set_visible(false);
 
+    // working-phase status: big centered text shown after the Install click
+    // while the ISO is resolved and Rufus is fetched/launched - the window
+    // stays visible instead of vanishing before Rufus appears
+    let mut lbl_working: nwg::Label = Default::default();
+    let _ = nwg::Label::builder()
+        .text("Preparing the USB install...")
+        .position((60, 320))
+        .size((760, 100))
+        .parent(&window)
+        .build(&mut lbl_working);
+    lbl_working.set_font(Some(&font_bold));
+    lbl_working.set_visible(false);
+
     // ---- first relayout pass (everything now exists) ----
     relayout(
         &LayoutCtx {
@@ -1757,6 +1921,15 @@ pub fn run_gui(
     let c2 = cancelled.clone();
     let f2 = confirmed.clone();
     let p2 = page.clone();
+    let working = Rc::new(Cell::new(false));
+    let ui_cell: Rc<std::cell::RefCell<Option<WorkingUi>>> =
+        Rc::new(std::cell::RefCell::new(None));
+    let g_cell: Rc<std::cell::RefCell<Option<GuiResult>>> =
+        Rc::new(std::cell::RefCell::new(None));
+    let working2 = working.clone();
+    let ui_cell2 = ui_cell.clone();
+    let g_cell2 = g_cell.clone();
+    let iso_arg2 = iso_arg.to_string();
     let browse_data_sys = sys_items.clone();
     let _handlers = nwg::full_bind_event_handler(&window.handle, {
         // clones for the move closure; the outer harvest still uses the Rc originals
@@ -1892,7 +2065,50 @@ pub fn run_gui(
                             btn_next.set_text("Next >");
                         }
                     } else {
+                        // ---- Install clicked: enter the working phase ----
+                        // The window STAYS VISIBLE (status text + progress)
+                        // while main() resolves the ISO and launches Rufus;
+                        // it only closes once Rufus is up (or the chosen
+                        // write path needs no Rufus).
+                        glog("click install");
                         f2.set(true);
+                        working.set(true);
+                        let g = harvest_gui_result(
+                            &iso_arg2,
+                            &distro_urls,
+                            &iso_items,
+                            &fp_items,
+                            &sys_items,
+                            &wifi_items,
+                            &wifi_checks,
+                        );
+                        g_cell.replace(Some(g));
+                        frame_hw.set_visible(false);
+                        frame_iso.set_visible(false);
+                        frame_fp.set_visible(false);
+                        frame_sys.set_visible(false);
+                        frame_wifi.set_visible(false);
+                        sb_iso.set_visible(false);
+                        sb_fp.set_visible(false);
+                        sb_sys.set_visible(false);
+                        sb_wifi.set_visible(false);
+                        btn_back.set_enabled(false);
+                        btn_next.set_enabled(false);
+                        btn_cancel.set_enabled(false);
+                        btn_everything.set_enabled(false);
+                        lbl_dl.set_visible(false);
+                        pb_dl.set_visible(false);
+                        lbl_working.set_visible(true);
+                        let ui = WorkingUi {
+                            main: window.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            status: lbl_working.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            bg: bg_downloads.clone(),
+                        };
+                        ui_cell.replace(Some(ui));
+                        // The callback (main's on_confirm) runs right after
+                        // the dispatch loop ends - the window stays visible
+                        // the whole time and the callback pumps it through
+                        // WorkingUi::pump.
                         nwg::stop_thread_dispatch();
                     }
                 } else if handle == btn_back.handle {
@@ -2013,8 +2229,10 @@ pub fn run_gui(
                 }
                 // Persistent ISO download progress: parented to the window,
                 // so it stays visible on EVERY page while a background
-                // download (distro radio click) is running.
-                {
+                // download (distro radio click) is running. Once the working
+                // phase starts the bar is hidden (wait_downloads drives the
+                // same info through the big status label).
+                if !working2.get() {
                     let bgs = bg_downloads.borrow();
                     let active = bgs
                         .iter()
@@ -2101,11 +2319,33 @@ pub fn run_gui(
     glog("dispatch end");
     timer.stop();
 
-    if cancelled.get() || !confirmed.get() {
+    // The harvest ran in the Install-click handler (working phase); the
+    // window is still alive here (the event handler keeps the control
+    // handles), so main's callback can resolve the ISO + launch Rufus while
+    // the user sees the status text and the live progress bar.
+    let Some(g) = g_cell2.borrow_mut().take() else {
+        return None; // cancelled or closed without Install
+    };
+    let Some(ui) = ui_cell2.borrow_mut().take() else {
         return None;
-    }
+    };
+    let work = on_confirm(g.clone(), &ui);
+    Some((g, work))
+}
 
-    // ---- harvest ----
+/// The wizard's harvest: turn the checked radios/checks/edits into a
+/// GuiResult. Runs inside the Install-click handler while the window is still
+/// alive (the working phase), NOT after the loop.
+#[allow(clippy::too_many_arguments)]
+fn harvest_gui_result(
+    iso_arg: &str,
+    distro_urls: &[String],
+    iso_items: &PageItems,
+    fp_items: &PageItems,
+    sys_items: &PageItems,
+    wifi_items: &PageItems,
+    wifi_checks: &Rc<std::cell::RefCell<Vec<Box<nwg::CheckBox>>>>,
+) -> GuiResult {
     // Checkbox precedence: existing USB > existing ISO > fresh download.
     let mut reuse_usb: Option<String> = None;
     let mut chosen_iso: Option<String> = None;
@@ -2179,45 +2419,10 @@ pub fn run_gui(
         None => None,
     };
 
-    // If the confirmed choice is a fresh download that already started in the
-    // background (distro radio click), wait for it here instead of having
-    // the console step download it again from scratch.
-    if let Some((url, _)) = download_iso.as_ref() {
-        let hit = bg_downloads
-            .borrow()
-            .iter()
-            .position(|b| b.url == *url);
-        if let Some(i) = hit {
-            let b = bg_downloads.borrow_mut().remove(i);
-            sys::out::step("Waiting for the background ISO download to finish...");
-            let mut last = 0u64;
-            loop {
-                match b.rx.try_recv() {
-                    Ok(Ok(())) => {
-                        sys::out::info(&format!("Downloaded: {}", b.dest));
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        sys::out::warn(&format!("Background download failed: {}", e));
-                        break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        sys::out::warn("Background download thread ended unexpectedly.");
-                        break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        let n = b.prog.load(std::sync::atomic::Ordering::Relaxed);
-                        let mb = n / sys::MB / 200 * 200;
-                        if mb >= last + 200 {
-                            last = mb;
-                            sys::out::info(&format!("  {} MB...", mb));
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(400));
-                    }
-                }
-            }
-        }
-    }
+    // NOTE: joining a still-running background ISO download happens in
+    // WorkingUi::wait_downloads (called by main's working-phase callback),
+    // which pumps the GUI so the progress bar stays live - this harvest
+    // runs inside the click handler and must not block with sleeps.
 
     // flatpaks: grid apps (kind 0), FSearch (kind 1), extra IDs (Edit kind 1)
     let mut flatpak_ids: Vec<String> = Vec::new();
@@ -2303,7 +2508,7 @@ pub fn run_gui(
         chosen_iso.unwrap_or_default()
     };
 
-    Some(GuiResult {
+    GuiResult {
         iso_path,
         flatpak_ids: [flatpak_ids, extra].concat(),
         wsl_vhdx,
@@ -2346,5 +2551,5 @@ pub fn run_gui(
             }
             Some(mode)
         },
-    })
+    }
 }

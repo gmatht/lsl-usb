@@ -30,8 +30,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 export LIBGUESTFS_BACKEND=direct
-DISK=${WIN95_DISK:-/tmp/win95-flat.qcow2}
-SOURCE=${WIN95_SOURCE:-/tmp/Win95.vmdk}
+DISK=${WIN95_DISK:-/root/vm/win95-flat.qcow2}
+SOURCE=${WIN95_SOURCE:-/root/vm/Win95.vmdk}
 QMP_PORT=${QMP_PORT:-4445}
 VNC_DISPLAY=:5
 BUILD_ARGS=()
@@ -174,7 +174,12 @@ EOF
 # ------------------------------------------------------------- build phase
 do_build() {
   echo "== building (i586-rust9x-windows-msvc)"
-  cargo +rust9x build --offline --target i586-rust9x-windows-msvc "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}" 2>&1 | grep -E "^error" -A6 | head -40 || true
+  out=$(cargo +rust9x build --offline --target i586-rust9x-windows-msvc "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}" 2>&1)
+  if echo "$out" | grep -qE '^error'; then
+    echo "$out" | grep -E "^error" -A6 | head -40
+    echo "== build FAILED"
+    exit 1
+  fi
   SRC=target/i586-rust9x-windows-msvc/debug/lsl-install.exe
   for a in "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"; do
     [ "$a" = "--release" ] && SRC=target/i586-rust9x-windows-msvc/release/lsl-install.exe

@@ -5,6 +5,11 @@
 //! feature that needs a newer Windows is behind a runtime capability check
 //! with a graceful fallback (see README.md for the capability matrix).
 
+// (Patch-Win95) no C main() -> the Win95 entry below (extern "C" fn main).
+// Test builds keep the normal Rust entry so libtest's harness main is
+// generated and `cargo test` actually runs the #[test]s.
+#![cfg_attr(not(test), no_main)]
+
 #![no_main]
 
 mod boot;
@@ -30,11 +35,37 @@ const ISO_KERNEL: (u32, u32) = (6, 8);
 /// Overrides the rustc `lang_start` shim (Win95: `std::rt` init hangs
 /// inside KERNEL32; the VC6 CRT startup calls `main` directly instead).
 /// (Patch-Win95 applied by win95.sh.)
+// (Patch-Win95 applied by win95.sh.) Only in real builds: in test builds the
+// libtest harness generates the entry point, and a second `main` would be a
+// duplicate-symbol error.
+#[cfg(not(test))]
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
+    // (Patch-Win95) std console writes die on Win95 (WriteConsoleW is a W
+    // stub), so surface panics in a MessageBox instead of dead stderr.
+    std::panic::set_hook(Box::new(|info| {
+        use winapi::um::winuser::{MB_ICONERROR, MB_OK, MessageBoxA};
+        let mut msg: Vec<u8> = format!(
+            "panic: {}\r\nat: {}",
+            info,
+            info.location().map(|l| l.to_string()).unwrap_or_default()
+        )
+        .bytes()
+        .collect();
+        msg.push(0);
+        unsafe {
+            MessageBoxA(
+                0 as _,
+                msg.as_ptr() as *const _,
+                b"lsl-install panic\0".as_ptr() as *const _,
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }));
     run();
     0
 }
+
 
 fn run() {
     // When launched via WSL interop the current directory can be a
@@ -183,8 +214,110 @@ fn run() {
     let mut skip_write = false;
 
     // GUI first: collects configuration while nothing destructive happens.
+    // After the Install click the wizard STAYS OPEN in a working phase
+    // (status text + progress bar) while this callback resolves the ISO and
+    // launches Rufus; the window only closes once Rufus is up (it used to
+    // vanish right at the click, leaving the console looking hung until
+    // Rufus finally appeared). Nothing destructive happens inside the
+    // wizard itself - Rufus's START button remains the one confirmation.
+    let mut work: Option<gui::GuiWork> = None;
+    let mut on_confirm = |g: gui::GuiResult, ui: &gui::WorkingUi| -> gui::GuiWork {
+        // a fresh download picked on page 1 may still be running: join it
+        // with the window open (progress bar keeps updating)
+        ui.wait_downloads();
+        let iso = match resolve_iso(
+            &g.iso_path,
+            &opts.mint_version,
+            &opts.download_dir,
+            &opts.bundle_dir,
+            !opts.skip_iso_download,
+            g.download_iso.clone(),
+            Some(ui),
+        ) {
+            Ok(i) => i,
+            Err(e) => {
+                ui.close();
+                out::err(&e);
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = validate_live_iso(&iso) {
+            ui.close();
+            out::err(&e);
+            std::process::exit(1);
+        }
+        // the wizard's write-method radio is explicit by construction
+        let mode = g.write_mode.clone().unwrap_or_else(|| "rufus".into());
+        match mode.as_str() {
+            "nofmt" => {
+                ui.set_status(
+                    "Preparing the USB stick (non-destructive write, no reformat) - see the console for progress...",
+                );
+                ui.pump();
+                out::step("USB write method: built-in non-destructive (wizard choice).");
+                match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64) {
+                    Ok(t) => {
+                        ui.close();
+                        gui::GuiWork {
+                            iso,
+                            mode,
+                            rufus_proc: None,
+                            known: Vec::new(),
+                            nofmt_letter: Some(t.letter.clone()),
+                        }
+                    }
+                    Err(e) => {
+                        ui.close();
+                        out::err(&e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "skip" => {
+                out::step("Skipping the USB write (wizard choice).");
+                out::info("Write the image yourself (e.g. with Rufus), then this step picks up the USB.");
+                ui.close();
+                gui::GuiWork {
+                    iso,
+                    mode,
+                    rufus_proc: None,
+                    known: Vec::new(),
+                    nofmt_letter: None,
+                }
+            }
+            _ => {
+                ui.set_status("Launching Rufus with the ISO pre-selected...");
+                ui.pump();
+                out::step("Launching Rufus with the ISO pre-selected.");
+                out::info("In Rufus: pick the target USB stick, then click START (this is the one destructive confirmation).");
+                let rufus_exe = match rufus::get_rufus(&opts.rufus_path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        ui.close();
+                        out::err(&e);
+                        std::process::exit(1);
+                    }
+                };
+                let proc = rufus::launch(&rufus_exe, &iso).ok().flatten();
+                let known: Vec<String> = sys::list_volumes()
+                    .iter()
+                    .filter(|v| !v.letter.is_empty())
+                    .map(|v| v.letter.clone())
+                    .collect();
+                // Rufus is up (or spawning): the GUI has done its job
+                ui.close();
+                gui::GuiWork {
+                    iso,
+                    mode: "rufus".into(),
+                    rufus_proc: proc,
+                    known,
+                    nofmt_letter: None,
+                }
+            }
+        }
+    };
     if !opts.no_gui {
-        let Some(g) = gui::run_gui(
+        let Some((g, w)) = gui::run_gui(
             &wsl_vhdx,
             &flatpak_apps,
             &iso_path,
@@ -198,10 +331,12 @@ fn run() {
             } else {
                 "rufus"
             },
+            &mut on_confirm,
         ) else {
             out::warn("Cancelled.");
             std::process::exit(2); // 2 = user cancel (bat skips pause)
         };
+        work = Some(w);
         iso_path = g.iso_path;
         flatpak_apps = [g.flatpak_ids, flatpak_apps].concat();
         wsl_vhdx = g.wsl_vhdx;
@@ -257,6 +392,43 @@ fn run() {
     }
 
     if vol.is_none() {
+        if let Some(w) = work.take() {
+            // The working phase already resolved the ISO and started the
+            // write step while the wizard was still visible; only the
+            // wait for the (Rufus-)written USB remains.
+            iso_path = w.iso.clone();
+            match w.mode.as_str() {
+                "rufus" => {
+                    vol = Some(rufus::wait_usb_ready(
+                        &opts.volume_label,
+                        w.rufus_proc,
+                        &w.known,
+                        0,
+                    ));
+                    iso_used = w.iso;
+                }
+                "nofmt" => {
+                    if let Some(letter) = &w.nofmt_letter {
+                        vol = sys::list_volumes()
+                            .into_iter()
+                            .find(|v| v.letter.eq_ignore_ascii_case(letter));
+                        if vol.is_none() {
+                            out::err(&format!(
+                                "Target volume {} disappeared after the write.",
+                                letter
+                            ));
+                            std::process::exit(1);
+                        }
+                    }
+                    iso_used = String::new();
+                }
+                _ => {
+                    let known: Vec<String> = Vec::new();
+                    vol = Some(rufus::wait_usb_ready(&opts.volume_label, None, &known, 0));
+                    iso_used = w.iso;
+                }
+            }
+        } else {
         let iso = match resolve_iso(
             &iso_path,
             &opts.mint_version,
@@ -264,6 +436,7 @@ fn run() {
             &opts.bundle_dir,
             !opts.skip_iso_download,
             download_iso.clone(),
+            None,
         ) {
             Ok(i) => i,
             Err(e) => {
@@ -273,6 +446,13 @@ fn run() {
         };
         iso_path = iso.clone();
         if let Err(e) = validate_live_iso(&iso) {
+            out::err(&e);
+            std::process::exit(1);
+        }
+        // Provenance check for ANY linuxmint-* ISO (downloads were verified in
+        // resolve_iso; this also covers user-supplied/picked-from-disk ISOs)
+        // before either write path touches a stick.
+        if let Err(e) = verify_mint_iso_sha256(&iso) {
             out::err(&e);
             std::process::exit(1);
         }
@@ -348,6 +528,7 @@ fn run() {
             vol = Some(rufus::wait_usb_ready(&opts.volume_label, proc, &known, 0));
             iso_used = iso;
             }
+        }
         }
     }
 
@@ -540,6 +721,69 @@ fn run() {
     }
 }
 
+/// Verify a linuxmint-* ISO against the official sha256sum.txt (the only
+/// distro with a checksum contract here). Applies to user-supplied ISOs too:
+/// the write step (Rufus OR the non-destructive grub4dos path) should never
+/// run on an ISO whose contents nobody has verified.
+/// No-op (Ok) for every other distro name. Missing transport / missing
+/// entry in the checksum file => warning + proceed, consistent with
+/// resolve_iso's "proceeding UNVERIFIED" stance for downloads.
+fn verify_mint_iso_sha256(iso: &str) -> Result<(), String> {
+    // NOTE: no std::path here - the rust9x std's Path::file_name proved
+    // unreliable for drive-letter paths on this target (the unit test caught
+    // it: a full C:\...\linuxmint-*.iso yielded None => verification would
+    // silently be skipped). mint_version_from_name splits on separators
+    // itself.
+    let name = iso.to_string();
+    let Some(version) = mint_version_from_name(&name) else {
+        return Ok(());
+    };
+    let sum_url = format!(
+        "https://mirrors.kernel.org/linuxmint/stable/{}/sha256sum.txt",
+        version
+    );
+    out::step(&format!("Verifying SHA-256 of {} ...", name));
+    let expected = match net::get(&sum_url, net::user_agent()) {
+        Ok(r) if r.status == 200 => {
+            find_checksum(&String::from_utf8_lossy(&r.body), &name)
+        }
+        _ => None,
+    };
+    let Some(exp) = expected else {
+        out::warn(&format!(
+            "Could not fetch the official checksum ({}) - proceeding UNVERIFIED.",
+            sum_url
+        ));
+        return Ok(());
+    };
+    out::info("Computing SHA-256 (this takes a while)...");
+    match lslfiles::sha256_file(iso) {
+        Some(actual) if actual.eq_ignore_ascii_case(&exp) => {
+            out::info("SHA256 verified.");
+            Ok(())
+        }
+        Some(actual) => Err(format!(
+            "SHA256 mismatch for {}:\n  expected: {}\n  actual:   {}\nDo NOT write this ISO to a USB - it is corrupt or tampered with.",
+            name, exp, actual
+        )),
+        None => Err(format!("Cannot read {} for hashing.", iso)),
+    }
+}
+
+/// The Mint version in a `linuxmint-<ver>-*.iso` name, or None when the
+/// file is not a Mint ISO (=> no checksum contract => skip verification).
+fn mint_version_from_name(name: &str) -> Option<String> {
+    // Accept full paths too: the GUI hands us "C:\Downloads\linuxmint-22.3-..."
+    // (and the wizard's local-ISO radios are full paths), so compare on the
+    // basename - otherwise a perfectly good Mint ISO would silently skip its
+    // checksum contract.
+    let base = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    if !base.starts_with("linuxmint-") {
+        return None;
+    }
+    base.split('-').nth(1).map(|v| v.to_string())
+}
+
 fn append_file(path: &str, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     std::fs::OpenOptions::new()
@@ -680,6 +924,7 @@ fn resolve_iso(
     _bundle_dir: &str,
     auto_download: bool,
     gui_download: Option<(String, String)>,
+    ui: Option<&crate::gui::WorkingUi>,
 ) -> Result<String, String> {
     if !path.is_empty() {
         if !sys::path_exists(path) {
@@ -767,11 +1012,22 @@ fn resolve_iso(
             ));
         }
         let mut last = 0u64;
+        let mut last_ui = 0u64;
         match net::download_to_file(&url, &dest, net::user_agent(), &mut |n| {
             let mb = n / sys::MB;
             if mb >= last + 200 {
                 last = mb;
                 out::info(&format!("  {} MB...", mb));
+            }
+            // the wizard window is still open: keep its status + progress
+            // live (the message pump repaints; without this the window the
+            // user is watching would sit frozen mid-download)
+            if let Some(ui) = ui {
+                if mb >= last_ui + 50 {
+                    last_ui = mb;
+                    ui.set_status(&format!("Downloading {} - {} MB of ~3 GB...", iso_name, mb));
+                    ui.pump();
+                }
             }
         }) {
             Ok(n) if n > 0 => {}
@@ -970,5 +1226,27 @@ fn win95_args() -> Vec<String> {
             out.push(cur);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mint_version_parse() {
+        assert_eq!(
+            mint_version_from_name("linuxmint-22.3-cinnamon-64bit.iso"),
+            Some("22.3".to_string())
+        );
+        assert_eq!(
+            mint_version_from_name("C:\\Downloads\\linuxmint-21.3-mate-64bit.iso"),
+            Some("21.3".to_string())
+        );
+        // non-Mint ISOs have no checksum contract
+        assert_eq!(mint_version_from_name("ubuntu-24.04.iso"), None);
+        assert_eq!(mint_version_from_name("debian-live-13.6.0.iso"), None);
+        assert_eq!(mint_version_from_name("redox_desktop_i686.iso"), None);
+        assert_eq!(mint_version_from_name("linuxmint-"), Some("".to_string()));
     }
 }

@@ -675,15 +675,57 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str) -> Result<(),
     sys::create_dir_all(&format!("{}_ISO", root));
     let iso_dst = format!("{}_ISO\\{}", root, safe_name);
     let iso_rel = format!("/_ISO/{}", safe_name);
+    // The whole point of this mode is a *bootable* stick: a corrupted ISO
+    // copy (bad USB write, or a stale same-size file already on the stick)
+    // would loopback-boot garbage. So the stick copy is SHA-256-verified
+    // against the source in every case.
+    let mut src_hash: Option<String> = None;
     match sys::file_size(&iso_dst) {
         Some(sz) if sz == iso_len => {
-            out::info(&format!("ISO already on stick: {} (same size, skipping copy)", iso_dst));
+            out::info(&format!(
+                "ISO already on stick: {} (same size; verifying before reuse)",
+                iso_dst
+            ));
+            let dst = crate::lslfiles::sha256_file(&iso_dst)
+                .ok_or_else(|| format!("cannot hash {} for verification", iso_dst))?;
+            src_hash = Some(
+                crate::lslfiles::sha256_file(iso)
+                    .ok_or_else(|| format!("cannot hash {} for verification", iso))?,
+            );
+            if dst == src_hash.clone().unwrap() {
+                out::info("  existing copy verified (SHA-256 matches the source)." );
+            } else {
+                out::warn("  existing copy is CORRUPT (SHA-256 mismatch) - re-copying from the source.");
+                sys::delete_file(&iso_dst);
+                src_hash = None; // fall through to the copy path below
+            }
         }
-        _ => {
-            out::step(&format!("Copying the ISO onto {}: (files only, no formatting)...", t.letter));
-            copy_file_progress(iso, &iso_dst)?;
-        }
+        _ => {}
     }
+    if src_hash.is_none() {
+        out::step(&format!(
+            "Copying the ISO onto {}: (files only, no formatting)...",
+            t.letter
+        ));
+        src_hash = Some(copy_file_progress(iso, &iso_dst)?);
+    }
+    // Read the written file back and compare hashes: catches silent USB
+    // write corruption before the user ever tries to boot it.
+    let src = src_hash.unwrap();
+    out::step("Verifying the ISO copy on the stick (SHA-256)...");
+    let dst = crate::lslfiles::sha256_file(&iso_dst)
+        .ok_or_else(|| format!("cannot hash {} for verification", iso_dst))?;
+    if dst != src {
+        sys::delete_file(&iso_dst);
+        return Err(format!(
+            "the ISO copy on {}: is CORRUPT (SHA-256 mismatch, stick copy {} != source {}).\n  \
+             The bad copy was deleted - check the stick (try a different port/cable), then re-run.",
+            t.letter,
+            &dst[..16.min(dst.len())],
+            &src[..16.min(src.len())]
+        ));
+    }
+    out::info("  verified: the stick copy matches the source byte for byte.");
 
     // menu.lst: create or append (idempotent per title).
     let title = format!("{} (loopback ISO)", iso_name.trim_end_matches(".iso"));
@@ -751,14 +793,17 @@ fn uefi_cfg(title: &str, iso_rel: &str) -> String {
     )
 }
 
-/// Buffered chunk copy with MB progress on the console.
-fn copy_file_progress(src: &str, dst: &str) -> Result<(), String> {
+/// Buffered chunk copy with MB progress on the console. Returns the
+/// SHA-256 of the bytes written (computed while copying - the source does
+/// not need to be read a second time for verification).
+fn copy_file_progress(src: &str, dst: &str) -> Result<String, String> {
     let mut r = std::fs::File::open(src).map_err(|e| format!("open {}: {}", src, e))?;
     let total = r.metadata().map(|m| m.len()).unwrap_or(0);
     let mut w = std::io::BufWriter::with_capacity(
         4 << 20,
         std::fs::File::create(dst).map_err(|e| format!("create {}: {}", dst, e))?,
     );
+    let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     let mut done: u64 = 0;
     let t0 = std::time::Instant::now();
@@ -768,6 +813,7 @@ fn copy_file_progress(src: &str, dst: &str) -> Result<(), String> {
         if n == 0 {
             break;
         }
+        h.update(&buf[..n]);
         w.write_all(&buf[..n]).map_err(|e| format!("write {}: {}", dst, e))?;
         done += n as u64;
         if last.elapsed().as_secs() >= 2 {
@@ -786,7 +832,7 @@ fn copy_file_progress(src: &str, dst: &str) -> Result<(), String> {
         done as f64 / sys::GB as f64,
         t0.elapsed().as_secs_f32()
     ));
-    Ok(())
+    Ok(format!("{:x}", h.finalize()))
 }
 
 #[cfg(test)]
