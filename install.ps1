@@ -1164,7 +1164,7 @@ function Install-LslFiles {
     }
 
     # 2) the FAT-side lsl scripts (same set as bin/config.sh --sync-only)
-    foreach ($d in @('bin', 'systemd')) {
+    foreach ($d in @('bin', 'systemd', 'initramfs')) {
         $src = Join-Path $BundleDir $d
         if (Test-Path $src) {
             Copy-Item $src (Join-Path $root $d) -Recurse -Force
@@ -1178,8 +1178,12 @@ function Install-LslFiles {
             $copied += $f
         }
     }
-    # 3) initrd: the modified one (HDD-mirror auto-detect) plus the original as a
-    #    safe fallback. Boot the "(safe)" entry to use the original initrd (no mirror).
+    # 3) initrd: normally NOT shipped in the bundle any more (it doubled the zip
+    #    size and the stock initrd is already on the USB). Old bundles may still
+    #    carry one - copy it if present. On the first Linux boot,
+    #    bin/lsl-initrd-repack.sh repacks the stock initrd in place (HDD-mirror
+    #    hooks injected) and preserves the original as initrd.safe.lz, adding the
+    #    "(safe)" boot entries that Add-SafeBootEntry would have added here.
     foreach ($i in @('initrd.lz', 'initrd.safe.lz')) {
         $srcInitrd = Join-Path $BundleDir "casper/$i"
         if (Test-Path $srcInitrd) {
@@ -1211,6 +1215,95 @@ function Install-LslFiles {
 # download must not abort the install - the user can run bin/lsl-rusttools.sh
 # on the live USB later to fetch them.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Built-in non-destructive install: copy the live image files onto an existing
+# FAT32 USB and install a boot sector. NO format, NO erase - the target keeps
+# whatever was already on it. Best-effort: a failure to install the boot sector
+# is reported but does not abort the file copy.
+# ---------------------------------------------------------------------------
+function Install-NonDestructive {
+    param($Vol, [string]$Iso)
+    $root = "$($Vol.DriveLetter):\"
+    if (-not (Test-Path $root)) { throw "Target volume not accessible: $root" }
+
+    # 1) Copy the live image files (casper layout + boot files) onto the USB.
+    #    Mount the ISO read-only and copy its contents, preserving the layout.
+    Write-Info "Copying live image files from $Iso to $root ..."
+    $img = Mount-DiskImage -ImagePath $Iso -PassThru
+    try {
+        $vol = $img | Get-Volume
+        $srcRoot = "$($vol.DriveLetter):\"
+        if (-not (Test-Path (Join-Path $srcRoot 'casper\filesystem.squashfs'))) {
+            throw 'ISO does not contain casper\filesystem.squashfs - not a casper live image.'
+        }
+        # Copy the whole ISO tree (casper/, boot/, isolinux/, dists/, ...).
+        Copy-Item (Join-Path $srcRoot '*') $root -Recurse -Force
+    } finally {
+        Dismount-DiskImage -ImagePath $Iso -ErrorAction SilentlyContinue | Out-Null
+    }
+
+    # 2) Mark the partition bootable/active (best-effort; diskpart 'active'
+    #    sets the boot flag on the selected partition without formatting).
+    try {
+        $null = & diskpart /s (Write-ActiveScript -DriveLetter $Vol.DriveLetter) 2>$null
+        Write-Info 'Marked the partition active.'
+    } catch {
+        Write-Warn2 "Could not mark the partition active: $($_.Exception.Message)"
+    }
+
+    # 3) Install a boot sector so the USB is bootable. On a FAT32 volume this
+    #    means writing the syslinux MBR boot code (first 440 bytes of the
+    #    physical disk, leaving the partition table intact) and the partition
+    #    boot record. We use the syslinux mbr.bin shipped on the ISO if present.
+    Write-Info 'Installing boot sector (no format)...'
+    $mbr = Join-Path $root 'isolinux\mbr.bin'
+    if (-not (Test-Path $mbr)) { $mbr = Join-Path $root 'boot\mbr.bin' }
+    if (Test-Path $mbr) {
+        try {
+            $written = Write-MbrBootCode -DriveLetter $Vol.DriveLetter -Mbr $mbr
+            if ($written) { Write-Info 'Boot sector written (MBR boot code).' }
+            else { Write-Warn2 'Could not write the MBR boot code (needs admin + raw disk access). The USB may not boot until you use Rufus.' }
+        } catch {
+            Write-Warn2 "Could not write the boot sector: $($_.Exception.Message). The USB may not boot until you use Rufus."
+        }
+    } else {
+        Write-Warn2 'No mbr.bin found on the ISO; skipping boot-sector install. The USB may not boot.'
+    }
+}
+
+function Write-ActiveScript {
+    param([string]$DriveLetter)
+    $f = Join-Path $env:TEMP 'lsl-diskpart-active.txt'
+    @('select volume ' + $DriveLetter, 'active', 'exit') | Set-Content -Encoding ascii -Path $f
+    return $f
+}
+
+function Write-MbrBootCode {
+    # Write the first 440 bytes of the syslinux MBR boot code to the physical
+    # disk, leaving the partition table (bytes 446-511) untouched. Requires
+    # admin and raw disk access. Returns $true on success.
+    param([string]$DriveLetter, [string]$Mbr)
+    try {
+        # Resolve the physical disk number for the volume via diskpart.
+        $dp = Join-Path $env:TEMP 'lsl-diskpart-disk.txt'
+        @('select volume ' + $DriveLetter, 'detail volume', 'exit') | Set-Content -Encoding ascii -Path $dp
+        $out = & diskpart /s $dp 2>&1
+        $diskLine = $out | Select-String -Pattern 'Disk \d+' | Select-Object -First 1
+        if (-not $diskLine) { return $false }
+        $diskNum = [int]($diskLine.Matches[0].Value -replace '\D', '')
+        $dev = "\\.\PhysicalDrive$diskNum"
+        $mbrBytes = [System.IO.File]::ReadAllBytes($Mbr)
+        if ($mbrBytes.Length -lt 440) { return $false }
+        $fs = [System.IO.File]::Open($dev, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+        try {
+            $fs.Write($mbrBytes, 0, 440)
+            $fs.Flush()
+        } finally { $fs.Close() }
+        return $true
+    } catch {
+        return $false
+    }
+}
 function Install-RustTools {
     param($Vol)
     $root = "$($Vol.DriveLetter):\"
@@ -1560,6 +1653,7 @@ function Show-InstallerGui {
         Phase = 'iso'; Percent = 0; Message = 'Starting...'
         Done = $false; Error = ''; IsoPath = ''; EtaSec = -1
         CancelDownload = $false; ChosenIso = $defaultIso; ReuseUsb = ''
+        WriteMethod = 'rufus'; TargetVol = $null
         EverythingRequested = $false
         DownloadUrl = "https://mirrors.kernel.org/linuxmint/stable/$MintVersion/linuxmint-$MintVersion-cinnamon-64bit.iso"
         DownloadName = "linuxmint-$MintVersion-cinnamon-64bit.iso"
@@ -1588,7 +1682,7 @@ function Show-InstallerGui {
     # restarted when the user picks a different ISO on page 1.
     $ui = @{ Page = 0; FlatpakDone = $false; VhdxDone = $false; Checks = @()
         HwStarted = $false; HwDone = $false; HwPending = $null; HwCounts = @{ A = 0; C = 0; D = 0; U = 0 }
-        Ps = $null; Handle = $null; IsoReady = $false }
+        Ps = $null; Handle = $null; IsoReady = $false; WriteMethod = 'rufus'; TargetVol = $null }
 
     # --- runspace: ISO download/verify (starts immediately) ---
     $runspaceScript = @'
@@ -2253,6 +2347,104 @@ try {
         $wifiHost.Controls.Add($lbl)
     }
 
+    # --- page 4: INSTALL NOW (write method + target) ---
+    $page4 = New-Object System.Windows.Forms.Panel
+    $page4.Location = New-Object System.Drawing.Point(12, 88)
+    $page4.Size = New-Object System.Drawing.Size(836, 630)
+    $page4.Visible = $false
+    $form.Controls.Add($page4)
+
+    $lblInstallTitle = New-Object System.Windows.Forms.Label
+    $lblInstallTitle.Text = 'INSTALL NOW'
+    $lblInstallTitle.Location = New-Object System.Drawing.Point(10, 10)
+    $lblInstallTitle.Size = New-Object System.Drawing.Size(560, 24)
+    $lblInstallTitle.Font = New-Object System.Drawing.Font($lblInstallTitle.Font, [System.Drawing.FontStyle]::Bold)
+    $page4.Controls.Add($lblInstallTitle)
+
+    $lblInstallHelp = New-Object System.Windows.Forms.Label
+    $lblInstallHelp.Text = 'Choose how to write the live image to the USB, then click Install.'
+    $lblInstallHelp.Location = New-Object System.Drawing.Point(10, 36)
+    $lblInstallHelp.Size = New-Object System.Drawing.Size(560, 18)
+    $page4.Controls.Add($lblInstallHelp)
+
+    # --- write method radios ---
+    $rbRufus = New-Object System.Windows.Forms.RadioButton
+    $rbRufus.Text = 'Rufus (recommended - formats the USB, writes the ISO)'
+    $rbRufus.Location = New-Object System.Drawing.Point(10, 70)
+    $rbRufus.Size = New-Object System.Drawing.Size(560, 20)
+    $rbRufus.Checked = $true
+    $rbRufus.Add_CheckedChanged({
+        if ($this.Checked) { $ui.WriteMethod = 'rufus' }
+    })
+    $page4.Controls.Add($rbRufus)
+
+    $lblRufusNote = New-Object System.Windows.Forms.Label
+    $lblRufusNote.Text = 'Launches Rufus with the ISO pre-selected. You click START (the one destructive confirmation).'
+    $lblRufusNote.Location = New-Object System.Drawing.Point(24, 90)
+    $lblRufusNote.Size = New-Object System.Drawing.Size(560, 18)
+    $page4.Controls.Add($lblRufusNote)
+
+    $rbCopy = New-Object System.Windows.Forms.RadioButton
+    $rbCopy.Text = 'Built-in non-destructive (copy files + boot sector, NO format)'
+    $rbCopy.Location = New-Object System.Drawing.Point(10, 120)
+    $rbCopy.Size = New-Object System.Drawing.Size(560, 20)
+    $rbCopy.Add_CheckedChanged({
+        if ($this.Checked) { $ui.WriteMethod = 'copy' }
+    })
+    $page4.Controls.Add($rbCopy)
+
+    $lblCopyNote = New-Object System.Windows.Forms.Label
+    $lblCopyNote.Text = 'Copies the live image files onto an existing FAT32 USB and installs a boot sector. Does not format or erase anything.'
+    $lblCopyNote.Location = New-Object System.Drawing.Point(24, 140)
+    $lblCopyNote.Size = New-Object System.Drawing.Size(560, 34)
+    $page4.Controls.Add($lblCopyNote)
+
+    # --- target USB picker (only relevant for the copy method) ---
+    $lblTarget = New-Object System.Windows.Forms.Label
+    $lblTarget.Text = 'Target USB (for the non-destructive copy):'
+    $lblTarget.Location = New-Object System.Drawing.Point(10, 190)
+    $lblTarget.Size = New-Object System.Drawing.Size(560, 18)
+    $page4.Controls.Add($lblTarget)
+
+    $targetHost = New-Object System.Windows.Forms.Panel
+    $targetHost.Location = New-Object System.Drawing.Point(0, 210)
+    $targetHost.Size = New-Object System.Drawing.Size(600, 200)
+    $targetHost.AutoScroll = $true
+    $page4.Controls.Add($targetHost)
+
+    $targetRadios = @()
+    $targetVols = @(Get-Volume -ErrorAction SilentlyContinue |
+        Where-Object { $_.DriveType -eq 'Removable' -and $_.DriveLetter } | Sort-Object DriveLetter)
+    $ty = 5
+    if ($targetVols.Count -eq 0) {
+        $lblNone = New-Object System.Windows.Forms.Label
+        $lblNone.Text = '[No removable USB drives detected]'
+        $lblNone.Location = New-Object System.Drawing.Point(10, $ty)
+        $lblNone.Size = New-Object System.Drawing.Size(560, 20)
+        $targetHost.Controls.Add($lblNone)
+        $ty += 20
+    }
+    foreach ($tv in $targetVols) {
+        $rb = New-Object System.Windows.Forms.RadioButton
+        $rb.Text = "$($tv.DriveLetter):  $($tv.FileSystemLabel)  ($([math]::Round($tv.Size/1GB,1)) GB)"
+        $rb.Location = New-Object System.Drawing.Point(10, $ty)
+        $rb.Size = New-Object System.Drawing.Size(560, 20)
+        $rb.Tag = $tv
+        $rb.Add_CheckedChanged({
+            if ($this.Checked -and $this.Tag) { $ui.TargetVol = $this.Tag }
+        })
+        $targetHost.Controls.Add($rb)
+        $targetRadios += $rb
+        $ty += 24
+    }
+    if ($targetRadios.Count -gt 0) { $targetRadios[0].Checked = $true }
+
+    $lblInstallSummary = New-Object System.Windows.Forms.Label
+    $lblInstallSummary.Location = New-Object System.Drawing.Point(10, 420)
+    $lblInstallSummary.Size = New-Object System.Drawing.Size(560, 40)
+    $lblInstallSummary.Text = ''
+    $page4.Controls.Add($lblInstallSummary)
+
     # --- page 0: hardware compatibility (Linux LKDDb rating) ---
     $pageHw = New-Object System.Windows.Forms.Panel
     $pageHw.Location = New-Object System.Drawing.Point(12, 88)
@@ -2400,17 +2592,19 @@ try {
     $page1.Visible  = ($ui.Page -eq 1)
     $page2.Visible  = ($ui.Page -eq 2)
     $page3.Visible  = ($ui.Page -eq 3)
+    $page4.Visible  = ($ui.Page -eq 4)
     $btnBack.Enabled = ($ui.Page -gt 0)
 
     $btnNext.Add_Click({
-        if ($ui.Page -lt 3) {
+        if ($ui.Page -lt 4) {
             $ui.Page++
             $pageHw.Visible = ($ui.Page -eq 0)
             $page1.Visible = ($ui.Page -eq 1)
             $page2.Visible = ($ui.Page -eq 2)
             $page3.Visible = ($ui.Page -eq 3)
+            $page4.Visible = ($ui.Page -eq 4)
             $btnBack.Enabled = ($ui.Page -gt 0)
-            if ($ui.Page -eq 3) { $btnNext.Text = 'Install' }
+            if ($ui.Page -eq 4) { $btnNext.Text = 'Install' }
         } else {
             if ($state.Done -and -not $state.Error) {
                 $timer.Stop()
@@ -2426,6 +2620,7 @@ try {
             $page1.Visible = ($ui.Page -eq 1)
             $page2.Visible = ($ui.Page -eq 2)
             $page3.Visible = ($ui.Page -eq 3)
+            $page4.Visible = ($ui.Page -eq 4)
             $btnBack.Enabled = ($ui.Page -gt 0)
             $btnNext.Enabled = $true
             $btnNext.Text = 'Next >'
@@ -2505,7 +2700,7 @@ try {
                 $progress.Style = 'Blocks'
                 if ($state.Percent -gt 0) { $progress.Value = $state.Percent }
             }
-            if ($ui.Page -eq 3) {
+            if ($ui.Page -eq 4) {
                 $ready = ($state.Done -and -not $state.Error)
                 $btnNext.Enabled = $ready
                 if ($ready) {
@@ -2632,6 +2827,8 @@ try {
         CopySfsHdd       = $chkSfsHdd.Checked
         ReclaimWinSwap   = $chkReclaim.Checked
         UseExistingUsb = $state.ReuseUsb
+        WriteMethod    = $ui.WriteMethod
+        TargetVol      = $ui.TargetVol
     }
 }
 
@@ -2825,6 +3022,8 @@ $doEfu = $true
 $installEverything = $true
 $preloadDrivers = $true
 $reclaimWinSwap = $false
+$WriteMethod = 'rufus'
+$TargetVol = $null
 if (-not $NoGui) {
     $gui = Show-InstallerGui -IsoPath $IsoPath -MintVersion $MintVersion -DownloadDir $DownloadDir `
         -WslVhdx $WslVhdx -FlatpakApps $FlatpakApps
@@ -2840,6 +3039,8 @@ if (-not $NoGui) {
     $preloadDrivers = $gui.Drivers
     $copySfsHdd = $gui.CopySfsHdd
     $reclaimWinSwap = $gui.ReclaimWinSwap
+    $WriteMethod = $gui.WriteMethod
+    $TargetVol   = $gui.TargetVol
     if ($gui.UseExistingUsb) {
         $vol = $gui.UseExistingUsb
         WriteStep "Using existing Mint live USB: $($vol.DriveLetter): ($($vol.FileSystemLabel)) - no Rufus write."
@@ -2866,6 +3067,13 @@ if (-not $vol) {
         WriteStep 'Skipping Rufus (-SkipRufus).'
         Write-Info 'Write the image yourself (e.g. with Rufus), then this step picks up the USB.'
         $vol = Wait-UsbReady -Label $VolumeLabel
+    } elseif ($WriteMethod -eq 'copy') {
+        # Built-in non-destructive copy: copy the live image files onto an
+        # existing FAT32 USB and install a boot sector. No format, no erase.
+        if (-not $TargetVol) { throw 'No target USB selected for the non-destructive copy.' }
+        $vol = $TargetVol
+        WriteStep "Non-destructive copy to $($vol.DriveLetter): ($($vol.FileSystemLabel)) - no format."
+        Install-NonDestructive -Vol $vol -Iso $iso
     } else {
         $rufus = Get-Rufus -Path $RufusPath
         WriteStep 'Launching Rufus with the ISO pre-selected.'

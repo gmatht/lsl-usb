@@ -569,6 +569,34 @@ Remove-Item function:global:Get-LhwPage -ErrorAction SilentlyContinue
 Remove-Item $fakeBundle -Recurse -Force -ErrorAction SilentlyContinue
 $script:BundleDir = $null
 
+# --- 12c. Install-NonDestructive (built-in copy, no format) ---
+Write-Host '== Install-NonDestructive =='
+$script:mockCopied = @()
+$script:mockDiskpart = @()
+function global:New-Item { param([string]$ItemType, [switch]$Force, [string]$Path) }
+function global:Copy-Item { param([string]$Path, [string]$Destination, [switch]$Recurse, [switch]$Force) $script:mockCopied += $Path }
+function global:Mount-DiskImage { param([string]$ImagePath, [switch]$PassThru) return [pscustomobject]@{ DriveLetter = 'H' } }
+function global:Get-Volume { param([object]$ImagePath) return [pscustomobject]@{ DriveLetter = 'H' } }
+function global:Dismount-DiskImage { param([string]$ImagePath, [string]$ErrorAction) }
+function global:Write-ActiveScript { param([string]$DriveLetter) return 'active-script.txt' }
+function global:Write-MbrBootCode { param([string]$DriveLetter, [string]$Mbr) return $true }
+$script:mockDiskpartOut = @('  Disk 2', '  Type  : USB')
+function global:diskpart { param([string]$s) $script:mockDiskpart += $s; return $script:mockDiskpartOut }
+function global:Test-Path { param([string]$Path, [string]$PathType) return $true }
+$volND = [pscustomobject]@{ DriveLetter = 'G' }
+$isoND = 'C:\fake\mint.iso'
+Install-NonDestructive -Vol $volND -Iso $isoND
+Assert-True ($script:mockCopied.Count -gt 0) 'Install-NonDestructive copies ISO files to the target'
+Assert-True ($script:mockDiskpart.Count -ge 1) 'Install-NonDestructive runs diskpart (active + boot sector)'
+Remove-Item function:global:New-Item -ErrorAction SilentlyContinue
+Remove-Item function:global:Copy-Item -ErrorAction SilentlyContinue
+Remove-Item function:global:Mount-DiskImage -ErrorAction SilentlyContinue
+Remove-Item function:global:Get-Volume -ErrorAction SilentlyContinue
+Remove-Item function:global:Dismount-DiskImage -ErrorAction SilentlyContinue
+Remove-Item function:global:Write-ActiveScript -ErrorAction SilentlyContinue
+Remove-Item function:global:Write-MbrBootCode -ErrorAction SilentlyContinue
+Remove-Item function:global:diskpart -ErrorAction SilentlyContinue
+Remove-Item function:global:Test-Path -ErrorAction SilentlyContinue
 Write-Host ''
 Write-Host "RESULT: $($script:pass) passed, $($script:fail) failed"
 if ($script:fail -gt 0) { exit 1 }
