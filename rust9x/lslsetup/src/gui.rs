@@ -29,6 +29,19 @@ use native_windows_gui as nwg;
 
 use crate::sys;
 
+/// Multiline TextBox flags WITHOUT `ES_AUTOVSCROLL`. On Windows 10/11 a
+/// multiline edit with `ES_AUTOVSCROLL` can auto-size its height to the
+/// number of lines of text, squashing a fixed-height box to a few pixels
+/// (the "squashed edit box" bug). These boxes are fixed-height, so keep the
+/// scrollbars but drop the auto-scroll style that triggers the collapse.
+fn multiline_edit_flags() -> nwg::TextBoxFlags {
+    nwg::TextBoxFlags::VISIBLE
+        | nwg::TextBoxFlags::VSCROLL
+        | nwg::TextBoxFlags::HSCROLL
+        | nwg::TextBoxFlags::AUTOHSCROLL
+        | nwg::TextBoxFlags::TAB_STOP
+}
+
 fn glog(msg: &str) {
     // Opt-in tracing: set LSL_GUI_DEBUG=1 (tests/win-gui-test.ps1 does).
     if std::env::var("LSL_GUI_DEBUG").as_deref() != Ok("1") {
@@ -1742,11 +1755,15 @@ pub fn run_gui(
         });
         let mut e: Box<nwg::TextBox> = Box::default();
         let _ = nwg::TextBox::builder()
+            .flags(multiline_edit_flags())
             .position((10, 290))
             .size((560, 76))   // 4 lines deep
             .text(&flatpak_extra.join(", "))
             .parent(&frame_fp)
             .build(&mut e);
+        // (Win10/11) re-assert the height: a multiline edit can otherwise
+        // auto-size to its content and squash to a few pixels.
+        e.set_size(560, 76);
         fp_items.borrow_mut().push(PageItem {
             ctl: PageCtl::Edit(e, 1),
             x: 10,
@@ -1812,6 +1829,7 @@ pub fn run_gui(
         push_lbl(&mut sys, "WSL VHDX paths (one per line):", 10, 6, -20, 18, false);
         let mut vhdx: Box<nwg::TextBox> = Box::default();
         let _ = nwg::TextBox::builder()
+            .flags(multiline_edit_flags())
             .position((10, 26))
             .size((410, 160))
             .text(&{
@@ -1824,6 +1842,8 @@ pub fn run_gui(
             })
             .parent(&frame_sys)
             .build(&mut vhdx);
+        // (Win10/11) re-assert the height (see multiline_edit_flags).
+        vhdx.set_size(410, 160);
         sys.push(PageItem { ctl: PageCtl::Edit(vhdx, 1), x: 10, y: 26, w: -20, h: 160, idx: 0 });
         push_lbl(&mut sys, "LSL_DATA_DIR (Linux path, e.g. /mnt/c/Users/you/lsl-usb):", 10, 192, -20, 18, false);
         let default_data = format!(

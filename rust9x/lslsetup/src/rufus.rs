@@ -42,20 +42,28 @@ fn json_strings(json: &str, key: &str) -> Vec<String> {
     out
 }
 
-/// Locate Rufus: caller-supplied path, then cache. Download from GitHub
-/// releases (latest rufus-<ver>.exe asset) when missing.
-pub fn get_rufus(path: &str) -> Result<String, String> {
-    if !path.is_empty() {
-        if path_exists(path) {
-            return Ok(path.to_string());
-        }
-        return Err(format!("Rufus not found: {}", path));
+/// Rufus version to download for this OS. Rufus 4.x requires Windows 8 or
+/// later, so Windows 7 (and anything older) gets the last Win7-compatible
+/// release (3.22); Windows 8+ get the latest. Returns None for "latest".
+fn rufus_version_for_os() -> Option<String> {
+    rufus_version_for_os_ver(sys::os_ver())
+}
+
+/// Pure version-selection logic (testable without a live OS).
+fn rufus_version_for_os_ver(ver: sys::OsVer) -> Option<String> {
+    match ver {
+        sys::OsVer::Win9x
+        | sys::OsVer::Nt4
+        | sys::OsVer::Win2000
+        | sys::OsVer::Xp
+        | sys::OsVer::Vista
+        | sys::OsVer::Win7 => Some("3.22".to_string()),
+        _ => None,
     }
-    let exe = cached_path();
-    if path_exists(&exe) {
-        out::info(&format!("Using cached Rufus: {}", exe));
-        return Ok(exe);
-    }
+}
+
+/// Resolve the latest rufus-<ver>.exe asset from the GitHub releases API.
+fn latest_rufus_asset() -> Result<(String, String), String> {
     out::info("Looking up the latest Rufus release on GitHub...");
     let json = match net::get("https://api.github.com/repos/pbatard/rufus/releases/latest", net::user_agent()) {
         Ok(r) if r.status == 200 => String::from_utf8_lossy(&r.body).into_owned(),
@@ -74,19 +82,62 @@ pub fn get_rufus(path: &str) -> Result<String, String> {
     let names = json_strings(&json, "name");
     let urls = json_strings(&json, "browser_download_url");
     let tag = json_strings(&json, "tag_name").first().cloned().unwrap_or_default();
-    let mut asset: Option<(String, String)> = None;
     for (name, url) in names.iter().zip(urls.iter()) {
         let is_rufus = name.starts_with("rufus-")
             && name.ends_with(".exe")
             && name[6..name.len() - 4].chars().all(|c| c.is_ascii_digit() || c == '.');
         if is_rufus {
-            asset = Some((name.clone(), url.clone()));
-            break;
+            return Ok((name.clone(), url.clone()));
         }
     }
-    let Some((name, url)) = asset else {
-        return Err(format!("No rufus.exe asset found in release {}", tag));
+    Err(format!("No rufus.exe asset found in release {}", tag))
+}
+
+/// Locate Rufus: caller-supplied path, then cache. When missing, OFFER to
+/// download it (never silently) — picking a version that runs on this OS
+/// (Windows 7 and older get the last Win7-compatible release, 3.22; Windows
+/// 8+ get the latest).
+pub fn get_rufus(path: &str) -> Result<String, String> {
+    if !path.is_empty() {
+        if path_exists(path) {
+            return Ok(path.to_string());
+        }
+        return Err(format!("Rufus not found: {}", path));
+    }
+    let exe = cached_path();
+    if path_exists(&exe) {
+        out::info(&format!("Using cached Rufus: {}", exe));
+        return Ok(exe);
+    }
+    // Pick the right version for this OS before offering the download.
+    let pinned = rufus_version_for_os();
+    let (name, url) = match &pinned {
+        Some(v) => (
+            format!("rufus-{}.exe", v),
+            format!(
+                "https://github.com/pbatard/rufus/releases/download/v{}/rufus-{}.exe",
+                v, v
+            ),
+        ),
+        None => latest_rufus_asset()?,
     };
+    let ver_desc = match &pinned {
+        Some(v) => format!(
+            "Rufus {} (the last version that runs on this Windows)",
+            v
+        ),
+        None => "the latest Rufus".to_string(),
+    };
+    // Offer, don't silently fetch: the user may prefer to supply their own
+    // rufus.exe via --rufus-path.
+    out::step(&format!("Rufus is not installed. {} will be downloaded.", ver_desc));
+    let ans = out::prompt("Download it now? Type OK to continue, or press Enter to abort: ");
+    if ans != "OK" {
+        return Err(
+            "Aborted. Download rufus.exe manually from https://rufus.ie and pass it via --rufus-path."
+                .into(),
+        );
+    }
     let tmp = format!("{}\\{}", sys::temp_dir(), name);
     out::info(&format!(
         "Downloading {} ({:.1} MB)...",
@@ -341,5 +392,28 @@ mod tests {
             format!("{:x}", h.finalize()),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn win7_and_older_get_win7_compatible_rufus() {
+        // Windows 7 (and older) cannot run Rufus 4.x (needs Win8+), so they
+        // must be offered the last Win7-compatible release (3.22).
+        for v in [
+            sys::OsVer::Win9x,
+            sys::OsVer::Nt4,
+            sys::OsVer::Win2000,
+            sys::OsVer::Xp,
+            sys::OsVer::Vista,
+            sys::OsVer::Win7,
+        ] {
+            assert_eq!(rufus_version_for_os_ver(v).as_deref(), Some("3.22"), "{:?}", v);
+        }
+    }
+
+    #[test]
+    fn win8_and_newer_get_latest_rufus() {
+        for v in [sys::OsVer::Win8, sys::OsVer::Win10Plus] {
+            assert_eq!(rufus_version_for_os_ver(v), None, "{:?}", v);
+        }
     }
 }

@@ -1,17 +1,23 @@
 Status as of finishing this list (Sep 2026):
 
-[x] Rename to lslsetup.txt
-    Done - TODO.txt was renamed to this file.
+[x] Rename the whole subproject to lslsetup / lslsetup.exe
+    Done - the subproject (directory, package, exe) is now lslsetup /
+    lslsetup.exe (was lsl-install). The embedded manifest was recompiled,
+    and run.sh / win95.sh / the PowerShell tests / README were updated.
+    (This item was about the subproject, not the TODO file.)
 
-[ ] Figure out why text areas are sometimes only a few pixels tall.
-    NOT CONFIRMED FIXED. Root cause is a Win95 multiline-EDIT quirk that
-    could not be reproduced from Linux (needs the Win95 VM).
-    Guard added: tests/win-install-page-test.ps1 now keys on the two
-    multiline textboxes (flatpak-extra IDs on page 2, WSL VHDX on page 3)
-    and asserts each renders >= 60px tall (built at 76px / 160px). If the
-    collapse still happens on a real VM run, page2/page3
-    -multiline-textareas-not-collapsed will go red. Run it in the VM to
-    confirm and then fix the underlying EDIT sizing there.
+[~] Figure out why text areas are sometimes only a few pixels tall.
+    Reported on Windows 10/11 (not Win95). Fix applied but NOT yet
+    confirmed on a real Win10/11 box: the two multiline textboxes
+    (flatpak-extra IDs on page 2, WSL VHDX on page 3) were built with nwg's
+    default flags including ES_AUTOVSCROLL, which on modern Windows can
+    auto-size a fixed-height multiline edit to its content and squash it to
+    a few pixels. They now use multiline_edit_flags() (no ES_AUTOVSCROLL)
+    and re-assert their height after build.
+    Guard: tests/win-install-page-test.ps1 asserts each renders >= 60px
+    (built at 76px / 160px) on pages 2 and 3. Run it on the Win10/11 box to
+    confirm; if page2/page3-multiline-textareas-not-collapsed still goes
+    red, the collapse is something else and needs a live repro there.
 
 [x] Figure out why Window sometime just disapears without lauching Rufus.
     Fixed - a rufus::launch failure used to be swallowed (.ok().flatten());
@@ -45,6 +51,14 @@ Status as of finishing this list (Sep 2026):
     files are dropped in place, so Mint (or Zorin) is never downloaded onto
     an already-rufus'ed stick.
 
+[x] Offer to download Rufus (older version for Win7 etc.)
+    Done - when Rufus is not installed, the installer now OFFERS to download
+    it (console prompt) instead of silently fetching, and picks a version
+    that runs on this OS: Windows 7 (and older) get the last Win7-compatible
+    release (3.22); Windows 8+ get the latest. Unit tests added
+    (rufus::tests::win7_and_older_get_win7_compatible_rufus,
+    win8_and_newer_get_latest_rufus).
+
 All builds green: cargo +rust9x build {debug,release} --target
-i586-rust9x-windows-msvc; 25 unit tests pass under wine (6 new for the
-hardware cache fix; 19 pre-existing).
+i586-rust9x-windows-msvc; 27 unit tests pass under wine (6 hardware cache,
+2 rufus version, 19 pre-existing).
