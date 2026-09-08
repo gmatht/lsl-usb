@@ -1,0 +1,7 @@
+Rename to lslsetup.txt
+Figure out why text areas are sometimes only a few pixels tall.
+Figure out why Window sometime just disapears without lauching Rufus.
+If we choose to use the builtin downloader, why don't we get a screen asking which USB to use ETC.?
+Slow on deployed machine to fetch hardware, make sure cache is compiled into exe
+When we choose install why does it download Mint even though we had (1) selected to use Zorin on (2) an already rufus'ed USB?
+
