@@ -24,12 +24,23 @@ public class W {
     [DllImport("user32.dll")] public static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] public static extern int GetWindowLongW(IntPtr h, int n);
     [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out R r);
+    public struct R { public int L; public int T; public int Rt; public int B; }
 }
 '@
 $GW_CHILD = 5
 $GW_NEXT = 2
 $BM_CLICK = 0x00F5
 $GWL_STYLE = -16
+# ES_MULTILINE: a multiline edit (nwg::TextBox). The LSL_DATA_DIR box is a
+# single-line TextInput (ES_MULTILINE unset) and must NOT be counted.
+$ES_MULTILINE = 0x0004
+# Rendered-height floor: the flatpak-extra box (page 2) is built 76px tall
+# (4 lines) and the WSL VHDX box (page 3) 160px tall. Anything the user
+# would describe as "only a few pixels tall" is far below this and must go
+# red. This is the regression guard for TODO item "text areas are sometimes
+# only a few pixels tall".
+$TEXTAREA_MIN_H = 60
 
 $script:fails = @()
 function Check([bool]$cond, [string]$name, [string]$detail = '') {
@@ -84,6 +95,33 @@ function VisibleRadios([IntPtr]$main) {
     }
     return $out
 }
+# Visible multiline EDIT controls that are shorter than $minH px, returned as
+# "text=<...> height=N" strings. A collapse to a few pixels puts every
+# multiline textbox into this list (TODO item "text areas a few pixels").
+function ShortMultilineEdits([IntPtr]$main, [int]$minH) {
+    $bad = @()
+    foreach ($h in Kids $main) {
+        if ((Cls $h) -ne 'Edit') { continue }
+        if (-not (Vis $h)) { continue }
+        if (((Style $h) -band $ES_MULTILINE) -eq 0) { continue }  # single-line
+        $r = New-Object 'W+R'
+        [W]::GetWindowRect($h, [ref]$r) | Out-Null
+        $hgt = $r.B - $r.T
+        if ($hgt -lt $minH) { $bad += "'$((Txt $h))' height=$hgt" }
+    }
+    return $bad
+}
+# At least one visible multiline edit box (the flatpak-extra / VHDX textbox)
+# must be present and rendered with a real height.
+function CheckTextareaHeights([IntPtr]$main, [int]$page) {
+    $bad = @(ShortMultilineEdits $main $TEXTAREA_MIN_H)
+    Check ($bad.Count -eq 0) "page$page-multiline-textareas-not-collapsed" ($bad -join '; ')
+    $any = 0
+    foreach ($h in Kids $main) {
+        if ((Cls $h) -eq 'Edit' -and (Vis $h) -and (((Style $h) -band $ES_MULTILINE) -ne 0)) { $any++ }
+    }
+    Check ($any -gt 0) "page$page-has-multiline-textarea" "none visible"
+}
 function Alive([Diagnostics.Process]$p, [IntPtr]$main) {
     $p.Refresh()
     return ((-not $p.HasExited) -and ([W]::IsWindow($main)))
@@ -130,6 +168,9 @@ try {
         [W]::SendMessageW($nb, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
         $next = $page + 1
         Check (WaitFor $markers[$next] 10) "page${next}-shows"
+        # pages 2 (flatpak extra IDs) and 3 (WSL VHDX) each carry a multiline
+        # textbox; assert they are rendered full-height, not a few pixels.
+        if ($next -eq 2 -or $next -eq 3) { CheckTextareaHeights $main $next }
         Check (Alive $proc $main) "after-click${next}-alive"
     }
 

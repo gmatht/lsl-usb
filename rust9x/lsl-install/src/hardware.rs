@@ -551,36 +551,57 @@ pub fn linux_compat_rating(d: &Device, bundle_dir: &str, iso_kernel: (u32, u32))
         d.vendor.to_lowercase(),
         d.device.to_lowercase()
     );
-    let html = lhw_fetch_page(&id, bundle_dir);
-    let (mut name, mut ksup, mut src, mut third) = parse_lhw_html(&html);
-    let mut have_data = !html.is_empty();
-    if !have_data {
-        // compiled-in snapshot: rates common hardware with no network request
-        if let Some((e_name, e_ksup, e_src, e_third)) = embedded_lookup(&id) {
-            if !e_name.is_empty() {
-                name = e_name.to_string();
-            }
-            ksup = e_ksup.to_string();
-            src = e_src.to_string();
-            third = e_third;
-            have_data = true;
-        }
-    }
-    // Curated table override (known-problem chips).
+    // Curated-table override first: known-problem chips are 'C' before any
+    // cache/network rating is even consulted (matches install.ps1). This
+    // also means a known chip never triggers a slow, rate-limited fetch.
     if let Some(t) = driver_table().iter().find(|t| t.id == d.id) {
         return Rating {
             rating: 'C',
-            name,
+            name: d.name.clone(),
             reason: format!("needs out-of-tree driver ({}) - staged to <USB>:\\drivers\\", t.pkg),
         };
     }
-    if !have_data {
+    // Compiled-in snapshot FIRST (../..lsl-hw-cache → build.rs →
+    // EMBEDDED_HW_CACHE): common hardware rates instantly with no network
+    // request at all. Before this, the embedded summary was only consulted
+    // as a *fallback* after a live linux-hardware.org fetch — and that live
+    // fetch carries a 10-second robots crawl-delay per device, which is why
+    // a fresh (deployed) machine crept through the rating. Devices in the
+    // snapshot never touch the network now.
+    if let Some((e_name, e_ksup, e_src, e_third)) = embedded_lookup(&id) {
+        let name = if e_name.is_empty() {
+            d.name.clone()
+        } else {
+            e_name.to_string()
+        };
+        return rating_from_lkddb(name, e_ksup.to_string(), e_src.to_string(), e_third, iso_kernel);
+    }
+    // Not in the snapshot: on-disk caches (user + bundle), then ONE polite
+    // live fetch (10s crawl-delay). Unlisted devices alone pay that cost.
+    let html = lhw_fetch_page(&id, bundle_dir);
+    if html.is_empty() {
         return Rating {
             rating: 'U',
-            name,
+            name: d.name.clone(),
             reason: "no data (linux-hardware.org unreachable/rate-limited/TLS too old)".into(),
         };
     }
+    let (name, ksup, src, third) = parse_lhw_html(&html);
+    let name = if name.is_empty() { d.name.clone() } else { name };
+    rating_from_lkddb(name, ksup, src, third, iso_kernel)
+}
+
+/// Turn an LKDDb summary (device name, "X and newer" kernel-support string,
+/// driver source, out-of-tree repos) into an A/C/D/U Rating against the ISO
+/// kernel. Shared by the compiled-in snapshot and the live/fetch path so
+/// both rate identically.
+fn rating_from_lkddb(
+    name: String,
+    ksup: String,
+    src: String,
+    third: Vec<String>,
+    iso_kernel: (u32, u32),
+) -> Rating {
     if ksup.is_empty() {
         let extra = if !third.is_empty() {
             format!(" - out-of-tree options: {}", third.join(", "))
@@ -696,4 +717,86 @@ pub fn flatpak_suggestions() -> Vec<(String, String, bool)> {
 fn unused_out() {
     out::plain("");
     path_exists("");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(kind: &'static str, vendor: &str, device: &str) -> Device {
+        Device {
+            name: format!("{}-{}", kind, device),
+            pnp_id: format!("{}VEN_{}&DEV_{}", kind, vendor, device),
+            kind,
+            class: "Net".into(),
+            vendor: vendor.to_string(),
+            device: device.to_string(),
+            id: format!("{}:{}", vendor, device),
+        }
+    }
+
+    // Common hardware in the compiled-in snapshot must rate INSTANTLY (the
+    // embedded cache is hit first, so no linux-hardware.org fetch / 10s
+    // crawl-delay is ever incurred). This is the "make sure cache is
+    // compiled into exe" fix for the slow deployed-machine fetch.
+    #[test]
+    fn embedded_cache_rates_known_hardware_without_network() {
+        // pci:8086-3ea0 = Intel WhiskeyLake-U GT2 [UHD Graphics 620],
+        // "4.16 and newer", present in EMBEDDED_HW_CACHE.
+        let d = dev("pci", "8086", "3ea0");
+        let r = linux_compat_rating(&d, "", (6, 8));
+        assert_eq!(r.rating, 'A', "{}: {}", r.rating, r.reason);
+        assert!(
+            r.name.contains("UHD Graphics"),
+            "should use the embedded device name, got: {}",
+            r.name
+        );
+        assert!(
+            !r.reason.contains("unreachable"),
+            "embedded path must not report a missing network",
+        );
+    }
+
+    // Devices in the curated driver table are always 'C', regardless of
+    // cache/network data.
+    #[test]
+    fn driver_table_override_wins() {
+        // 0BDA:8179 = Realtek RTL8188EU (in driver_table).
+        let d = dev("usb", "0BDA", "8179");
+        let r = linux_compat_rating(&d, "", (6, 8));
+        assert_eq!(r.rating, 'C', "{}: {}", r.rating, r.reason);
+        assert!(r.reason.contains("rtl8188eu"), "{}", r.reason);
+    }
+
+    #[test]
+    fn rating_parser_handles_in_kernel_since() {
+        // "4.16 and newer" vs ISO kernel 6.8 -> in-kernel -> A.
+        let r = rating_from_lkddb("x".into(), "4.16 and newer".into(), "driver".into(), vec![], (6, 8));
+        assert_eq!(r.rating, 'A', "{}: {}", r.rating, r.reason);
+    }
+
+    #[test]
+    fn rating_parser_reports_bridge_only_as_d() {
+        // A bcma/bridge-only src is not a real driver, even if "old enough".
+        let r = rating_from_lkddb("x".into(), "3.0 and newer".into(), "bcma".into(), vec![], (6, 8));
+        assert_eq!(r.rating, 'D', "{}: {}", r.rating, r.reason);
+    }
+
+    #[test]
+    fn rating_parser_reports_newer_kernel_as_c() {
+        // Needs 6.9+, ISO has 6.8 -> not in-kernel -> C.
+        let r = rating_from_lkddb("x".into(), "6.9 and newer".into(), "driver".into(), vec![], (6, 8));
+        assert_eq!(r.rating, 'C', "{}: {}", r.rating, r.reason);
+        assert!(
+            r.reason.contains("needs kernel") && r.reason.contains("6.9"),
+            "{}",
+            r.reason
+        );
+    }
+
+    #[test]
+    fn rating_parser_reports_missing_entry_as_u() {
+        let r = rating_from_lkddb("x".into(), String::new(), String::new(), vec![], (6, 8));
+        assert_eq!(r.rating, 'U', "{}: {}", r.rating, r.reason);
+    }
 }

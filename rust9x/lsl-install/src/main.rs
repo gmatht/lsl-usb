@@ -217,6 +217,24 @@ fn run() {
     // wizard itself - Rufus's START button remains the one confirmation.
     let mut work: Option<gui::GuiWork> = None;
     let mut on_confirm = |g: gui::GuiResult, ui: &gui::WorkingUi| -> gui::GuiWork {
+        // Reusing an existing live USB (page-1 "Use an existing Live USB"
+        // radio): there is nothing to download or write - the main flow
+        // picks up the drive letter from g.use_existing_usb after the
+        // wizard closes and drops the lsl-usb files in place. Skipping the
+        // ISO resolution here is what stops the installer from downloading
+        // Mint (or any distro) when the user already has a rufus'ed stick.
+        if g.use_existing_usb.is_some() {
+            ui.set_status("Using the existing live USB - no download, no Rufus write...");
+            ui.pump();
+            ui.close();
+            return gui::GuiWork {
+                iso: String::new(),
+                mode: "skip".into(),
+                rufus_proc: None,
+                known: Vec::new(),
+                nofmt_letter: None,
+            };
+        }
         // a fresh download picked on page 1 may still be running: join it
         // with the window open (progress bar keeps updating)
         ui.wait_downloads();
@@ -282,7 +300,14 @@ fn run() {
                     Ok(p) => p,
                     Err(e) => fatal_gui(&e, ui),
                 };
-                let proc = rufus::launch(&rufus_exe, &iso).ok().flatten();
+                // Do NOT swallow a launch failure: the window must not just
+                // vanish with no Rufus and no explanation. A failed launch
+                // (e.g. runas declined, exe missing) surfaces as a dialog
+                // instead of a silent close.
+                let proc = match rufus::launch(&rufus_exe, &iso) {
+                    Ok(p) => p,
+                    Err(e) => fatal_gui(&e, ui),
+                };
                 let known: Vec<String> = sys::list_volumes()
                     .iter()
                     .filter(|v| !v.letter.is_empty())

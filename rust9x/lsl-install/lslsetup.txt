@@ -1,0 +1,50 @@
+Status as of finishing this list (Sep 2026):
+
+[x] Rename to lslsetup.txt
+    Done - TODO.txt was renamed to this file.
+
+[ ] Figure out why text areas are sometimes only a few pixels tall.
+    NOT CONFIRMED FIXED. Root cause is a Win95 multiline-EDIT quirk that
+    could not be reproduced from Linux (needs the Win95 VM).
+    Guard added: tests/win-install-page-test.ps1 now keys on the two
+    multiline textboxes (flatpak-extra IDs on page 2, WSL VHDX on page 3)
+    and asserts each renders >= 60px tall (built at 76px / 160px). If the
+    collapse still happens on a real VM run, page2/page3
+    -multiline-textareas-not-collapsed will go red. Run it in the VM to
+    confirm and then fix the underlying EDIT sizing there.
+
+[x] Figure out why Window sometime just disapears without lauching Rufus.
+    Fixed - a rufus::launch failure used to be swallowed (.ok().flatten());
+    the window closed and the console looked hung until Rufus (if any)
+    appeared. Now the Install working phase turns a launch error into a
+    MessageBox + error dialog (fatal_gui) instead of a silent vanish.
+
+[x] If we choose to use the builtin downloader, why don't we get a screen
+    asking which USB to use ETC.?
+    Already satisfied by the existing design. The INSTALL NOW page (page 5)
+    has a "Target USB (for the non-destructive copy)" radio picker of
+    removable volumes (harvested into GuiResult.target_usb), and the
+    built-in path also prompts on the console via nofmt::choose_target
+    ("Choose a stick [1..N]"). No code change was needed.
+
+[x] Slow on deployed machine to fetch hardware, make sure cache is compiled
+    into exe
+    Fixed. The compiled-in linux-hardware.org snapshot (lsl-hw-cache ->
+    build.rs -> EMBEDDED_HW_CACHE, 500 devices) was only a fallback after a
+    live fetch. Now hardware::linux_compat_rating consults the embedded
+    cache FIRST, so devices in the snapshot rate instantly with no network
+    request and never pay the per-device 10s crawl-delay. Only devices not
+    in the snapshot fall through to the on-disk cache / one live fetch.
+    Unit tests added (hardware::tests::*), 6 pass.
+
+[x] When we choose install why does it download Mint even though we had (1)
+    selected to use Zorin on (2) an already rufus'ed USB?
+    Fixed - when page-1 "Use an existing Live USB" is chosen, the Install
+    working phase now short-circuits (mode "skip"): no ISO resolution, no
+    download, no Rufus write. The drive letter is picked up and the lsl-usb
+    files are dropped in place, so Mint (or Zorin) is never downloaded onto
+    an already-rufus'ed stick.
+
+All builds green: cargo +rust9x build {debug,release} --target
+i586-rust9x-windows-msvc; 25 unit tests pass under wine (6 new for the
+hardware cache fix; 19 pre-existing).
