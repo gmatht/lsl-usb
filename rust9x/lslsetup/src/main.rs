@@ -1,4 +1,4 @@
-//! lsl-install — full reimplementation of lsl-usb's install.ps1 as a native
+//! lslsetup — full reimplementation of lsl-usb's install.ps1 as a native
 //! Windows executable built with the rust9x toolchain.
 //!
 //! The binary runs on Windows 95 -> 11 (rust9x + unicows + VC6 CRT). Every
@@ -52,7 +52,7 @@ pub extern "C" fn main() -> i32 {
             MessageBoxA(
                 0 as _,
                 msg.as_ptr() as *const _,
-                b"lsl-install panic\0".as_ptr() as *const _,
+                b"lslsetup panic\0".as_ptr() as *const _,
                 MB_OK | MB_ICONERROR,
             );
         }
@@ -997,7 +997,7 @@ fn fatal_gui(msg: &str, ui: &gui::WorkingUi) -> ! {
         MessageBoxA(
             0 as _,
             m.as_ptr() as *const _,
-            b"lsl-install\0".as_ptr() as *const _,
+            b"lslsetup\0".as_ptr() as *const _,
             MB_OK | MB_ICONERROR,
         );
     }

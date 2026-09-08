@@ -29,12 +29,12 @@ public class W {
 '@
 [W]::SetProcessDPIAware() | Out-Null
 
-$p = Start-Process -FilePath "$dir\lsl-install.exe" -ArgumentList '--no-elevation' -PassThru
+$p = Start-Process -FilePath "$dir\lslsetup.exe" -ArgumentList '--no-elevation' -PassThru
 Start-Sleep -Seconds 7
 
 $proc = $null
 for ($i = 0; $i -lt 10 -and -not $proc; $i++) {
-    $proc = Get-Process lsl-install -ErrorAction SilentlyContinue |
+    $proc = Get-Process lslsetup -ErrorAction SilentlyContinue |
         Where-Object { $_.MainWindowTitle -like '*lsl-usb installer*' } | Select-Object -First 1
     if (-not $proc) { Start-Sleep -Seconds 1 }
 }
@@ -75,10 +75,11 @@ function ClickAt([int]$cx, [int]$cy) {
 ClickAt 218 177
 Start-Sleep -Milliseconds 400
 Snap 'sort-support-single'
-ClickAt 218 177
-Snap 'sort-support-desc'
+# Back button: Next at (756..852,706..734) center (804,720); Back center (705,720)
+ClickAt 705 720
+Snap 'nav-back-to-p0'
+
 # click "Device" heading (col 2, spans ~250-500 -> center 22+375=397)
-ClickAt 408 177
-Snap 'sort-device-asc'
+
 Stop-Process -Id $p.Id -Force
 Write-Output 'done'

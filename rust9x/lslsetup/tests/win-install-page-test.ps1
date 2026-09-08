@@ -135,11 +135,11 @@ function WaitFor([scriptblock]$cond, [int]$timeoutSec) {
     return $false
 }
 
-$p = Start-Process -FilePath "$dir\lsl-install.exe" -ArgumentList '--no-elevation' -PassThru
+$p = Start-Process -FilePath "$dir\lslsetup.exe" -ArgumentList '--no-elevation' -PassThru
 try {
     $proc = $null
     $ok = WaitFor {
-        $proc = Get-Process lsl-install -ErrorAction SilentlyContinue |
+        $proc = Get-Process lslsetup -ErrorAction SilentlyContinue |
             Where-Object { $_.MainWindowTitle -like '*lsl-usb installer*' } | Select-Object -First 1
         $null -ne $proc
     } 25

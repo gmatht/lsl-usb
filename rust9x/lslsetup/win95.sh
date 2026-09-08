@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and run lsl-install on Windows 95 (QEMU).
+# Build and run lslsetup on Windows 95 (QEMU).
 #
 #   ./win95.sh              patch + build + upload + run (debug build)
 #   ./win95.sh --release    optimized build (lto=fat, slower to compile)
@@ -8,7 +8,7 @@
 #   ./win95.sh run          boot VM, launch, screenshot, clean shutdown
 #   ./win95.sh --no-shutdown  leave the VM running when done
 #
-# Output: dist/lsl-install-win95.exe   (host)  →  C:\LSLSETUP.EXE  (guest)
+# Output: dist/lslsetup-win95.exe   (host)  →  C:\LSLSETUP.EXE  (guest)
 # Screenshots: dist/lsl-boot.png, dist/lsl-window.png
 #
 # The Win95 port applies these source patches (idempotent — re-running is
@@ -180,13 +180,13 @@ do_build() {
     echo "== build FAILED"
     exit 1
   fi
-  SRC=target/i586-rust9x-windows-msvc/debug/lsl-install.exe
+  SRC=target/i586-rust9x-windows-msvc/debug/lslsetup.exe
   for a in "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"; do
-    [ "$a" = "--release" ] && SRC=target/i586-rust9x-windows-msvc/release/lsl-install.exe
+    [ "$a" = "--release" ] && SRC=target/i586-rust9x-windows-msvc/release/lslsetup.exe
   done
   [ -f "$SRC" ] || { echo "ERROR: build output missing: $SRC" >&2; exit 1; }
   mkdir -p dist
-  python3 - "$SRC" dist/lsl-install-win95.exe <<'PYEOF'
+  python3 - "$SRC" dist/lslsetup-win95.exe <<'PYEOF'
 import struct, sys
 # Win95 loader: zero DllCharacteristics (rust9x emits 0x8140). NOTE the
 # layout: optional-header offset 68 = Subsystem (MUST keep), 70 =
@@ -197,8 +197,8 @@ pe = struct.unpack("<I", d[0x3c:0x40])[0]
 struct.pack_into("<H", d, pe + 24 + 70, 0)
 open(sys.argv[2], "wb").write(d)
 PYEOF
-  echo "-- built dist/lsl-install-win95.exe ($(stat -c%s dist/lsl-install-win95.exe) bytes)"
-  md5sum dist/lsl-install-win95.exe
+  echo "-- built dist/lslsetup-win95.exe ($(stat -c%s dist/lslsetup-win95.exe) bytes)"
+  md5sum dist/lslsetup-win95.exe
 }
 
 # ------------------------------------------------------------ upload phase
@@ -216,10 +216,10 @@ do_upload() {
   echo "== uploading to $DISK"
   stop_vm
   [ -f "$DISK" ] || { echo "   scratch disk missing; converting from $SOURCE"; qemu-img convert -O qcow2 "$SOURCE" "$DISK"; }
-  guestfish -a "$DISK" -m /dev/sda1 upload dist/lsl-install-win95.exe /LSLSETUP.EXE
+  guestfish -a "$DISK" -m /dev/sda1 upload dist/lslsetup-win95.exe /LSLSETUP.EXE
   guestfish --ro -a "$DISK" -m /dev/sda1 download /LSLSETUP.EXE /tmp/_lsl_verify.exe
   a=$(md5sum /tmp/_lsl_verify.exe | cut -d' ' -f1)
-  b=$(md5sum dist/lsl-install-win95.exe | cut -d' ' -f1)
+  b=$(md5sum dist/lslsetup-win95.exe | cut -d' ' -f1)
   [ "$a" = "$b" ] || { echo "ERROR: upload md5 mismatch ($a != $b)" >&2; exit 1; }
   rm -f /tmp/_lsl_verify.exe
   echo "   upload verified (md5 $a)"
@@ -249,7 +249,7 @@ do_run() {
   if python3 "$QMP_PY" wait-change dist/lsl-boot.png --timeout 90; then
     sleep 8
     python3 "$QMP_PY" shot dist/lsl-window.png
-    echo "OK: lsl-install is running under Windows 95 — see dist/lsl-window.png"
+    echo "OK: lslsetup is running under Windows 95 — see dist/lsl-window.png"
   else
     python3 "$QMP_PY" shot dist/lsl-window.png
     echo "WARNING: screen did not change after launch; eyeball dist/lsl-window.png"

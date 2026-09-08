@@ -25,9 +25,9 @@ public class W {
 }
 '@
 [W]::SetProcessDPIAware() | Out-Null
-$p = Start-Process -FilePath "$dir\lsl-install.exe" -ArgumentList '--no-elevation' -PassThru
+$p = Start-Process -FilePath "$dir\lslsetup.exe" -ArgumentList '--no-elevation' -PassThru
 Start-Sleep -Seconds 7
-$proc = Get-Process lsl-install -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like '*lsl-usb installer*' } | Select-Object -First 1
+$proc = Get-Process lslsetup -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like '*lsl-usb installer*' } | Select-Object -First 1
 if (-not $proc) { Write-Output 'NO-WINDOW'; exit 1 }
 $proc.Refresh()
 [W]::SetWindowPos($proc.MainWindowHandle, [IntPtr](-1), 0, 0, 0, 0, 3) | Out-Null

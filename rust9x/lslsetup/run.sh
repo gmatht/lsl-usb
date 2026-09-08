@@ -12,16 +12,16 @@
 #
 # Release variant (commented out by default):
 #cargo +rust9x build --release --target i586-rust9x-windows-msvc
-#target/i586-rust9x-windows-msvc/release/lsl-install.exe
+#target/i586-rust9x-windows-msvc/release/lslsetup.exe
 set -euo pipefail
 cd "$(dirname "$0")"
 cargo +rust9x build --target i586-rust9x-windows-msvc
-exe=target/i586-rust9x-windows-msvc/debug/lsl-install.exe
+exe=target/i586-rust9x-windows-msvc/debug/lslsetup.exe
 case "$(df --output=target "$exe" | tail -n 1)" in
   /mnt/*) exec "$exe" "$@" ;;
 esac
 if [ -d /mnt/c/Users/Public ]; then
-  dest=/mnt/c/Users/Public/lsl-test/lsl-install.exe
+  dest=/mnt/c/Users/Public/lsl-test/lslsetup.exe
   mkdir -p "$(dirname "$dest")"
   cp "$exe" "$dest"
   exec "$dest" "$@"

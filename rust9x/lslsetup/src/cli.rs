@@ -65,7 +65,7 @@ impl Default for Opts {
 }
 
 pub const USAGE: &str = "\
-Usage: lsl-install [options]
+Usage: lslsetup [options]
 
 Options:
   --iso-path <path>          Path to an existing live ISO

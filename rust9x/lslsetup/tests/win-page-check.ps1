@@ -9,46 +9,34 @@ $env:LSL_GUI_DEBUG = '1'
 # New anchors (client coords): nav Next center (cw-60, ch-26), Back
 # (cw-155, ch-26), Cancel (cw-250, ch-26); page frame top ~45, listview at
 # (10+12, 45+30) etc.
-$ErrorActionPreference = 'Stop'
 $dir = 'C:\Users\Public\lsl-test'
-Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 public class W {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out R r);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-    [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint data, UIntPtr extra);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     public struct R { public int L, T, Rt, B; }
 }
 '@
 [W]::SetProcessDPIAware() | Out-Null
-
-$p = Start-Process -FilePath "$dir\lsl-install.exe" -ArgumentList '--no-elevation' -PassThru
+$p = Start-Process -FilePath "$dir\lslsetup.exe" -ArgumentList '--no-elevation' -PassThru
 Start-Sleep -Seconds 7
-
-$proc = $null
-for ($i = 0; $i -lt 10 -and -not $proc; $i++) {
-    $proc = Get-Process lsl-install -ErrorAction SilentlyContinue |
-        Where-Object { $_.MainWindowTitle -like '*lsl-usb installer*' } | Select-Object -First 1
-    if (-not $proc) { Start-Sleep -Seconds 1 }
-}
-if (-not $proc) { Write-Output 'NO-WINDOW-FOUND'; exit 1 }
+$proc = Get-Process lslsetup -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like '*lsl-usb installer*' } | Select-Object -First 1
+if (-not $proc) { Write-Output 'NO-WINDOW'; exit 1 }
 $proc.Refresh()
-[W]::SetWindowPos($proc.MainWindowHandle, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002) | Out-Null  # TOPMOST, NOSIZE|NOMOVE
-[W]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
-Start-Sleep -Milliseconds 800
-Write-Output ('foreground is our window: ' + ([W]::GetForegroundWindow() -eq $proc.MainWindowHandle))
-
+[W]::SetWindowPos($proc.MainWindowHandle, [IntPtr](-1), 0, 0, 0, 0, 3) | Out-Null
+Start-Sleep -Seconds 1
 function Snap([string]$name) {
     $proc.Refresh()
     $r = New-Object 'W+R'
     [W]::GetWindowRect($proc.MainWindowHandle, [ref]$r) | Out-Null
+    if (($r.Rt - $r.L) -le 0) { Write-Output "snap-skip $name"; return }
     $bmp = New-Object System.Drawing.Bitmap(($r.Rt - $r.L), ($r.B - $r.T))
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size)
@@ -56,30 +44,34 @@ function Snap([string]$name) {
     $g.Dispose(); $bmp.Dispose()
     Write-Output "snapped $name"
 }
-
 function ClickAt([int]$cx, [int]$cy) {
     $proc.Refresh()
     $r = New-Object 'W+R'
     [W]::GetWindowRect($proc.MainWindowHandle, [ref]$r) | Out-Null
-    $x = $r.L + $cx
-    $y = $r.T + $cy
-    [W]::SetCursorPos($x, $y) | Out-Null
+    [W]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
     Start-Sleep -Milliseconds 150
+    [W]::SetCursorPos($r.L + $cx, $r.T + $cy) | Out-Null
+    Start-Sleep -Milliseconds 120
     [W]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
     [W]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 400
 }
-
-# listview header: frame at client (12,88), list at (10,30) in-frame -> client
-# (22,118); header row ~20 px tall. Column 1 "Support" center ~ (22+185, 128).
-ClickAt 218 177
-Start-Sleep -Milliseconds 400
-Snap 'sort-support-single'
-# Back button: Next at (756..852,706..734) center (804,720); Back center (705,720)
-ClickAt 705 720
-Snap 'nav-back-to-p0'
-
-# click "Device" heading (col 2, spans ~250-500 -> center 22+375=397)
-
+# 1) click the www globe of row 1 (list x 710-790 -> client 782; row 1 y ~160)
+ClickAt 783 210
+Start-Sleep -Seconds 2
+Snap 'chk-www'
+# 2) Next -> page 1
+ClickAt 849 777
+Snap 'chk-p1-top'
+# 3) scroll down twice (scrollbar arrows at client (847, ~670))
+ClickAt 858 700
+ClickAt 858 700
+ClickAt 858 700
+Snap 'chk-p1-scrolled'
+# 4) to page 3
+ClickAt 849 777
+ClickAt 849 777
+ClickAt 849 777
+Snap 'chk-p3'
 Stop-Process -Id $p.Id -Force
 Write-Output 'done'

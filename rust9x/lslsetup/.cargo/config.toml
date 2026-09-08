@@ -52,7 +52,7 @@ rustflags = [
   # Application manifest (asInvoker: opt out of the UAC installer-detection
   # heuristic that auto-elevates *install*.exe; dpiAware; supportedOS).
   # Compiled once with: llvm-rc /FO src/app_manifest.res src/app_manifest.rc
-  '-Clink-arg=/root/src/lsl-usb/rust9x/lsl-install/src/app_manifest.res',
+  '-Clink-arg=/root/src/lsl-usb/rust9x/lslsetup/src/app_manifest.res',
 
   # Stub libs for modern /DEFAULTLIB markers emitted by rust9x's std
   # (windows_link references synchronization.lib but resolves

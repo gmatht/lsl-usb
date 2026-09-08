@@ -1,4 +1,4 @@
-# lsl-install
+# lslsetup
 
 Full reimplementation of lsl-usb's `install.ps1` (3040 lines of PowerShell) as
 a **single native Windows executable**, built with the
@@ -8,7 +8,7 @@ Windows Forms.
 
 ```
 cargo +rust9x build --target i686-rust9x-windows-msvc
-# -> target/i686-rust9x-windows-msvc/debug/lsl-install.exe
+# -> target/i686-rust9x-windows-msvc/debug/lslsetup.exe
 ```
 
 ## Feature coverage vs install.ps1
@@ -116,7 +116,7 @@ Tested on the actual host via WSL interop (`pwsh.exe`, see
 
 ## Capability matrix (graceful degradation)
 
-| Feature | install.ps1 needs | lsl-install needs | Fallback when unsupported |
+| Feature | install.ps1 needs | lslsetup needs | Fallback when unsupported |
 |---|---|---|---|
 | ISO mount/validate | Win8+ `Mount-DiskImage` | none | pure-Rust ISO9660 parser — works everywhere |
 | PnP hardware enum | WMI (2000+) | registry only (NT `SYSTEM\CCS\Enum`, 9x `Enum`) | empty list + warning |
@@ -154,17 +154,17 @@ commented-out for non-rust9x targets.
 Same options as install.ps1's parameter block, as long flags:
 
 ```
-lsl-install.exe --help
-lsl-install.exe --dry-run                       # detection report, writes nothing
-lsl-install.exe --probe-os                      # capability self-test
-lsl-install.exe --iso-path C:\ISO\zorin-18.1.iso
-lsl-install.exe --skip-rufus --no-gui --volume-label "MINT"
+lslsetup.exe --help
+lslsetup.exe --dry-run                       # detection report, writes nothing
+lslsetup.exe --probe-os                      # capability self-test
+lslsetup.exe --iso-path C:\ISO\zorin-18.1.iso
+lslsetup.exe --skip-rufus --no-gui --volume-label "MINT"
 
 # non-destructive: keep everything on the stick, no reformat (BIOS/CSM boot):
-lsl-install.exe --write-mode nofmt --iso-path C:\ISO\linuxmint-22.3-cinnamon-64bit.iso
-lsl-install.exe --write-mode nofmt --usb-letter E --iso-path C:\ISO\mint.iso   # pin the target
-lsl-install.exe --write-mode nofmt --allow-fixed ...                            # allow a USB HDD (fixed)
-lsl-install.exe --write-mode nofmt --uefi-bootx64 bootx64.efi ...               # optional UEFI files
+lslsetup.exe --write-mode nofmt --iso-path C:\ISO\linuxmint-22.3-cinnamon-64bit.iso
+lslsetup.exe --write-mode nofmt --usb-letter E --iso-path C:\ISO\mint.iso   # pin the target
+lslsetup.exe --write-mode nofmt --allow-fixed ...                            # allow a USB HDD (fixed)
+lslsetup.exe --write-mode nofmt --uefi-bootx64 bootx64.efi ...               # optional UEFI files
 ```
 
 Exit codes: 0 success, 1 fatal error, 2 user cancel.

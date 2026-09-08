@@ -1,4 +1,4 @@
-//! Win32 capability layer for lsl-install.
+//! Win32 capability layer for lslsetup.
 //!
 //! Design rule: the binary must LOAD and RUN on Windows 95/98/Me (rust9x).
 //! Therefore the set of statically-linked imports is restricted to APIs that
