@@ -23,6 +23,7 @@ mod net;
 mod nofmt;
 mod rufus;
 mod sys;
+mod usbcheck;
 mod wifi;
 
 use sys::out;
@@ -186,7 +187,10 @@ fn run() {
     // which require Administrator rights, and the DD-mode live USB interacts
     // with Secure Boot - confirm with the user before any destructive step.
     assert_admin(&opts);
-    confirm_secure_boot();
+    // Console flow keeps the hard gate; the GUI flow must never stall on a
+    // console question - the wizard's Secure Boot banner carries the same
+    // guidance on every page.
+    confirm_secure_boot(opts.no_gui);
     warn_low_ram();
 
     let mut iso_path = opts.iso_path.clone();
@@ -217,6 +221,11 @@ fn run() {
     // Rufus finally appeared). Nothing destructive happens inside the
     // wizard itself - Rufus's START button remains the one confirmation.
     let mut work: Option<gui::GuiWork> = None;
+    // Set when the whole-USB check already ran inside the working phase
+    // (wizard nofmt path) or the console nofmt path, so the shared
+    // post-write choke point below does not run it twice.
+    let mut check_done = false;
+    let mut want_check = opts.check_usb;
     let mut on_confirm = |g: gui::GuiResult, ui: &gui::WorkingUi| -> gui::GuiWork {
         // Reusing an existing live USB (page-1 "Use an existing Live USB"
         // radio): there is nothing to download or write - the main flow
@@ -230,7 +239,7 @@ fn run() {
             // finish: show the summary the user can automate
             ui.show_final(
                 "lslsetup - finished",
-                &summary_for(&g, &opts, "", "skip"),
+                &summary_for(&g, &opts, "", "skip", None, None),
                 true,
             );
             return gui::GuiWork {
@@ -239,6 +248,8 @@ fn run() {
                 rufus_proc: None,
                 known: Vec::new(),
                 nofmt_letter: None,
+                nofmt_pending: None,
+                back: false,
             };
         }
         // a fresh download picked on page 1 may still be running: join it
@@ -254,10 +265,43 @@ fn run() {
             Some(ui),
         ) {
             Ok(i) => i,
-            Err(e) => fatal_gui(&e, ui),
+            Err(e) => {
+                if fatal_gui(&e, ui) {
+                    return gui::GuiWork::back();
+                }
+                unreachable!()
+            }
         };
         if let Err(e) = validate_live_iso(&iso) {
-            fatal_gui(&e, ui);
+            if fatal_gui(&e, ui) {
+                return gui::GuiWork::back();
+            }
+            unreachable!()
+        }
+        // Arch consistency with the ISO page: a 64-bit image on a
+        // 32-bit-only machine would not boot. Back-to-options returns to
+        // the wizard to pick the recommended 32-bit distro instead.
+        // Unknown arch passes; an explicit local pick is judged by its
+        // filename, a fresh download by its distro arch.
+        let iso_is_64 = if g.iso_path.is_empty() {
+            match g.distro_arch {
+                Some("i686") => false,
+                Some(_) => true,
+                None => crate::gui::iso_arch_64(&iso).unwrap_or(false),
+            }
+        } else {
+            crate::gui::iso_arch_64(&iso).unwrap_or(false)
+        };
+        if iso_is_64 && !crate::gui::is_64bit_capable() {
+            let msg = format!(
+                "{} is a 64-bit image but this machine does not support 64-bit - it would not boot.\n\
+                 Go Back and pick the recommended 32-bit distro (antiX), or build this USB for a 64-bit PC instead.",
+                iso
+            );
+            if fatal_gui(&msg, ui) {
+                return gui::GuiWork::back();
+            }
+            unreachable!()
         }
         // the wizard's write-method radio is explicit by construction; on
         // pre-Win7 the Rufus radio is greyed out, so a "rufus" value here can
@@ -279,19 +323,53 @@ fn run() {
         match mode.as_str() {
             "nofmt" => {
                 ui.set_status(
-                    "Preparing the USB stick (non-destructive write, no reformat) - see the console for progress...",
+                    "Preparing the USB stick (non-destructive write, no reformat)...",
                 );
                 ui.pump();
                 out::step("USB write method: built-in non-destructive (wizard choice).");
-                // the INSTALL page's target-USB radio wins; without a plugged-in
-                // stick (or --usb-letter) nofmt falls back to its own picker
+                // The INSTALL page's target-USB radio is the GUI's choice; a
+                // CLI --usb-letter pin is honoured when no radio was picked.
+                // There is deliberately no console-picker fallback: the
+                // working phase stays in the window, and the picker is
+                // enumerated when the wizard opens (a stick plugged in
+                // afterwards is invisible until restart).
+                if g.target_usb.is_none() && opts.usb_letter.trim().is_empty() {
+                    if fatal_gui("No target USB was selected on the INSTALL page.\nThe list is read when the wizard opens - a stick plugged in afterwards will not appear.\nPlug the stick in, restart the wizard, select it, and click Install again.", ui) {
+                        return gui::GuiWork::back();
+                    }
+                    unreachable!()
+                }
                 let letter_hint = g.target_usb.as_deref().unwrap_or(opts.usb_letter.as_str());
-                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64) {
-                    Ok(t) => {
+                // the wizard's BIOS/UEFI checkboxes AND the CLI flags must both allow a path
+                let want_bios = opts.bios_boot && g.bios_boot;
+                let want_uefi = opts.uefi_boot && g.uefi_boot;
+                // The radio click IS the confirmation - re-typing the letter
+                // on the console would stall the working phase. Flag-pinned
+                // targets keep the typed gate (raw-sector writes must never
+                // hinge on a stale flag).
+                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some()) {
+                    Ok((t, metrics, pending)) => {
+                        // Whole-USB check while the wizard is still open
+                        // (live status); a failure offers Back-to-options.
+                        let mut check_rep = None;
+                        if g.check_usb || opts.check_usb {
+                            ui.set_status("Write done - checking the whole USB surface (slow, cache bypassed)...");
+                            ui.pump();
+                            match usbcheck::check_whole_usb(&t.letter, Some(ui)) {
+                                Ok(r) => check_rep = Some(r),
+                                Err(e) => {
+                                    if fatal_gui(&e, ui) {
+                                        return gui::GuiWork::back();
+                                    }
+                                    unreachable!()
+                                }
+                            }
+                            check_done = true;
+                        }
                         // finished: show the summary page (window stays open)
                         ui.show_final(
                             "lslsetup - finished",
-                            &summary_for(&g, &opts, &iso, "nofmt"),
+                            &summary_for(&g, &opts, &iso, "nofmt", Some(&metrics), check_rep.as_ref()),
                             true,
                         );
                         gui::GuiWork {
@@ -300,21 +378,30 @@ fn run() {
                             rufus_proc: None,
                             known: Vec::new(),
                             nofmt_letter: Some(t.letter.clone()),
+                            nofmt_pending: pending,
+                            back: false,
                         }
                     }
-                    Err(e) => fatal_gui(&e, ui),
+                    Err(e) => {
+                        if fatal_gui(&e, ui) {
+                            return gui::GuiWork::back();
+                        }
+                        unreachable!()
+                    }
                 }
             }
             "skip" => {
                 out::step("Skipping the USB write (wizard choice).");
                 out::info("Write the image yourself (e.g. with Rufus), then this step picks up the USB.");
-                ui.show_final("lslsetup - finished", &summary_for(&g, &opts, &iso, "skip"), true);
+                ui.show_final("lslsetup - finished", &summary_for(&g, &opts, &iso, "skip", None, None), true);
                 gui::GuiWork {
                     iso,
                     mode,
                     rufus_proc: None,
                     known: Vec::new(),
                     nofmt_letter: None,
+                    nofmt_pending: None,
+                    back: false,
                 }
             }
             _ => {
@@ -324,7 +411,12 @@ fn run() {
                 out::info("In Rufus: pick the target USB stick, then click START (this is the one destructive confirmation).");
                 let rufus_exe = match rufus::get_rufus(&opts.rufus_path, Some(ui)) {
                     Ok(p) => p,
-                    Err(e) => fatal_gui(&e, ui),
+                    Err(e) => {
+                        if fatal_gui(&e, ui) {
+                            return gui::GuiWork::back();
+                        }
+                        unreachable!()
+                    }
                 };
                 // Do NOT swallow a launch failure: the window must not just
                 // vanish with no Rufus and no explanation. A failed launch
@@ -332,7 +424,12 @@ fn run() {
                 // instead of a silent close.
                 let proc = match rufus::launch(&rufus_exe, &iso) {
                     Ok(p) => p,
-                    Err(e) => fatal_gui(&e, ui),
+                    Err(e) => {
+                        if fatal_gui(&e, ui) {
+                            return gui::GuiWork::back();
+                        }
+                        unreachable!()
+                    }
                 };
                 let known: Vec<String> = sys::list_volumes()
                     .iter()
@@ -343,7 +440,7 @@ fn run() {
                 // automate before the console takes over to wait for the USB.
                 ui.show_final(
                     "lslsetup - finished",
-                    &summary_for(&g, &opts, &iso, "rufus"),
+                    &summary_for(&g, &opts, &iso, "rufus", None, None),
                     true,
                 );
                 gui::GuiWork {
@@ -352,6 +449,8 @@ fn run() {
                     rufus_proc: proc,
                     known,
                     nofmt_letter: None,
+                    nofmt_pending: None,
+                    back: false,
                 }
             }
         }
@@ -388,6 +487,7 @@ fn run() {
         copy_sfs_hdd = g.sfs_hdd;
         reclaim_win_swap = g.reclaim_win_swap;
         rust_tools = g.rust_tools;
+        want_check = want_check || g.check_usb;
         distro_arch = g.distro_arch;
         download_iso = g.download_iso;
         if let Some(m) = g.write_mode.clone() {
@@ -404,6 +504,9 @@ fn run() {
     }
 
     let mut vol: Option<sys::Volume> = None;
+    // Non-destructive installs validate + stage files first and flip the
+    // boot sectors only after every drop below (commit_boot_sectors).
+    let mut pending_mbr: Option<nofmt::PendingMbr> = None;
 
     // Reuse an existing Mint live USB when chosen (GUI) or offered (console).
     if let Some(letter) = reuse_usb.clone() {
@@ -461,6 +564,7 @@ fn run() {
                         }
                     }
                     iso_used = String::new();
+                    pending_mbr = w.nofmt_pending.clone();
                 }
                 _ => {
                     let known: Vec<String> = Vec::new();
@@ -489,6 +593,10 @@ fn run() {
             out::err(&e);
             std::process::exit(1);
         }
+        // Same arch check as the wizard (warning only on console).
+        if crate::gui::iso_arch_64(&iso).unwrap_or(false) && !crate::gui::is_64bit_capable() {
+            out::warn(&format!("{} looks like a 64-bit image but this machine does not support 64-bit - it will not boot here. Use a 32-bit distro (antiX) unless this USB targets another PC.", iso));
+        }
         // Provenance check for ANY linuxmint-* ISO (downloads were verified in
         // resolve_iso; this also covers user-supplied/picked-from-disk ISOs)
         // before either write path touches a stick.
@@ -511,7 +619,7 @@ fn run() {
                 out::step("USB write method:");
                 out::info("  1. Rufus (recommended - well tested, UEFI + BIOS; rewrites the stick)");
                 out::info("  2. Built-in non-destructive (less tested - no reformat, keeps existing files;");
-                out::info("     grub4dos loopback boot, BIOS/CSM firmware, stick must be FAT32/NTFS)");
+                out::info("     BIOS + UEFI boot (FAT32 + loader for UEFI), stick must be FAT32/NTFS)");
                 out::info("  3. Skip - I will write the USB myself (like --skip-rufus)");
                 let ans = out::prompt("Choose [1-3], or press Enter for 1 (Rufus): ");
                 match ans.as_str() {
@@ -531,14 +639,22 @@ fn run() {
             // Non-destructive grub4dos install: MBR boot-code area only,
             // ISO copied as a file, menu.lst loopback. The stick keeps its
             // filesystem and all existing files.
-            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64) {
-                Ok(t) => {
+            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false) {
+                Ok((t, _metrics, pending)) => {
+                    pending_mbr = pending;
                     vol = sys::list_volumes()
                         .into_iter()
                         .find(|v| v.letter.eq_ignore_ascii_case(&t.letter));
                     if vol.is_none() {
                         out::err(&format!("Target volume {} disappeared after the write.", t.letter));
                         std::process::exit(1);
+                    }
+                    if opts.check_usb {
+                        if let Err(e) = usbcheck::check_whole_usb(&t.letter, None) {
+                            out::err(&e);
+                            std::process::exit(1);
+                        }
+                        check_done = true;
                     }
                 }
                 Err(e) => {
@@ -573,7 +689,17 @@ fn run() {
     }
 
     let vol = vol.expect("USB target");
+    // Whole-USB surface check for every path that did not run it yet
+    // (Rufus / skip / reuse, wizard or console): DeleteMe fill +
+    // uncached read-back verify, DeleteMe removed on success.
+    if want_check && !check_done {
+        if let Err(e) = usbcheck::check_whole_usb(&vol.letter, None) {
+            out::err(&e);
+            std::process::exit(1);
+        }
+    }
     assert_usb_capacity(&vol, &iso_used);
+    wait_volume_ready(&vol.letter);
 
     out::step("Dropping lsl-usb files onto the USB...");
     if let Err(e) = lslfiles::install_lsl_files(&vol.letter, &opts.bundle_dir) {
@@ -732,6 +858,16 @@ fn run() {
     out::info("Boot the USB. First boot runs the minimal layer script (installs packages, then persists a new layer).");
     out::info("Set LSL_DATA_DIR in /cdrom/lsl-usb.env if you do not want the default (/mnt/c/Users/lsl-usb).");
 
+    // Final step of a non-destructive install, AFTER every file drop above:
+    // flip the boot sectors. A volume drop from here on strands nothing -
+    // the reboot offer below is firmware-enumerated and needs no mount.
+    if let Some(p) = &pending_mbr {
+        if let Err(e) = nofmt::commit_boot_sectors(p) {
+            out::err(&e);
+            std::process::exit(1);
+        }
+    }
+
     // Reboot into the USB boot menu + drop a "Reboot to Select USB" shortcut.
     let shortcuts = boot::create_boot_shortcuts();
     if !shortcuts.is_empty() {
@@ -877,7 +1013,7 @@ fn assert_admin(opts: &cli::Opts) {
     }
 }
 
-fn confirm_secure_boot() {
+fn confirm_secure_boot(hard_gate: bool) {
     if boot::secure_boot_status() != sys::SecBoot::Enabled {
         return;
     }
@@ -887,6 +1023,10 @@ fn confirm_secure_boot() {
     out::info("asking to enroll Linux Mint's signing key - choose \"Enroll MOK\" and continue.");
     out::info("If the USB will not start at all, disable Secure Boot in your firmware setup");
     out::info("(Boot / Security / Authentication menu) and try again.");
+    if !hard_gate {
+        out::info("Continuing to the wizard - the Secure Boot banner there carries this guidance.");
+        return;
+    }
     let ans = out::prompt("If you have enrolled the MOK (or disabled Secure Boot), type OK to continue; otherwise press Enter to abort: ");
     if ans != "OK" {
         out::err("Aborted. Enroll the Linux Mint MOK or disable Secure Boot, then re-run the installer.");
@@ -1018,20 +1158,32 @@ pub(crate) fn resolve_page_iso(url: &str) -> Option<(String, String)> {
 /// its own console window, which vanishes on exit. Print to the console AND
 /// show a dialog with the reason, so a failure never looks like a silent
 /// abort with no explanation.
-fn fatal_gui(msg: &str, ui: &gui::WorkingUi) -> ! {
+/// Fatal error inside the Install working phase: the wizard window is still
+/// open, but the elevated child may own a different console (or none) than
+/// the one the user is watching - via ShellExecute "runas" the child gets
+/// its own console window, which vanishes on exit. Print to the console AND
+/// show a dialog with the reason, so a failure never looks like a silent
+/// abort with no explanation.
+/// Returns true when the user clicked "Back to install options" (caller
+/// must unwind to the wizard via GuiWork::back()), false when the page was
+/// closed (caller exits with an error code).
+fn fatal_gui(msg: &str, ui: &gui::WorkingUi) -> bool {
     // Print to the console AND keep the wizard window open showing the
     // reason on the FAILED page - the window is never just destroyed with no
     // explanation. The user reads why (download/Rufus/launch failure) before
-    // closing the page, which then exits with an error code.
+    // closing the page, which then exits with an error code - or goes Back
+    // to pick another method (e.g. Rufus after a nofmt refusal).
     out::err(msg);
-    ui.show_final("lslsetup - failed", &format!("{}\r\n\r\nSee the console for the full log.", msg), false);
+    if ui.show_final("lslsetup - failed", &format!("{}\r\n\r\nSee the console for the full log.", msg), false) {
+        return true;
+    }
     std::process::exit(1);
 }
 
 /// Build the "automate these settings" command line on the FINISHED page:
 /// the flags that reproduce the GUI choices on a later headless / scripted
 /// run. Only options that have CLI equivalents are emitted.
-fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str) -> String {
+fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str, metrics: Option<&crate::nofmt::WriteMetrics>, check: Option<&crate::usbcheck::UsbCheckReport>) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push("Setup is configured. Your choices:".into());
     if !iso.is_empty() {
@@ -1047,8 +1199,44 @@ fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str) -> S
         _ => "Rufus (DD-style USB write)",
     };
     lines.push(format!("  - USB write: {}", mode_desc));
+    if let Some(m) = metrics {
+        if m.bytes_copied > 0 {
+            lines.push(format!(
+                "  - USB write speed: {:.1} MB/s ({:.1} GB in {:.1}s)",
+                m.write_mbps,
+                m.bytes_copied as f64 / crate::sys::GB as f64,
+                m.write_seconds
+            ));
+        }
+        if m.bytes_verified > 0 {
+            lines.push(format!(
+                "  - USB verify speed: {:.1} MB/s ({:.1} GB in {:.1}s)",
+                m.verify_mbps,
+                m.bytes_verified as f64 / crate::sys::GB as f64,
+                m.verify_seconds
+            ));
+            if m.verify_disk_est_mbps > 0.0 {
+                lines.push(format!(
+                    "  - USB disk read speed (est.): ~{:.0} MB/s (serial read+hash decomposed)",
+                    m.verify_disk_est_mbps
+                ));
+            } else {
+                lines.push("  - USB disk read speed: at least the verify speed above (hash-bound run)".into());
+            }
+        }
+    }
     if let Some(letter) = g.target_usb.as_deref() {
         lines.push(format!("  - Target USB: {:?}", letter.trim()));
+    }
+    if let Some(c) = check {
+        lines.push(format!(
+            "  - Whole-USB check: PASSED ({:.1} GB in {} file(s), {:.0}s, DeleteMe removed)",
+            c.bytes_verified as f64 / 1e9,
+            c.files,
+            c.secs
+        ));
+    } else if g.check_usb {
+        lines.push("  - Whole-USB check: requested".into());
     }
     if !g.flatpak_ids.is_empty() {
         // friendly names (reverse-map the reverse-DNS IDs); unknown/extra IDs
@@ -1114,6 +1302,15 @@ fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str) -> S
             a.push("--write-mode nofmt".into());
             if let Some(letter) = g.target_usb.as_deref() {
                 a.push(format!("--usb-letter {}", letter.trim()));
+            }
+            if !g.bios_boot {
+                a.push("--no-bios-boot".into());
+            }
+            if !g.uefi_boot {
+                a.push("--no-uefi-boot".into());
+            }
+            if g.check_usb {
+                a.push("--check-usb".into());
             }
         }
         "skip" => a.push("--skip-rufus".into()),
@@ -1399,6 +1596,29 @@ fn select_existing_iso() -> Option<String> {
         }
     }
     None
+}
+
+/// Wait (bounded) for a just-written stick to reappear before the file
+/// drops. The MBR write can knock the volume offline transiently; the drops
+/// below need it mounted. The common case costs one syscall - only a
+/// post-write remount window waits. Never prompts; if the volume never
+/// comes back the drops fail loudly on their own errors.
+/// (Console text only: the wizard window is closed by this phase.)
+fn wait_volume_ready(letter: &str) {
+    if sys::path_exists(&format!("{}:\\", letter)) {
+        return;
+    }
+    out::warn(&format!("{}: not visible after the write - waiting for Windows to re-mount (unplug/replug now and it will be picked up; 60s max)...", letter));
+    let mut waited = 0u32;
+    while waited < 60 {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        waited += 5;
+        if sys::path_exists(&format!("{}:\\", letter)) {
+            out::info(&format!("{}: reachable again.", letter));
+            return;
+        }
+    }
+    out::warn(&format!("{}: still not visible - the drops below may fail; unplug/replug and re-run if they do.", letter));
 }
 
 /// Assert-UsbCapacity: warn before the Rufus write + first boot.

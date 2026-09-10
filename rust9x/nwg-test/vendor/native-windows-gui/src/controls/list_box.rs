@@ -115,7 +115,7 @@ impl<D: Display+Default> ListBox<D> {
 
     /// Insert an item in the collection and the control. 
     ///
-    /// SPECIAL behaviour! If index is `std::usize::MAX`, the item is added at the end of the collection.
+    /// SPECIAL behaviour! If index is `usize::MAX`, the item is added at the end of the collection.
     /// The method will still panic if `index > len` with every other values.
     pub fn insert(&self, index: usize, item: D) {
         use winapi::um::winuser::LB_INSERTSTRING;
@@ -125,7 +125,7 @@ impl<D: Display+Default> ListBox<D> {
         let display_os = to_utf16(&display);
 
         let mut col = self.collection.borrow_mut();
-        if index == std::usize::MAX {
+        if index == usize::MAX {
             col.push(item);
         } else {
             col.insert(index, item);
@@ -180,11 +180,11 @@ impl<D: Display+Default> ListBox<D> {
 
         let handle = check_hwnd(&self.handle, NOT_BOUND, BAD_HANDLE);
         let select_count = match wh::send_message(handle, LB_GETSELCOUNT, 0, 0) {
-            LB_ERR => usize::max_value(),
+            LB_ERR => usize::MAX,
             value => value as usize
         };
 
-        if select_count == usize::max_value() || usize::max_value() == 0 {
+        if select_count == usize::MAX || usize::MAX == 0 {
             return Vec::new();
         }
 
@@ -455,14 +455,14 @@ impl<D: Display+Default> ListBox<D> {
     /// Get read-only access to the inner collection of the list box
     /// This call refcell.borrow under the hood. Be sure to drop the value before
     /// calling other list box methods
-    pub fn collection(&self) -> Ref<Vec<D>> {
+    pub fn collection(&self) -> Ref<'_, Vec<D>> {
         self.collection.borrow()
     }
 
     /// Get mutable access to the inner collection of the list box. Does not update the visual
     /// control. Call `sync` to update the view. This call refcell.borrow_mut under the hood. 
     /// Be sure to drop the value before calling other list box methods
-    pub fn collection_mut(&self) -> RefMut<Vec<D>> {
+    pub fn collection_mut(&self) -> RefMut<'_, Vec<D>> {
         self.collection.borrow_mut()
     }
 

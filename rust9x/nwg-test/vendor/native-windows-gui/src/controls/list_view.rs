@@ -4,7 +4,7 @@ use winapi::um::commctrl::{
     LVS_ICON, LVS_SMALLICON, LVS_LIST, LVS_REPORT, LVS_NOCOLUMNHEADER, LVCOLUMNW, LVCFMT_LEFT, LVCFMT_RIGHT, LVCFMT_CENTER, LVCFMT_JUSTIFYMASK,
     LVCFMT_IMAGE, LVCFMT_BITMAP_ON_RIGHT, LVCFMT_COL_HAS_IMAGES, LVITEMW, LVIF_TEXT, LVCF_WIDTH, LVCF_TEXT, LVS_EX_GRIDLINES, LVS_EX_BORDERSELECT,
     LVS_EX_AUTOSIZECOLUMNS, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_FULLROWSELECT, LVS_SINGLESEL, LVCF_FMT, LVIF_IMAGE, LVS_SHOWSELALWAYS,
-    LVS_EX_HEADERDRAGDROP, LVS_EX_HEADERINALLVIEWS, LVM_GETHEADER, HDITEMA, HDITEMW, HDI_FORMAT, HDM_GETITEMA, HDM_SETITEMA, HDF_SORTUP, HDF_SORTDOWN
+    LVS_EX_HEADERDRAGDROP, LVS_EX_HEADERINALLVIEWS, LVM_GETHEADER, HDITEMA, HDI_FORMAT, HDM_GETITEMA, HDM_SETITEMA, HDF_SORTUP, HDF_SORTDOWN
 };
 use super::{ControlBase, ControlHandle};
 use crate::win32::window_helper as wh;
@@ -676,7 +676,7 @@ impl ListView {
         let handle = check_hwnd(&self.handle, NOT_BOUND, BAD_HANDLE);
         let insert = insert.into();
 
-        let row_insert = insert.index.unwrap_or(i32::max_value());
+        let row_insert = insert.index.unwrap_or(i32::MAX);
         let column_insert = insert.column_index;
         if column_insert > 0 && !self.has_item(row_insert as _, 0) {
             self.insert_item(InsertListViewItem { 

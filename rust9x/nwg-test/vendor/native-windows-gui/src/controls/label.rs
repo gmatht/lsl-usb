@@ -78,6 +78,32 @@ pub struct Label {
     handler1: RefCell<Option<RawEventHandler>>,
 }
 
+/// Wrapped line count for WM_NCCALCSIZE sizing: explicit breaks plus a
+/// greedy word-wrap of each logical line at `ave_cw` px per char in
+/// `client_w` px (same estimate the app's wrap_text/text_h pair uses).
+/// Pure (unit-tested below).
+fn nc_wrapped_lines(text: &str, client_w: i32, ave_cw: i32) -> i32 {
+    let per_line = ((client_w / ave_cw.max(1)).max(1)) as usize;
+    let mut lines = 0usize;
+    for logical in text.split('\n') {
+        let logical = logical.strip_suffix('\r').unwrap_or(logical);
+        let mut line = 0usize;
+        let mut wrapped = 1usize;
+        for (i, word) in logical.split(' ').enumerate() {
+            let wl = word.chars().count();
+            if i > 0 && line + 1 + wl > per_line {
+                wrapped += 1;
+                line = 0;
+            } else if i > 0 {
+                line += 1;
+            }
+            line += wl;
+        }
+        lines += wrapped;
+    }
+    lines.max(1) as i32
+}
+
 impl Label {
 
     pub fn builder<'a>() -> LabelBuilder<'a> {
@@ -267,15 +293,38 @@ impl Label {
                     GetTextMetricsA(dc, &mut tm);
                     SelectObject(dc, old);
                     ReleaseDC(hwnd, dc);
-                    let client_height = tm.tmHeight + tm.tmExternalLeading;
 
-                    // Calculate NC area to center text.
                     let mut client: RECT = mem::zeroed();
                     let mut window: RECT = mem::zeroed();
                     GetClientRect(hwnd, &mut client);
                     GetWindowRect(hwnd, &mut window);
-
                     let window_height = window.bottom - window.top;
+                    if window_height <= 0 {
+                        return None; // transient zero-size: keep defaults
+                    }
+
+                    // (Multiline fix) size the client area for EVERY wrapped
+                    // line of the label's current text, not a single line:
+                    // explicit breaks plus greedy word-wrap at the average
+                    // char width. Single-line labels are unaffected (1 line).
+                    // Text taller than the window keeps the full client area
+                    // (bottom clips, as before).
+                    let line_h = (tm.tmHeight + tm.tmExternalLeading).max(1);
+                    let text = wh::get_window_text(hwnd);
+                    let lines = nc_wrapped_lines(
+                        &text,
+                        (window.right - window.left).max(1),
+                        tm.tmAveCharWidth.max(1),
+                    );
+                    let mut client_height = lines * line_h;
+                    if client_height < line_h {
+                        client_height = line_h;
+                    }
+                    if client_height > window_height {
+                        client_height = window_height;
+                    }
+
+                    // Calculate NC area to center text.
                     let info_ptr: *mut NCCALCSIZE_PARAMS = l as *mut NCCALCSIZE_PARAMS;
                     // (Patch-Win95) Win95 USER passes 2-byte-aligned 16-bit-heap
                     // pointers in WM_NCCALCSIZE lParam; an aligned reference would
@@ -478,3 +527,36 @@ impl<'a> LabelBuilder<'a> {
 
 }
 
+
+#[cfg(test)]
+mod nc_tests {
+    use super::nc_wrapped_lines;
+
+    #[test]
+    fn single_line_stays_single() {
+        assert_eq!(nc_wrapped_lines("hello", 800, 8), 1);
+        assert_eq!(nc_wrapped_lines("", 800, 8), 1);
+    }
+
+    #[test]
+    fn explicit_breaks_count() {
+        assert_eq!(nc_wrapped_lines("a\r\nb\r\nc", 800, 8), 3);
+        assert_eq!(nc_wrapped_lines("a\nb", 800, 8), 2);
+        // trailing break leaves an empty final line, like the static renders
+        assert_eq!(nc_wrapped_lines("a\r\n", 800, 8), 2);
+    }
+
+    #[test]
+    fn long_lines_word_wrap() {
+        // 20 chars at 10 px/char in a 100 px client area: 10 chars/line
+        assert_eq!(nc_wrapped_lines("aaaaa bbbbb ccccc", 100, 10), 3);
+        // fits exactly: no extra line
+        assert_eq!(nc_wrapped_lines("aaaaa bbbb", 100, 10), 1);
+    }
+
+    #[test]
+    fn degenerate_widths_cannot_collapse() {
+        assert_eq!(nc_wrapped_lines("a b c", 0, 8), 3);
+        assert_eq!(nc_wrapped_lines("a b c", 100, 0), 1);
+    }
+}

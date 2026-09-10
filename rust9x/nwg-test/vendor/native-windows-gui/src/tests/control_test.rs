@@ -834,7 +834,7 @@ mod partial_controls_test_ui {
             GridLayout::builder()
                 .parent(&data.dialog_tab)
                 .min_size([400, 150])
-                .max_size([u32::max_value(), 200])
+                .max_size([u32::MAX, 200])
                 .child(0, 0, &data.test_open_file_button)
                 .child(1, 0, &data.test_open_directory_button)
                 .child(2, 0, &data.test_save_file_button)
@@ -1170,7 +1170,7 @@ fn run_combo_tests(app: &ControlsTest, _evt: Event) {
         assert_eq!(app.test_combo.set_selection_string("Blue"), Some(0));
 
         app.test_combo.insert(1, "BOO!");
-        app.test_combo.insert(std::usize::MAX, "Ahoy!!");
+        app.test_combo.insert(usize::MAX, "Ahoy!!");
         assert_eq!(app.test_combo.set_selection_string("BOO!"), Some(1));
         assert_eq!(app.test_combo.set_selection_string("Ahoy!!"), Some(6));
 
@@ -1285,7 +1285,7 @@ fn run_list_tests(app: &ControlsTest, _evt: Event) {
         assert_eq!(app.test_list_box1.selection_string(), Some("Green".to_string()));
 
         app.test_list_box1.insert(1, "BOO!");
-        app.test_list_box1.insert(std::usize::MAX, "Ahoy!!");
+        app.test_list_box1.insert(usize::MAX, "Ahoy!!");
         assert_eq!(app.test_list_box1.set_selection_string("BOO!"), Some(1));
         assert_eq!(app.test_list_box1.set_selection_string("Ahoy!!"), Some(7));
 

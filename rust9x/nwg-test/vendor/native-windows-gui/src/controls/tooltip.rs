@@ -258,7 +258,7 @@ impl Tooltip {
         let handle = check_hwnd(&self.handle, NOT_BOUND, BAD_HANDLE);
         let value = match delay {
             Some(d) => d & 0xFFFF,
-            None => u16::max_value() & 0xFFFF,
+            None => u16::MAX & 0xFFFF,
         };
 
         wh::send_message(handle, TTM_SETDELAYTIME, TTDT_INITIAL as WPARAM, value as LPARAM);

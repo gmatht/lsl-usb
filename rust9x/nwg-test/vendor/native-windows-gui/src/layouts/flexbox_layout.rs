@@ -173,7 +173,7 @@ impl FlexboxLayout {
         Panic:
         - The layout must have been successfully built otherwise this function will panic.
     */
-    pub fn children(&self) -> FlexboxLayoutChildren {
+    pub fn children(&self) -> FlexboxLayoutChildren<'_> {
         let inner = self.inner.borrow();
         if inner.base.is_null() {
             panic!("Flexbox layout is not yet initialized!");
@@ -193,7 +193,7 @@ impl FlexboxLayout {
         Panic:
         - The layout must have been successfully built otherwise this function will panic.
     */
-    pub fn children_mut(&self) -> FlexboxLayoutChildrenMut {
+    pub fn children_mut(&self) -> FlexboxLayoutChildrenMut<'_> {
         let inner = self.inner.borrow_mut();
         if inner.base.is_null() {
             panic!("Flexbox layout is not yet initialized!");

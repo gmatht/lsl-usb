@@ -49,11 +49,6 @@ pub fn wide(s: &str) -> Vec<u16> {
     std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
 
-/// Wide (UTF-16) string WITHOUT terminator.
-pub fn wide_nul(s: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(s).encode_wide().collect()
-}
-
 pub fn from_wide(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     OsString::from_wide(&buf[..end]).to_string_lossy().into_owned()
@@ -331,6 +326,153 @@ pub enum SecBoot {
     Enabled,
     Disabled,
     Unknown,
+}
+
+/// Three-state capability: Yes / No / Unknown (could not be determined).
+/// Unknown is honest, not a shrug: e.g. CSM presence on a UEFI-booted box
+/// has no reliable API, and the stick may target a different PC anyway.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FwCap {
+    Yes,
+    No,
+    Unknown,
+}
+
+/// What THIS motherboard/firmware can boot (the stick may be built for
+/// another PC - callers must say "this machine" explicitly).
+#[derive(Clone, Debug)]
+pub struct BoardCaps {
+    pub booted_uefi: bool,
+    /// Board can UEFI-boot.
+    pub uefi_capable: FwCap,
+    /// Board can legacy/CSM-boot.
+    pub bios_capable: FwCap,
+    /// Short basis string, e.g. "this boot is UEFI; SMBIOS reports UEFI".
+    pub detail: String,
+}
+
+/// Does this CPU support 64-bit long mode? (CPUID Fn8000_0001:EDX bit 29,
+/// the LM flag.) This is a property of the bare hardware - unlike
+/// IsWow64Process it is true even under 32-bit Windows on a 64-bit CPU,
+/// which is exactly the case that matters when picking a live-USB image
+/// (the USB boots the hardware, not the installed Windows).
+/// Pentium+ always has CPUID, matching the i586 baseline.
+pub fn cpu_has_long_mode() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        true // 64-bit build proves long mode
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        // __cpuid is safe on recent toolchains; allow(unused_unsafe) keeps
+        // older ones (where it is still unsafe) warning-free too.
+        #[allow(unused_unsafe)]
+        unsafe {
+            if std::arch::x86::__cpuid(0x8000_0000).eax < 0x8000_0001 {
+                return false; // no extended leaves at all (ancient CPU)
+            }
+            std::arch::x86::__cpuid(0x8000_0001).edx & (1 << 29) != 0
+        }
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+static BOARD: OnceLock<BoardCaps> = OnceLock::new();
+/// Cached board firmware capabilities.
+pub fn board_caps() -> &'static BoardCaps {
+    BOARD.get_or_init(|| {
+        let (booted_uefi, _) = firmware();
+        if is_9x() {
+            // No firmware APIs: 9x boots legacy by definition.
+            return BoardCaps {
+                booted_uefi: false,
+                uefi_capable: FwCap::No,
+                bios_capable: FwCap::Yes,
+                detail: "Windows 9x boots legacy BIOS only".into(),
+            };
+        }
+        let smbios = smbios_uefi_supported();
+        let (uefi_capable, uefi_why) = if booted_uefi {
+            (FwCap::Yes, "this boot is UEFI")
+        } else {
+            match smbios {
+                Some(true) => (FwCap::Yes, "SMBIOS reports UEFI supported (this boot is legacy/CSM)"),
+                Some(false) => (FwCap::No, "SMBIOS has no UEFI flag and this boot is legacy (legacy-only board)"),
+                None => (FwCap::Unknown, "this boot is legacy; SMBIOS unreadable"),
+            }
+        };
+        // CSM detection has no reliable API: a legacy boot proves BIOS
+        // works; a UEFI boot says nothing (CSM is often gone on post-2020
+        // boards, but checking needs firmware setup).
+        let (bios_capable, bios_why) = if !booted_uefi {
+            (FwCap::Yes, "this boot is legacy/BIOS")
+        } else {
+            (FwCap::Unknown, "this boot is UEFI; CSM/legacy presence unknown (check firmware setup for a CSM/Legacy option)")
+        };
+        BoardCaps {
+            booted_uefi,
+            uefi_capable,
+            bios_capable,
+            detail: format!("{}, {}", uefi_why, bios_why),
+        }
+    })
+}
+
+/// SMBIOS Type 0 "UEFI Specification is supported" flag (Characteristics
+/// Extension Byte 2, bit 3). Raw RSMB table via GetSystemFirmwareTable
+/// (XP+; needs no privilege). None = unavailable/unparseable/too old.
+fn smbios_uefi_supported() -> Option<bool> {
+    type GetTableFn = unsafe extern "system" fn(u32, u32, *mut u8, u32) -> u32;
+    let f = proc_from_module::<GetTableFn>("kernel32.dll", "GetSystemFirmwareTable")?;
+    const RSMB: u32 = 0x52534D42;
+    let need = unsafe { f(RSMB, 0, std::ptr::null_mut(), 0) };
+    if need == 0 || need > 256 * 1024 {
+        return None;
+    }
+    let mut buf = vec![0u8; need as usize];
+    let got = unsafe { f(RSMB, 0, buf.as_mut_ptr(), need) };
+    if got == 0 || got > need {
+        return None;
+    }
+    buf.truncate(got as usize);
+    smbios_uefi_flag(&buf)
+}
+
+/// Scan a raw SMBIOS table for a Type 0 structure with a long enough
+/// formatted area; return its UEFI-supported bit. Pure (unit-tested).
+fn smbios_uefi_flag(table: &[u8]) -> Option<bool> {
+    let mut pos = 0usize;
+    while pos + 4 <= table.len() {
+        let typ = table[pos];
+        let len = table[pos + 1] as usize;
+        if len < 4 || pos + len > table.len() {
+            return None; // corrupt table: stop, don't guess
+        }
+        if typ == 0 {
+            // Extension Byte 2 lives at structure offset 0x13, so the
+            // formatted area must be at least 0x14 bytes.
+            if len < 0x14 {
+                return None; // pre-UEFI-era structure layout
+            }
+            return Some(table[pos + 0x13] & 0x08 != 0);
+        }
+        // skip formatted area + string area (double-NUL terminated)
+        pos += len;
+        loop {
+            if pos + 1 >= table.len() {
+                return None;
+            }
+            if table[pos] == 0 && table[pos + 1] == 0 {
+                pos += 2;
+                break;
+            }
+            pos += 1;
+        }
+    }
+    None // no Type 0 found
 }
 
 static FIRMWARE: OnceLock<(bool, SecBoot)> = OnceLock::new();
@@ -742,9 +884,13 @@ pub fn list_volumes() -> Vec<Volume> {
             let end = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
             let drive = from_wide(&rest[..end]); // "C:\"
             rest = &rest[end + 1..];
-            let dt = GetDriveTypeW(std::ptr::null()); // drive root as-is
+            // NOTE: the drive root must be passed explicitly - NULL means
+            // "the current directory's drive", which would stamp every
+            // volume with C:'s type (USB sticks misread as fixed, mounted
+            // ISOs never detected as CD-ROM).
+            let mut wdrive = wide(&drive);
+            let dt = GetDriveTypeW(wdrive.as_ptr());
             let (label, fs) = vol_info(&drive);
-            let mut wdrive = wide_nul(&drive);
             let mut freeq: winapi::shared::ntdef::ULARGE_INTEGER = std::mem::zeroed();
             let mut totalq: winapi::shared::ntdef::ULARGE_INTEGER = std::mem::zeroed();
             GetDiskFreeSpaceExW(
@@ -771,7 +917,7 @@ pub fn list_volumes() -> Vec<Volume> {
 }
 
 unsafe fn vol_info(root: &str) -> (String, String) {
-    let mut wroot = wide_nul(root);
+    let mut wroot = wide(root);
     let mut label = [0u16; 261];
     let mut fs = [0u16; 64];
     // explicit block: unsafe ops in an unsafe-fn body need one on this toolchain
@@ -1605,6 +1751,56 @@ pub fn browse_folder(title: &str) -> Option<String> {
             return None;
         }
         Some(from_wide(&buf))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal Type 0 structure: type=0, len=0x14, ext byte2 at +0x13,
+    /// then an empty string area (double NUL).
+    fn type0(ext2: u8) -> Vec<u8> {
+        let mut v = vec![0u8; 0x14];
+        v[0] = 0;
+        v[1] = 0x14;
+        v[0x13] = ext2;
+        v.extend_from_slice(&[0, 0]);
+        v
+    }
+
+    #[test]
+    fn smbios_uefi_bit_parsed() {
+        assert_eq!(smbios_uefi_flag(&type0(0x08)), Some(true));
+        assert_eq!(smbios_uefi_flag(&type0(0x00)), Some(false));
+        // other bits set, UEFI bit clear
+        assert_eq!(smbios_uefi_flag(&type0(0xF7)), Some(false));
+    }
+
+    #[test]
+    fn smbios_skips_earlier_structures() {
+        // a Type 1 structure with one string, then Type 0 with UEFI set
+        let mut v = vec![1u8, 8, 0x10, 0x27, 1, 2, 3, 4];
+        v.extend_from_slice(b"sys\0ver\0\0");
+        v.extend_from_slice(&type0(0x08));
+        assert_eq!(smbios_uefi_flag(&v), Some(true));
+    }
+
+    #[test]
+    fn smbios_short_or_missing_is_none() {
+        assert_eq!(smbios_uefi_flag(&[]), None);
+        // Type 0 with a pre-UEFI short layout
+        let mut v = vec![0u8; 8];
+        v[0] = 0;
+        v[1] = 8;
+        v.extend_from_slice(&[0, 0]);
+        assert_eq!(smbios_uefi_flag(&v), None);
+        // corrupt length running past the buffer
+        assert_eq!(smbios_uefi_flag(&[0, 200, 0, 0]), None);
+        // no Type 0 at all
+        let mut v = vec![127u8, 4, 0, 0];
+        v.extend_from_slice(&[0, 0]);
+        assert_eq!(smbios_uefi_flag(&v), None);
     }
 }
 

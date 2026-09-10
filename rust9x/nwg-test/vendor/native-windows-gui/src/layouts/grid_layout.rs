@@ -81,7 +81,7 @@ A GridLayouts has the following properties:
 * margin - The top, right, bottom, left margins of the layout - (default: [5, 5, 5, 5])
 * spacing - The spacing between children controls - (default: 5)
 * min_size - The minimum size of the layout - (default: [0, 0])
-* max_size - The maximum size of the layout - (default: [u32::max_value(), u32::max_value()])
+* max_size - The maximum size of the layout - (default: [u32::MAX, u32::MAX])
 * max_column - Number of columns - (default: None),
 * max_row - Number of rows - (default: None),
 
@@ -113,7 +113,7 @@ impl GridLayout {
             margins: [5, 5, 5, 5],
             spacing: 5,
             min_size: [0, 0],
-            max_size: [u32::max_value(), u32::max_value()],
+            max_size: [u32::MAX, u32::MAX],
             column_count: None,
             row_count: None
         };
@@ -476,7 +476,7 @@ impl Default for GridLayout {
             children: Vec::new(),
             margins: [5, 5, 5, 5],
             min_size: [0, 0],
-            max_size: [u32::max_value(), u32::max_value()],
+            max_size: [u32::MAX, u32::MAX],
             column_count: None,
             row_count: None,
             spacing: 5,

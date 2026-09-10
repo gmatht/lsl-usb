@@ -1,4 +1,4 @@
-use super::base_helper::{to_utf16, from_utf16, to_ansi, from_ansi};
+use super::base_helper::{to_ansi, from_ansi};
 use super::high_dpi;
 use winapi::shared::windef::{HFONT, HWND, HMENU};
 use winapi::shared::minwindef::{UINT, WPARAM, LPARAM, LRESULT};

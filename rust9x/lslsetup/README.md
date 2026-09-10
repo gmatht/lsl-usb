@@ -27,7 +27,7 @@ Everything the PS script does is implemented:
 - Non-destructive write (`--write-mode nofmt`, keep Rufus as the default):
   turns an already-formatted FAT32/NTFS stick into a live USB WITHOUT
   reformatting. Writes grub4dos boot code into the MBR boot-code area ONLY
-  (bytes 0..446; partition table, disk signature and every file untouched),
+  (bytes 0..440; disk signature, partition table and every file untouched),
   **plus the grub4dos stage1 continuation into sectors 1..15** (the stage1 is
   8192 bytes = 16 sectors; the BIOS loads only sector 0, and the stage1 reads
   sectors 1..15 to load the rest of itself — without them it dies with
@@ -37,18 +37,31 @@ Everything the PS script does is implemented:
   0.4.6a binaries are embedded (`assets/`, GPL-2, SHA-256-pinned). The target
   must really be a removable USB drive: DRIVE_REMOVABLE **and**
   IOCTL_STORAGE_QUERY_PROPERTY BusTypeUsb, mapped via
-  IOCTL_STORAGE_GET_DEVICE_NUMBER; \(\\.\\)PhysicalDrive0, GPT, superfloppy
+  IOCTL_STORAGE_GET_DEVICE_NUMBER; \(\\.\\)PhysicalDrive0, superfloppy
   and exFAT sticks are refused; the first 64 sectors are backed up before the
   one raw write and verified by read-back afterwards. `--usb-letter` pins the
   target, `--allow-fixed` deliberately relaxes only the removable check
-  (never the USB-bus check), `--uefi-bootx64` optionally side-loads
-  BOOTX64.EFI + grub.cfg (files only). Win9x is refused (needs the NT
+  (never the USB-bus check). UEFI boots via BOOTX64.EFI + grub.cfg (files
+  only): `--uefi-bootx64` supplies the loader, otherwise the vendored
+  `assets/BOOTX64.EFI` is used when one was built in (grub4dos-for-UEFI
+  preferred - it reuses the same menu.lst/ISO mapping). The INSTALL page has
+  BIOS-boot and UEFI-boot checkboxes, on by default when the selected stick
+  supports them and greyed out with the reason when not, plus a this-machine
+  firmware line (booted UEFI/legacy, board UEFI/CSM capability via SMBIOS)
+  that warns when the selection won't boot the current PC; a FAILED page offers
+  Back-to-options to retry with another method. A "Check whole USB" checkbox
+  (also `--check-usb`) fills free space with 4 GB pseudo-random chunks in
+  DeleteMe\, reads every byte back with OS caching disabled, then deletes
+  DeleteMe - catching dying and fake-capacity sticks. Win9x is refused
+  (needs the NT
   \\.\\PhysicalDriveN namespace) and falls back to the Rufus flow
 
   **Configuration compatibility (grub4dos is picky — verified by
   `tests/qemu-boot-test.sh`):**
-  - **MBR only** — GPT and superfloppy (no partition table) sticks are
-    refused; grub4dos is a BIOS/CSM bootloader.
+  - **MBR for BIOS, either for UEFI** — superfloppy (no partition table)
+    sticks are refused; the grub4dos BIOS stage1 needs MBR sectors 1-15, so
+    GPT sticks get a files-only UEFI install (no raw sectors touched, FAT32
+    required) while MBR sticks can take both loaders at once.
   - **FAT32 or NTFS only** — exFAT (the default on many large sticks) is
     refused with a clear reason: grub4dos cannot read it, so the stick could
     not boot. FAT32 also caps the ISO at <4 GiB.

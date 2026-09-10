@@ -13,6 +13,9 @@ pub struct Opts {
     pub usb_letter: String,     // --usb-letter <X>: pick the nofmt target
     pub allow_fixed: bool,      // --allow-fixed: override removable+USB checks
     pub uefi_bootx64: String,   // optional BOOTX64.EFI for the nofmt stick
+    pub bios_boot: bool,        // nofmt: install the grub4dos BIOS path (default on)
+    pub uefi_boot: bool,        // nofmt: install the UEFI files (default on)
+    pub check_usb: bool,        // fill free space with PRNG data + read-back verify (default off: slow)
     pub wsl_vhdx: Vec<String>,
     pub flatpak_apps: Vec<String>,
     pub skip_iso_download: bool,
@@ -59,6 +62,9 @@ impl Default for Opts {
             usb_letter: String::new(),
             allow_fixed: false,
             uefi_bootx64: String::new(),
+            bios_boot: true,
+            uefi_boot: true,
+            check_usb: false,
             wsl_vhdx: Vec::new(),
             flatpak_apps: Vec::new(),
             skip_iso_download: false,
@@ -91,11 +97,21 @@ Options:
   --rufus-path <path>        Path to rufus.exe (auto-downloaded if missing)
   --write-mode <mode>        rufus (default, DD-style write) or nofmt
                              (non-destructive: grub4dos MBR-code write + the
-                             ISO copied as a file + menu.lst loopback; the
-                             stick must already be FAT32/NTFS)
+                             ISO copied as a file + menu.lst loopback +
+                             BOOTX64.EFI/grub.cfg for UEFI (BIOS + UEFI);
+                             the stick must already be FAT32/NTFS)
   --usb-letter <X>           Drive letter for the nofmt target (else a picker)
   --allow-fixed              Allow non-removable targets in nofmt mode
   --uefi-bootx64 <path>      Optional BOOTX64.EFI for nofmt UEFI booting
+  --no-bios-boot             nofmt: skip the grub4dos BIOS path (UEFI files only)
+  --no-uefi-boot             nofmt: skip the UEFI files (BIOS path only)
+  --check-usb                After writing: fill free space with PRNG test
+                             data in DeleteMe, read it all back uncached
+                             (bypasses the OS cache), then delete it
+                             (GRUB2 or grub4dos-for-UEFI loader; the latter
+                             reuses the same menu.lst/ISO mapping. Required
+                             for GPT sticks, which get a files-only UEFI
+                             install with no raw sector writes)
   --volume-label <label>     USB volume label to target
   --wsl-vhdx <path>          Extra WSL VHDX path (repeatable)
   --flatpak-apps <id>        Extra flatpak app id (repeatable)
@@ -140,6 +156,9 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--usb-letter" => o.usb_letter = next()?,
             "--allow-fixed" => o.allow_fixed = true,
             "--uefi-bootx64" => o.uefi_bootx64 = next()?,
+            "--no-bios-boot" => o.bios_boot = false,
+            "--no-uefi-boot" => o.uefi_boot = false,
+            "--check-usb" => o.check_usb = true,
             "--wsl-vhdx" => o.wsl_vhdx.push(next()?),
             "--flatpak-apps" => o.flatpak_apps.push(next()?),
             "--skip-iso-download" => o.skip_iso_download = true,

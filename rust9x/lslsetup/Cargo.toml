@@ -21,6 +21,13 @@ flate2 = "1"
 tar = "0.4"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
+[build-dependencies]
+# Host-side only: build.rs re-inflates assets/grldr.gz (gzip -9 + advdef -z -4)
+# and verifies the pinned raw SHA-256, so a corrupt/foreign blob fails the
+# build instead of shipping a bad bootloader.
+flate2 = "1"
+sha2 = "0.10"
+
 # Win95-compatible vendored copy of native-windows-gui 1.0.13 (see
 # ../nwg-test/vendor/native-windows-gui/README-WIN95.md).
 [patch.crates-io]
@@ -29,11 +36,20 @@ native-windows-gui = { path = "../nwg-test/vendor/native-windows-gui" }
 [profile.dev]
 # Unwind support needs at least VC8 (VS2005); we link the VC6 CRT.
 panic = "abort"
+# The installer hashes gigabytes (SHA-256 copy/verify); unoptimized sha2
+# crawls at single-digit MB/s and makes debug installs unusable. O2
+# saturates the software implementation (measured equal to O3), so pin just
+# this crate and keep fast debug compiles everywhere else.
+[profile.dev.package.sha2]
+opt-level = 2
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
-debug = 2
+# No debug info in the shipped EXE (~7 MB saving: debug sections were ~82%
+# of the binary). Use a dev build when crash backtraces are needed.
+debug = 0
+strip = true
 opt-level = "z"
 # Unwind support needs at least VC8 (VS2005); we link the VC6 CRT.
 panic = "abort"

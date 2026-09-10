@@ -69,8 +69,9 @@ pub fn show_dry_run_report(opts: &crate::cli::Opts) {
     // ---- write mode ----
     if opts.write_mode.eq_ignore_ascii_case("nofmt") {
         out::step("Write mode: non-destructive (nofmt)");
-        out::info("Would write grub4dos boot code into MBR bytes 0..446 only (partition table kept),");
-        out::info("copy grldr + the ISO as a regular file, and generate menu.lst (loopback boot).");
+        out::info("Would copy grldr + the ISO as a regular file, generate menu.lst (loopback boot),");
+        out::info("install BOOTX64.EFI + grub.cfg for UEFI (FAT32 + loader),");
+        out::info("and, after every other drop below, flip the MBR boot code (bytes 0..440; signature + partition table kept).");
         out::info("No formatting; existing files untouched. Target must be a removable USB drive,");
         out::info("FAT32/NTFS, MBR-partitioned (--allow-fixed overrides the removable check).");
         if !opts.usb_letter.is_empty() {
@@ -274,6 +275,16 @@ pub fn show_dry_run_report(opts: &crate::cli::Opts) {
         sys::os_ver(),
         boot::is_uefi(),
         boot::secure_boot_status()
+    ));
+    // Board firmware: what THIS motherboard can boot (the stick may target
+    // another PC, so this informs the checkbox choice, never blocks it).
+    let bc = sys::board_caps();
+    out::info(&format!(
+        "  Board firmware: boots {} (UEFI-capable: {:?}, legacy/CSM-capable: {:?}, {})",
+        if bc.booted_uefi { "UEFI" } else { "legacy/BIOS" },
+        bc.uefi_capable,
+        bc.bios_capable,
+        bc.detail
     ));
     out::info(&format!("  HTTP transport (winhttp): {}", net::has_transport()));
     out::info(&format!("  netsh wifi profiles: {}", wifi::has_netsh()));

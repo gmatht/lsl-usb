@@ -1,0 +1,22 @@
+Vendored UEFI loader for the non-destructive (nofmt) install path.
+
+What:      grub4dos-for-UEFI BOOTX64.EFI (x86_64, PE32+, EFI application,
+           417,792 bytes, unsigned - Secure Boot must be OFF)
+Upstream:  https://github.com/chenall/grub4dos
+Release:   tag "for_UEFI", published 2026-05-07
+Asset:     grub4dos-for_UEFI-2026-05-07.7z (top-level BOOTX64.EFI)
+Source:    git clone git://github.com/chenall/grub4dos.git && git checkout a518a66
+URL:       https://github.com/chenall/grub4dos/releases/download/for_UEFI/grub4dos-for_UEFI-2026-05-07.7z
+SHA-256:   d5229249db559d33933ae5c3ad9feffb1ad6635a505e49cd93e2225f93da52c2
+           (pinned in BOOTX64.EFI.sha256; nofmt refuses the bytes at runtime
+           on mismatch - see bundled_uefi() in src/nofmt.rs)
+
+Why this binary: it reads the same menu.lst/ISO mapping the installer
+already writes for the BIOS path, so one menu serves both firmware modes;
+plain GRUB2 also works via the generated grub.cfg. Same upstream project
+as the vendored BIOS assets (grldr/grldr.mbr, GPL - see COPYING).
+
+Build:     build.rs embeds this file into lslsetup.exe via OUT_DIR/BOOTX64.EFI
+           (include_bytes!). Absent file -> no UEFI vendoring and
+           --uefi-bootx64 remains the only UEFI source. To update: replace
+           this file, refresh the .sha256 pin, and rebuild.

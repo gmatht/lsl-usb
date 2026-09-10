@@ -30,7 +30,7 @@ pub(crate) mod richedit;
 #[cfg(feature = "plotting")]
 pub(crate) mod plotters_d2d;
 
-use std::{fs, mem, ptr};
+use std::{mem, ptr};
 use crate::errors::NwgError;
 
 

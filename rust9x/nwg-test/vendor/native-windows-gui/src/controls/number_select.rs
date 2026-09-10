@@ -77,8 +77,8 @@ impl Default for NumberSelectData {
         NumberSelectData::Int { 
             value: 0,
             step: 1,
-            max: i64::max_value(),
-            min: i64::min_value(),
+            max: i64::MAX,
+            min: i64::MIN,
         }
     }
 }
@@ -299,7 +299,7 @@ impl<'a> NumberSelectBuilder<'a> {
     pub fn value_int(mut self, v: i64) -> NumberSelectBuilder<'a> {
         match &mut self.data {
             NumberSelectData::Int { value, .. } => { *value = v; }
-            data => *data = NumberSelectData::Int { value: v, step: 1, max: i64::max_value(), min: i64::min_value() }
+            data => *data = NumberSelectData::Int { value: v, step: 1, max: i64::MAX, min: i64::MIN }
         }
         self
     }
@@ -307,7 +307,7 @@ impl<'a> NumberSelectBuilder<'a> {
     pub fn step_int(mut self, v: i64) -> NumberSelectBuilder<'a> {
         match &mut self.data {
             NumberSelectData::Int { step, .. } => { *step = v; }
-            data => *data = NumberSelectData::Int { value: 0, step: v, max: i64::max_value(), min: i64::min_value() }
+            data => *data = NumberSelectData::Int { value: 0, step: v, max: i64::MAX, min: i64::MIN }
         }
         self
     }
@@ -315,7 +315,7 @@ impl<'a> NumberSelectBuilder<'a> {
     pub fn max_int(mut self, v: i64) -> NumberSelectBuilder<'a> {
         match &mut self.data {
             NumberSelectData::Int { max, .. } => { *max = v; }
-            data => *data = NumberSelectData::Int { value: 0, step: 1, max: v, min: i64::min_value() }
+            data => *data = NumberSelectData::Int { value: 0, step: 1, max: v, min: i64::MIN }
         }
         self
     }
@@ -323,7 +323,7 @@ impl<'a> NumberSelectBuilder<'a> {
     pub fn min_int(mut self, v: i64) -> NumberSelectBuilder<'a> {
         match &mut self.data {
             NumberSelectData::Int { min, .. } => { *min = v; }
-            data => *data = NumberSelectData::Int { value: 0, step: 1, max: i64::max_value(), min: v }
+            data => *data = NumberSelectData::Int { value: 0, step: 1, max: i64::MAX, min: v }
         }
         self
     }

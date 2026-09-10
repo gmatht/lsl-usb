@@ -8,7 +8,7 @@ use winapi::shared::windef::{HWND, HMENU, HBRUSH};
 use winapi::shared::basetsd::{DWORD_PTR, UINT_PTR};
 use winapi::um::winuser::{WNDPROC, NMHDR, IDCANCEL, IDOK};
 use winapi::um::commctrl::{NMTTDISPINFOW, SUBCLASSPROC};
-use super::base_helper::{CUSTOM_ID_BEGIN, to_utf16, to_ansi, from_ansi};
+use super::base_helper::{CUSTOM_ID_BEGIN, to_ansi, from_ansi};
 use super::window_helper::{NOTICE_MESSAGE, NWG_INIT, NWG_TRAY, NWG_TIMER_TICK, NWG_TIMER_STOP};
 use super::high_dpi;
 use crate::controls::ControlHandle;
@@ -142,7 +142,7 @@ pub fn full_bind_event_handler<F>(handle: &ControlHandle, f: F) -> EventHandler
         EnumChildWindows(hwnd, Some(handler_children), (&mut handler.handles as *mut Vec<HWND>) as LPARAM);
         EnumChildWindows(hwnd, Some(set_children_subclass), params_ptr as LPARAM);
         SetWindowSubclass(hwnd, callback_fn, subclass_id, callback_ptr as UINT_PTR);
-        Box::from_raw(params_ptr);
+        let _ = Box::from_raw(params_ptr);
     }
 
     handler
@@ -225,7 +225,7 @@ pub fn unbind_event_handler(handler: &EventHandler)
 
     // Finally free the pointer to the pointer to the callback
     unsafe {
-        Box::from_raw(callback_ptr);
+        let _ = Box::from_raw(callback_ptr);
     }
 }
 
@@ -426,7 +426,7 @@ pub(crate) unsafe fn build_sysclass<'a>(
 ) -> Result<(), NwgError> 
 {
     use winapi::um::winuser::{LoadCursorA, RegisterClassExA};
-    use winapi::um::winuser::{CS_HREDRAW, CS_VREDRAW, COLOR_WINDOW, IDC_ARROW, WNDCLASSEXA};
+    use winapi::um::winuser::{CS_HREDRAW, CS_VREDRAW, COLOR_WINDOW, WNDCLASSEXA};
     use winapi::um::errhandlingapi::GetLastError;
     use winapi::shared::winerror::ERROR_CLASS_ALREADY_EXISTS;
 
@@ -568,7 +568,6 @@ unsafe extern "system" fn process_events(hwnd: HWND, msg: UINT, w: WPARAM, l: LP
       WM_ENTERSIZEMOVE, SIZE_MAXIMIZED, SIZE_MINIMIZED, WM_KEYDOWN, WM_KEYUP, WM_CHAR, WM_MOUSEWHEEL, WM_DROPFILES, GET_WHEEL_DELTA_WPARAM,
       WM_GETMINMAXINFO, WM_ENTERMENULOOP, WM_EXITMENULOOP, WM_SYSKEYDOWN, WM_SYSKEYUP};
     use winapi::um::shellapi::{NIN_BALLOONSHOW, NIN_BALLOONHIDE, NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK};
-    use winapi::um::winnt::WCHAR;
     use winapi::shared::minwindef::{HIWORD, LOWORD};
 
     let callback_ptr = data as *mut *const Callback;
@@ -600,13 +599,13 @@ unsafe extern "system" fn process_events(hwnd: HWND, msg: UINT, w: WPARAM, l: LP
         },
         WM_NOTIFY => {
             let code = {
-                let notif_ptr: *mut NMHDR = mem::transmute(l);
+                let notif_ptr: *mut NMHDR = std::ptr::with_exposed_provenance_mut::<NMHDR>(l as usize);
                 (&*notif_ptr).code
             };
         
             match code {
-                TTN_GETDISPINFOW => handle_tooltip_callback(mem::transmute::<_, *mut NMTTDISPINFOW>(l), callback),
-                _ => handle_default_notify_callback(mem::transmute::<_, *const NMHDR>(l), callback)
+                TTN_GETDISPINFOW => handle_tooltip_callback(std::ptr::with_exposed_provenance_mut::<NMTTDISPINFOW>(l as usize), callback),
+                _ => handle_default_notify_callback(std::ptr::with_exposed_provenance::<NMHDR>(l as usize), callback)
             }
         },
         WM_MENUCOMMAND => {
@@ -746,7 +745,7 @@ unsafe extern "system" fn process_raw_events(hwnd: HWND, msg: UINT, w: WPARAM, l
     let callback: Box<RawCallback> = Box::from_raw(*callback_wrapper_ptr);
 
     let result = callback(hwnd, msg, w, l);
-    Box::into_raw(callback);
+    let _ = Box::into_raw(callback);
 
     match result {
         Some(r) => r,
@@ -1066,26 +1065,17 @@ unsafe fn is_textbox_control(hwnd: HWND) -> bool {
 type SubclassId = (usize, usize, UINT_PTR);
 
 #[cfg(target_env="gnu")]
-static mut SUBCLASS_COLLECTION: Option<Mutex<HashMap<SubclassId, DWORD_PTR>>> = None;
+static SUBCLASS_COLLECTION: std::sync::LazyLock<Mutex<HashMap<SubclassId, DWORD_PTR>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 
 #[cfg(target_env="gnu")]
 #[allow(non_snake_case)]
 unsafe fn GetWindowSubclass(hwnd: HWND, proc: SUBCLASSPROC, uid: UINT_PTR, data: *mut DWORD_PTR) -> BOOL {
-    if SUBCLASS_COLLECTION.is_none() {
-        SUBCLASS_COLLECTION = Some(Mutex::new(HashMap::new()));
-    }
-
     let id = (hwnd as usize, mem::transmute(proc), uid);
-    match SUBCLASS_COLLECTION.as_ref() {
-        Some(collection_mutex) => {
-            let collection = collection_mutex.lock().unwrap();
-            match collection.get(&id) {
-                Some(v) => { *data = *v; 1 },
-                None => { 0 }
-            }
-        },
-        None => unreachable!()
+    let collection = SUBCLASS_COLLECTION.lock().unwrap();
+    match collection.get(&id) {
+        Some(v) => { *data = *v; 1 },
+        None => { 0 }
     }
 }
 
@@ -1094,19 +1084,9 @@ unsafe fn GetWindowSubclass(hwnd: HWND, proc: SUBCLASSPROC, uid: UINT_PTR, data:
 unsafe fn SetWindowSubclass(hwnd: HWND, proc: SUBCLASSPROC, uid: UINT_PTR, data: DWORD_PTR) -> BOOL {
     use winapi::um::commctrl::SetWindowSubclass;
 
-    if SUBCLASS_COLLECTION.is_none() {
-        SUBCLASS_COLLECTION = Some(Mutex::new(HashMap::new()));
-    }
-
     let id = (hwnd as usize, mem::transmute(proc), uid);
-    match SUBCLASS_COLLECTION.as_ref() {
-        Some(collection_mutex) => {
-            let mut collection = collection_mutex.lock().unwrap();
-            collection.insert(id, data);
-        },
-        None => unreachable!()
-    }
-
+    let mut collection = SUBCLASS_COLLECTION.lock().unwrap();
+    collection.insert(id, data);
 
     SetWindowSubclass(hwnd, proc, uid, data)
 }
@@ -1117,18 +1097,9 @@ unsafe fn SetWindowSubclass(hwnd: HWND, proc: SUBCLASSPROC, uid: UINT_PTR, data:
 unsafe fn RemoveWindowSubclass(hwnd: HWND, proc: SUBCLASSPROC, uid: UINT_PTR) -> BOOL {
     use winapi::um::commctrl::RemoveWindowSubclass;
 
-    if SUBCLASS_COLLECTION.is_none() {
-        SUBCLASS_COLLECTION = Some(Mutex::new(HashMap::new()));
-    }
-
     let id = (hwnd as usize, mem::transmute(proc), uid);
-    match SUBCLASS_COLLECTION.as_ref() {
-        Some(collection_mutex) => {
-            let mut collection = collection_mutex.lock().unwrap();
-            collection.remove(&id);
-        },
-        None => unreachable!()
-    }
+    let mut collection = SUBCLASS_COLLECTION.lock().unwrap();
+    collection.remove(&id);
 
     RemoveWindowSubclass(hwnd, proc, uid)
 }

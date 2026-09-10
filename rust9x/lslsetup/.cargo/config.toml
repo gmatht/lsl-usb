@@ -49,10 +49,8 @@ rustflags = [
   # VC6-era CRT doesn't support SAFESEH (rustc passes /SAFESEH for i686)
   '-Clink-arg=/SAFESEH:NO',
 
-  # Application manifest (asInvoker: opt out of the UAC installer-detection
-  # heuristic that auto-elevates *install*.exe; dpiAware; supportedOS).
-  # Compiled once with: llvm-rc /FO src/app_manifest.res src/app_manifest.rc
-  '-Clink-arg=/root/src/lsl-usb/rust9x/lslsetup/src/app_manifest.res',
+  # Application manifest: emitted by build.rs from the manifest dir
+  # (see above) so the path works on any build machine.
 
   # Stub libs for modern /DEFAULTLIB markers emitted by rust9x's std
   # (windows_link references synchronization.lib but resolves

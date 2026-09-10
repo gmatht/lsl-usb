@@ -50,7 +50,9 @@ trap 'cleanup; rm -rf "$WORK"' EXIT
 mkfs.vfat -F 32 -n LSLTEST "${LOOP}p1" >/dev/null 2>&1
 mkdir -p "$WORK/mnt"
 mount "${LOOP}p1" "$WORK/mnt"
-cp "$ASSETS/grldr" "$WORK/mnt/grldr"
+# grldr ships compressed (assets/grldr.gz: gzip -9 + advdef -z -4); the
+# installer inflates it with flate2, so the test does the same here.
+python3 -c "import gzip,shutil; shutil.copyfileobj(gzip.open('$ASSETS/grldr.gz','rb'), open('$WORK/mnt/grldr','wb'))"
 mkdir -p "$WORK/mnt/_ISO"
 cp "$WORK/test.iso" "$WORK/mnt/_ISO/test.iso"
 cat > "$WORK/menu.lst" <<'EOF'
@@ -96,8 +98,9 @@ boot_and_check() { # $1=img $2=expected-marker
 }
 
 # copy grldr + ISO + menu.lst into a mounted partition (grub4dos layout)
+# (grldr ships compressed; inflate exactly like the installer does)
 populate() { # $1=mountpoint
-  cp "$ASSETS/grldr" "$1/grldr"
+  python3 -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open('$ASSETS/grldr.gz','rb'), open(sys.argv[1],'wb'))" "$1/grldr"
   mkdir -p "$1/_ISO"
   cp "$WORK/test.iso" "$1/_ISO/test.iso"
   cp "$WORK/menu.lst" "$1/menu.lst"

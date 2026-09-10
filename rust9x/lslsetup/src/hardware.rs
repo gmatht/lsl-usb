@@ -417,13 +417,57 @@ pub fn install_driver_packages(vol_letter: &str, skip_download: bool) -> Vec<Str
 // ---------------------------------------------------------------------------
 
 // Compiled-in summary of the lsl-hw-cache snapshot (see build.rs): common
-// hardware rates instantly, with no network request at all.
+// hardware rates instantly, with no network request at all. The table is
+// gzip-compressed (~9.5:1 — highly repetitive text) and inflated once on
+// first lookup; flate2's decoder is already linked for Packages.gz.
 include!(concat!(env!("OUT_DIR"), "/hw_cache_embedded.rs"));
 
+struct HwCacheEntry {
+    id: String,
+    name: String,
+    ksup: String,
+    src: String,
+    third: Vec<String>,
+}
+
+static HW_CACHE: std::sync::OnceLock<Vec<HwCacheEntry>> = std::sync::OnceLock::new();
+
+fn hw_cache() -> &'static [HwCacheEntry] {
+    HW_CACHE.get_or_init(|| {
+        let mut out = Vec::with_capacity(HW_CACHE_ENTRIES);
+        let mut dec = flate2::read::GzDecoder::new(COMPRESSED_HW_CACHE);
+        let mut plain = String::new();
+        use std::io::Read;
+        if dec.read_to_string(&mut plain).is_err() {
+            return Vec::new(); // build-verified; on failure callers fall through to disk/network
+        }
+        for line in plain.lines() {
+            let mut f = line.split('\x1f');
+            let (Some(id), Some(name), Some(ksup), Some(src), Some(third)) =
+                (f.next(), f.next(), f.next(), f.next(), f.next())
+            else {
+                continue;
+            };
+            out.push(HwCacheEntry {
+                id: id.to_string(),
+                name: name.to_string(),
+                ksup: ksup.to_string(),
+                src: src.to_string(),
+                third: if third.is_empty() {
+                    Vec::new()
+                } else {
+                    third.split(',').map(|s| s.to_string()).collect()
+                },
+            });
+        }
+        out
+    })
+}
+
 fn embedded_lookup(id: &str) -> Option<(&'static str, &'static str, &'static str, Vec<String>)> {
-    for (e_id, e_name, e_ksup, e_src, e_third) in EMBEDDED_HW_CACHE.iter() {
-        if *e_id == id {
-            return Some((*e_name, *e_ksup, *e_src, e_third.iter().map(|t| t.to_string()).collect()));
+    for e in hw_cache().iter() {
+        if e.id == id {
+            return Some((e.name.as_str(), e.ksup.as_str(), e.src.as_str(), e.third.clone()));
         }
     }
     None
@@ -542,6 +586,60 @@ pub fn lhw_url(d: &Device) -> String {
         d.vendor.to_lowercase(),
         d.device.to_lowercase()
     )
+}
+
+/// Fast path: curated table + embedded cache + on-disk cache, NO network.
+/// Returns Some(Rating) if any cache hit, None if a live fetch is needed.
+pub fn linux_compat_rating_cached(d: &Device, bundle_dir: &str, iso_kernel: (u32, u32)) -> Option<Rating> {
+    // Curated-table override first
+    if let Some(t) = driver_table().iter().find(|t| t.id == d.id) {
+        return Some(Rating {
+            rating: 'C',
+            name: d.name.clone(),
+            reason: format!("needs out-of-tree driver ({}) - staged to <USB>:\\drivers\\", t.pkg),
+        });
+    }
+    let id = format!(
+        "{}:{}-{}",
+        d.kind.to_lowercase(),
+        d.vendor.to_lowercase(),
+        d.device.to_lowercase()
+    );
+    // Compiled-in snapshot
+    if let Some((e_name, e_ksup, e_src, e_third)) = embedded_lookup(&id) {
+        let name = if e_name.is_empty() {
+            d.name.clone()
+        } else {
+            e_name.to_string()
+        };
+        return Some(rating_from_lkddb(
+            name,
+            e_ksup.to_string(),
+            e_src.to_string(),
+            e_third.iter().map(|t| t.to_string()).collect(),
+            iso_kernel,
+        ));
+    }
+    // On-disk caches (user + bundle)
+    let user_cache = lhw_cache_file(&id);
+    if let Ok(html) = std::fs::read_to_string(&user_cache) {
+        if !html.is_empty() {
+            let (name, ksup, src, third) = parse_lhw_html(&html);
+            let name = if name.is_empty() { d.name.clone() } else { name };
+            return Some(rating_from_lkddb(name, ksup, src, third, iso_kernel));
+        }
+    }
+    if !bundle_dir.is_empty() {
+        let bc = bundle_cache_file(bundle_dir, &id);
+        if let Ok(html) = std::fs::read_to_string(&bc) {
+            if !html.is_empty() {
+                let (name, ksup, src, third) = parse_lhw_html(&html);
+                let name = if name.is_empty() { d.name.clone() } else { name };
+                return Some(rating_from_lkddb(name, ksup, src, third, iso_kernel));
+            }
+        }
+    }
+    None
 }
 
 pub fn linux_compat_rating(d: &Device, bundle_dir: &str, iso_kernel: (u32, u32)) -> Rating {
