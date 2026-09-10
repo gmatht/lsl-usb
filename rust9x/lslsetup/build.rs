@@ -80,16 +80,17 @@ fn main() {
         }
     }
 
-    // Optional vendored UEFI loader: drop a BOOTX64.EFI (grub4dos-for-UEFI
-    // preferred - it reuses the same menu.lst/ISO mapping; plain GRUB2 works
-    // too via the generated grub.cfg) at assets/BOOTX64.EFI and rebuild.
-    // Absent file -> BUNDLED_BOOTX64_EFI is None and --uefi-bootx64 remains
-    // the only UEFI source. An adjacent assets/BOOTX64.EFI.sha256 (hex,
-    // whitespace tolerated) pins the hash; nofmt refuses the bundled bytes
-    // at runtime on mismatch.
+    // Optional vendored UEFI loaders embedded via OUT_DIR/uefi_embedded.rs:
+    // (a) the SIGNED chain (assets/shimx64.efi.gz + grubx64.efi.gz +
+    // mmx64.efi.gz - shim + Canonical-signed GRUB2; Secure Boot ON), the
+    // DEFAULT loader when present, and (b) the unsigned grub4dos-for-UEFI
+    // BOOTX64.EFI fallback (Secure Boot must be OFF). Absent files -> the
+    // matching BUNDLED_* static is None and --uefi-bootx64 <file> remains
+    // the remaining UEFI source. sha256 pins sit next to each asset; nofmt
+    // refuses the bundled bytes at runtime on mismatch.
     let out_dir = env::var("OUT_DIR").unwrap();
     let uefi_src = Path::new(&manifest).join("assets").join("BOOTX64.EFI");
-    let uefi_code = if uefi_src.is_file() {
+    let mut uefi_code = if uefi_src.is_file() {
         let bytes = fs::read(&uefi_src).unwrap();
         let pin_path = Path::new(&manifest).join("assets").join("BOOTX64.EFI.sha256");
         if pin_path.is_file() {
@@ -121,6 +122,68 @@ fn main() {
     fs::write(Path::new(&out_dir).join("uefi_embedded.rs"), &uefi_code).unwrap();
     println!("cargo:rerun-if-changed=assets/BOOTX64.EFI");
     println!("cargo:rerun-if-changed=assets/BOOTX64.EFI.sha256");
+    // Signed UEFI chain (Secure Boot ON): Microsoft-signed shim ->
+    // Canonical-signed grub2 (+ signed MokManager), see assets/SIGNED-UEFI.txt.
+    // Each assets/<name>.efi.gz is gzip -9 of the raw EFI binary; the raw
+    // SHA-256 is pinned in assets/<name>.efi.sha256 (lowercase hex, whitespace
+    // tolerated) and verified here, so a corrupt/foreign blob fails the build
+    // instead of shipping a bootloader that cannot be trusted. A present .gz
+    // WITHOUT its pin is a hard error - an unverifiable signed chain must
+    // never sneak into the binary.
+    for name in ["shimx64.efi", "grubx64.efi", "mmx64.efi"] {
+        let gz_path = Path::new(&manifest).join("assets").join(format!("{}.gz", name));
+        let pin_path = Path::new(&manifest).join("assets").join(format!("{}.sha256", name));
+        println!("cargo:rerun-if-changed=assets/{}.gz", name);
+        println!("cargo:rerun-if-changed=assets/{}.sha256", name);
+        let upper = name.replace('.', "_").to_ascii_uppercase();
+        let (embedded, pin_lit) = if gz_path.is_file() {
+            assert!(pin_path.is_file(), "assets/{}.gz has no {}.sha256 pin - add one", name, name);
+            let pin: String = fs::read_to_string(&pin_path)
+                .unwrap()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let gz = fs::read(&gz_path).unwrap();
+            let mut dec = flate2::read::GzDecoder::new(&gz[..]);
+            let mut raw = Vec::new();
+            use std::io::Read as _;
+            dec.read_to_end(&mut raw).unwrap_or_else(|e| {
+                panic!("assets/{}.gz does not inflate (not a valid gzip stream): {}", name, e)
+            });
+            let mut h = sha2::Sha256::new();
+            use sha2::Digest as _;
+            h.update(&raw);
+            let hex = format!("{:x}", h.finalize());
+            assert_eq!(hex, pin, "assets/{}.gz inflates to unexpected bytes (got sha256 {})", name, hex);
+            assert!(
+                gz.len() < raw.len(),
+                "assets/{}.gz ({} bytes) is no smaller than the raw binary ({} bytes) - recompress it",
+                name, gz.len(), raw.len()
+            );
+            let dst = Path::new(&out_dir).join(name);
+            fs::write(&dst, &raw).unwrap();
+            println!("cargo:warning={} OK: {} -> {} bytes, sha256 {}", name, raw.len(), gz.len(), &hex[..16]);
+            (
+                format!(
+                    "pub static BUNDLED_{}: Option<&[u8]> = Some(include_bytes!(\"{}\"));",
+                    upper,
+                    dst.to_string_lossy().replace('\\', "/")
+                ),
+                format!("pub static BUNDLED_{}_SHA256: Option<&str> = Some(\"{}\");", upper, pin),
+            )
+        } else {
+            (
+                format!("pub static BUNDLED_{}: Option<&[u8]> = None;", upper),
+                format!("pub static BUNDLED_{}_SHA256: Option<&str> = None;", upper),
+            )
+        };
+        uefi_code.push_str(&embedded);
+        uefi_code.push('\n');
+        uefi_code.push_str(&pin_lit);
+        uefi_code.push('\n');
+    }
+    fs::write(Path::new(&out_dir).join("uefi_embedded.rs"), &uefi_code).unwrap();
     // Application manifest for rust9x targets (asInvoker: opt out of the
     // UAC installer-detection heuristic; dpiAware; supportedOS). The .res
     // was compiled once with: llvm-rc /FO src/app_manifest.res

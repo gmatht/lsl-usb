@@ -7,15 +7,28 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 
 pub fn sha256_file(path: &str) -> Option<String> {
+    sha256_file_progress(path, &mut |_, _| {})
+}
+
+/// SHA-256 of a file with live (done, total) progress. Same result as
+/// `sha256_file`; use it for multi-GB files so callers can drive a
+/// progress bar and pump the GUI — a silent 3 GB hash over USB looks
+/// exactly like a freeze.
+pub fn sha256_file_progress(path: &str, progress: &mut dyn FnMut(u64, u64)) -> Option<String> {
     let mut f = std::fs::File::open(path).ok()?;
+    let total = f.metadata().map(|m| m.len()).unwrap_or(0);
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
+    let mut done = 0u64;
+    progress(0, total);
     loop {
         let n = f.read(&mut buf).unwrap_or(0);
         if n == 0 {
             break;
         }
         h.update(&buf[..n]);
+        done += n as u64;
+        progress(done, total);
     }
     Some(format!("{:x}", h.finalize()))
 }

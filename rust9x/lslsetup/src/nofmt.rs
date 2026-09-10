@@ -5,7 +5,7 @@
 //!      the ISO *as a regular file* onto the stick (SHA-256-verified);
 //!   2. generates/appends a `menu.lst` that loopback-maps the ISO and
 //!      chainloads the ISO's own bootloader (plus BOOTX64.EFI/grub.cfg
-//!      for UEFI);
+//!      and a mirrored \efi\grub\menu.lst for UEFI);
 //!   3. LAST, writes grub4dos boot code into the MBR *boot-code area only*
 //!      (bytes 0..440) - disk signature (440..446), partition table
 //!      (446..510) and 0x55AA signature (510..512) are preserved - plus
@@ -39,8 +39,19 @@
 //!     by read-back afterwards;
 //!   - Win9x is refused (needs the \\.\PhysicalDriveN NT device namespace).
 //!
-//! UEFI (incl. grub4dos-for-UEFI, which reads the same menu.lst/ISO
-//! mapping) is supported side-by-side via --uefi-bootx64 <BOOTX64.EFI>:
+//! UEFI (incl. grub4dos-for-UEFI, which boots the menu.lst direct-kernel
+//! entry - the loopback `map (0xff)` chainload is BIOS-only) is supported
+//! side-by-side via --uefi-bootx64 <BOOTX64.EFI>: the same menu entries are
+//! ALSO mirrored to \efi\grub\menu.lst, which is the ONLY menu location
+//! grub4dos-for-UEFI reads (its source searches /efi/grub/menu.lst, then
+//! `find --set-root /efi/grub/menu.lst`; the volume-root menu.lst is
+//! BIOS-only, so without the mirror a UEFI boot drops to its prompt). The
+//! DEFAULT UEFI loader is the bundled signed chain - Microsoft-signed shim
+//! -> Canonical-signed GRUB2 (assets/shimx64.efi.gz + grubx64.efi.gz +
+//! mmx64.efi.gz, see assets/SIGNED-UEFI.txt) - which boots with Secure Boot
+//! ON or OFF and reads grub.cfg; --uefi-loader grub4dos opts back into
+//! grub4dos-for-UEFI (Secure Boot OFF), and an explicit --uefi-bootx64
+//! <file> always wins over both.
 //! whenever possible BOTH loaders are installed and a boot-capability
 //! summary says which firmware modes will boot (warning when only one
 //! will). GPT sticks get a files-only UEFI install (no raw sectors
@@ -134,8 +145,64 @@ fn grldr() -> &'static [u8] {
 const GRLDR_SHA256: &str = "dece3f8d20f84ae0d0fb892b5c3a2d19e7233d0d8885b0027a6f43d77239128d";
 const GRLDR_MBR_SHA256: &str = "f5c6e8e2c1eb7380285fa9cb1c9168e92d5b3b55cde052c043ba81ed17b9acef";
 
-// Optional vendored UEFI loader (see build.rs: assets/BOOTX64.EFI).
+// Optional vendored UEFI loaders (see build.rs + assets/SIGNED-UEFI.txt):
+// the SIGNED chain (Microsoft-signed shim -> Canonical-signed GRUB2, boots
+// with Secure Boot ON or OFF) is the DEFAULT loader whenever bundled; the
+// unsigned grub4dos-for-UEFI BOOTX64.EFI (Secure Boot must be OFF) is the
+// fallback. An explicit --uefi-bootx64 file always wins over both.
 include!(concat!(env!("OUT_DIR"), "/uefi_embedded.rs"));
+
+/// Which UEFI loader to install on the stick.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum UefiLoader {
+    /// Best default: the signed shim+GRUB2 chain when bundled, else
+    /// grub4dos-for-UEFI (or a --uefi-bootx64 file, which always wins).
+    #[default]
+    Auto,
+    /// Microsoft-signed shim -> Canonical-signed GRUB2 (+ MokManager).
+    Signed,
+    /// grub4dos-for-UEFI (unsigned; Secure Boot must be OFF).
+    Grub4dos,
+}
+
+/// `--uefi-loader` override, set once during arg parsing (cli.rs) so the
+/// GUI and console flows both honor the flag without threading it through
+/// the shared install signature (which the GUI also calls). Absent -> Auto.
+static UEFI_LOADER_OVERRIDE: std::sync::OnceLock<UefiLoader> = std::sync::OnceLock::new();
+
+/// Set from the `--uefi-loader` CLI flag; a second set is ignored.
+pub fn set_uefi_loader_override(loader: UefiLoader) {
+    let _ = UEFI_LOADER_OVERRIDE.set(loader);
+}
+
+/// The active loader selection: the CLI override, else Auto.
+fn active_uefi_loader() -> UefiLoader {
+    UEFI_LOADER_OVERRIDE.get().copied().unwrap_or(UefiLoader::Auto)
+}
+
+/// The vendored signed chain, verified: (shim, Canonical-signed GRUB2,
+/// MokManager). Any pin mismatch or missing component disables the whole
+/// chain (assets/*.sha256; an unverifiable signed loader must never be
+/// installed).
+pub fn bundled_signed() -> Option<(&'static [u8], &'static [u8], &'static [u8])> {
+    let ok = |data: Option<&'static [u8]>, pin: Option<&'static str>| -> bool {
+        match (data, pin) {
+            (Some(d), Some(p)) => sha256_hex(d).eq_ignore_ascii_case(p),
+            _ => false,
+        }
+    };
+    if !ok(BUNDLED_SHIMX64_EFI, BUNDLED_SHIMX64_EFI_SHA256)
+        || !ok(BUNDLED_GRUBX64_EFI, BUNDLED_GRUBX64_EFI_SHA256)
+        || !ok(BUNDLED_MMX64_EFI, BUNDLED_MMX64_EFI_SHA256)
+    {
+        return None;
+    }
+    Some((
+        BUNDLED_SHIMX64_EFI.unwrap(),
+        BUNDLED_GRUBX64_EFI.unwrap(),
+        BUNDLED_MMX64_EFI.unwrap(),
+    ))
+}
 
 /// The vendored UEFI loader, if one was present at build time. Verified
 /// against the pinned hash (assets/BOOTX64.EFI.sha256) when pinned.
@@ -148,10 +215,77 @@ pub fn bundled_uefi() -> Option<&'static [u8]> {
     BUNDLED_BOOTX64_EFI
 }
 
-/// Where the UEFI loader would come from, in priority order.
+/// The resolved UEFI boot path for this run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResolvedUefi {
+    /// Microsoft-signed shim -> Canonical-signed GRUB2 (Secure Boot ON).
+    Signed,
+    /// grub4dos-for-UEFI BOOTX64.EFI (Secure Boot must be OFF).
+    Grub4dos,
+    /// User-supplied --uefi-bootx64 file, installed as-is.
+    Custom,
+    /// No loader available for the selection.
+    Unavailable,
+}
+
+impl ResolvedUefi {
+    /// One-line description for the plan/summary/probe texts.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            ResolvedUefi::Signed => "signed shim -> GRUB2 (Secure Boot ON works)",
+            ResolvedUefi::Grub4dos => "grub4dos-for-UEFI BOOTX64.EFI (Secure Boot must be OFF)",
+            ResolvedUefi::Custom => "--uefi-bootx64 file",
+            ResolvedUefi::Unavailable => "no UEFI loader",
+        }
+    }
+
+    /// grub4dos-family paths also mirror the menu entries to
+    /// \\efi\\grub\\menu.lst (the only menu location grub4dos-for-UEFI
+    /// reads); the signed GRUB2 chain reads only grub.cfg.
+    pub fn mirror_menu(&self) -> bool {
+        matches!(self, ResolvedUefi::Grub4dos | ResolvedUefi::Custom)
+    }
+}
+
+/// Priority: an existing --uefi-bootx64 file wins; otherwise the selected
+/// loader (default Auto = signed chain when bundled, else grub4dos).
+fn resolve_uefi(loader: UefiLoader, uefi_bootx64: &str) -> ResolvedUefi {
+    if !uefi_bootx64.is_empty() && sys::path_exists(uefi_bootx64) {
+        return ResolvedUefi::Custom;
+    }
+    match loader {
+        UefiLoader::Signed => {
+            if bundled_signed().is_some() {
+                ResolvedUefi::Signed
+            } else {
+                ResolvedUefi::Unavailable
+            }
+        }
+        UefiLoader::Grub4dos => {
+            if bundled_uefi().is_some() {
+                ResolvedUefi::Grub4dos
+            } else {
+                ResolvedUefi::Unavailable
+            }
+        }
+        UefiLoader::Auto => {
+            if bundled_signed().is_some() {
+                ResolvedUefi::Signed
+            } else if bundled_uefi().is_some() {
+                ResolvedUefi::Grub4dos
+            } else {
+                ResolvedUefi::Unavailable
+            }
+        }
+    }
+}
+
+/// Where the UEFI loader would come from, in priority order (informational).
 pub fn uefi_source_name(uefi_bootx64: &str) -> Option<&'static str> {
     if !uefi_bootx64.is_empty() && sys::path_exists(uefi_bootx64) {
         Some("--uefi-bootx64 file")
+    } else if bundled_signed().is_some() {
+        Some("vendored signed shim+GRUB2")
     } else if bundled_uefi().is_some() {
         Some("vendored BOOTX64.EFI")
     } else {
@@ -181,7 +315,7 @@ pub fn probe_boot_caps(letter: &str, uefi_bootx64: &str) -> BootCaps {
         .unwrap_or_default();
     let fs_uc = fs.to_ascii_uppercase();
     let gpt: Option<bool> = read_head(letter).map(|h| is_gpt(&h));
-    let uefi_src = uefi_source_name(uefi_bootx64);
+    let uefi_res = resolve_uefi(UefiLoader::Auto, uefi_bootx64);
     // BIOS (grub4dos): FAT/NTFS only, MBR only.
     let (bios_ok, bios_why) = if !(fs_uc.starts_with("FAT") || fs_uc == "NTFS") {
         (false, format!("{} is not readable by grub4dos (needs FAT/NTFS)", if fs.is_empty() { "this filesystem".into() } else { fs.clone() }))
@@ -199,9 +333,9 @@ pub fn probe_boot_caps(letter: &str, uefi_bootx64: &str) -> BootCaps {
     let (uefi_ok, uefi_why) = if !fs_uc.starts_with("FAT") {
         (false, format!("UEFI firmware reads FAT only ({} here); Windows solves this with a separate FAT32 ESP", if fs.is_empty() { "unknown fs".into() } else { fs.clone() }))
     } else {
-        match uefi_src {
-            Some(s) => (true, format!("BOOTX64.EFI + grub.cfg ({})", s)),
-            None => (false, "no UEFI loader (vendor assets/BOOTX64.EFI or pass --uefi-bootx64)".into()),
+        match uefi_res {
+            ResolvedUefi::Unavailable => (false, "no UEFI loader (vendor the signed shim+GRUB2 chain, assets/BOOTX64.EFI, or pass --uefi-bootx64)".into()),
+            r => (true, format!("{} + grub.cfg", r.describe())),
         }
     };
     BootCaps { bios_ok, bios_why, uefi_ok, uefi_why }
@@ -364,6 +498,34 @@ pub fn menu_entry(title: &str, iso_rel: &str) -> String {
          map --hook\n\
          root (0xff)\n\
          chainloader (0xff)\n\
+         boot\n"
+    )
+}
+
+/// Kernel/initrd filenames probed under casper/ (first hit wins).
+const CASPER_KERNEL_CANDIDATES: &[&str] = &["casper/vmlinuz", "casper/vmlinuz.efi"];
+const CASPER_INITRD_CANDIDATES: &[&str] = &[
+    "casper/initrd",
+    "casper/initrd.lz",
+    "casper/initrd.gz",
+    "casper/initrd.img",
+    "casper/initrd-generic",
+];
+
+/// The grub4dos menu entry that boots a casper ISO's kernel directly.
+/// Unlike `menu_entry` (whose `map (0xff)` + `chainloader (0xff)` build on
+/// BIOS INT 13h CD emulation), this uses only `find`/`kernel`/`initrd`/
+/// `boot` — commands grub4dos-for-UEFI implements — so it boots on BOTH
+/// firmwares. casper locates the squashfs itself via `iso-scan/filename`
+/// (the big filesystem stays inside the ISO; only ~100 MB of
+/// kernel+initrd is extracted to the stick). All paths are grub4dos-style
+/// (`/_ISO/...`, forward slashes).
+pub fn menu_entry_direct(title: &str, iso_rel: &str, kern_rel: &str, init_rel: &str) -> String {
+    format!(
+        "\ntitle {title}\n\
+         find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
+         kernel {kern_rel} boot=casper iso-scan/filename={iso_rel} quiet splash\n\
+         initrd {init_rel}\n\
          boot\n"
     )
 }
@@ -809,6 +971,25 @@ pub fn choose_target(letter_hint: &str, allow_fixed: bool) -> Result<UsbTarget, 
 // Assets (embedded, SHA-256 pinned)
 // ---------------------------------------------------------------------------
 
+/// Minimal PE sanity for a boot loader: MZ header, PE signature, x86-64
+/// machine, PE32+ magic and EFI-application subsystem. Not a cryptographic
+/// check (that is the pinned SHA-256); it catches truncated/wrong-arch
+/// blobs early, in verify_assets() and the unit tests.
+fn pe_efi_ok(d: &[u8]) -> bool {
+    if d.len() < 0x200 || &d[0..2] != b"MZ" {
+        return false;
+    }
+    let pe = u32::from_le_bytes(d[0x3C..0x40].try_into().unwrap_or([0u8; 4])) as usize;
+    if pe + 0x5E >= d.len() || &d[pe..pe + 4] != b"PE\0\0" {
+        return false;
+    }
+    // machine at pe+4; magic (PE32+) at pe+24; subsystem (EFI application)
+    // at pe+24+68 = pe+92.
+    u16::from_le_bytes(d[pe + 4..pe + 6].try_into().unwrap()) == 0x8664
+        && u16::from_le_bytes(d[pe + 24..pe + 26].try_into().unwrap()) == 0x020B
+        && u16::from_le_bytes(d[pe + 92..pe + 94].try_into().unwrap()) == 10
+}
+
 fn verify_assets() -> Result<(), String> {
     for (name, data, want) in [
         ("grldr", grldr(), GRLDR_SHA256),
@@ -823,6 +1004,23 @@ fn verify_assets() -> Result<(), String> {
         }
         if name == "grldr.mbr" && data.len() < MBR_CODE_END {
             return Err("embedded grldr.mbr is truncated".into());
+        }
+    }
+    // Signed UEFI chain: the pins were checked by bundled_signed(); also
+    // require each component to be a plausible EFI application so a wrong-
+    // arch or truncated blob fails here (and in tests) instead of on a PC.
+    if bundled_signed().is_some() {
+        for (name, data) in [
+            ("shimx64.efi", BUNDLED_SHIMX64_EFI.unwrap()),
+            ("grubx64.efi", BUNDLED_GRUBX64_EFI.unwrap()),
+            ("mmx64.efi", BUNDLED_MMX64_EFI.unwrap()),
+        ] {
+            if !pe_efi_ok(data) {
+                return Err(format!(
+                    "embedded signed loader {} is not a PE32+ x86-64 EFI application",
+                    name
+                ));
+            }
         }
     }
     Ok(())
@@ -851,6 +1049,7 @@ pub fn install_from_iso(
     want_uefi: bool,
     ui: Option<&dyn WriteUi>,
     preconfirmed: bool,
+    skip_verify: bool,
 ) -> Result<(UsbTarget, WriteMetrics, Option<PendingMbr>), String> {
     if !want_bios && !want_uefi {
         // Say WHY, not just that: the GUI greys out unsupported paths (the
@@ -877,9 +1076,22 @@ pub fn install_from_iso(
     out::step("Non-destructive write (no reformat):");
     out::info(&format!("  target: {}", target.describe()));
     out::info(&format!("  iso   : {}", iso));
-    out::info(&format!("  plan  : BIOS boot {} + UEFI boot {} (files always: ISO as a file, menu.lst, grub.cfg).",
+    let uefi_plan = resolve_uefi(active_uefi_loader(), uefi_bootx64);
+    let uefi_plan_txt = if want_uefi {
+        format!("ON ({})", uefi_plan.describe())
+    } else {
+        "OFF".into()
+    };
+    let menu_files = if uefi_plan.mirror_menu() {
+        "menu.lst, efi\\grub\\menu.lst (grub4dos-for-UEFI), grub.cfg"
+    } else {
+        "menu.lst, grub.cfg (signed GRUB2)"
+    };
+    out::info(&format!(
+        "  plan  : BIOS boot {} + UEFI boot {} (files always: ISO as a file, {}).",
         if want_bios { "ON (grub4dos MBR bytes 0..440 ONLY, signature + partition table kept)" } else { "OFF" },
-        if want_uefi { "ON (BOOTX64.EFI)" } else { "OFF" }));
+        uefi_plan_txt, menu_files
+    ));
     out::info("          Nothing is formatted; existing files are not modified or deleted.");
     // (board-vs-selection warnings print inside install_on_target, next to
     // the per-stick capability summary)
@@ -903,7 +1115,7 @@ pub fn install_from_iso(
         }
     }
 
-    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, ui)?;
+    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, active_uefi_loader(), ui, skip_verify)?;
     Ok((target, metrics, pending))
 }
 
@@ -1002,7 +1214,247 @@ fn report_board(want_bios: bool, want_uefi: bool) {
 }
 
 /// Plain file I/O phase shared by both paths: ISO as a file (+ SHA-256
-/// verify), menu.lst (BIOS menu, written whenever `with_bios_files`), and
+/// Extract casper/vmlinuz + casper/initrd from the ISO onto the stick
+/// (`boot_dir`, forward-slash rel paths returned for menu.lst). Skips
+/// files already present at the right size (verified ISO reuse). Returns
+/// None when the ISO is not casper-shaped — the loopback entry then stays
+/// the only one (status quo: BIOS boots, UEFI does not). Failures are
+/// soft: the caller warns and continues loopback-only.
+fn extract_casper_boot(
+    iso_path: &str,
+    boot_dir_fs: &str,
+    boot_dir_rel: &str,
+    ui: Option<&dyn WriteUi>,
+) -> Option<(String, String)> {
+    let mut iso = match crate::iso::Iso::open(iso_path) {
+        Ok(i) => i,
+        Err(_) => return None,
+    };
+    let pick = |iso: &mut crate::iso::Iso, cands: &[&str]| -> Option<String> {
+        for c in cands {
+            if iso.file_size(c).map(|s| s > 0).unwrap_or(false) {
+                return Some(c.to_string());
+            }
+        }
+        None
+    };
+    let kern_src = pick(&mut iso, CASPER_KERNEL_CANDIDATES)?;
+    let init_src = pick(&mut iso, CASPER_INITRD_CANDIDATES)?;
+    let kern_name = kern_src.rsplit('/').next().unwrap_or("vmlinuz").to_string();
+    let init_name = init_src.rsplit('/').next().unwrap_or("initrd").to_string();
+    crate::sys::create_dir_all(boot_dir_fs);
+    if let Some(u) = ui {
+        u.show_progress(true);
+    }
+    let mut get = |src: &str, name: &str| -> Option<String> {
+        let dest_fs = format!("{}\\{}", boot_dir_fs, name);
+        let dest_rel = format!("{}/{}", boot_dir_rel, name);
+        let want = iso.file_size(src).unwrap_or(0);
+        if crate::sys::file_size(&dest_fs).map(|s| s == want).unwrap_or(false) {
+            out::info(&format!("{} already extracted ({} bytes).", dest_fs, want));
+            return Some(dest_rel);
+        }
+        out::step(&format!("Extracting {} from the ISO...", src));
+        let mut last_pct = 0u64;
+        let r = iso.extract_file(src, &dest_fs, &mut |done, total| {
+            if let Some(u) = ui {
+                u.set_progress(done, total);
+            }
+            let pct = done * 100 / total.max(1);
+            if pct >= last_pct + 10 {
+                last_pct = pct;
+                out::info(&format!("  {}%", pct));
+            }
+        });
+        match r {
+            Ok(n) if n == want => Some(dest_rel),
+            _ => {
+                crate::sys::delete_file(&dest_fs);
+                None
+            }
+        }
+    };
+    let k = get(&kern_src, &kern_name)?;
+    let i = get(&init_src, &init_name)?;
+    Some((k, i))
+}
+
+/// Write both menu.lst entries for an ISO already on the stick: the
+/// direct-kernel entry first (default — boots on BIOS *and* UEFI
+/// grub4dos), then the loopback chainload (BIOS-only fallback). Idempotent
+/// per title; writes a file only when something was added. When `uefi` is
+/// set, the identical entries are mirrored to \efi\grub\menu.lst — the only
+/// menu location grub4dos-for-UEFI reads. Returns the loopback title (used
+/// for the install summary).
+fn write_menu_entries(
+    root: &str,
+    iso_dst: &str,
+    iso_rel: &str,
+    safe_name: &str,
+    iso_name: &str,
+    uefi: bool,
+    ui: Option<&dyn WriteUi>,
+) -> Result<String, String> {
+    let title = format!("{} (loopback ISO)", iso_name.trim_end_matches(".iso"));
+    let menu_path = format!("{}menu.lst", root);
+    let (mut menu, existed) = match std::fs::read_to_string(&menu_path) {
+        Ok(s) => (s, true),
+        Err(_) => (default_menu(), false),
+    };
+    let mut dirty = false;
+    // Direct-kernel entry FIRST (default): `kernel`/`initrd` work on both
+    // BIOS and UEFI grub4dos, while the loopback chainload below is
+    // BIOS-only (INT 13h `(0xff)` emulation). Without this, UEFI boots
+    // drop to a grub4dos prompt. The squashfs stays inside the ISO;
+    // casper loop-mounts it via iso-scan/filename=.
+    let stem = safe_name.trim_end_matches(".iso");
+    let boot_dir_fs = format!("{}_ISO\\{}", root, stem);
+    let boot_dir_rel = format!("/_ISO/{}", stem);
+    // Hoisted to outer scope so the same bodies can feed the UEFI mirror
+    // below (same titles, same commands - both files must agree).
+    let mut dtitle = String::new();
+    let mut dentry = String::new();
+    match extract_casper_boot(iso_dst, &boot_dir_fs, &boot_dir_rel, ui) {
+        Some((kern_rel, init_rel)) => {
+            dtitle = format!("{} (direct kernel)", iso_name.trim_end_matches(".iso"));
+            dentry = menu_entry_direct(&dtitle, iso_rel, &kern_rel, &init_rel);
+            let (m, added) = upsert_menu(&menu, &dtitle, &dentry);
+            menu = m;
+            if added {
+                dirty = true;
+                out::info(&format!("menu.lst entry '{}' (boots BIOS + UEFI)", dtitle));
+            } else {
+                out::info(&format!("menu.lst already contains an entry titled '{}'", dtitle));
+            }
+        }
+        None => {
+            out::info("No casper kernel/initrd in this ISO - loopback entry only (BIOS boot; UEFI needs a casper-based ISO).");
+        }
+    }
+    let entry = menu_entry(&title, iso_rel);
+    let (m, added) = upsert_menu(&menu, &title, &entry);
+    menu = m;
+    if added {
+        dirty = true;
+        out::info(&format!("menu.lst entry '{}' (BIOS chainload fallback)", title));
+    } else {
+        out::info(&format!("menu.lst already contains an entry titled '{}'", title));
+    }
+    if dirty {
+        std::fs::write(&menu_path, menu).map_err(|e| format!("write menu.lst: {}", e))?;
+        out::info(&format!("{} menu.lst.", if existed { "Updated" } else { "Created" }));
+    }
+    // grub4dos-for-UEFI reads ONLY /efi/grub/menu.lst (checked against the
+    // chenall/grub4dos `for_UEFI` source: stage2/disk_io.c searches that one
+    // path, then `find --set-root /efi/grub/menu.lst` across every drive; the
+    // volume-root menu.lst is BIOS-only). Without this mirror a UEFI boot
+    // finds no menu and drops to the grub4dos-for-UEFI prompt - so install
+    // the same entries there whenever a UEFI loader goes onto the stick.
+    if uefi {
+        let uefi_menu_path = format!("{}efi\\grub\\menu.lst", root);
+        sys::create_dir_all(&format!("{}efi\\grub", root));
+        let (mut um, uexisted) = match std::fs::read_to_string(&uefi_menu_path) {
+            Ok(s) => (s, true),
+            Err(_) => (default_menu(), false),
+        };
+        let mut udirty = false;
+        if !dtitle.is_empty() {
+            let (m, added) = upsert_menu(&um, &dtitle, &dentry);
+            um = m;
+            udirty |= added;
+        }
+        let (m, added) = upsert_menu(&um, &title, &entry);
+        um = m;
+        udirty |= added;
+        if udirty {
+            std::fs::write(&uefi_menu_path, um).map_err(|e| format!("write efi\\grub\\menu.lst: {}", e))?;
+            out::info(&format!(
+                "{} efi\\grub\\menu.lst (grub4dos-for-UEFI reads THIS menu, not the root menu.lst).",
+                if uexisted { "Updated" } else { "Created" }
+            ));
+        } else {
+            out::info("efi\\grub\\menu.lst already has the entries (grub4dos-for-UEFI menu up to date).");
+        }
+    }
+    Ok(title)
+}
+
+/// Write the \EFI\BOOT payload: BOOTX64.EFI (the loader) plus, for the
+/// signed chain, grubx64.efi (GRUB2, verified by shim) and mmx64.efi
+/// (MokManager), and always the generated grub.cfg (the GRUB2 menu).
+fn write_efi_bootdir(
+    root: &str,
+    bootx64: &[u8],
+    signed: Option<(&[u8], &[u8])>,
+    title: &str,
+    iso_rel: &str,
+) -> Result<(), String> {
+    let bootdir = format!("{}EFI\\BOOT", root);
+    sys::create_dir_all(&bootdir);
+    std::fs::write(format!("{}\\BOOTX64.EFI", bootdir), bootx64)
+        .map_err(|e| format!("write BOOTX64.EFI: {}", e))?;
+    if let Some((grub, mm)) = signed {
+        std::fs::write(format!("{}\\grubx64.efi", bootdir), grub)
+            .map_err(|e| format!("write grubx64.efi: {}", e))?;
+        std::fs::write(format!("{}\\mmx64.efi", bootdir), mm)
+            .map_err(|e| format!("write mmx64.efi: {}", e))?;
+    }
+    std::fs::write(format!("{}\\grub.cfg", bootdir), uefi_cfg(title, iso_rel))
+        .map_err(|e| format!("write grub.cfg: {}", e))?;
+    Ok(())
+}
+
+/// Install the resolved UEFI loader into \EFI\BOOT (files only). Returns
+/// whether any UEFI files were installed. Callers resolve first
+/// (resolve_uefi) so an explicitly requested-but-unavailable loader errors
+/// before the file phase; reaching `Unavailable` here only happens for
+/// Auto/Grub4dos with nothing bundled, which warns and skips.
+fn install_uefi_resolved(
+    root: &str,
+    title: &str,
+    iso_rel: &str,
+    uefi_bootx64: &str,
+    loader: UefiLoader,
+) -> Result<bool, String> {
+    match resolve_uefi(loader, uefi_bootx64) {
+        ResolvedUefi::Signed => {
+            let (shim, grub, mm) = bundled_signed().expect("resolve said Signed but the chain is gone");
+            write_efi_bootdir(root, shim, Some((grub, mm)), title, iso_rel)?;
+            out::info("UEFI: signed shim -> GRUB2 chain installed (Secure Boot ON works too).");
+            Ok(true)
+        }
+        ResolvedUefi::Grub4dos => {
+            let bytes = bundled_uefi().expect("resolve said Grub4dos but nothing is bundled");
+            write_efi_bootdir(root, bytes, None, title, iso_rel)?;
+            out::info("UEFI: grub4dos-for-UEFI BOOTX64.EFI installed (Secure Boot must be OFF).");
+            Ok(true)
+        }
+        ResolvedUefi::Custom => {
+            let bytes =
+                std::fs::read(uefi_bootx64).map_err(|e| format!("read {}: {}", uefi_bootx64, e))?;
+            write_efi_bootdir(root, &bytes, None, title, iso_rel)?;
+            out::info(&format!(
+                "UEFI: BOOTX64.EFI (--uefi-bootx64 {}) + grub.cfg installed.",
+                uefi_bootx64
+            ));
+            Ok(true)
+        }
+        ResolvedUefi::Unavailable => {
+            out::warn(if loader == UefiLoader::Signed {
+                "--uefi-loader signed is set but the signed chain is not bundled - vendor assets/shimx64.efi.gz + grubx64.efi.gz + mmx64.efi.gz and rebuild, or pass --uefi-loader grub4dos. UEFI files skipped."
+            } else if loader == UefiLoader::Grub4dos {
+                "--uefi-loader grub4dos is set but no grub4dos-for-UEFI loader is bundled - vendor assets/BOOTX64.EFI or pass --uefi-loader signed. UEFI files skipped."
+            } else {
+                "UEFI requested but no loader is available (vendor the signed chain or assets/BOOTX64.EFI, or pass --uefi-bootx64) - UEFI files skipped."
+            });
+            Ok(false)
+        }
+    }
+}
+
+/// File phase for the no-reformat methods: grldr (BIOS, when
+/// `with_bios_files`), ISO as a file (SHA-256 verified), `menu.lst` (+ the
+/// \efi\grub\menu.lst mirror when the grub4dos-family loader is used), and
 /// the optional UEFI side-load. Returns (menu title, whether UEFI files
 /// were installed).
 fn install_files(
@@ -1012,9 +1464,27 @@ fn install_files(
     uefi_bootx64: &str,
     with_bios_files: bool,
     want_uefi: bool,
+    uefi_loader: UefiLoader,
     ui: Option<&dyn WriteUi>,
+    skip_verify: bool,
 ) -> Result<(String, bool, WriteMetrics), String> {
     let root = format!("{}:\\", t.letter);
+    // Resolve the UEFI loader up front: the menu-mirror decision depends on
+    // it, an explicitly requested-but-unavailable loader must fail BEFORE
+    // the slow ISO copy, and a missing --uefi-bootx64 falls back cleanly.
+    if !uefi_bootx64.is_empty() && !sys::path_exists(uefi_bootx64) {
+        out::warn(&format!(
+            "--uefi-bootx64 not found: {} (falling back to the selected loader)",
+            uefi_bootx64
+        ));
+    }
+    let uefi_res = resolve_uefi(uefi_loader, uefi_bootx64);
+    if uefi_loader == UefiLoader::Signed && uefi_res == ResolvedUefi::Unavailable {
+        return Err(
+            "--uefi-loader signed requested but the signed chain is not bundled (vendor assets/shimx64.efi.gz + grubx64.efi.gz + mmx64.efi.gz and rebuild, or drop --uefi-loader grub4dos). UEFI files skipped."
+                .into(),
+        );
+    }
     if with_bios_files {
         let grldr_path = format!("{}grldr", root);
         if sys::path_exists(&grldr_path) {
@@ -1049,48 +1519,16 @@ fn install_files(
     sys::create_dir_all(&format!("{}_ISO", root));
     let iso_dst = format!("{}_ISO\\{}", root, safe_name);
     let iso_rel = format!("/_ISO/{}", safe_name);
-    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui)?;
-    let title = format!("{} (loopback ISO)", iso_name.trim_end_matches(".iso"));
-    // menu.lst uses grub4dos syntax; grub4dos-for-UEFI reads the same file,
-    // so it doubles as the UEFI menu when that loader is used.
-    let menu_path = format!("{}menu.lst", root);
-    let (menu, existed) = match std::fs::read_to_string(&menu_path) {
-        Ok(s) => (s, true),
-        Err(_) => (default_menu(), false),
-    };
-    let entry = menu_entry(&title, &iso_rel);
-    let (menu, added) = upsert_menu(&menu, &title, &entry);
-    if added {
-        std::fs::write(&menu_path, menu).map_err(|e| format!("write menu.lst: {}", e))?;
-        out::info(&format!("{} menu.lst entry '{}'", if existed { "Appended" } else { "Created" }, title));
-    } else {
-        out::info(&format!("menu.lst already contains an entry titled '{}'", title));
-    }
-    // UEFI side-load (files only; FAT32 stick, Secure Boot off for unsigned
-    // loaders). Source priority: --uefi-bootx64 file, then the vendored
-    // assets/BOOTX64.EFI (grub4dos-for-UEFI preferred - it reuses this same
-    // menu.lst/ISO mapping; plain GRUB2 works via the generated grub.cfg).
-    let mut uefi_ok = false;
-    if !uefi_bootx64.is_empty() && !sys::path_exists(uefi_bootx64) {
-        out::warn(&format!("--uefi-bootx64 not found: {} (falling back to the vendored loader, if any)", uefi_bootx64));
-    }
-    let uefi_bytes: Option<Vec<u8>> = if !uefi_bootx64.is_empty() && sys::path_exists(uefi_bootx64) {
-        Some(std::fs::read(uefi_bootx64).map_err(|e| format!("read {}: {}", uefi_bootx64, e))?)
-    } else {
-        bundled_uefi().map(|b| b.to_vec())
-    };
-    if let Some(bytes) = uefi_bytes {
-        let bootdir = format!("{}EFI\\BOOT", root);
-        sys::create_dir_all(&bootdir);
-        std::fs::write(format!("{}\\BOOTX64.EFI", bootdir), &bytes)
-            .map_err(|e| format!("write BOOTX64.EFI: {}", e))?;
-        std::fs::write(format!("{}\\grub.cfg", bootdir), uefi_cfg(&title, &iso_rel))
-            .map_err(|e| format!("write grub.cfg: {}", e))?;
-        out::info("UEFI: BOOTX64.EFI + grub.cfg installed (no formatting).");
-        uefi_ok = true;
-    } else if want_uefi {
-        out::warn("UEFI requested but no loader available (vendor assets/BOOTX64.EFI or pass --uefi-bootx64) - UEFI files skipped.");
-    }
+    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui, skip_verify)?;
+    // menu.lst uses grub4dos syntax; when the grub4dos-family loader is
+    // used the same entries are mirrored to efi\grub\menu.lst (the only
+    // menu location grub4dos-for-UEFI reads - no mirror = UEFI prompt);
+    // the signed GRUB2 chain reads grub.cfg instead.
+    let title = write_menu_entries(&root, &iso_dst, &iso_rel, &safe_name, &iso_name, uefi_res.mirror_menu(), ui)?;
+    // UEFI side-load (files only; FAT32 stick). Signed shim -> GRUB2 works
+    // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need
+    // Secure Boot OFF (see assets/SIGNED-UEFI.txt).
+    let uefi_ok = install_uefi_resolved(&root, &title, &iso_rel, uefi_bootx64, uefi_loader)?;
     Ok((title, uefi_ok, metrics))
 }
 
@@ -1102,7 +1540,6 @@ fn install_files(
 /// Plain data only (no handles, no lifetimes).
 #[derive(Clone, Debug)]
 pub struct PendingMbr {
-    pub target: UsbTarget,
     pub phys_path: String,
     pub new_mbr: [u8; 512],
     pub early_mbr: [u8; 512],
@@ -1193,7 +1630,7 @@ pub fn commit_boot_sectors(p: &PendingMbr) -> Result<(), String> {
     Ok(())
 }
 
-fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, ui: Option<&dyn WriteUi>) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
+fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
     let fs_uc = t.fs.to_ascii_uppercase();
     // grub4dos reads FAT12/16/32 and NTFS only. exFAT (the default on many
     // large sticks) is NOT readable by grub4dos, so a stick left exFAT cannot
@@ -1272,7 +1709,7 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
             return Err(
                 concat!(
                     "GPT stick: the grub4dos BIOS path cannot be installed on GPT and no UEFI loader is available. ",
-                    "Vendor one (assets/BOOTX64.EFI, grub4dos-for-UEFI preferred) or pass --uefi-bootx64 <BOOTX64.EFI>, ",
+                    "Vendor one (the signed shim+GRUB2 chain, or assets/BOOTX64.EFI) or pass --uefi-bootx64 <BOOTX64.EFI>, ",
                     "convert the stick to MBR, or use the Rufus flow."
                 )
                 .into(),
@@ -1280,7 +1717,7 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         }
         out::step("GPT stick: files-only UEFI install (no raw sectors touched).");
         report_board(false, true);
-        let (title, uefi_ok, metrics) = install_files(t, iso, iso_len, uefi_bootx64, false, true, ui)?;
+        let (title, uefi_ok, metrics) = install_files(t, iso, iso_len, uefi_bootx64, false, true, uefi_loader, ui, skip_verify)?;
         report_bootability(false, "GPT stick - grub4dos BIOS stage1 has nowhere to live (sectors 1-15 are the GPT header/table)", uefi_ok, &title);
         return Ok((metrics, None));
     }
@@ -1443,52 +1880,35 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     // The whole point of this mode is a *bootable* stick: a corrupted ISO
     // copy (bad USB write, or a stale same-size file already on the stick)
     // would loopback-boot garbage. So the stick copy is SHA-256-verified
-    // against the source in every case.
-    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui)?;
+    // against the source in every case (unless verification was skipped).
+    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui, skip_verify)?;
 
-    // menu.lst: create or append (idempotent per title).
-    let title = format!("{} (loopback ISO)", iso_name.trim_end_matches(".iso"));
-    let menu_path = format!("{}menu.lst", root);
-    let (menu, existed) = match std::fs::read_to_string(&menu_path) {
-        Ok(s) => (s, true),
-        Err(_) => (default_menu(), false),
-    };
-    let entry = menu_entry(&title, &iso_rel);
-    let (menu, added) = upsert_menu(&menu, &title, &entry);
-    if added {
-        std::fs::write(&menu_path, menu).map_err(|e| format!("write menu.lst: {}", e))?;
-        out::info(&format!(
-            "{} menu.lst entry '{}'",
-            if existed { "Appended" } else { "Created" },
-            title
+    // menu.lst: direct-kernel entry (BIOS + UEFI grub4dos) first, then the
+    // loopback chainload fallback (BIOS-only). Resolve the UEFI loader up
+    // front: the efi\grub\menu.lst mirror applies to the grub4dos-family
+    // loaders only (the signed GRUB2 chain reads grub.cfg), and an
+    // explicitly requested-but-unavailable loader must fail here, before
+    // the remaining file work.
+    if !uefi_bootx64.is_empty() && !sys::path_exists(uefi_bootx64) {
+        out::warn(&format!(
+            "--uefi-bootx64 not found: {} (falling back to the selected loader)",
+            uefi_bootx64
         ));
-    } else {
-        out::info(&format!("menu.lst already contains an entry titled '{}'", title));
     }
+    let uefi_res = resolve_uefi(uefi_loader, uefi_bootx64);
+    if uefi_loader == UefiLoader::Signed && uefi_res == ResolvedUefi::Unavailable {
+        return Err(
+            "--uefi-loader signed requested but the signed chain is not bundled (vendor assets/shimx64.efi.gz + grubx64.efi.gz + mmx64.efi.gz and rebuild, or drop --uefi-loader grub4dos). UEFI files skipped."
+                .into(),
+        );
+    }
+    let title = write_menu_entries(&root, &iso_dst, &iso_rel, &safe_name, &iso_name, uefi_res.mirror_menu(), ui)?;
 
-    // UEFI side-load (files only; FAT32 stick, Secure Boot off for unsigned
-    // loaders). Source priority: --uefi-bootx64 file, then the vendored
-    // assets/BOOTX64.EFI. Skipped when UEFI boot is unchecked.
+    // UEFI side-load (files only; FAT32 stick). Signed shim -> GRUB2 works
+    // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need
+    // Secure Boot OFF. Skipped when UEFI boot is unchecked.
     if want_uefi {
-        if !uefi_bootx64.is_empty() && !sys::path_exists(uefi_bootx64) {
-            out::warn(&format!("--uefi-bootx64 not found: {} (falling back to the vendored loader, if any)", uefi_bootx64));
-        }
-        let uefi_bytes: Option<Vec<u8>> = if !uefi_bootx64.is_empty() && sys::path_exists(uefi_bootx64) {
-            Some(std::fs::read(uefi_bootx64).map_err(|e| format!("read {}: {}", uefi_bootx64, e))?)
-        } else {
-            bundled_uefi().map(|b| b.to_vec())
-        };
-        if let Some(bytes) = uefi_bytes {
-            let bootdir = format!("{}EFI\\BOOT", root);
-            sys::create_dir_all(&bootdir);
-            std::fs::write(format!("{}\\BOOTX64.EFI", bootdir), &bytes)
-                .map_err(|e| format!("write BOOTX64.EFI: {}", e))?;
-            std::fs::write(format!("{}\\grub.cfg", bootdir), uefi_cfg(&title, &iso_rel))
-                .map_err(|e| format!("write grub.cfg: {}", e))?;
-            out::info("UEFI: BOOTX64.EFI + grub.cfg installed (no formatting).");
-        } else {
-            out::warn("UEFI requested but no loader available (vendor assets/BOOTX64.EFI or pass --uefi-bootx64) - UEFI files skipped.");
-        }
+        install_uefi_resolved(&root, &title, &iso_rel, uefi_bootx64, uefi_loader)?;
     } else {
         out::info("UEFI boot not selected - EFI files skipped.");
     }
@@ -1508,7 +1928,6 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     // Package the validated payload for the final commit, which runs after
     // the main-phase drops (commit_boot_sectors re-checks freshness there).
     let pending = PendingMbr {
-        target: t.clone(),
         phys_path: phys_path.clone(),
         new_mbr,
         early_mbr: mbr,
@@ -1578,6 +1997,7 @@ fn copy_file_progress(
     src: &str,
     dst: &str,
     ui: Option<&dyn WriteUi>,
+    do_hash: bool,
 ) -> Result<(String, WriteMetrics), String> {
     let mut r = open_for_hash(src, src)?;
     let total = r.metadata().map(|m| m.len()).unwrap_or(0);
@@ -1605,7 +2025,9 @@ fn copy_file_progress(
         if n == 0 {
             break;
         }
-        h.update(&buf[..n]);
+        if do_hash {
+            h.update(&buf[..n]);
+        }
         w.write_all(&buf[..n]).map_err(|e| format!("write {}: {}", dst, e))?;
         done += n as u64;
 
@@ -1630,7 +2052,11 @@ fn copy_file_progress(
 
     let write_seconds = t0.elapsed().as_secs_f64();
     let write_mbps = (done as f64 / sys::MB as f64) / write_seconds.max(0.001);
-    let hash = format!("{:x}", h.finalize());
+    let hash = if do_hash {
+        format!("{:x}", h.finalize())
+    } else {
+        String::new()
+    };
 
     out::info(&format!(
         "  copied {:.1} GB in {:.1}s ({:.1} MB/s)",
@@ -1770,11 +2196,66 @@ fn verify_file_progress(
 }
 
 /// Copy when needed, then flush cache and verify.  Returns (source hash, metrics).
+/// SHA-256 one file with live GUI progress + console milestones. Used by
+/// the ISO-reuse path (stick copy and source both get fully hashed before
+/// the reuse is accepted).
+fn hash_reuse_file(
+    path: &str,
+    label: &str,
+    total: u64,
+    ui: Option<&dyn WriteUi>,
+) -> Option<String> {
+    if let Some(u) = ui {
+        u.show_progress(true);
+        u.set_progress(0, total);
+        u.set_status(&format!(
+            "{}... 0 / {:.0} MB",
+            label,
+            total as f64 / sys::MB as f64
+        ));
+        u.pump();
+    }
+    let t0 = std::time::Instant::now();
+    let mut last_ui = std::time::Instant::now();
+    let mut last_pct = 0u64;
+    let hash = crate::lslfiles::sha256_file_progress(path, &mut |done, total| {
+        let pct = done * 100 / total.max(1);
+        if pct >= last_pct + 25 {
+            last_pct = pct;
+            out::info(&format!("  {}% ({}...)", pct, label));
+        }
+        if last_ui.elapsed().as_millis() >= 300 {
+            last_ui = std::time::Instant::now();
+            if let Some(u) = ui {
+                let mbps = (done as f64 / sys::MB as f64) / t0.elapsed().as_secs_f64().max(0.001);
+                u.set_progress(done, total);
+                u.set_status(&format!(
+                    "{}... {:.0} / {:.0} MB  ({:.1} MB/s)",
+                    label,
+                    done as f64 / sys::MB as f64,
+                    total as f64 / sys::MB as f64,
+                    mbps
+                ));
+                u.pump();
+            }
+        }
+    });
+    if hash.is_some() {
+        out::info(&format!(
+            "  {} done in {:.0}s.",
+            label,
+            t0.elapsed().as_secs_f64()
+        ));
+    }
+    hash
+}
+
 fn copy_and_verify_iso(
     iso: &str,
     iso_dst: &str,
     iso_len: u64,
     ui: Option<&dyn WriteUi>,
+    verify: bool,
 ) -> Result<(String, WriteMetrics), String> {
     // The Install handler hid the progress bar/label; re-show them so the
     // live write/verify speed has a bar to go with it. show_final hides
@@ -1783,6 +2264,29 @@ fn copy_and_verify_iso(
         u.show_progress(true);
     }
     let mut metrics = WriteMetrics::default();
+    if !verify {
+        out::warn("USB verification SKIPPED by request - the stick copy is UNVERIFIED (size match only); corruption would only show up at boot.");
+        if let Some(u) = ui {
+            u.set_status("USB verification skipped - stick copy UNVERIFIED (size match only).");
+            u.pump();
+        }
+        match sys::file_size(iso_dst) {
+            Some(sz) if sz == iso_len => {
+                out::info(&format!("Reusing existing same-size copy UNVERIFIED: {}", iso_dst));
+            }
+            _ => {
+                out::step(&format!(
+                    "Copying the ISO onto {} (no hashing - verification skipped)...",
+                    iso_dst
+                ));
+                let (_, m) = copy_file_progress(iso, iso_dst, ui, false)?;
+                metrics.bytes_copied = m.bytes_copied;
+                metrics.write_seconds = m.write_seconds;
+                metrics.write_mbps = m.write_mbps;
+            }
+        }
+        return Ok((String::new(), metrics));
+    }
     let mut src_hash: Option<String> = None;
     match sys::file_size(iso_dst) {
         Some(sz) if sz == iso_len => {
@@ -1790,10 +2294,14 @@ fn copy_and_verify_iso(
                 "ISO already on stick: {} (same size; verifying before reuse)",
                 iso_dst
             ));
-            let dst = crate::lslfiles::sha256_file(iso_dst)
+            // Two full multi-GB hashes follow (stick copy, then source).
+            // Both MUST drive the progress bar and pump the GUI, or the
+            // window freezes for minutes on USB2 with zero feedback.
+            let dst = hash_reuse_file(iso_dst, "Verifying existing ISO on stick (1/2: USB copy)", iso_len, ui)
                 .ok_or_else(|| format!("cannot hash {} for verification", iso_dst))?;
+            let src_len = sys::file_size(iso).unwrap_or(iso_len);
             src_hash = Some(
-                crate::lslfiles::sha256_file(iso)
+                hash_reuse_file(iso, "Verifying existing ISO on stick (2/2: source file)", src_len, ui)
                     .ok_or_else(|| format!("cannot hash {} for verification", iso))?,
             );
             if dst == src_hash.clone().unwrap() {
@@ -1811,7 +2319,7 @@ fn copy_and_verify_iso(
             "Copying the ISO onto {}: (files only, no formatting)...",
             iso_dst
         ));
-        let (hash, m) = copy_file_progress(iso, iso_dst, ui)?;
+        let (hash, m) = copy_file_progress(iso, iso_dst, ui, true)?;
         src_hash = Some(hash);
         metrics.bytes_copied = m.bytes_copied;
         metrics.write_seconds = m.write_seconds;
@@ -1900,6 +2408,34 @@ mod tests {
         let (again, changed2) = merged_mbr(&new_mbr);
         assert!(!changed2);
         assert_eq!(again, new_mbr);
+    }
+
+    #[test]
+    fn menu_entry_direct_uses_kernel_not_map() {
+        // The UEFI path: grub4dos-for-UEFI has no INT 13h `(0xff)`
+        // emulation, so the direct entry must avoid map/chainloader and
+        // boot the extracted kernel with iso-scan pointing at the ISO.
+        let e = menu_entry_direct(
+            "Mint (direct kernel)",
+            "/_ISO/mint.iso",
+            "/_ISO/mint/vmlinuz",
+            "/_ISO/mint/initrd",
+        );
+        assert!(e.contains("title Mint (direct kernel)"));
+        assert!(e.contains("kernel /_ISO/mint/vmlinuz boot=casper iso-scan/filename=/_ISO/mint.iso"));
+        assert!(e.contains("initrd /_ISO/mint/initrd"));
+        assert!(e.contains("\nboot\n"));
+        assert!(!e.contains("map "), "direct entry must not use map: {}", e);
+        assert!(!e.contains("chainloader"), "direct entry must not chainload: {}", e);
+        // coexists with the loopback entry (different titles)
+        let (m1, a1) = upsert_menu(&default_menu(), "Mint (direct kernel)", &e);
+        assert!(a1);
+        let (m2, a2) = upsert_menu(&m1, "Mint (loopback ISO)", &menu_entry("Mint (loopback ISO)", "/_ISO/mint.iso"));
+        assert!(a2);
+        assert_eq!(
+            m2.lines().filter(|l| l.trim_start().starts_with("title ")).count(),
+            2
+        );
     }
 
     #[test]
@@ -2087,6 +2623,91 @@ mod tests {
         // pinned hash must match what build.rs embedded (refuses at runtime
         // otherwise, which would silently disable UEFI).
         assert_eq!(sha256_hex(data), BUNDLED_BOOTX64_SHA256.unwrap().to_lowercase());
-        assert_eq!(uefi_source_name(""), Some("vendored BOOTX64.EFI"));
+        // the DEFAULT loader is now the signed chain when it is bundled
+        assert_eq!(uefi_source_name(""), Some("vendored signed shim+GRUB2"));
+    }
+
+    #[test]
+    fn signed_chain_is_pe_and_pinned() {
+        // The signed chain (shim + Canonical-signed GRUB2 + MokManager) is
+        // the DEFAULT UEFI loader: it boots with Secure Boot ON or OFF, so
+        // every component must be present, pin-verified (bundled_signed
+        // refuses mismatches) and a real PE32+ x86-64 EFI application.
+        let (shim, grub, mm) = bundled_signed()
+            .expect("signed chain missing from the build (assets/shimx64.efi.gz + grubx64.efi.gz + mmx64.efi.gz + .sha256 pins)");
+        for (name, d) in [("shimx64.efi", shim), ("grubx64.efi", grub), ("mmx64.efi", mm)] {
+            assert!(d.len() > 100_000, "{}: suspiciously small: {}", name, d.len());
+            assert!(pe_efi_ok(d), "{}: not a PE32+ x86-64 EFI application", name);
+        }
+        // per-component pins must exist and match the embedded bytes
+        for (name, data, pin) in [
+            ("shimx64.efi", shim, BUNDLED_SHIMX64_EFI_SHA256.unwrap()),
+            ("grubx64.efi", grub, BUNDLED_GRUBX64_EFI_SHA256.unwrap()),
+            ("mmx64.efi", mm, BUNDLED_MMX64_EFI_SHA256.unwrap()),
+        ] {
+            assert_eq!(sha256_hex(data), pin.to_lowercase(), "{} pin mismatch", name);
+        }
+    }
+
+    #[test]
+    fn uefi_loader_resolution_matrix() {
+        // Bundled build: Auto resolves to the signed chain (Secure Boot ON);
+        // grub4dos explicitly opts out of it; the mirror applies to the
+        // grub4dos-family, not to the signed GRUB2 chain (grub.cfg only).
+        assert!(bundled_signed().is_some(), "this build ships the signed chain");
+        assert_eq!(resolve_uefi(UefiLoader::Auto, ""), ResolvedUefi::Signed);
+        assert_eq!(resolve_uefi(UefiLoader::Signed, ""), ResolvedUefi::Signed);
+        assert_eq!(resolve_uefi(UefiLoader::Grub4dos, ""), ResolvedUefi::Grub4dos);
+        assert!(!resolve_uefi(UefiLoader::Signed, "").mirror_menu());
+        assert!(resolve_uefi(UefiLoader::Grub4dos, "").mirror_menu());
+        // a --uefi-bootx64 file always wins (checked against the real FS)
+        let tmp = std::env::temp_dir().join(format!("lslsetup-uefi-resolve-{}", std::process::id()));
+        std::fs::write(&tmp, b"MZ-not-real-but-present").unwrap();
+        let p = tmp.to_string_lossy().into_owned();
+        assert_eq!(resolve_uefi(UefiLoader::Signed, &p), ResolvedUefi::Custom);
+        assert!(resolve_uefi(UefiLoader::Signed, &p).mirror_menu());
+        assert_eq!(resolve_uefi(UefiLoader::Signed, "").describe().contains("Secure Boot ON"), true);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn grub4dos_uefi_menu_is_mirrored_to_efi_grub() {
+        // grub4dos-for-UEFI (assets/BOOTX64.EFI) reads ONLY /efi/grub/menu.lst
+        // (chenall/grub4dos stage2/disk_io.c: that one path, then `find
+        // --set-root /efi/grub/menu.lst`); the volume-root menu.lst is
+        // BIOS-only. Without the mirror a UEFI boot finds no menu and drops to
+        // the grub4dos-for-UEFI prompt - regression coverage for the mirror.
+        let mut d = std::env::temp_dir();
+        d.push(format!("lslsetup-uefi-menu-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d); // stale run from an earlier crash
+        std::fs::create_dir_all(&d).unwrap();
+        let root = {
+            let s = d.to_string_lossy().replace('/', "\\");
+            if s.ends_with('\\') { s } else { format!("{}\\", s) }
+        };
+        // Not a real ISO: no casper kernel, so only the loopback entry lands.
+        let iso_dst = format!("{}fake.iso", root);
+        std::fs::write(&iso_dst, b"not a real iso - no casper kernel").unwrap();
+        // UEFI install: BOTH the BIOS root menu and the efi\grub mirror exist.
+        let t = write_menu_entries(&root, &iso_dst, "/_ISO/fake.iso", "fake", "fake.iso", true, None).unwrap();
+        assert_eq!(t, "fake (loopback ISO)");
+        let root_menu = std::fs::read_to_string(format!("{}menu.lst", root)).unwrap();
+        let uefi_menu = std::fs::read_to_string(format!("{}efi\\grub\\menu.lst", root)).unwrap();
+        assert!(root_menu.contains("title fake (loopback ISO)"));
+        assert!(uefi_menu.contains("title fake (loopback ISO)"));
+        // Fresh stick: both start from default_menu(), so the mirror is identical.
+        assert_eq!(uefi_menu, root_menu);
+        // Re-running is idempotent: no duplicate titles, identical bytes.
+        write_menu_entries(&root, &iso_dst, "/_ISO/fake.iso", "fake", "fake.iso", true, None).unwrap();
+        assert_eq!(std::fs::read_to_string(format!("{}menu.lst", root)).unwrap(), root_menu);
+        assert_eq!(std::fs::read_to_string(format!("{}efi\\grub\\menu.lst", root)).unwrap(), uefi_menu);
+        // BIOS-only install: the mirror must not exist at all.
+        let _ = std::fs::remove_dir_all(format!("{}efi", root));
+        write_menu_entries(&root, &iso_dst, "/_ISO/fake.iso", "fake", "fake.iso", false, None).unwrap();
+        assert!(
+            !std::path::Path::new(&format!("{}efi\\grub\\menu.lst", root)).exists(),
+            "efi\\grub\\menu.lst must not be created for a BIOS-only install"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

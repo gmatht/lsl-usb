@@ -999,12 +999,17 @@ pub fn create_dir_all(p: &str) {
         if part.is_empty() {
             continue;
         }
-        if !cur.is_empty() && !cur.ends_with(':') {
+        // Re-add the separator after a drive root too ("C:" -> "C:\Users"):
+        // the previous `!cur.ends_with(':')` guard built drive-relative paths
+        // like "C:Users", which only happened to resolve while the drive's
+        // current directory was its root and failed for every other absolute
+        // path (e.g. a temp dir on C: whose CWD is elsewhere).
+        if !cur.is_empty() && !cur.ends_with('\\') {
             cur.push('\\');
         }
         cur.push_str(part);
         if cur.len() == 2 {
-            continue; // drive root
+            continue; // drive root ("C:") itself: nothing to create
         }
         unsafe {
             CreateDirectoryW(wide(&cur).as_ptr(), std::ptr::null_mut());
@@ -1801,6 +1806,24 @@ mod tests {
         let mut v = vec![127u8, 4, 0, 0];
         v.extend_from_slice(&[0, 0]);
         assert_eq!(smbios_uefi_flag(&v), None);
+    }
+
+    #[test]
+    fn create_dir_all_builds_absolute_paths() {
+        // Regression: the old implementation turned "C:\a\b" into "C:a\b"
+        // (drive-relative), which only worked while the drive's CWD was its
+        // root. Must handle a plain absolute temp path correctly.
+        let mut d = std::env::temp_dir();
+        d.push(format!("lslsetup-mkdir-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let sub = d.join("efi").join("grub");
+        let s = sub.to_string_lossy().into_owned();
+        create_dir_all(&s);
+        assert!(sub.is_dir(), "create_dir_all failed to create {}", s);
+        // idempotent: existing dirs are fine (errors ignored)
+        create_dir_all(&s);
+        assert!(sub.is_dir());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 

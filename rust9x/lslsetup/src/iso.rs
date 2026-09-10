@@ -162,6 +162,59 @@ impl Iso {
         Ok(buf)
     }
 
+    /// Stream a file out of the ISO to `dest` (chunked, with progress),
+    /// without ever holding the whole file in memory: vmlinuz+initrd run
+    /// ~100 MB, too much to buffer on a 256 MB Win9x box. Returns bytes
+    /// written. Case-insensitive lookup, like `read_file`.
+    pub fn extract_file(
+        &mut self,
+        path: &str,
+        dest: &str,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<u64, IsoErr> {
+        let mut parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        let fname = parts.pop().unwrap_or("").to_string();
+        let dirpath = parts.join("/");
+        let mut cur_extent = self.root_extent;
+        let mut cur_size = self.root_size;
+        if !dirpath.is_empty() {
+            for part in dirpath.split('/') {
+                if part.is_empty() {
+                    continue;
+                }
+                let d = read_dir_record(&mut self.file, cur_extent, cur_size).map_err(IsoErr::Io)?;
+                let e = parse_entries(&d);
+                let hit = e
+                    .iter()
+                    .find(|(n, _, _, is_dir)| *is_dir && n.eq_ignore_ascii_case(part))
+                    .ok_or(IsoErr::NotIso9660)?;
+                cur_extent = hit.1;
+                cur_size = hit.2;
+            }
+        }
+        let dir = read_dir_record(&mut self.file, cur_extent, cur_size).map_err(IsoErr::Io)?;
+        let hit = parse_entries(&dir)
+            .into_iter()
+            .find(|(n, _, _, is_dir)| !*is_dir && n.eq_ignore_ascii_case(&fname))
+            .ok_or(IsoErr::NotIso9660)?;
+        let (extent, size) = (hit.1 as u64, hit.2 as u64);
+        self.file
+            .seek(SeekFrom::Start(extent * SECTOR))
+            .map_err(IsoErr::Io)?;
+        let mut out = std::fs::File::create(dest).map_err(IsoErr::Io)?;
+        let mut buf = vec![0u8; 1 << 20];
+        let mut done = 0u64;
+        use std::io::Write;
+        while done < size {
+            let n = ((size - done).min(buf.len() as u64)) as usize;
+            self.file.read_exact(&mut buf[..n]).map_err(IsoErr::Io)?;
+            out.write_all(&buf[..n]).map_err(IsoErr::Io)?;
+            done += n as u64;
+            progress(done, size);
+        }
+        Ok(done)
+    }
+
     pub fn file_size(&mut self, path: &str) -> Option<u64> {
         let mut parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
         let fname = parts.pop()?.to_string();

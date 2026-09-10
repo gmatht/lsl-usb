@@ -2,6 +2,14 @@ Vendored UEFI loader for the non-destructive (nofmt) install path.
 
 What:      grub4dos-for-UEFI BOOTX64.EFI (x86_64, PE32+, EFI application,
            417,792 bytes, unsigned - Secure Boot must be OFF)
+
+NOTE:      This is the FALLBACK UEFI loader. When the signed chain is also
+           vendored (assets/shimx64.efi.gz + grubx64.efi.gz + mmx64.efi.gz,
+           see assets/SIGNED-UEFI.txt), the signed shim+GRUB2 chain is the
+           DEFAULT --uefi-loader signed because it boots with Secure Boot
+           ON or OFF. Use --uefi-loader grub4dos to prefer THIS loader
+           (its menu.lst is mirrored to \efi\grub\menu.lst, the only menu
+           location grub4dos-for-UEFI reads).
 Upstream:  https://github.com/chenall/grub4dos
 Release:   tag "for_UEFI", published 2026-05-07
 Asset:     grub4dos-for_UEFI-2026-05-07.7z (top-level BOOTX64.EFI)

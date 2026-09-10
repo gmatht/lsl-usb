@@ -1,0 +1,60 @@
+Vendored SIGNED UEFI chain for the nofmt (and GPT files-only) install paths:
+Microsoft-signed shim -> Canonical-signed GRUB2. Boots with Secure Boot ON,
+and (because shim only enforces shim-lock when SB is active) also boots under
+SB OFF - so it is strictly more compatible than the unsigned grub4dos-for-UEFI
+loader, which is why it is the DEFAULT UEFI loader when these files are
+present in the build (override: --uefi-loader grub4dos, or drop any loader in
+via --uefi-bootx64 <file>).
+
+Layout written to the stick (all files-only, no formatting):
+  \EFI\BOOT\BOOTX64.EFI  = shim (this shimx64.efi)        <-- firmware entry
+  \EFI\BOOT\grubx64.efi  = Canonical-signed GRUB2         <-- shim's second stage
+  \EFI\BOOT\mmx64.efi    = MokManager (enroll MOKs)       <-- optional, handy
+  \EFI\BOOT\grub.cfg     = generated menu (loopback + direct-kernel entries)
+
+shim loads grubx64.efi from its own directory and verifies it against the
+embedded Canonical CA; GRUB2 then reads /EFI/BOOT/grub.cfg (its default
+config-file fallback). Kernels loaded by that grub must be Canonical-signed
+while Secure Boot is ON (Ubuntu/Mint live ISO kernels are; grub's shim_lock
+is inactive when SB is OFF, so unsigned kernels still boot then).
+
+What:      shim 15.8, signed by the Microsoft UEFI CA
+Source:    Ubuntu noble shim-signed package
+File:      shimx64.efi.dualsigned  (BOTH the old and the new Microsoft
+           signing certs - boots on pre- and post-transition firmware alike;
+           the package's plain shimx64.efi is UNSIGNED and its
+           .signed.latest/.signed.previous carry only one cert each)
+Package:   shim-signed_1.59+15.8-0ubuntu2_amd64.deb
+URL:       http://archive.ubuntu.com/ubuntu/pool/main/s/shim-signed/
+Sizes:     raw 957,042+ bytes, gz 393,575 bytes
+SHA-256:   d51bd80c4d3064d787e65cf16f74ca3773fd706ba2753327bb98df85ab2a8092
+           (pinned in assets/shimx64.efi.sha256; verify_assets() refuses a
+           mismatch at runtime)
+
+What:      GRUB 2.14 for x86_64-efi, signed by Canonical's UEFI key (the CA
+           embedded in the shim above). Standalone image: loopback, linux,
+           initrd, search, normal, configfile, iso9660, fat, part_gpt,
+           part_msdos all embedded - no /boot/grub module tree needed.
+Source:    Ubuntu noble grub-efi-amd64-signed package
+File:      grubx64.efi.signed
+Package:   grub-efi-amd64-signed_1.215+2.14-2ubuntu1_amd64.deb
+URL:       http://archive.ubuntu.com/ubuntu/pool/main/g/grub2-signed/
+Sizes:     raw 2,828,168 bytes, gz 1,528,599 bytes
+SHA-256:   33e1d46cb68e41a293c767750078bbdb857ad7c1197a2206dea737bc9ccb8dbf
+           (pinned in assets/grubx64.efi.sha256)
+
+What:      MokManager (mmx64.efi), signed - lets the user enroll MOK keys
+           when shim's chain rejects a kernel (needed only for booting
+           unsigned kernels with Secure Boot intentionally kept ON).
+File:      mmx64.efi (shim-signed package, same URL/package as the shim)
+Sizes:     raw 856,280 bytes, gz 342,067 bytes
+SHA-256:   5f9fc41db3dfe3b581fc20cae696af82c5ca21e96071ec9c4c28ee4a15f989d8
+           (pinned in assets/mmx64.efi.sha256)
+
+Build:     assets/*.gz are gzip -9 of the raw files (like assets/grldr.gz).
+           build.rs inflates each and verifies the raw SHA-256 against the
+           .sha256 pins, then embeds the inflated bytes via OUT_DIR
+           (uefi_embedded.rs: BUNDLED_SHIM/GRUB/MM); nofmt refuses a pinned
+           mismatch at runtime. To update: replace the .gz, refresh the
+           .sha256 pin, rebuild. GPLv3+ for shim, GPLv3+ for GRUB2 (see
+           assets/COPYING and the Ubuntu package copyrights).

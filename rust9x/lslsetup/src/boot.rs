@@ -43,6 +43,7 @@ pub fn boot_menu_key() -> String {
         ("dell", "F12"),
         ("hewlett-packard", "F9"),
         ("hp ", "F9"),
+        ("hp", "F9"),
         ("lenovo", "F12"),
         ("asus", "F8"),
         ("msi", "F11"),
@@ -277,11 +278,29 @@ use winapi::um::combaseapi::CoCreateInstance;
 // Boot-choice dialog (nwg modal — replaces the WinForms version)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
 pub enum BootChoice {
     Usb,
     Adv,
     Fw,
     None,
+}
+
+/// One-line manual boot-menu hint for reboot offers (standalone dialog +
+/// wizard boot page). Falls back to the common keys when the board is
+/// unknown.
+pub fn boot_key_hint() -> String {
+    let key = boot_menu_key();
+    if key.is_empty() {
+        "Manual boot-menu key unknown - watch for the prompt during POST (often F12, F9, F8, or Esc).".into()
+    } else {
+        format!("Manual boot menu: press {} during POST.", key)
+    }
+}
+
+/// Whether the one-time-boot entry can be set (UEFI + bcdedit-capable Windows).
+pub fn can_set_next_boot() -> bool {
+    is_uefi() && sys::os_ver() >= sys::OsVer::Win8
 }
 
 pub fn show_boot_choice_dialog() -> BootChoice {
@@ -292,18 +311,14 @@ pub fn show_boot_choice_dialog() -> BootChoice {
     // Idempotent-enough: registers common controls; harmless if already done.
     let _ = nwg::init();
 
-    let uefi = is_uefi() && sys::os_ver() >= sys::OsVer::Win8;
-    let key = boot_menu_key();
-    let _key_hint = if key.is_empty() {
-        "press F12/Del/Esc during POST".to_string()
-    } else {
-        format!("press {} during POST", key)
-    };
+    let uefi = can_set_next_boot();
+    let key_hint = boot_key_hint();
 
     let choice: Rc<RefCell<BootChoice>> = Rc::new(RefCell::new(BootChoice::None));
     let choice2 = choice.clone();
 
     let mut window: nwg::Window = Default::default();
+    let mut key_lbl: nwg::Label = Default::default();
     let mut usb_btn: nwg::Button = Default::default();
     let mut adv_btn: nwg::Button = Default::default();
     let mut fw_btn: nwg::Button = Default::default();
@@ -314,27 +329,33 @@ pub fn show_boot_choice_dialog() -> BootChoice {
         .center(true)
         .title("lsl-usb - Boot from USB")
         .build(&mut window);
+    let _ = nwg::Label::builder()
+        .text(&key_hint)
+        .position((12, 10))
+        .size((524, 24))
+        .parent(&window)
+        .build(&mut key_lbl);
     let _ = nwg::Button::builder()
         .text("Boot USB now (set one-time boot entry)")
-        .position((12, 16))
+        .position((12, 42))
         .size((524, 30))
         .parent(&window)
         .build(&mut usb_btn);
     let _ = nwg::Button::builder()
         .text("Advanced boot menu (shutdown /r /o)")
-        .position((12, 52))
+        .position((12, 78))
         .size((524, 30))
         .parent(&window)
         .build(&mut adv_btn);
     let _ = nwg::Button::builder()
         .text("Firmware boot menu (shutdown /r /fw)")
-        .position((12, 88))
+        .position((12, 114))
         .size((524, 30))
         .parent(&window)
         .build(&mut fw_btn);
     let _ = nwg::Button::builder()
         .text("Don't reboot")
-        .position((12, 124))
+        .position((12, 150))
         .size((524, 30))
         .parent(&window)
         .build(&mut none_btn);

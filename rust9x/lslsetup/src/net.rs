@@ -13,6 +13,7 @@ const WINHTTP_OPTION_SECURE_PROTOCOLS: u32 = 84;
 const SP_PROT_TLS1_2_CLIENT: u32 = 0x0000_0800;
 const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+const WINHTTP_QUERY_CONTENT_LENGTH: u32 = 5;
 const WINHTTP_OPTION_REDIRECT_POLICY: u32 = 88;
 const WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS: u32 = 2;
 
@@ -305,6 +306,27 @@ pub fn download_to_file(
             return Err(HttpErr::Failed(format!("HTTP {}", status)));
         }
 
+        // Length enforcement: without it a stalled/broken stream returns
+        // Ok(short) and callers verify a truncated file (Rufus died in
+        // Authenticode with exactly this shape). Unknown length (chunked /
+        // header absent) skips the check, as before.
+        let mut content_len: Option<u64> = None;
+        {
+            let mut n: u32 = 0;
+            let mut sz: u32 = 4;
+            if (wh.query_headers)(
+                req,
+                WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                std::ptr::null_mut(),
+                &mut n as *mut u32 as *mut c_void,
+                &mut sz,
+                std::ptr::null_mut(),
+            ) != 0 && n > 0
+            {
+                content_len = Some(n as u64);
+            }
+        }
+
         let file = std::fs::File::create(dest).map_err(|e| HttpErr::Failed(e.to_string()))?;
         let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
         let mut downloaded: u64 = 0;
@@ -328,6 +350,15 @@ pub fn download_to_file(
         (wh.close_handle)(req);
         (wh.close_handle)(conn);
         (wh.close_handle)(session);
+        if !length_ok(downloaded, content_len) {
+            // Never leave a partial file behind to be mistaken for complete.
+            let _ = std::fs::remove_file(dest);
+            return Err(HttpErr::Failed(format!(
+                "incomplete download ({} of {} bytes) - the connection broke mid-stream; try again",
+                downloaded,
+                content_len.unwrap_or(0)
+            )));
+        }
         Ok(downloaded)
     }
 }
@@ -404,4 +435,28 @@ pub fn has_transport() -> bool {
 
 pub fn user_agent() -> &'static str {
     "lsl-usb-installer/1.0"
+}
+
+/// Length validation for a finished download: unknown length (chunked /
+/// header absent) can't be checked; a known length must match exactly.
+fn length_ok(downloaded: u64, content_length: Option<u64>) -> bool {
+    match content_length {
+        None => true,
+        Some(n) => downloaded == n,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_length_validation() {
+        assert!(length_ok(100, None)); // chunked: nothing to check against
+        assert!(length_ok(100, Some(100)));
+        assert!(length_ok(0, Some(0)));
+        assert!(!length_ok(50, Some(100))); // stalled stream: the Rufus case
+        assert!(!length_ok(0, Some(100)));
+        assert!(!length_ok(101, Some(100)));
+    }
 }

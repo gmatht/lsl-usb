@@ -249,6 +249,7 @@ fn run() {
                 known: Vec::new(),
                 nofmt_letter: None,
                 nofmt_pending: None,
+                boot_choice: None,
                 back: false,
             };
         }
@@ -343,11 +344,12 @@ fn run() {
                 // the wizard's BIOS/UEFI checkboxes AND the CLI flags must both allow a path
                 let want_bios = opts.bios_boot && g.bios_boot;
                 let want_uefi = opts.uefi_boot && g.uefi_boot;
+                let skip_verify = g.skip_verify || opts.skip_verify;
                 // The radio click IS the confirmation - re-typing the letter
                 // on the console would stall the working phase. Flag-pinned
                 // targets keep the typed gate (raw-sector writes must never
                 // hinge on a stale flag).
-                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some()) {
+                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some(), skip_verify) {
                     Ok((t, metrics, pending)) => {
                         // Whole-USB check while the wizard is still open
                         // (live status); a failure offers Back-to-options.
@@ -372,6 +374,14 @@ fn run() {
                             &summary_for(&g, &opts, &iso, "nofmt", Some(&metrics), check_rep.as_ref()),
                             true,
                         );
+                        // Boot choice as the next page of the SAME window
+                        // (no close-and-reopen dialog): manual key hint included.
+                        let mut boot_body = String::from("The USB stick is ready. Reboot into it now, or later by hand.\n");
+                        boot_body.push_str(&crate::boot::boot_key_hint());
+                        if !crate::boot::can_set_next_boot() {
+                            boot_body.push_str("\nOne-time-boot needs UEFI + bcdedit-capable Windows (absent here) - pick the firmware menu or reboot by hand.");
+                        }
+                        let boot_choice = ui.ask_boot_choice(&boot_body, crate::boot::can_set_next_boot());
                         gui::GuiWork {
                             iso,
                             mode,
@@ -379,6 +389,7 @@ fn run() {
                             known: Vec::new(),
                             nofmt_letter: Some(t.letter.clone()),
                             nofmt_pending: pending,
+                            boot_choice: Some(boot_choice),
                             back: false,
                         }
                     }
@@ -401,6 +412,7 @@ fn run() {
                     known: Vec::new(),
                     nofmt_letter: None,
                     nofmt_pending: None,
+                    boot_choice: None,
                     back: false,
                 }
             }
@@ -450,6 +462,7 @@ fn run() {
                     known,
                     nofmt_letter: None,
                     nofmt_pending: None,
+                    boot_choice: None,
                     back: false,
                 }
             }
@@ -533,6 +546,9 @@ fn run() {
             out::step("Using existing Mint live USB - no ISO download, no Rufus write.");
         }
     }
+
+    // GUI nofmt flow already asked in-window (same window, next page).
+    let gui_boot_choice = work.as_ref().and_then(|w| w.boot_choice.clone());
 
     if vol.is_none() {
         if let Some(w) = work.take() {
@@ -639,7 +655,7 @@ fn run() {
             // Non-destructive grub4dos install: MBR boot-code area only,
             // ISO copied as a file, menu.lst loopback. The stick keeps its
             // filesystem and all existing files.
-            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false) {
+            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false, opts.skip_verify) {
                 Ok((t, _metrics, pending)) => {
                     pending_mbr = pending;
                     vol = sys::list_volumes()
@@ -873,7 +889,11 @@ fn run() {
     if !shortcuts.is_empty() {
         out::info(&format!("Created 'LSL - Reboot to Select USB' shortcut(s): {}", shortcuts.join(", ")));
     }
-    let choice = boot::show_boot_choice_dialog();
+    // GUI nofmt flow already asked in-window; every other flow gets the dialog.
+    let choice = match gui_boot_choice {
+        Some(c) => c,
+        None => boot::show_boot_choice_dialog(),
+    };
     match choice {
         boot::BootChoice::Usb => {
             let set = boot::set_next_boot_usb();
@@ -1207,6 +1227,8 @@ fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str, metr
                 m.bytes_copied as f64 / crate::sys::GB as f64,
                 m.write_seconds
             ));
+        } else {
+            lines.push("  - USB write: skipped (verified copy already on the stick - 0 bytes written)".into());
         }
         if m.bytes_verified > 0 {
             lines.push(format!(
@@ -1223,6 +1245,8 @@ fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str, metr
             } else {
                 lines.push("  - USB disk read speed: at least the verify speed above (hash-bound run)".into());
             }
+        } else if mode == "nofmt" {
+            lines.push("  - USB verify: SKIPPED (unverified - corruption would only show at boot)".into());
         }
     }
     if let Some(letter) = g.target_usb.as_deref() {

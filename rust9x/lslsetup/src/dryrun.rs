@@ -69,8 +69,17 @@ pub fn show_dry_run_report(opts: &crate::cli::Opts) {
     // ---- write mode ----
     if opts.write_mode.eq_ignore_ascii_case("nofmt") {
         out::step("Write mode: non-destructive (nofmt)");
+        let uefi_src = crate::nofmt::uefi_source_name(&opts.uefi_bootx64);
         out::info("Would copy grldr + the ISO as a regular file, generate menu.lst (loopback boot),");
-        out::info("install BOOTX64.EFI + grub.cfg for UEFI (FAT32 + loader),");
+        if uefi_src != Some("vendored signed shim+GRUB2") {
+            out::info("mirror the entries to efi\\grub\\menu.lst for grub4dos-for-UEFI,");
+        }
+        out::info(&format!(
+            "install the UEFI loader ({}) + grub.cfg for UEFI (FAT32),",
+            uefi_src
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "none bundled - use --uefi-bootx64 or vendor one".into())
+        ));
         out::info("and, after every other drop below, flip the MBR boot code (bytes 0..440; signature + partition table kept).");
         out::info("No formatting; existing files untouched. Target must be a removable USB drive,");
         out::info("FAT32/NTFS, MBR-partitioned (--allow-fixed overrides the removable check).");

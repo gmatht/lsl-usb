@@ -13,6 +13,7 @@ pub struct Opts {
     pub usb_letter: String,     // --usb-letter <X>: pick the nofmt target
     pub allow_fixed: bool,      // --allow-fixed: override removable+USB checks
     pub uefi_bootx64: String,   // optional BOOTX64.EFI for the nofmt stick
+    pub uefi_loader: String,    // nofmt UEFI loader: auto|signed|grub4dos (also applied via nofmt::set_uefi_loader_override)
     pub bios_boot: bool,        // nofmt: install the grub4dos BIOS path (default on)
     pub uefi_boot: bool,        // nofmt: install the UEFI files (default on)
     pub check_usb: bool,        // fill free space with PRNG data + read-back verify (default off: slow)
@@ -20,6 +21,7 @@ pub struct Opts {
     pub flatpak_apps: Vec<String>,
     pub skip_iso_download: bool,
     pub skip_rufus: bool,
+    pub skip_verify: bool,     // skip USB copy SHA-256 verification (faster; UNVERIFIED)
     pub no_gui: bool,
     pub dry_run: bool,
     pub rate_hardware: bool,
@@ -62,6 +64,7 @@ impl Default for Opts {
             usb_letter: String::new(),
             allow_fixed: false,
             uefi_bootx64: String::new(),
+            uefi_loader: "auto".into(),
             bios_boot: true,
             uefi_boot: true,
             check_usb: false,
@@ -69,6 +72,7 @@ impl Default for Opts {
             flatpak_apps: Vec::new(),
             skip_iso_download: false,
             skip_rufus: false,
+            skip_verify: false,
             no_gui: false,
             dry_run: false,
             rate_hardware: false,
@@ -102,21 +106,27 @@ Options:
                              the stick must already be FAT32/NTFS)
   --usb-letter <X>           Drive letter for the nofmt target (else a picker)
   --allow-fixed              Allow non-removable targets in nofmt mode
-  --uefi-bootx64 <path>      Optional BOOTX64.EFI for nofmt UEFI booting
+  --uefi-bootx64 <path>      Optional custom BOOTX64.EFI for nofmt UEFI
+                             booting (installed as-is; wins over the loader
+                             picked below)
+  --uefi-loader <auto|signed|grub4dos>
+                             nofmt UEFI loader: signed (Microsoft shim +
+                             Canonical-signed GRUB2 - works with Secure Boot
+                             ON, the default when that chain is bundled),
+                             grub4dos (unsigned grub4dos-for-UEFI; Secure
+                             Boot must be OFF), auto (best default; a
+                             --uefi-bootx64 file also takes priority)
   --no-bios-boot             nofmt: skip the grub4dos BIOS path (UEFI files only)
   --no-uefi-boot             nofmt: skip the UEFI files (BIOS path only)
   --check-usb                After writing: fill free space with PRNG test
                              data in DeleteMe, read it all back uncached
                              (bypasses the OS cache), then delete it
-                             (GRUB2 or grub4dos-for-UEFI loader; the latter
-                             reuses the same menu.lst/ISO mapping. Required
-                             for GPT sticks, which get a files-only UEFI
-                             install with no raw sector writes)
   --volume-label <label>     USB volume label to target
   --wsl-vhdx <path>          Extra WSL VHDX path (repeatable)
   --flatpak-apps <id>        Extra flatpak app id (repeatable)
   --skip-iso-download        Do not offer to download a Mint ISO
   --skip-rufus               Do not launch Rufus; wait for a Mint live USB
+  --skip-verify              Skip USB copy verification (faster; UNVERIFIED)
   --no-gui                   Console-only flow (no config dialog)
   --dry-run                  Detection-only mode; writes nothing
   --rate-hardware            With --dry-run: rate ALL PCI/USB devices
@@ -156,6 +166,17 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--usb-letter" => o.usb_letter = next()?,
             "--allow-fixed" => o.allow_fixed = true,
             "--uefi-bootx64" => o.uefi_bootx64 = next()?,
+            "--uefi-loader" => {
+                let v = next()?.to_ascii_lowercase();
+                o.uefi_loader = v.clone();
+                let loader = match v.as_str() {
+                    "auto" => crate::nofmt::UefiLoader::Auto,
+                    "signed" => crate::nofmt::UefiLoader::Signed,
+                    "grub4dos" => crate::nofmt::UefiLoader::Grub4dos,
+                    _ => return Err("--uefi-loader must be one of auto, signed, grub4dos".into()),
+                };
+                crate::nofmt::set_uefi_loader_override(loader);
+            }
             "--no-bios-boot" => o.bios_boot = false,
             "--no-uefi-boot" => o.uefi_boot = false,
             "--check-usb" => o.check_usb = true,
@@ -163,6 +184,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--flatpak-apps" => o.flatpak_apps.push(next()?),
             "--skip-iso-download" => o.skip_iso_download = true,
             "--skip-rufus" => o.skip_rufus = true,
+            "--skip-verify" => o.skip_verify = true,
             "--no-gui" => o.no_gui = true,
             "--dry-run" => o.dry_run = true,
             "--rate-hardware" => o.rate_hardware = true,

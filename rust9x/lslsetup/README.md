@@ -41,10 +41,14 @@ Everything the PS script does is implemented:
   and exFAT sticks are refused; the first 64 sectors are backed up before the
   one raw write and verified by read-back afterwards. `--usb-letter` pins the
   target, `--allow-fixed` deliberately relaxes only the removable check
-  (never the USB-bus check). UEFI boots via BOOTX64.EFI + grub.cfg (files
-  only): `--uefi-bootx64` supplies the loader, otherwise the vendored
-  `assets/BOOTX64.EFI` is used when one was built in (grub4dos-for-UEFI
-  preferred - it reuses the same menu.lst/ISO mapping). The INSTALL page has
+  (never the USB-bus check). UEFI boots files-only from \EFI\BOOT: the
+  DEFAULT loader is the bundled signed chain - Microsoft-signed shim ->
+  Canonical-signed GRUB2 (`--uefi-loader signed`; works with Secure Boot ON
+  or OFF) - with the unsigned grub4dos-for-UEFI `assets/BOOTX64.EFI`
+  (`--uefi-loader grub4dos`; Secure Boot must be OFF) as the fallback, which
+  mirrors its menu to \efi\grub\menu.lst, the only menu location that loader
+  reads; `--uefi-bootx64 <file>` supplies any custom loader and wins over
+  both. The INSTALL page has
   BIOS-boot and UEFI-boot checkboxes, on by default when the selected stick
   supports them and greyed out with the reason when not, plus a this-machine
   firmware line (booted UEFI/legacy, board UEFI/CSM capability via SMBIOS)

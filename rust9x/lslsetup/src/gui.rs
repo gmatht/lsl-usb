@@ -96,6 +96,7 @@ pub struct GuiResult {
     pub bios_boot: bool,                       // INSTALL-page "BIOS boot" checkbox (default: supported)
     pub uefi_boot: bool,                       // INSTALL-page "UEFI boot" checkbox (default: supported)
     pub check_usb: bool,                       // INSTALL-page "Check whole USB" checkbox (default: off, slow)
+    pub skip_verify: bool,                     // INSTALL-page "Skip verify" checkbox (default: off = verify)
 }
 
 /// Wizard pages: 0 hw, 1 iso, 2 flatpak, 3 system, 4 wifi, 5 install.
@@ -1128,6 +1129,7 @@ struct LayoutCtx<'a> {
     btn_back: &'a nwg::Button,
     btn_next: &'a nwg::Button,
     btn_cancel: &'a nwg::Button,
+    btn_reboot: &'a nwg::Button,
     lbl_dl: &'a nwg::Label,
     pb_dl: &'a nwg::ProgressBar,
     iso: &'a PageItems,
@@ -1186,8 +1188,10 @@ fn relayout(c: &LayoutCtx, cw: i32, ch: i32) {
     c.btn_next.set_size(96, 28);
     c.btn_back.set_position(cw - MARGIN - 96 - 96, ny);
     c.btn_back.set_size(90, 28);
-    //c.btn_cancel.set_position(cw - MARGIN - 96 - 96 - 96, ny);
-    c.btn_cancel.set_position(8, ny);
+    c.btn_reboot.set_position(8, ny);
+    c.btn_reboot.set_size(90, 28);
+    let cancel_x = if c.btn_reboot.visible() { 8 + 90 + 8 } else { 8 };
+    c.btn_cancel.set_position(cancel_x, ny);
     c.btn_cancel.set_size(90, 28);
 
     // persistent download progress ("Downloading {}-..." label + bar):
@@ -1198,7 +1202,7 @@ fn relayout(c: &LayoutCtx, cw: i32, ch: i32) {
     // the button row in the free middle between Cancel (left) and Back.
     c.lbl_dl.set_position(MARGIN, label_y);
     c.lbl_dl.set_size(fw as u32, label_h as u32);
-    let bar_x0 = MARGIN + 90 + 12;
+    let bar_x0 = cancel_x + 90 + 12;
     let bar_x1 = cw - MARGIN - 96 - 96 - 10;
     // MIN_CW guarantees room, but clamp anyway so a sub-minimum window
     // can only clip the bar, never push it under a button.
@@ -1440,6 +1444,9 @@ pub struct GuiWork {
     /// mode == "nofmt": validated-but-unflipped boot sectors, committed
     /// after the main-phase file drops (see nofmt::commit_boot_sectors).
     pub nofmt_pending: Option<crate::nofmt::PendingMbr>,
+    /// mode == "nofmt": reboot choice from the in-window boot page
+    /// (ask_boot_choice); run() executes it instead of a second dialog.
+    pub boot_choice: Option<crate::boot::BootChoice>,
     /// FAILED page "Back to install options": resume the wizard.
     pub back: bool,
 }
@@ -1455,6 +1462,7 @@ impl GuiWork {
             known: Vec::new(),
             nofmt_letter: None,
             nofmt_pending: None,
+            boot_choice: None,
             back: true,
         }
     }
@@ -1484,6 +1492,12 @@ pub struct WorkingUi {
     open_clicked: Rc<std::cell::Cell<bool>>,
     sum_back: usize, // "Back to install options" (FAILED page only)
     back_clicked: Rc<std::cell::Cell<bool>>,
+    // Boot-choice page clicks (ask_boot_choice reuses the summary HWNDs;
+    // separate cells so the two modal loops never read stale flags).
+    boot_usb: Rc<std::cell::Cell<bool>>,
+    boot_adv: Rc<std::cell::Cell<bool>>,
+    boot_fw: Rc<std::cell::Cell<bool>>,
+    boot_none: Rc<std::cell::Cell<bool>>,
 }
 
 impl WorkingUi {
@@ -1674,6 +1688,104 @@ impl WorkingUi {
         false
     }
 
+    /// Boot-choice page in the SAME window (after the FINISHED summary):
+    /// stacked full-width action buttons reusing the summary HWNDs,
+    /// mirroring the standalone boot dialog. Blocks pumping the GUI until
+    /// a choice is made; window close / Escape means Don't reboot. `can_usb`
+    /// hides the one-time-boot button where bcdedit can't work. The window
+    /// is destroyed on return - the console tail + reboot follow.
+    pub fn ask_boot_choice(&self, body: &str, can_usb: bool) -> crate::boot::BootChoice {
+        use crate::boot::BootChoice;
+        let (cw, ch) = client_size(self.main as winapi::shared::windef::HWND);
+        let fw = (cw - 2 * MARGIN).max(MIN_CW - 2 * MARGIN);
+        let bw = (fw - 20).max(60);
+        let top = 78;
+        self.raw_show(self.sum_frame, true);
+        set_ctl_rect(self.sum_frame, MARGIN, top, fw, (ch - top - NAV_H).max(80));
+        set_wnd_text(self.sum_heading, "lslsetup - boot the USB");
+        set_ctl_rect(self.sum_heading, MARGIN + 10, top + 6, bw, 22);
+        self.raw_show(self.sum_heading, true);
+        set_wnd_text(self.sum_body, body);
+        set_ctl_rect(self.sum_body, MARGIN + 10, top + 34, bw, 60);
+        self.raw_show(self.sum_body, true);
+        // stacked actions, same order as the standalone dialog
+        let mut y = top + 100;
+        if can_usb {
+            set_wnd_text(self.sum_btn, "Reboot to USB now");
+            set_ctl_rect(self.sum_btn, MARGIN + 10, y, bw, 28);
+            self.raw_show(self.sum_btn, true);
+        } else {
+            self.raw_show(self.sum_btn, false);
+        }
+        y += 36;
+        set_wnd_text(self.sum_copy, "Firmware boot menu");
+        set_ctl_rect(self.sum_copy, MARGIN + 10, y, bw, 28);
+        self.raw_show(self.sum_copy, true);
+        y += 36;
+        set_wnd_text(self.sum_open, "Advanced startup menu");
+        set_ctl_rect(self.sum_open, MARGIN + 10, y, bw, 28);
+        self.raw_show(self.sum_open, true);
+        y += 36;
+        set_wnd_text(self.sum_back, "Don't reboot");
+        set_ctl_rect(self.sum_back, MARGIN + 10, y, bw, 28);
+        self.raw_show(self.sum_back, true);
+        // hide everything else that could paint over it
+        self.raw_show(self.nav_back, false);
+        self.raw_show(self.nav_next, false);
+        self.raw_show(self.nav_cancel, false);
+        self.raw_show(self.status, false);
+        self.raw_show(self.dl, false);
+        self.raw_show(self.dlbar, false);
+        self.repaint_window();
+
+        use winapi::um::winuser::SetFocus;
+        unsafe {
+            SetFocus((if can_usb { self.sum_btn } else { self.sum_copy }) as winapi::shared::windef::HWND);
+        }
+
+        self.boot_usb.set(false);
+        self.boot_adv.set(false);
+        self.boot_fw.set(false);
+        self.boot_none.set(false);
+        let mut choice: Option<BootChoice> = None;
+        while choice.is_none() {
+            // raw keys: Escape declines, Return takes the primary action
+            // (BN_CLICKED via Enter proved flaky on the Win95 VM).
+            use winapi::um::winuser::{
+                PeekMessageW, PM_NOREMOVE, WM_KEYDOWN, MSG, VK_ESCAPE, VK_RETURN,
+            };
+            let mut msg: MSG = unsafe { std::mem::zeroed() };
+            if unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), WM_KEYDOWN, WM_KEYDOWN, PM_NOREMOVE) }
+                != 0
+            {
+                let vk = msg.wParam as u32;
+                if vk == VK_ESCAPE as u32 {
+                    choice = Some(BootChoice::None);
+                } else if vk == VK_RETURN as u32 {
+                    choice = Some(if can_usb { BootChoice::Usb } else { BootChoice::None });
+                }
+            }
+            self.pump();
+            if !is_window(self.main) {
+                break;
+            }
+            if self.boot_usb.get() {
+                choice = Some(BootChoice::Usb);
+            } else if self.boot_adv.get() {
+                choice = Some(BootChoice::Adv);
+            } else if self.boot_fw.get() {
+                choice = Some(BootChoice::Fw);
+            } else if self.boot_none.get() {
+                choice = Some(BootChoice::None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        // page's job is done - destroy the window; the console tail and the
+        // reboot itself follow (both need no window).
+        self.close();
+        choice.unwrap_or(BootChoice::None)
+    }
+
     fn repaint_window(&self) {
         use winapi::um::winuser::GetClientRect;
         if !is_window(self.main) {
@@ -1841,6 +1953,11 @@ pub fn run_gui(
     let sum_open_h: Rc<Cell<usize>> = Rc::new(Cell::new(0));
     let copy_clicked: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let open_clicked: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // boot-choice page clicks (wired in the button-click handler below)
+    let boot_usb: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let boot_adv: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let boot_fw: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let boot_none: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
     let (tx, rx) = mpsc::channel::<HwMsg>();
 
@@ -2039,6 +2156,14 @@ pub fn run_gui(
     ].iter().enumerate() {
         lv_insert_column_direct(&lv_hw, i, text, *width);
     }
+    let mut btn_reboot: nwg::Button = Default::default();
+    let _ = nwg::Button::builder()
+        .text("Reboot")
+        .position((8, 706))
+        .size((90, 28))
+        .parent(&window)
+        .build(&mut btn_reboot);
+    let btn_reboot = Rc::new(btn_reboot);
 
     // ---- page 1: ISO selection (all checkboxes, one column, scrollbar) ----
     let _ = nwg::Frame::builder()
@@ -2651,6 +2776,20 @@ pub fn run_gui(
             items.push(PageItem { ctl: PageCtl::Check(cb, 8), x: 10, y: iy, w: -20, h: 20, idx: 0 });
             iy += 24;
         }
+        // Skip-verify checkbox (Check kind 9): off by default (verification
+        // stays on unless the user opts out; skipped copies are size-match
+        // only and corruption shows up at boot, not here).
+        {
+            let mut cb: Box<nwg::CheckBox> = Box::default();
+            let _ = nwg::CheckBox::builder()
+                .text("Skip USB copy verification (faster; corruption would only show at boot)")
+                .position((10, iy))
+                .size((780, 20))
+                .parent(&*frame_install)
+                .build(&mut cb);
+            items.push(PageItem { ctl: PageCtl::Check(cb, 9), x: 10, y: iy, w: -20, h: 20, idx: 0 });
+            iy += 24;
+        }
         let mut note: Box<nwg::Label> = Box::default();
         let note_text = if rufus_ok {
             "Rufus launches with the ISO pre-selected (you click START there). Built-in copies the image files with no format."
@@ -2887,6 +3026,7 @@ pub fn run_gui(
             btn_back: &*btn_back,
             btn_next: &*btn_next,
             btn_cancel: &*btn_cancel,
+            btn_reboot: &*btn_reboot,
             lbl_dl: &lbl_dl,
             pb_dl: &pb_dl,
             iso: &iso_items,
@@ -3014,6 +3154,10 @@ pub fn run_gui(
     let browse_data_sys = sys_items.clone();
     let _handlers = nwg::full_bind_event_handler(&window.handle, {
         // clones for the move closure; the outer harvest still uses the Rc originals
+        let boot_usb_c = boot_usb.clone();
+        let boot_adv_c = boot_adv.clone();
+        let boot_fw_c = boot_fw.clone();
+        let boot_none_c = boot_none.clone();
         let wifi_checks = wifi_checks.clone();
         let iso_items = iso_items.clone();
         let fp_items = fp_items.clone();
@@ -3052,6 +3196,7 @@ pub fn run_gui(
     let btn_next_c = btn_next.clone();
     let btn_cancel_c = btn_cancel.clone();
     let btn_everything_c = btn_everything.clone();
+    let btn_reboot_c = btn_reboot.clone();
     let working_c = working.clone();
     // Ctrl+Alt+B hotkey registration (see INSTALL_HOTKEY_ID): a real
     // RegisterHotKey, because focus usually sits on a child control whose
@@ -3075,6 +3220,7 @@ pub fn run_gui(
             let frame_install = frame_install.clone();
             let btn_back = btn_back.clone();
             let btn_next = btn_next.clone();
+            let btn_reboot = btn_reboot.clone();
             let install_items = install_items.clone();
             move |_, msg, w, _| {
                 use winapi::um::winuser::WM_HOTKEY;
@@ -3094,6 +3240,7 @@ pub fn run_gui(
                 frame_install.set_visible(true);
                 btn_back.set_enabled(true);
                 btn_next.set_enabled(true);
+                btn_reboot.set_visible(false);
                 btn_next.set_text(nav_label(INSTALL_PAGE));
                 // ...with the built-in non-destructive method preselected,
                 // so the hotkey lands ready to Install (programmatic check
@@ -3144,6 +3291,7 @@ pub fn run_gui(
                         btn_back: &*btn_back_c,
                         btn_next: &*btn_next_c,
                         btn_cancel: &*btn_cancel_c,
+                        btn_reboot: &*btn_reboot_c,
                         lbl_dl: &lbl_dl,
                         pb_dl: &pb_dl,
                         iso: &iso_items,
@@ -3219,6 +3367,24 @@ pub fn run_gui(
                     back_clicked.set(true);
                     glog("click back-to-options on failed page");
                 }
+                // boot-choice page (ask_boot_choice): same HWNDs, separate
+                // cells - the summary loop ignores these and vice versa.
+                if sum_btn_h.get() != 0 && click_hwnd == sum_btn_h.get() {
+                    boot_usb_c.set(true);
+                    glog("click boot-usb");
+                }
+                if sum_copy_h.get() != 0 && click_hwnd == sum_copy_h.get() {
+                    boot_adv_c.set(true);
+                    glog("click boot-advanced");
+                }
+                if sum_open_h.get() != 0 && click_hwnd == sum_open_h.get() {
+                    boot_fw_c.set(true);
+                    glog("click boot-firmware");
+                }
+                if sum_back_h.get() != 0 && click_hwnd == sum_back_h.get() {
+                    boot_none_c.set(true);
+                    glog("click boot-none");
+                }
                 // master wifi switch: toggling it checks/unchecks every network
                 if click_hwnd == master_hwnd {
                     let mut st = nwg::CheckBoxState::Unchecked;
@@ -3244,6 +3410,7 @@ pub fn run_gui(
                         frame_install_c.set_visible(p2.get() == INSTALL_PAGE);
                         btn_back_c.set_enabled(p2.get() > 0);
                         btn_next_c.set_text(nav_label(p2.get()));
+                        btn_reboot_c.set_visible(p2.get() == 0);
                     } else {
                         // ---- Install clicked: enter the working phase ----
                         // The window STAYS VISIBLE (status text + progress)
@@ -3279,6 +3446,7 @@ pub fn run_gui(
                         btn_next_c.set_enabled(false);
                         btn_cancel_c.set_enabled(false);
                         btn_everything_c.set_enabled(false);
+                        btn_reboot_c.set_visible(false);
                         lbl_dl.set_visible(false);
                         pb_dl.set_visible(false);
                         lbl_working.set_visible(true);
@@ -3302,6 +3470,10 @@ pub fn run_gui(
                             open_clicked: open_clicked.clone(),
                             sum_back: sum_back_h.get(),
                             back_clicked: back_clicked.clone(),
+                            boot_usb: boot_usb.clone(),
+                            boot_adv: boot_adv.clone(),
+                            boot_fw: boot_fw.clone(),
+                            boot_none: boot_none.clone(),
                         };
                         ui_cell.replace(Some(ui));
                         // The callback (main's on_confirm) runs right after
@@ -3324,6 +3496,7 @@ pub fn run_gui(
                         btn_back_c.set_enabled(p2.get() > 0);
                         btn_next_c.set_enabled(true);
                         btn_next_c.set_text(nav_label(p2.get()));
+                        btn_reboot_c.set_visible(p2.get() == 0);
                     }
                 } else if handle == btn_cancel_c.handle {
                     glog("click cancel");
@@ -3349,6 +3522,27 @@ pub fn run_gui(
                             let es = crate::lslfiles::install_everything();
                             let _ = tx2.send(HwMsg::EverythingDone(!es.is_empty()));
                         });
+                    }
+                } else if handle == btn_reboot_c.handle {
+                    glog("click reboot");
+                    match crate::boot::show_boot_choice_dialog() {
+                        crate::boot::BootChoice::Usb => {
+                            if !crate::boot::set_next_boot_usb().is_empty() {
+                                crate::boot::reboot("/r /t 0");
+                            } else {
+                                crate::boot::reboot(crate::boot::reboot_args());
+                            }
+                            std::process::exit(0);
+                        }
+                        crate::boot::BootChoice::Adv => {
+                            crate::boot::reboot("/r /o /f /t 0");
+                            std::process::exit(0);
+                        }
+                        crate::boot::BootChoice::Fw => {
+                            crate::boot::reboot(crate::boot::reboot_args());
+                            std::process::exit(0);
+                        }
+                        crate::boot::BootChoice::None => {}
                     }
                 } else {
                     // ISO-page radios: selecting a "Download Fresh" distro
@@ -3605,6 +3799,7 @@ pub fn run_gui(
         btn_next.set_enabled(true);
         btn_cancel.set_enabled(true);
         btn_everything.set_enabled(true);
+        btn_reboot.set_visible(false);
         page.set(INSTALL_PAGE);
         frame_hw.set_visible(false);
         frame_iso.set_visible(false);
@@ -3876,6 +4071,17 @@ fn harvest_gui_result(
             let mut on = false;
             for it in install_items.borrow().iter() {
                 if let PageCtl::Check(cb, 8) = &it.ctl {
+                    on = cb.check_state() == nwg::CheckBoxState::Checked;
+                    break;
+                }
+            }
+            on
+        },
+        skip_verify: {
+            // INSTALL-page skip-verify checkbox (kind 9); default off
+            let mut on = false;
+            for it in install_items.borrow().iter() {
+                if let PageCtl::Check(cb, 9) = &it.ctl {
                     on = cb.check_state() == nwg::CheckBoxState::Checked;
                     break;
                 }
