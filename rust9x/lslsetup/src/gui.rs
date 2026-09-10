@@ -13,8 +13,14 @@
 //!   page 4  wifi networks (master switch + per-network list)
 //!   page 5  INSTALL NOW: USB write method (Rufus / built-in
 //!           non-destructive / skip) + target USB picker
-//! Heavy work (download, Rufus, file copy) runs on the console afterwards,
-//! and the boot-choice dialog finishes the flow.
+//! On Install the wizard STAYS OPEN in a working phase and handles every
+//! download (ISO + Rufus) itself with live status/progress — no "type OK"
+//! console gate. It ends on a FINISHED / FAILED summary page (window stays
+//! open) that shows the chosen settings and the equivalent command line for
+//! headless/scripted runs; the page only closes when the user clicks
+//! Finish/Close. The boot-choice dialog then finishes the flow.
+//!
+//! A console flow is still available via --no-gui.
 //!
 //! Layout: everything is positioned from the live CLIENT size in one place
 //! (`relayout`). The window opens at the default 880x760 client — clamped to
@@ -40,6 +46,18 @@ fn multiline_edit_flags() -> nwg::TextBoxFlags {
         | nwg::TextBoxFlags::HSCROLL
         | nwg::TextBoxFlags::AUTOHSCROLL
         | nwg::TextBoxFlags::TAB_STOP
+}
+
+/// Summary-page body flags: multiline readonly WITHOUT `TAB_STOP`. A readonly
+/// multiline edit with TAB_STOP swallows the Tab key (inserts a tab) instead
+/// of moving focus, which would trap the user on the FINISHED/FAILED page
+/// (found by the Win95 puppeting session: Tab never reached the Finish
+/// button).
+fn summary_body_flags() -> nwg::TextBoxFlags {
+    nwg::TextBoxFlags::VISIBLE
+        | nwg::TextBoxFlags::VSCROLL
+        | nwg::TextBoxFlags::HSCROLL
+        | nwg::TextBoxFlags::AUTOHSCROLL
 }
 
 fn glog(msg: &str) {
@@ -529,6 +547,67 @@ fn client_size(hwnd: winapi::shared::windef::HWND) -> (i32, i32) {
         GetClientRect(hwnd, &mut cr);
         (cr.right - cr.left, cr.bottom - cr.top)
     }
+}
+
+/// Position + size a raw HWND (as usize).
+fn set_ctl_rect(h: usize, x: i32, y: i32, w: i32, hpx: i32) {
+    use winapi::um::winuser::{SetWindowPos, HWND_TOP, SWP_NOZORDER};
+    if h == 0 || !is_window(h) {
+        return;
+    }
+    unsafe {
+        SetWindowPos(
+            h as winapi::shared::windef::HWND,
+            HWND_TOP,
+            x,
+            y,
+            w.max(1),
+            hpx.max(1),
+            SWP_NOZORDER,
+        );
+    }
+}
+
+/// Put `text` on the clipboard as ANSI text (CF_TEXT — the only format
+/// Win95 reliably supports; a command line / error message is ASCII).
+fn copy_to_clipboard(text: &str) {
+    use winapi::um::winuser::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData, CF_TEXT,
+    };
+    use winapi::um::winbase::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT};
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return;
+        }
+        EmptyClipboard();
+        // ANSI bytes, NUL-terminated
+        let mut bytes: Vec<u8> = text.bytes().collect();
+        bytes.push(0);
+        let h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len());
+        if !h.is_null() {
+            let p = winapi::um::winbase::GlobalLock(h);
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+                winapi::um::winbase::GlobalUnlock(h);
+                SetClipboardData(CF_TEXT, h);
+            }
+        }
+        CloseClipboard();
+    }
+}
+
+/// First http(s) URL in `text` (for the "Open manual download" button).
+fn first_url(text: &str) -> Option<String> {
+    for needle in ["https://", "http://"] {
+        if let Some(i) = text.find(needle) {
+            let rest = &text[i..];
+            let end = rest
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(rest.len());
+            return Some(rest[..end].to_string());
+        }
+    }
+    None
 }
 
 /// Bottom-strip geometry from the client height: pages must end at or
@@ -1172,11 +1251,28 @@ pub struct GuiWork {
     pub nofmt_letter: Option<String>,
 }
 
-/// Raw-HWND facade over the wizard window while the working phase runs.
+/// Raw-HWND facade over the wizard window while the working phase runs and
+/// during the FINISHED / FAILED summary page shown at the very end.
 pub struct WorkingUi {
     main: usize,
     status: usize,
     bg: Rc<std::cell::RefCell<Vec<BgDl>>>,
+    // FINISHED/SUMMARY page controls + the nav buttons they temporarily
+    // replace (all raw HWNDs so the GUI thread can drive them mid-pump).
+    sum_frame: usize,
+    sum_heading: usize,
+    sum_body: usize,
+    sum_btn: usize,
+    sum_copy: usize,
+    sum_open: usize,
+    nav_back: usize,
+    nav_next: usize,
+    nav_cancel: usize,
+    dl: usize, // "Downloading ..." label (hidden on the final page)
+    dlbar: usize, // the persistent ISO progress bar (hidden on the final page)
+    done: Rc<std::cell::Cell<bool>>, // set by the Finish/Close button click
+    copy_clicked: Rc<std::cell::Cell<bool>>,
+    open_clicked: Rc<std::cell::Cell<bool>>,
 }
 
 impl WorkingUi {
@@ -1196,6 +1292,130 @@ impl WorkingUi {
             use winapi::um::winuser::DestroyWindow;
             unsafe { DestroyWindow(self.main as winapi::shared::windef::HWND) };
         }
+    }
+
+    fn raw_show(&self, h: usize, vis: bool) {
+        use winapi::um::winuser::{ShowWindow, SW_HIDE, SW_SHOW};
+        if h != 0 && is_window(h) {
+            unsafe { ShowWindow(h as winapi::shared::windef::HWND, if vis { SW_SHOW } else { SW_HIDE }) };
+        }
+    }
+
+    /// Render the FINAL page and block (pumping the GUI) until the user
+    /// clicks its button, then destroy the window. `ok` picks the heading
+    /// tone + button label: a green-ish "finished" summary on success, a
+    /// red "failed" screen (with the reason) on error. The window does NOT
+    /// just vanish: the reason / summary stays on-screen so the user reads
+    /// it before choosing to dismiss.
+    pub fn show_final(&self, heading: &str, body: &str, ok: bool) {
+        let (cw, ch) = client_size(self.main as winapi::shared::windef::HWND);
+        let fw = (cw - 2 * MARGIN).max(MIN_CW - 2 * MARGIN);
+        // frame fills the page area (below the secure-boot header, above the
+        // nav strip); heading + a readonly body box inside it.
+        self.raw_show(self.sum_frame, true);
+        let top = 78;
+        let fh = (ch - top - NAV_H).max(80);
+        set_ctl_rect(self.sum_frame, MARGIN, top, fw, fh);
+        set_wnd_text(self.sum_heading, heading);
+        set_ctl_rect(self.sum_heading, MARGIN + 10, top + 6, (fw - 20).max(60), 22);
+        set_wnd_text(self.sum_body, body);
+        set_ctl_rect(
+            self.sum_body,
+            MARGIN + 10,
+            top + 34,
+            (fw - 20).max(60),
+            (fh - 34 - 46).max(40),
+        );
+        self.raw_show(self.sum_body, true);
+        self.raw_show(self.sum_heading, true);
+        // one button, bottom-right where "Next"/"Install" lived
+        let btn_x = (cw - MARGIN - 96).max(MARGIN);
+        let btn_y = (ch - MARGIN - 28).max(top);
+        set_wnd_text(self.sum_btn, if ok { "Finish" } else { "Close" });
+        set_ctl_rect(self.sum_btn, btn_x, btn_y, 96, 28);
+        self.raw_show(self.sum_btn, true);
+        // "Copy" sits left of Finish; "Open manual download" (failure only)
+        // sits bottom-left where Cancel used to be.
+        set_ctl_rect(self.sum_copy, (btn_x - 90 - 8).max(MARGIN), btn_y, 90, 28);
+        self.raw_show(self.sum_copy, true);
+        if !ok {
+            set_ctl_rect(self.sum_open, MARGIN, btn_y, 150, 28);
+            self.raw_show(self.sum_open, true);
+        } else {
+            self.raw_show(self.sum_open, false);
+        }
+        // hide everything else that could paint over / distract from it
+        self.raw_show(self.nav_back, false);
+        self.raw_show(self.nav_next, false);
+        self.raw_show(self.nav_cancel, false);
+        self.raw_show(self.status, false); // working-status label
+        self.raw_show(self.dl, false);
+        self.raw_show(self.dlbar, false);
+        self.repaint_window();
+
+        // Give the Finish/Close button focus so Enter/Space dismisses the
+        // page. Without this the readonly body textbox keeps focus and Tab
+        // (even without TAB_STOP) may not reach the button on every Windows.
+        use winapi::um::winuser::SetFocus;
+        unsafe {
+            SetFocus(self.sum_btn as winapi::shared::windef::HWND);
+        }
+
+        // block until the Finish/Close button (or a window close) fires;
+        // Copy / Open-manual-download are handled in-place and keep waiting.
+        // Escape/Enter also dismiss: keyboard button activation (BN_CLICKED
+        // via Enter/Space) proved flaky on the Win95 VM, so catch the raw
+        // WM_KEYDOWN too.
+        self.done.set(false);
+        self.copy_clicked.set(false);
+        self.open_clicked.set(false);
+        while !self.done.get() {
+            use winapi::um::winuser::{
+                PeekMessageW, PM_NOREMOVE, WM_KEYDOWN, MSG, VK_ESCAPE, VK_RETURN,
+            };
+            let mut msg: MSG = unsafe { std::mem::zeroed() };
+            if unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), WM_KEYDOWN, WM_KEYDOWN, PM_NOREMOVE) }
+                != 0
+            {
+                let vk = msg.wParam as u32;
+                if vk == VK_ESCAPE as u32 || vk == VK_RETURN as u32 {
+                    self.done.set(true);
+                }
+            }
+            self.pump();
+            if !is_window(self.main) {
+                break;
+            }
+            if self.copy_clicked.get() {
+                self.copy_clicked.set(false);
+                copy_to_clipboard(body);
+                set_wnd_text(self.sum_btn, if ok { "Finish" } else { "Close" });
+            }
+            if self.open_clicked.get() {
+                self.open_clicked.set(false);
+                if let Some(url) = first_url(body) {
+                    crate::sys::open_url(&url);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        // the window's job is done - destroy it so the post-GUI (Rufus wait,
+        // lsl file drop) console phase isn't left with an orphan window.
+        self.close();
+    }
+
+    fn repaint_window(&self) {
+        use winapi::um::winuser::GetClientRect;
+        if !is_window(self.main) {
+            return;
+        }
+        unsafe {
+            let mut cr: winapi::shared::windef::RECT = std::mem::zeroed();
+            GetClientRect(self.main as winapi::shared::windef::HWND, &mut cr);
+            use winapi::um::winuser::InvalidateRect;
+            InvalidateRect(self.main as winapi::shared::windef::HWND, std::ptr::null(), 1);
+        }
+        repaint(self.main);
     }
 
     /// Join any background ISO download started from the page-1 distro
@@ -1279,7 +1499,14 @@ fn pump_pending(main: usize) {
     const WM_QUIT: u32 = 0x0012;
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     unsafe {
-        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+        // Bound the batch: a continuously-reposted message (e.g. WM_PAINT
+        // from a busy window) would otherwise keep this loop spinning and
+        // starve the caller's own checks (the FINISHED-page modal loop's
+        // Escape/Enter PeekMessage never ran on the Win95 VM - the guest sat
+        // at ~80% CPU and ignored keys).
+        let mut n = 0;
+        while n < 100 && PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            n += 1;
             if msg.message == WM_QUIT {
                 PostThreadMessageW(GetCurrentThreadId(), WM_QUIT, msg.wParam, msg.lParam);
                 break;
@@ -1307,6 +1534,15 @@ pub fn run_gui(
     let confirmed = Rc::new(Cell::new(false));
     let cancelled = Rc::new(Cell::new(false));
     let page = Rc::new(Cell::new(0usize));
+    // FINISHED/FAILED page: finish-button HWND + its "clicked" latc.
+    let sum_btn_h: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+    let final_done: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // extra summary-page buttons: copy the body to the clipboard, and (on
+    // failure) open the first manual-download URL in the browser.
+    let sum_copy_h: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+    let sum_open_h: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+    let copy_clicked: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let open_clicked: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
     let (tx, rx) = mpsc::channel::<HwMsg>();
 
@@ -1994,6 +2230,24 @@ pub fn run_gui(
         items.push(PageItem { ctl: PageCtl::Lbl(help, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
         iy += 26;
         // write-method radios (kind 3): one group, exactly one checked
+        // Rufus (any version, incl. the Win7-compatible 3.22) requires
+        // Windows 7 or later. On older Windows the radio is greyed out with
+        // an explanatory tooltip and the default falls back to the built-in
+        // non-destructive write.
+        let rufus_ok = !matches!(
+            sys::os_ver(),
+            sys::OsVer::Win9x
+                | sys::OsVer::Nt4
+                | sys::OsVer::Win2000
+                | sys::OsVer::Xp
+                | sys::OsVer::Vista
+        );
+        let effective_pre = if !rufus_ok && write_mode_pre == "rufus" {
+            "nofmt"
+        } else {
+            write_mode_pre
+        };
+        let mut rufus_tt: Option<&'static mut nwg::Tooltip> = None;
         let methods = [
             ("Rufus (recommended - well tested, UEFI + BIOS; rewrites the stick)", "rufus"),
             ("Built-in non-destructive (less tested - no reformat, keeps existing files; BIOS boot)", "nofmt"),
@@ -2012,15 +2266,31 @@ pub fn run_gui(
                 .size((780, 20))
                 .parent(&frame_install)
                 .build(&mut rb);
-            if write_mode_pre == *mode {
+            if *mode == "rufus" && !rufus_ok {
+                rb.set_enabled(false);
+                if rufus_tt.is_none() {
+                    let mut tt: nwg::Tooltip = Default::default();
+                    let _ = nwg::Tooltip::builder().build(&mut tt);
+                    rufus_tt = Some(Box::leak(Box::new(tt)));
+                }
+                rufus_tt.as_mut().unwrap().register(
+                    rb.as_ref(),
+                    "Rufus requires Windows 7 or later - use the built-in non-destructive write instead.",
+                );
+            } else if effective_pre == *mode {
                 rb.set_check_state(nwg::RadioButtonState::Checked);
             }
             items.push(PageItem { ctl: PageCtl::Radio(rb, 3), x: 10, y: iy, w: -20, h: 20, idx: 0 });
             iy += 24;
         }
         let mut note: Box<nwg::Label> = Box::default();
+        let note_text = if rufus_ok {
+            "Rufus launches with the ISO pre-selected (you click START there). Built-in copies the image files with no format."
+        } else {
+            "Rufus requires Windows 7 or later and is disabled here - use the built-in non-destructive write (or Skip)."
+        };
         let _ = nwg::Label::builder()
-            .text("Rufus launches with the ISO pre-selected (you click START there). Built-in copies the image files with no format.")
+            .text(note_text)
             .position((10, iy))
             .size((560, 18))
             .parent(&frame_install)
@@ -2142,6 +2412,67 @@ pub fn run_gui(
         .build(&mut lbl_working);
     lbl_working.set_font(Some(&font_bold));
     lbl_working.set_visible(false);
+
+    // ---- FINISHED / FAILED summary page ----
+    // A dedicated frame + heading + readonly body + one button, all hidden
+    // until the working phase ends. The body is a readonly multiline textbox
+    // (copyable) so a long SUMMARY / automation command line can be read.
+    // nwg control ownership stays here; WorkingUi only holds their HWNDs.
+    let mut sum_frame: nwg::Frame = Default::default();
+    let mut sum_heading: nwg::Label = Default::default();
+    let mut sum_body: nwg::TextBox = Default::default();
+    let mut sum_btn: nwg::Button = Default::default();
+    let _ = nwg::Frame::builder()
+        .position((MARGIN, 78))
+        .size((DEF_CW - 2 * MARGIN, DEF_CH - 78 - NAV_H))
+        .parent(&window)
+        .build(&mut sum_frame);
+    let _ = nwg::Label::builder()
+        .text("")
+        .position((MARGIN + 10, 84))
+        .size((800, 22))
+        .parent(&window)
+        .build(&mut sum_heading);
+    sum_heading.set_font(Some(&font_bold));
+    let _ = nwg::TextBox::builder()
+        .text("")
+        .position((MARGIN + 10, 112))
+        .size((820, 500))
+        .flags(summary_body_flags())
+        .readonly(true)
+        .parent(&window)
+        .build(&mut sum_body);
+    let _ = nwg::Button::builder()
+        .text("Finish")
+        .position((DEF_CW - MARGIN - 96, 706))
+        .size((96, 28))
+        .parent(&window)
+        .build(&mut sum_btn);
+    // extra summary-page buttons: copy the body (the automation command / the
+    // error text) to the clipboard, and open the first manual-download URL.
+    let mut sum_copy: nwg::Button = Default::default();
+    let mut sum_open: nwg::Button = Default::default();
+    let _ = nwg::Button::builder()
+        .text("Copy")
+        .position((DEF_CW - MARGIN - 96 - 96 - 8, 706))
+        .size((90, 28))
+        .parent(&window)
+        .build(&mut sum_copy);
+    let _ = nwg::Button::builder()
+        .text("Open manual download")
+        .position((MARGIN, 706))
+        .size((150, 28))
+        .parent(&window)
+        .build(&mut sum_open);
+    sum_frame.set_visible(false);
+    sum_body.set_visible(false);
+    sum_heading.set_visible(false);
+    sum_btn.set_visible(false);
+    sum_copy.set_visible(false);
+    sum_open.set_visible(false);
+    sum_btn_h.set(sum_btn.handle.hwnd().map(|h| h as usize).unwrap_or(0));
+    sum_copy_h.set(sum_copy.handle.hwnd().map(|h| h as usize).unwrap_or(0));
+    sum_open_h.set(sum_open.handle.hwnd().map(|h| h as usize).unwrap_or(0));
 
     // ---- first relayout pass (everything now exists) ----
     relayout(
@@ -2410,6 +2741,20 @@ pub fn run_gui(
             Event::OnButtonClick => {
                 glog("click");
                 let click_hwnd = handle.hwnd().map(|h| h as usize).unwrap_or(0);
+                // FINISHED / FAILED summary-page button: dismiss it. This is the
+                // only action available once the working phase has ended.
+                if sum_btn_h.get() != 0 && click_hwnd == sum_btn_h.get() {
+                    final_done.set(true);
+                    glog("click finish/close on final page");
+                }
+                if sum_copy_h.get() != 0 && click_hwnd == sum_copy_h.get() {
+                    copy_clicked.set(true);
+                    glog("click copy on final page");
+                }
+                if sum_open_h.get() != 0 && click_hwnd == sum_open_h.get() {
+                    open_clicked.set(true);
+                    glog("click open-manual-download on final page");
+                }
                 // master wifi switch: toggling it checks/unchecks every network
                 if click_hwnd == master_hwnd {
                     let mut st = nwg::CheckBoxState::Unchecked;
@@ -2477,6 +2822,20 @@ pub fn run_gui(
                             main: window.handle.hwnd().map(|h| h as usize).unwrap_or(0),
                             status: lbl_working.handle.hwnd().map(|h| h as usize).unwrap_or(0),
                             bg: bg_downloads.clone(),
+                            sum_frame: sum_frame.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            sum_heading: sum_heading.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            sum_body: sum_body.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            sum_btn: sum_btn.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            sum_copy: sum_copy.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            sum_open: sum_open.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            nav_back: btn_back.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            nav_next: btn_next.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            nav_cancel: btn_cancel.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            dl: lbl_dl.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            dlbar: pb_dl.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            done: final_done.clone(),
+                            copy_clicked: copy_clicked.clone(),
+                            open_clicked: open_clicked.clone(),
                         };
                         ui_cell.replace(Some(ui));
                         // The callback (main's on_confirm) runs right after
@@ -3006,5 +3365,19 @@ mod tests {
         assert_eq!(write_mode_from_label("NON-DESTRUCTIVE copy"), "nofmt");
         // unknown labels fall back to Rufus, never to an empty/invalid mode
         assert_eq!(write_mode_from_label("???"), "rufus");
+    }
+
+    #[test]
+    fn first_url_finds_http_and_https() {
+        assert_eq!(
+            first_url("Download manually:\n  https://rufus.ie/downloads/rufus-4.6.exe\nand save it."),
+            Some("https://rufus.ie/downloads/rufus-4.6.exe".to_string())
+        );
+        assert_eq!(
+            first_url("see http://example.com/a b"),
+            Some("http://example.com/a".to_string())
+        );
+        assert_eq!(first_url("no url here"), None);
+        assert_eq!(first_url(""), None);
     }
 }

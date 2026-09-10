@@ -4,9 +4,15 @@
 //!   1. writes grub4dos boot code into the MBR *boot-code area only*
 //!      (bytes 0..446) - partition table (446..510), disk signature and
 //!      0x55AA signature (510..512) are preserved;
-//!   2. copies `grldr` (grub4dos loader, must be in the volume root) plus
+//!   2. writes the grub4dos stage1 *continuation* into sectors 1..15. The
+//!      stage1 (assets/grldr.mbr) is 8192 bytes = 16 sectors; the BIOS loads
+//!      only sector 0, and the stage1 then reads sectors 1..15 to load the
+//!      rest of itself (its FAT/NTFS/ISO reading code). Without them it dies
+//!      with "Missing helper" and the stick is NOT bootable (verified by
+//!      tests/qemu-boot-test.sh);
+//!   3. copies `grldr` (grub4dos loader, must be in the volume root) plus
 //!      the ISO *as a regular file* onto the stick;
-//!   3. generates/appends a `menu.lst` that loopback-maps the ISO and
+//!   4. generates/appends a `menu.lst` that loopback-maps the ISO and
 //!      chainloads the ISO's own bootloader.
 //!
 //! Nothing is formatted and no existing file is deleted; existing files
@@ -41,6 +47,51 @@ const GRLDR_MBR_SHA256: &str = "f5c6e8e2c1eb7380285fa9cb1c9168e92d5b3b55cde052c0
 const MBR_CODE_END: usize = 446;
 /// How many leading sectors to back up before touching sector 0.
 const BOOT_BACKUP_SECTORS: usize = 64;
+
+/// The grub4dos stage1 is 8192 bytes = 16 sectors. The BIOS loads only
+/// sector 0 (the MBR); the stage1 then reads sectors 1..15 to load the rest
+/// of itself (its FAT/NTFS/ISO reading code lives there). Without those
+/// sectors on the disk it dies with "Missing helper" and the stick is NOT
+/// bootable. This is the bytes that must sit in sectors 1..15.
+fn stage1_continuation() -> &'static [u8] {
+    &GRLDR_MBR[512..]
+}
+
+/// First partition's start LBA (from the MBR partition table), if any.
+/// Used to refuse targets whose first partition starts inside the sectors
+/// the grub4dos stage1 continuation needs (1..15).
+fn first_partition_lba(mbr: &[u8; 512]) -> Option<u32> {
+    let mut first: Option<u32> = None;
+    for i in 0..4usize {
+        let e = 446 + 16 * i;
+        if mbr[e + 4] == 0 {
+            continue; // unused entry
+        }
+        let lba = u32::from_le_bytes([mbr[e + 8], mbr[e + 9], mbr[e + 10], mbr[e + 11]]);
+        first = Some(first.map_or(lba, |f: u32| f.min(lba)));
+    }
+    first
+}
+
+/// The active (bootable) partition: (start LBA, type byte), or None if no
+/// partition carries the 0x80 boot flag. grub4dos's MBR stage1 boots ONLY
+/// from the active partition, so a stick with no active partition (or whose
+/// active partition is an extended one) cannot boot via this method.
+fn active_partition(mbr: &[u8; 512]) -> Option<(u32, u8)> {
+    for i in 0..4usize {
+        let e = 446 + 16 * i;
+        if mbr[e] == 0x80 {
+            let lba = u32::from_le_bytes([mbr[e + 8], mbr[e + 9], mbr[e + 10], mbr[e + 11]]);
+            return Some((lba, mbr[e + 4]));
+        }
+    }
+    None
+}
+
+/// Is `typ` an extended-partition type (which grub4dos cannot boot from)?
+fn is_extended_type(typ: u8) -> bool {
+    matches!(typ, 0x05 | 0x0F | 0x85)
+}
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested; no Win32 calls)
@@ -290,6 +341,52 @@ fn device_number(letter: &str) -> Result<u32, String> {
         ));
     }
     Ok(num.DeviceNumber)
+}
+
+/// The target volume's starting offset on its physical disk (bytes), via
+/// IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS. Used to confirm the volume is the
+/// active partition grub4dos will boot from.
+fn volume_disk_offset(letter: &str) -> Result<u64, String> {
+    use winapi::um::ioapiset::DeviceIoControl;
+    use winapi::um::winioctl::IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS;
+    #[repr(C)]
+    struct DiskExtent {
+        disk_number: u32,
+        starting_offset: i64,
+        extent_length: i64,
+    }
+    #[repr(C)]
+    struct VolumeDiskExtents {
+        number_of_disk_extents: u32,
+        extents: [DiskExtent; 1],
+    }
+    let vol = std::fs::File::open(format!(r"\\.\{}:", letter))
+        .map_err(|e| format!("cannot open \\.\\{}: ({}); is the volume mounted?", letter, e))?;
+    let mut out: VolumeDiskExtents = unsafe { std::mem::zeroed() };
+    let mut got = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            vol.as_raw_handle() as *mut winapi::ctypes::c_void,
+            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+            std::ptr::null_mut(),
+            0,
+            &mut out as *mut VolumeDiskExtents as *mut _,
+            std::mem::size_of::<VolumeDiskExtents>() as u32,
+            &mut got,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS failed on {}: {}",
+            letter,
+            sys::last_err()
+        ));
+    }
+    if out.number_of_disk_extents == 0 {
+        return Err(format!("no disk extents reported for {}:", letter));
+    }
+    Ok(out.extents[0].starting_offset as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -559,12 +656,21 @@ pub fn install_from_iso(
 
 fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str) -> Result<(), String> {
     let fs_uc = t.fs.to_ascii_uppercase();
-    // grub4dos reads FAT12/16/32 and NTFS only.
+    // grub4dos reads FAT12/16/32 and NTFS only. exFAT (the default on many
+    // large sticks) is NOT readable by grub4dos, so a stick left exFAT cannot
+    // boot via this method - refuse with a clear reason rather than write a
+    // stick that silently won't boot.
     if !(fs_uc.starts_with("FAT") || fs_uc == "NTFS") {
+        let hint = if fs_uc == "EXFAT" {
+            "exFAT is not readable by grub4dos, so this stick could not boot.\n\
+             Reformat it to FAT32 (<=32 GB) or NTFS first, or use the Rufus flow (which repartitions)."
+        } else {
+            "grub4dos needs FAT32 or NTFS.\n\
+             Reformat the stick to FAT32/NTFS, or use the Rufus flow (which repartitions)."
+        };
         return Err(format!(
-            "filesystem {} is not supported by the no-reformat method (grub4dos needs FAT32 or NTFS). \
-             This tool refuses to reformat - use the Rufus flow for a fresh write.",
-            t.fs
+            "filesystem {} is not supported by the no-reformat method. {}",
+            t.fs, hint
         ));
     }
     let iso_len = sys::file_size(iso).ok_or_else(|| format!("ISO not found: {}", iso))?;
@@ -602,6 +708,47 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str) -> Result<(),
     disk.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     disk.read_exact(&mut head).map_err(|e| e.to_string())?;
     check_boot_area(&head)?;
+
+    // grub4dos's MBR stage1 boots the active (0x80) partition if one exists;
+    // if that partition is a filesystem it boots it directly, if it is an
+    // extended partition it scans into it and boots the first logical
+    // FAT/NTFS partition. With no active partition it scans all partitions.
+    // So the only clear, verifiable conflict is an active *filesystem*
+    // partition that is not the volume we are about to write grldr onto.
+    // (Verified by tests/qemu-boot-test.sh, incl. the extended + no-active
+    // cases.)
+    let mbr: [u8; 512] = head[..512].try_into().unwrap();
+    match active_partition(&mbr) {
+        Some((lba, typ)) => {
+            if !is_extended_type(typ) {
+                let vol_off = volume_disk_offset(&t.letter)?;
+                if (lba as u64) * 512 != vol_off {
+                    return Err(format!(
+                        "the target volume {}: is NOT the active (bootable) partition on the disk\n\
+                         (active partition starts at sector {}, this volume at sector {}).\n\
+                         grub4dos boots the active partition, so this stick would not boot.\n\
+                         Mark the target partition active (diskpart: select partition; active), or use a\n\
+                         single-partition stick, or the Rufus flow.",
+                        t.letter,
+                        lba,
+                        vol_off / 512
+                    ));
+                }
+            }
+        }
+        None => {
+            // No active partition: grub4dos scans. Fine for a single partition;
+            // warn if there are several (it may boot a different one).
+            let n = (0..4usize).filter(|&i| mbr[446 + 16 * i + 4] != 0).count();
+            if n > 1 {
+                out::warn(
+                    "no active partition and multiple partitions - grub4dos will boot the first\n\
+                     bootable one, which may not be the target volume. Consider marking the target\n\
+                     partition active (diskpart: select partition; active).",
+                );
+            }
+        }
+    }
     let backup_path = format!(
         "{}\\lsl-usb\\mbr-backup-PhysicalDrive{}.bin",
         sys::local_app_data(),
@@ -617,27 +764,51 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str) -> Result<(),
         return Err("MBR backup could not be written - aborting (nothing was modified).".into());
     }
 
-    // ---- the ONLY raw write: MBR boot-code area, bytes 0..446 ----
+    // ---- the ONLY raw writes: grub4dos stage1 into the MBR boot-code area
+    // (bytes 0..446, partition table preserved) AND its continuation into
+    // sectors 1..15. The stage1 is 8192 bytes = 16 sectors; the BIOS loads
+    // only sector 0, and the stage1 then reads sectors 1..15 to load the
+    // rest of itself - without them it dies with "Missing helper" and the
+    // stick is NOT bootable. ----
     let mbr: [u8; 512] = head[..512].try_into().unwrap();
-    let (new_mbr, changed) = merged_mbr(&mbr);
-    if changed {
+    // the continuation must not clobber the first partition
+    if let Some(first) = first_partition_lba(&mbr) {
+        if first <= 15 {
+            return Err(format!(
+                "the first partition starts at sector {} - the grub4dos stage1 needs sectors 1..15 for its continuation. Repartition the stick so the first partition starts after sector 15, or use the Rufus flow.",
+                first
+            ));
+        }
+    }
+    let (new_mbr, mbr_changed) = merged_mbr(&mbr);
+    let cont = stage1_continuation();
+    let cont_changed = &head[512..512 + cont.len()] != cont;
+    if mbr_changed || cont_changed {
         disk.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         disk.write_all(&new_mbr).map_err(|e| format!("MBR write failed: {}", e))?;
+        disk.seek(SeekFrom::Start(512)).map_err(|e| e.to_string())?;
+        disk.write_all(cont).map_err(|e| format!("grub4dos stage1 continuation write failed: {}", e))?;
         disk.sync_all().map_err(|e| format!("MBR flush failed: {}", e))?;
         // read back + verify
-        let mut back = [0u8; 512];
+        let mut back = vec![0u8; 512 + cont.len()];
         disk.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         disk.read_exact(&mut back).map_err(|e| e.to_string())?;
-        if back != new_mbr {
+        if back[..512] != new_mbr[..] {
             return Err(format!(
                 "MBR read-back mismatch - the write did not stick. Restore with the backup at {}",
+                backup_path
+            ));
+        }
+        if &back[512..] != cont {
+            return Err(format!(
+                "grub4dos stage1 continuation read-back mismatch - the write did not stick. Restore with the backup at {}",
                 backup_path
             ));
         }
         if &back[446..510] != &mbr[446..510] {
             return Err("partition table changed during the MBR write - aborting.".into());
         }
-        out::info("grub4dos boot code written to the MBR (partition table + signature preserved).");
+        out::info("grub4dos boot code written to the MBR + stage1 continuation (sectors 1-15); partition table preserved.");
     } else {
         out::info("grub4dos boot code already present - MBR untouched.");
     }
@@ -920,6 +1091,69 @@ mod tests {
     #[test]
     fn iso_name_sanitized() {
         assert_eq!(sanitize_iso_name("linux mint 22.iso"), "linux_mint_22.iso");
+    }
+
+    #[test]
+    fn stage1_continuation_is_15_sectors() {
+        // the grub4dos stage1 is 8192 bytes = 16 sectors; the BIOS loads only
+        // sector 0, so sectors 1..15 must carry the rest or the stick is not
+        // bootable ("Missing helper").
+        let cont = stage1_continuation();
+        assert_eq!(cont.len(), 15 * 512);
+        assert_eq!(cont, &GRLDR_MBR[512..]);
+        // and the MBR part is exactly the boot-code area
+        assert_eq!(&GRLDR_MBR[..MBR_CODE_END].len(), &MBR_CODE_END);
+    }
+
+    #[test]
+    fn first_partition_lba_parses() {
+        let mut m = valid_mbr();
+        // entry 0: type 0x0B, start LBA 2048
+        m[446 + 4] = 0x0B;
+        m[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+        assert_eq!(first_partition_lba(&m), Some(2048));
+        // a second, earlier partition wins (min)
+        m[446 + 16 + 4] = 0x0C;
+        m[446 + 16 + 8..446 + 16 + 12].copy_from_slice(&63u32.to_le_bytes());
+        assert_eq!(first_partition_lba(&m), Some(63));
+        // no used entries -> None
+        let mut empty = valid_mbr();
+        for i in 0..4usize {
+            empty[446 + 16 * i + 4] = 0;
+        }
+        assert_eq!(first_partition_lba(&empty), None);
+    }
+
+    #[test]
+    fn active_partition_finds_boot_flag() {
+        let mut m = valid_mbr();
+        // entry 0: boot flag 0x80, type 0x0C, start LBA 2048
+        m[446] = 0x80;
+        m[446 + 4] = 0x0C;
+        m[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+        assert_eq!(active_partition(&m), Some((2048, 0x0C)));
+        // no boot flag anywhere -> None
+        let mut none = valid_mbr();
+        for i in 0..4usize {
+            none[446 + 16 * i] = 0;
+        }
+        assert_eq!(active_partition(&none), None);
+        // a later entry with the flag wins
+        let mut later = valid_mbr();
+        later[446 + 16 + 0] = 0x80;
+        later[446 + 16 + 4] = 0x0B;
+        later[446 + 16 + 8..446 + 16 + 12].copy_from_slice(&63u32.to_le_bytes());
+        assert_eq!(active_partition(&later), Some((63, 0x0B)));
+    }
+
+    #[test]
+    fn extended_partition_types_flagged() {
+        assert!(is_extended_type(0x05));
+        assert!(is_extended_type(0x0F));
+        assert!(is_extended_type(0x85));
+        assert!(!is_extended_type(0x0B)); // FAT32
+        assert!(!is_extended_type(0x0C)); // FAT32 LBA
+        assert!(!is_extended_type(0x07)); // NTFS
     }
 
     #[test]

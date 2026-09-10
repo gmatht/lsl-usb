@@ -76,7 +76,10 @@ patch("Cargo.toml", [(
     "[profile.dev]",
 )], ["nwg-test/vendor/native-windows-gui"])
 
-# 2. main.rs — no_main + own main (skip std::rt: it hangs on Win95)
+# 2. main.rs — own main (skip std::rt: it hangs on Win95). The source's
+# #![cfg_attr(not(test), no_main)] already gives the Win95 build a no-main
+# binary while keeping a main for `cargo test`; a plain #![no_main] would
+# break the test harness link (undefined _main).
 patch("src/main.rs", [(
     "fn main() {",
     "/// Overrides the rustc `lang_start` shim (Win95: `std::rt` init hangs\n"
@@ -90,7 +93,6 @@ patch("src/main.rs", [(
     "\n"
     "fn run() {",
 )], ["Patch-Win95 applied by win95.sh"])
-patch("src/main.rs", [("mod boot;", "#![no_main]\n\nmod boot;")], ["#![no_main]"])
 
 # 3. main.rs — env::args() uses GetCommandLineW (stub on Win95)
 src = open("src/main.rs").read()

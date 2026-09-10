@@ -102,7 +102,7 @@ fn run() {
         .parent(&window)
         .build(&mut label);
 
-    // (probe) frame + label-in-frame + bold-font label — lsl-install parity
+    // (probe) frame + label-in-frame + bold-font label — lslsetup parity
     let _ = nwg::Frame::builder()
         .position((10, 100))
         .size((270, 90))
@@ -136,7 +136,7 @@ fn run() {
         .parent(&window)
         .build(&mut about_btn);
 
-    // (probe v2) lsl-install-style label operations
+    // (probe v2) lslsetup-style label operations
     let _ = nwg::Frame::builder()
         .position((150, 100))
         .size((460, 80))

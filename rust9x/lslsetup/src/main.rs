@@ -192,14 +192,15 @@ fn run() {
     let mut iso_path = opts.iso_path.clone();
     let mut flatpak_apps = opts.flatpak_apps.clone();
     let mut wsl_vhdx = opts.wsl_vhdx.clone();
-    let mut data_dir = String::new();
-    let mut copy_wifi = true;
-    let mut wifi_networks: Vec<String> = Vec::new();
-    let mut do_efu = true;
+    // defaults come from the CLI flags; the GUI (when used) overrides them
+    let mut data_dir = opts.data_dir.clone();
+    let mut copy_wifi = opts.wifi;
+    let mut wifi_networks: Vec<String> = opts.wifi_networks.clone();
+    let mut do_efu = opts.efu;
     let install_everything = true;
-    let mut preload_drivers = true;
-    let mut copy_sfs_hdd = false;
-    let mut reclaim_win_swap = false;
+    let mut preload_drivers = opts.drivers;
+    let mut copy_sfs_hdd = opts.sfs_hdd;
+    let mut reclaim_win_swap = opts.reclaim_win_swap;
     let mut rust_tools = false;
     let mut distro_arch: Option<&'static str> = None;
     let mut reuse_usb: Option<String> = None;
@@ -226,7 +227,12 @@ fn run() {
         if g.use_existing_usb.is_some() {
             ui.set_status("Using the existing live USB - no download, no Rufus write...");
             ui.pump();
-            ui.close();
+            // finish: show the summary the user can automate
+            ui.show_final(
+                "lslsetup - finished",
+                &summary_for(&g, &opts, "", "skip"),
+                true,
+            );
             return gui::GuiWork {
                 iso: String::new(),
                 mode: "skip".into(),
@@ -253,8 +259,23 @@ fn run() {
         if let Err(e) = validate_live_iso(&iso) {
             fatal_gui(&e, ui);
         }
-        // the wizard's write-method radio is explicit by construction
-        let mode = g.write_mode.clone().unwrap_or_else(|| "rufus".into());
+        // the wizard's write-method radio is explicit by construction; on
+        // pre-Win7 the Rufus radio is greyed out, so a "rufus" value here can
+        // only come from the CLI (--write-mode rufus) - refuse it loudly.
+        let mut mode = g.write_mode.clone().unwrap_or_else(|| "rufus".into());
+        if mode == "rufus"
+            && matches!(
+                sys::os_ver(),
+                sys::OsVer::Win9x
+                    | sys::OsVer::Nt4
+                    | sys::OsVer::Win2000
+                    | sys::OsVer::Xp
+                    | sys::OsVer::Vista
+            )
+        {
+            out::warn("Rufus requires Windows 7 or later - falling back to the built-in non-destructive write.");
+            mode = "nofmt".into();
+        }
         match mode.as_str() {
             "nofmt" => {
                 ui.set_status(
@@ -267,7 +288,12 @@ fn run() {
                 let letter_hint = g.target_usb.as_deref().unwrap_or(opts.usb_letter.as_str());
                 match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64) {
                     Ok(t) => {
-                        ui.close();
+                        // finished: show the summary page (window stays open)
+                        ui.show_final(
+                            "lslsetup - finished",
+                            &summary_for(&g, &opts, &iso, "nofmt"),
+                            true,
+                        );
                         gui::GuiWork {
                             iso,
                             mode,
@@ -282,7 +308,7 @@ fn run() {
             "skip" => {
                 out::step("Skipping the USB write (wizard choice).");
                 out::info("Write the image yourself (e.g. with Rufus), then this step picks up the USB.");
-                ui.close();
+                ui.show_final("lslsetup - finished", &summary_for(&g, &opts, &iso, "skip"), true);
                 gui::GuiWork {
                     iso,
                     mode,
@@ -296,7 +322,7 @@ fn run() {
                 ui.pump();
                 out::step("Launching Rufus with the ISO pre-selected.");
                 out::info("In Rufus: pick the target USB stick, then click START (this is the one destructive confirmation).");
-                let rufus_exe = match rufus::get_rufus(&opts.rufus_path) {
+                let rufus_exe = match rufus::get_rufus(&opts.rufus_path, Some(ui)) {
                     Ok(p) => p,
                     Err(e) => fatal_gui(&e, ui),
                 };
@@ -313,8 +339,13 @@ fn run() {
                     .filter(|v| !v.letter.is_empty())
                     .map(|v| v.letter.clone())
                     .collect();
-                // Rufus is up (or spawning): the GUI has done its job
-                ui.close();
+                // Rufus is up (or spawning): show the summary the user can
+                // automate before the console takes over to wait for the USB.
+                ui.show_final(
+                    "lslsetup - finished",
+                    &summary_for(&g, &opts, &iso, "rufus"),
+                    true,
+                );
                 gui::GuiWork {
                     iso,
                     mode: "rufus".into(),
@@ -519,7 +550,7 @@ fn run() {
             // in the remaining-space check below.
             iso_used = String::new();
         } else {
-            let rufus_exe = match rufus::get_rufus(&opts.rufus_path) {
+            let rufus_exe = match rufus::get_rufus(&opts.rufus_path, None) {
                 Ok(p) => p,
                 Err(e) => {
                     out::err(&e);
@@ -988,20 +1019,143 @@ pub(crate) fn resolve_page_iso(url: &str) -> Option<(String, String)> {
 /// show a dialog with the reason, so a failure never looks like a silent
 /// abort with no explanation.
 fn fatal_gui(msg: &str, ui: &gui::WorkingUi) -> ! {
-    ui.close();
+    // Print to the console AND keep the wizard window open showing the
+    // reason on the FAILED page - the window is never just destroyed with no
+    // explanation. The user reads why (download/Rufus/launch failure) before
+    // closing the page, which then exits with an error code.
     out::err(msg);
-    use winapi::um::winuser::{MB_ICONERROR, MB_OK, MessageBoxA};
-    let mut m: Vec<u8> = msg.bytes().collect();
-    m.push(0);
-    unsafe {
-        MessageBoxA(
-            0 as _,
-            m.as_ptr() as *const _,
-            b"lslsetup\0".as_ptr() as *const _,
-            MB_OK | MB_ICONERROR,
-        );
-    }
+    ui.show_final("lslsetup - failed", &format!("{}\r\n\r\nSee the console for the full log.", msg), false);
     std::process::exit(1);
+}
+
+/// Build the "automate these settings" command line on the FINISHED page:
+/// the flags that reproduce the GUI choices on a later headless / scripted
+/// run. Only options that have CLI equivalents are emitted.
+fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("Setup is configured. Your choices:".into());
+    if !iso.is_empty() {
+        lines.push(format!("  - ISO: {}", iso));
+    } else if let Some((_, name)) = &g.download_iso {
+        lines.push(format!("  - ISO: download '{}'", name));
+    } else {
+        lines.push("  - ISO: existing live USB".into());
+    }
+    let mode_desc = match mode {
+        "nofmt" => "non-destructive write (keep your stick's data)",
+        "skip" => "skip Rufus - write it yourself",
+        _ => "Rufus (DD-style USB write)",
+    };
+    lines.push(format!("  - USB write: {}", mode_desc));
+    if let Some(letter) = g.target_usb.as_deref() {
+        lines.push(format!("  - Target USB: {:?}", letter.trim()));
+    }
+    if !g.flatpak_ids.is_empty() {
+        // friendly names (reverse-map the reverse-DNS IDs); unknown/extra IDs
+        // fall back to the raw ID so nothing is hidden
+        let names: Vec<String> = g
+            .flatpak_ids
+            .iter()
+            .map(|id| {
+                crate::hardware::FLATPAK_MAP
+                    .iter()
+                    .find(|(_, i)| *i == id)
+                    .map(|(n, _)| n.to_string())
+                    .unwrap_or_else(|| id.clone())
+            })
+            .collect();
+        lines.push(format!("  - flatpaks: {}", names.join(", ")));
+    }
+    if !g.wsl_vhdx.is_empty() {
+        lines.push(format!("  - {} WSL VHDX path(s)", g.wsl_vhdx.len()));
+    }
+    if !g.data_dir.is_empty() {
+        lines.push(format!("  - LSL_DATA_DIR: {}", g.data_dir));
+    }
+    if g.wifi {
+        lines.push(format!("  - copy wifi profiles{}", if g.wifi_networks.is_empty() { String::new() } else { format!(" ({} selected)", g.wifi_networks.len()) }));
+    } else {
+        lines.push("  - wifi copy: off".into());
+    }
+    if g.sfs_hdd {
+        lines.push("  - squashfs -> HDD cache".into());
+    }
+    if g.reclaim_win_swap {
+        lines.push("  - reclaim Windows swap".into());
+    }
+    if g.rust_tools {
+        lines.push("  - rust tools: fd, bat, zoxide".into());
+    }
+    if g.drivers {
+        lines.push("  - network drivers: staged (RTL8812AU/8814AU/8188EU/8723BU, BCM43142/4360/4352/4313)".into());
+    }
+    if g.efu {
+        lines.push("  - Everything EFU index".into());
+    }
+
+    // the equivalent command line
+    let mut a: Vec<String> = Vec::new();
+    a.push(std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "lslsetup.exe".into()));
+    if !iso.is_empty() {
+        a.push(format!("--iso-path \"{}\"", iso));
+    }
+    if let Some((_, name)) = &g.download_iso {
+        if name.starts_with("linuxmint-") {
+            a.push(format!("--mint-version {}", opts.mint_version));
+        }
+    }
+    if !opts.download_dir.is_empty() {
+        a.push(format!("--download-dir \"{}\"", opts.download_dir));
+    }
+    match mode {
+        "nofmt" => {
+            a.push("--write-mode nofmt".into());
+            if let Some(letter) = g.target_usb.as_deref() {
+                a.push(format!("--usb-letter {}", letter.trim()));
+            }
+        }
+        "skip" => a.push("--skip-rufus".into()),
+        _ => {}
+    }
+    for id in &g.flatpak_ids {
+        a.push(format!("--flatpak-apps \"{}\"", id));
+    }
+    for v in &g.wsl_vhdx {
+        a.push(format!("--wsl-vhdx \"{}\"", v));
+    }
+    if !g.data_dir.is_empty() {
+        a.push(format!("--data-dir \"{}\"", g.data_dir));
+    }
+    if !g.wifi {
+        a.push("--no-wifi".into());
+    } else {
+        for n in &g.wifi_networks {
+            a.push(format!("--wifi-network \"{}\"", n));
+        }
+    }
+    if !g.efu {
+        a.push("--no-efu".into());
+    }
+    if !g.drivers {
+        a.push("--no-drivers".into());
+    }
+    if g.sfs_hdd {
+        a.push("--sfs-hdd-cache".into());
+    }
+    if g.reclaim_win_swap {
+        a.push("--reclaim-win-swap".into());
+    }
+    if g.rust_tools {
+        a.push("--preload-rust-tools".into());
+    }
+    lines.push(String::new());
+    lines.push("To automate these exact settings headlessly, run:".into());
+    lines.push(a.join(" "));
+    lines.push(String::new());
+    lines.push("Re-run with --dry-run to preview before writing.".into());
+    lines.join("\r\n")
 }
 
 /// Resolve-Iso: provided path -> existing ISO picker -> download (Mint or the
@@ -1087,9 +1241,10 @@ fn resolve_iso(
                 out::info(&format!("  {}", p));
             }
         }
-        // The GUI download selection is its own confirmation; only the
-        // pure-console flow gets the typed OK prompt.
-        if gui_download.is_none() {
+        // The GUI download selection is its own confirmation; the working
+        // phase (`ui` present) never types OK. Only the pure console flow
+        // (`--no-gui`, no live window) still keeps the typed-OK gate.
+        if gui_download.is_none() && ui.is_none() {
             let ans = out::prompt(&format!(
                 "Download {} (~3 GB) to {}? Type OK to continue, or press Enter to abort: ",
                 iso_name, dir

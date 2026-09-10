@@ -198,7 +198,8 @@ pub fn os_ver() -> OsVer {
         let mut vi: winapi::um::winnt::OSVERSIONINFOW = std::mem::zeroed();
         vi.dwOSVersionInfoSize = std::mem::size_of::<winapi::um::winnt::OSVERSIONINFOW>() as u32;
         if GetVersionExW(&mut vi) == 0 {
-            return OsVer::Win10Plus;
+            // Win95: GetVersionExW is a no-op stub; try the ANSI variant.
+            return os_ver_ansi();
         }
         let (maj, min) = (vi.dwMajorVersion, vi.dwMinorVersion);
         if vi.dwPlatformId != winapi::um::winnt::VER_PLATFORM_WIN32_NT {
@@ -214,6 +215,32 @@ pub fn os_ver() -> OsVer {
             _ => OsVer::Win10Plus,
         }
     })
+}
+
+/// ANSI fallback for os_ver (Win95's GetVersionExW is a no-op stub).
+fn os_ver_ansi() -> OsVer {
+    use winapi::um::sysinfoapi::GetVersionExA;
+    use winapi::um::winnt::OSVERSIONINFOA;
+    unsafe {
+        let mut vi: OSVERSIONINFOA = std::mem::zeroed();
+        vi.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOA>() as u32;
+        if GetVersionExA(&mut vi) == 0 {
+            return OsVer::Win10Plus;
+        }
+        let (maj, min) = (vi.dwMajorVersion, vi.dwMinorVersion);
+        if vi.dwPlatformId != winapi::um::winnt::VER_PLATFORM_WIN32_NT {
+            return OsVer::Win9x;
+        }
+        match (maj, min) {
+            (4, _) => OsVer::Nt4,
+            (5, 0) => OsVer::Win2000,
+            (5, _) => OsVer::Xp,
+            (6, 0) => OsVer::Vista,
+            (6, 1) => OsVer::Win7,
+            (6, 2) | (6, 3) => OsVer::Win8,
+            _ => OsVer::Win10Plus,
+        }
+    }
 }
 
 pub fn is_9x() -> bool {
@@ -611,8 +638,18 @@ impl Volume {
 }
 
 pub fn path_exists(p: &str) -> bool {
+    // Win95: GetFileAttributesW is a no-op stub (always fails). Try the ANSI
+    // variant as a fallback so the same logic works on 95 through 11 without
+    // needing version detection (which itself relies on W-APIs).
     let w = wide(p);
-    unsafe { GetFileAttributesW(w.as_ptr()) != u32::MAX }
+    if unsafe { GetFileAttributesW(w.as_ptr()) } != u32::MAX {
+        return true;
+    }
+    use winapi::um::fileapi::GetFileAttributesA;
+    let mut a = Vec::with_capacity(p.len() + 1);
+    a.extend_from_slice(p.as_bytes());
+    a.push(0);
+    unsafe { GetFileAttributesA(a.as_ptr() as *const i8) != u32::MAX }
 }
 
 pub fn is_dir(p: &str) -> bool {
@@ -629,11 +666,67 @@ pub fn file_size(p: &str) -> Option<u64> {
         let mut fd: winapi::um::minwinbase::WIN32_FIND_DATAW = std::mem::zeroed();
         let h = FindFirstFileW(w.as_ptr(), &mut fd);
         if h == INVALID_HANDLE_VALUE {
+            // Win95: FindFirstFileW is a no-op stub; fall back to ANSI.
+            return file_size_ansi(p);
+        }
+        FindClose(h);
+        Some(((fd.nFileSizeHigh as u64) << 32) | fd.nFileSizeLow as u64)
+    }
+}
+
+/// ANSI fallback for file_size (Win95's FindFirstFileW is a no-op stub).
+fn file_size_ansi(p: &str) -> Option<u64> {
+    use winapi::um::fileapi::FindFirstFileA;
+    use winapi::um::minwinbase::WIN32_FIND_DATAA;
+    let mut a = Vec::with_capacity(p.len() + 1);
+    a.extend_from_slice(p.as_bytes());
+    a.push(0);
+    unsafe {
+        let mut fd: WIN32_FIND_DATAA = std::mem::zeroed();
+        let h = FindFirstFileA(a.as_ptr() as *const i8, &mut fd);
+        if h == INVALID_HANDLE_VALUE {
             return None;
         }
         FindClose(h);
         Some(((fd.nFileSizeHigh as u64) << 32) | fd.nFileSizeLow as u64)
     }
+}
+
+/// List files matching `pattern` (e.g. "C:\\ISO\\*.iso") as (name, size),
+/// using the ANSI APIs. Win95's FindFirstFileW/FindNextFileW are no-op
+/// stubs, so the W-API callers fall back to this.
+pub fn list_files_ansi(pattern: &str) -> Vec<(String, u64)> {
+    use winapi::um::fileapi::{FindFirstFileA, FindNextFileA};
+    use winapi::um::minwinbase::WIN32_FIND_DATAA;
+    let mut a = Vec::with_capacity(pattern.len() + 1);
+    a.extend_from_slice(pattern.as_bytes());
+    a.push(0);
+    let mut out = Vec::new();
+    unsafe {
+        let mut fd: WIN32_FIND_DATAA = std::mem::zeroed();
+        let h = FindFirstFileA(a.as_ptr() as *const i8, &mut fd);
+        if h == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        loop {
+            let mut name = Vec::new();
+            let mut i = 0usize;
+            while fd.cFileName[i] != 0 {
+                name.push(fd.cFileName[i] as u8);
+                i += 1;
+            }
+            let name = String::from_utf8_lossy(&name).into_owned();
+            if name != "." && name != ".." {
+                let size = ((fd.nFileSizeHigh as u64) << 32) | fd.nFileSizeLow as u64;
+                out.push((name, size));
+            }
+            if FindNextFileA(h, &mut fd) == 0 {
+                break;
+            }
+        }
+        FindClose(h);
+    }
+    out
 }
 
 pub fn list_volumes() -> Vec<Volume> {

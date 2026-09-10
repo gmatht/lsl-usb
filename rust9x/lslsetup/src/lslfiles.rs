@@ -654,10 +654,18 @@ pub fn find_local_isos() -> Vec<String> {
     let mut hits: Vec<(String, u64)> = Vec::new();
     for d in dirs {
         let w = sys::wide(&format!("{}\\*.iso", d));
+        let mut found_any = false;
         unsafe {
             let mut fd: winapi::um::minwinbase::WIN32_FIND_DATAW = std::mem::zeroed();
             let h = winapi::um::fileapi::FindFirstFileW(w.as_ptr(), &mut fd);
             if h == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+                // Win95: FindFirstFileW is a no-op stub; fall back to ANSI.
+                for (name, size) in sys::list_files_ansi(&format!("{}\\*.iso", d)) {
+                    if size > 0 {
+                        hits.push((format!("{}\\{}", d, name), size));
+                        found_any = true;
+                    }
+                }
                 continue;
             }
             loop {
@@ -667,6 +675,7 @@ pub fn find_local_isos() -> Vec<String> {
                     let size = ((fd.nFileSizeHigh as u64) << 32) | fd.nFileSizeLow as u64;
                     if size > 0 {
                         hits.push((full, size));
+                        found_any = true;
                     }
                 }
                 if winapi::um::fileapi::FindNextFileW(h, &mut fd) == 0 {
@@ -675,6 +684,7 @@ pub fn find_local_isos() -> Vec<String> {
             }
             winapi::um::fileapi::FindClose(h);
         }
+        let _ = found_any;
     }
     // sort newest first is impossible without full timestamps sorting; keep
     // the simple name ordering and cap at 20 like the PS version.

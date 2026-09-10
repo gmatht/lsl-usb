@@ -93,11 +93,15 @@ fn latest_rufus_asset() -> Result<(String, String), String> {
     Err(format!("No rufus.exe asset found in release {}", tag))
 }
 
-/// Locate Rufus: caller-supplied path, then cache. When missing, OFFER to
-/// download it (never silently) — picking a version that runs on this OS
-/// (Windows 7 and older get the last Win7-compatible release, 3.22; Windows
-/// 8+ get the latest).
-pub fn get_rufus(path: &str) -> Result<String, String> {
+/// Locate Rufus: caller-supplied path, then cache. When missing, download it
+/// (never silently in the console: only a live GUI working phase counts as the
+/// user's consent — `ui` is Some exactly then). Picks a version that runs on
+/// this OS (Windows 7 and older get the last Win7-compatible release, 3.22;
+/// Windows 8+ get the latest). While downloading in the GUI it feeds live
+/// status + progress into the still-open wizard window instead of blocking a
+/// bare console.
+pub fn get_rufus(path: &str, ui: Option<&crate::gui::WorkingUi>) -> Result<String, String> {
+    let in_gui = ui.is_some();
     if !path.is_empty() {
         if path_exists(path) {
             return Ok(path.to_string());
@@ -128,28 +132,38 @@ pub fn get_rufus(path: &str) -> Result<String, String> {
         ),
         None => "the latest Rufus".to_string(),
     };
-    // Offer, don't silently fetch: the user may prefer to supply their own
-    // rufus.exe via --rufus-path.
-    out::step(&format!("Rufus is not installed. {} will be downloaded.", ver_desc));
-    let ans = out::prompt("Download it now? Type OK to continue, or press Enter to abort: ");
-    if ans != "OK" {
-        return Err(
-            "Aborted. Download rufus.exe manually from https://rufus.ie and pass it via --rufus-path."
-                .into(),
-        );
+    // In the GUI the Install click already consented to fetching Rufus; in the
+    // pure console flow ask first so a 3 MB surprise download needs an OK.
+    if !in_gui {
+        out::step(&format!("Rufus is not installed. {} will be downloaded.", ver_desc));
+        let ans = out::prompt("Download it now? Type OK to continue, or press Enter to abort: ");
+        if ans != "OK" {
+            return Err(
+                "Aborted. Download rufus.exe manually from https://rufus.ie and pass it via --rufus-path."
+                    .into(),
+            );
+        }
+    } else {
+        out::info(&format!("Rufus is not installed - downloading {} via the wizard.", ver_desc));
+        if let Some(u) = ui {
+            u.set_status(&format!("Downloading {}...", name));
+            u.pump();
+        }
     }
     let tmp = format!("{}\\{}", sys::temp_dir(), name);
-    out::info(&format!(
-        "Downloading {} ({:.1} MB)...",
-        name,
-        // size unknown until download; show progress by MB
-        0.0
-    ));
     let mut last_report = 0u64;
+    let mut last_ui = 0u64;
     let downloaded = match net::download_to_file(&url, &tmp, net::user_agent(), &mut |n| {
         if n / crate::sys::MB >= last_report + 100 {
             last_report = n / crate::sys::MB * crate::sys::MB;
             out::info(&format!("  {} MB...", n / crate::sys::MB));
+        }
+        if let Some(u) = ui {
+            if n / crate::sys::MB >= last_ui + 25 {
+                last_ui = n / crate::sys::MB;
+                u.set_status(&format!("Downloading {} - {} MB...", name, n / crate::sys::MB));
+                u.pump();
+            }
         }
     }) {
         Ok(n) => n,
@@ -159,8 +173,9 @@ pub fn get_rufus(path: &str) -> Result<String, String> {
         return Err("Rufus download was empty".into());
     }
     // Authenticode verify against "Akeo Consulting" (graceful on systems
-    // without wintrust: loud warning + explicit confirmation instead).
-    if !verify_authenticode(&tmp, "Akeo Consulting")? {
+    // without wintrust: loud warning +, in the GUI, auto-proceed since the
+    // Install click was the consent; in the console, explicit confirmation).
+    if !verify_authenticode(&tmp, "Akeo Consulting", in_gui)? {
         sys::delete_file(&tmp);
         return Err("Rufus download failed Authenticode verification (publisher mismatch).".into());
     }
@@ -201,13 +216,18 @@ fn manual_rufus_message() -> String {
 // prevent the exe from loading on Win9x, so resolve it dynamically; when
 // absent, fall back to a loud warning + explicit user confirmation.
 // ---------------------------------------------------------------------------
-fn verify_authenticode(path: &str, expect_subject: &str) -> Result<bool, String> {
+fn verify_authenticode(path: &str, expect_subject: &str, auto_accept: bool) -> Result<bool, String> {
     let Some(lib) = DynLib::load("wintrust.dll") else {
         out::warn(&format!(
             "Authenticode verification unavailable on this Windows (no wintrust.dll).\n\
              Cannot confirm the publisher is '{}'.",
             expect_subject
         ));
+        if auto_accept {
+            // The GUI Install click was the consent; proceed (loud warning
+            // above) rather than dead-end the user on an untypeable prompt.
+            return Ok(true);
+        }
         let ans = out::prompt("Type TRUST to accept the download anyway, or press Enter to abort: ");
         return Ok(ans.eq_ignore_ascii_case("TRUST"));
     };
@@ -360,7 +380,7 @@ pub fn json_strings_for_tests(json: &str, key: &str) -> Vec<String> {
 
 /// Everything.exe signature gate (called from lslfiles).
 pub fn verify_everything_signature(path: &str, expect_subject: &str) -> bool {
-    verify_authenticode(path, expect_subject).unwrap_or(false)
+    verify_authenticode(path, expect_subject, false).unwrap_or(false)
 }
 
 #[cfg(test)]

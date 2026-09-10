@@ -23,6 +23,15 @@ pub struct Opts {
     pub no_elevation: bool,
     pub preload_rust_tools: bool,
     pub probe_os: bool,
+    // settings the GUI also collects, exposed as flags so a FINISHED-page
+    // command line can reproduce the exact wizard choices headlessly
+    pub data_dir: String,
+    pub wifi: bool,             // copy wifi profiles (default on)
+    pub wifi_networks: Vec<String>,
+    pub efu: bool,              // write the Everything EFU index (default on)
+    pub drivers: bool,          // stage network drivers (default on)
+    pub sfs_hdd: bool,          // copy squashfs to the HDD cache
+    pub reclaim_win_swap: bool, // reclaim the Windows swapfile
 }
 
 impl Default for Opts {
@@ -60,6 +69,13 @@ impl Default for Opts {
             no_elevation: false,
             preload_rust_tools: false,
             probe_os: false,
+            data_dir: String::new(),
+            wifi: true,
+            wifi_networks: Vec::new(),
+            efu: true,
+            drivers: true,
+            sfs_hdd: false,
+            reclaim_win_swap: false,
         }
     }
 }
@@ -90,6 +106,13 @@ Options:
   --rate-hardware            With --dry-run: rate ALL PCI/USB devices
   --no-elevation             Skip the administrator check
   --preload-rust-tools       Download fd/bat/zoxide onto <USB>:\\bin
+  --data-dir <path>           LSL_DATA_DIR to write into lsl-usb.env
+  --no-wifi                   Do not copy wifi profiles
+  --wifi-network <name>       Copy only this wifi profile (repeatable)
+  --no-efu                    Do not write the Everything EFU index
+  --no-drivers                Do not stage out-of-tree network drivers
+  --sfs-hdd-cache             Copy the squashfs to the HDD cache
+  --reclaim-win-swap          Reclaim the Windows swapfile
   --help                     This text
 ";
 
@@ -127,9 +150,61 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--no-elevation" => o.no_elevation = true,
             "--preload-rust-tools" => o.preload_rust_tools = true,
             "--probe-os" => o.probe_os = true,
+            "--data-dir" => o.data_dir = next()?,
+            "--no-wifi" => o.wifi = false,
+            "--wifi-network" => o.wifi_networks.push(next()?),
+            "--no-efu" => o.efu = false,
+            "--no-drivers" => o.drivers = false,
+            "--sfs-hdd-cache" => o.sfs_hdd = true,
+            "--reclaim-win-swap" => o.reclaim_win_swap = true,
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown option: {}\n\n{}", other, USAGE)),
         }
     }
     Ok(o)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_new_automation_flags() {
+        let o = parse(&args(&[
+            "--data-dir", "D:\\lsl",
+            "--no-wifi",
+            "--wifi-network", "Home",
+            "--wifi-network", "Office",
+            "--no-efu",
+            "--no-drivers",
+            "--sfs-hdd-cache",
+            "--reclaim-win-swap",
+            "--preload-rust-tools",
+        ]))
+        .unwrap();
+        assert_eq!(o.data_dir, "D:\\lsl");
+        assert!(!o.wifi);
+        assert_eq!(o.wifi_networks, vec!["Home".to_string(), "Office".to_string()]);
+        assert!(!o.efu);
+        assert!(!o.drivers);
+        assert!(o.sfs_hdd);
+        assert!(o.reclaim_win_swap);
+        assert!(o.preload_rust_tools);
+    }
+
+    #[test]
+    fn defaults_match_gui_defaults() {
+        let o = parse(&args(&[])).unwrap();
+        assert!(o.wifi);
+        assert!(o.efu);
+        assert!(o.drivers);
+        assert!(!o.sfs_hdd);
+        assert!(!o.reclaim_win_swap);
+        assert!(o.data_dir.is_empty());
+        assert!(o.wifi_networks.is_empty());
+    }
 }

@@ -28,7 +28,11 @@ Everything the PS script does is implemented:
   turns an already-formatted FAT32/NTFS stick into a live USB WITHOUT
   reformatting. Writes grub4dos boot code into the MBR boot-code area ONLY
   (bytes 0..446; partition table, disk signature and every file untouched),
-  copies `grldr` + the ISO as a regular file onto the stick and generates a
+  **plus the grub4dos stage1 continuation into sectors 1..15** (the stage1 is
+  8192 bytes = 16 sectors; the BIOS loads only sector 0, and the stage1 reads
+  sectors 1..15 to load the rest of itself — without them it dies with
+  "Missing helper" and the stick is not bootable), copies `grldr` + the ISO as
+  a regular file onto the stick and generates a
   `menu.lst` that loopback-boots the ISO (YUMI/Easy2Boot style). The grub4dos
   0.4.6a binaries are embedded (`assets/`, GPL-2, SHA-256-pinned). The target
   must really be a removable USB drive: DRIVE_REMOVABLE **and**
@@ -40,6 +44,24 @@ Everything the PS script does is implemented:
   (never the USB-bus check), `--uefi-bootx64` optionally side-loads
   BOOTX64.EFI + grub.cfg (files only). Win9x is refused (needs the NT
   \\.\\PhysicalDriveN namespace) and falls back to the Rufus flow
+
+  **Configuration compatibility (grub4dos is picky — verified by
+  `tests/qemu-boot-test.sh`):**
+  - **MBR only** — GPT and superfloppy (no partition table) sticks are
+    refused; grub4dos is a BIOS/CSM bootloader.
+  - **FAT32 or NTFS only** — exFAT (the default on many large sticks) is
+    refused with a clear reason: grub4dos cannot read it, so the stick could
+    not boot. FAT32 also caps the ISO at <4 GiB.
+  - **The target volume must be the partition grub4dos will boot** — grub4dos's
+    MBR stage1 boots the active (0x80) partition if one exists, else scans all
+    partitions (including logical ones inside an extended partition). The
+    installer refuses only the clear conflict: an active *filesystem*
+    partition that is not the chosen volume (grub4dos would boot it instead).
+    Extended partitions are fine — grub4dos scans into them and boots the
+    logical FAT/NTFS partition. With no active partition and several
+    partitions it warns that grub4dos may boot a different one.
+  - **First partition must start after sector 15** — the grub4dos stage1
+    continuation occupies sectors 1..15.
 - lsl file drop (layer, bin/, systemd/, initramfs/, onboot.sh, lsl-usb.env,
   initrd.lz), build stamp, safe-boot GRUB + ISOLINUX entries
 - Wifi: `netsh` profile/key extraction → `wifi.sh` (nmcli lines)
@@ -57,7 +79,14 @@ Everything the PS script does is implemented:
   Reboot to Select USB" shortcuts, boot-choice dialog, reboot variants
 - GUI: nwg-based config wizard (ISO choice, existing-USB reuse, flatpak
   picker, wifi networks, data dir, option checkboxes) — `--no-gui` gives the
-  pure console flow
+  pure console flow. The Install click keeps the wizard open and does **all**
+  downloads itself (ISO + Rufus) with live status/progress — no "type OK"
+  console prompt in the GUI. On success it ends on a FINISHED summary page
+  (window stays open) listing the chosen settings plus the equivalent command
+  line so the exact choices can be re-run/automated headlessly (a **Copy**
+  button puts it on the clipboard); on failure it shows a FAILED page with the
+  reason and an **Open manual download** button instead of closing the windows
+  with no explanation.
 - `--dry-run`: the full detection report, plus a capability summary
 - `--probe-os`: capability self-test (OS/UEFI/RAM/volumes/netsh/winhttp/PnP)
 
@@ -102,7 +131,10 @@ Tested on the actual host via WSL interop (`pwsh.exe`, see
   install; page 3 shows real VHDX paths and 20 wifi networks
 - Manifest `asInvoker` kills the UAC installer-detection heuristic that
   auto-elevated `*install*.exe` (the exe checks admin itself)
-- The console download phase now asks for explicit `OK` before pulling ~3 GB
+- The console download phase uses an explicit `OK` gate before pulling
+  ~3 GB; the GUI flow never needs it (the wizard handles downloads itself)
+- The GUI ends on a FINISHED / FAILED summary page that shows the automation
+  command line (settings → CLI flags) instead of silently closing
 
 ## Bugs found by real-Windows testing (fixed)
 
@@ -113,6 +145,13 @@ Tested on the actual host via WSL interop (`pwsh.exe`, see
   `while LVM_GETCOLUMNWIDTH(n) != 0`, but comctl32 returns **-1** for
   out-of-range indices (wine returns 0, masking the bug). Columns are now
   inserted via direct `LVM_INSERTCOLUMNW`.
+- **nofmt wrote only the first 446 bytes of `grldr.mbr` to the MBR** — the
+  grub4dos stage1 is 8192 bytes = 16 sectors, and the BIOS loads only sector
+  0; the stage1 then reads sectors 1..15 to load the rest of itself. Without
+  them the stick died with "Missing helper" and was not bootable. Found by
+  `tests/qemu-boot-test.sh`; the fix writes the stage1 continuation into
+  sectors 1..15 (and refuses targets whose first partition starts inside
+  them).
 
 ## Capability matrix (graceful degradation)
 
@@ -160,6 +199,10 @@ lslsetup.exe --probe-os                      # capability self-test
 lslsetup.exe --iso-path C:\ISO\zorin-18.1.iso
 lslsetup.exe --skip-rufus --no-gui --volume-label "MINT"
 
+# headless automation of the exact wizard choices (see the FINISHED page):
+lslsetup.exe --iso-path C:\ISO\mint.iso --write-mode nofmt --usb-letter E \
+  --data-dir D:\lsl --wifi-network Home --sfs-hdd-cache --reclaim-win-swap
+
 # non-destructive: keep everything on the stick, no reformat (BIOS/CSM boot):
 lslsetup.exe --write-mode nofmt --iso-path C:\ISO\linuxmint-22.3-cinnamon-64bit.iso
 lslsetup.exe --write-mode nofmt --usb-letter E --iso-path C:\ISO\mint.iso   # pin the target
@@ -173,6 +216,17 @@ Exit codes: 0 success, 1 fatal error, 2 user cancel.
 
 - `cargo +rust9x test --target i686-rust9x-windows-msvc` (10 unit tests,
   incl. the nofmt MBR/menu.lst logic and asset-hash pins)
+- `tests/qemu-boot-test.sh` (Linux, needs qemu-system-i386 + grub-mkrescue +
+  xorriso + sfdisk + mkfs.vfat, run as root): builds a disk image replicating
+  exactly what the nofmt boot creator produces (using the real embedded
+  `assets/grldr` + `assets/grldr.mbr`), boots it in QEMU, and verifies the
+  whole chain — SeaBIOS → grub4dos MBR stage1 → grldr → menu.lst →
+  loopback-map the ISO → chainload the ISO's bootloader — by grepping the
+  serial console for a marker. It also asserts the stage1 continuation
+  (sectors 1..15) is required (without it the image fails with "Missing
+  helper"), that a no-active single-partition stick still boots (grub4dos
+  scans), and that a logical partition inside an active extended partition
+  boots (grub4dos scans into it).
 - `tests/win-gui-test.ps1`, `tests/win-sort-test.ps1`, `tests/win-nav-test.ps1`
   (run on the Windows host): launch the wizard, navigate pages, click column
   headings and screenshot each state; `--probe-os` and `--dry-run` outputs are
