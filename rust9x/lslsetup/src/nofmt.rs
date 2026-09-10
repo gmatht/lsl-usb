@@ -71,7 +71,56 @@ pub trait WriteUi {
     fn set_status(&self, msg: &str);
     fn set_progress(&self, done: u64, total: u64);
     fn show_progress(&self, visible: bool);
+    /// Arm (true) or disarm (false) the mid-verify skip: armed repurposes
+    /// the working-phase Cancel button as "Skip verify".
+    fn arm_skip_button(&self, armed: bool);
     fn pump(&self);
+}
+
+/// Mid-verify skip state: the user bails out of the SHA-256 read-back
+/// while watching live speed, instead of deciding blind upfront. Checked
+/// per chunk; plain atomics, no locks, no threads.
+static VERIFY_SKIP_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static VERIFY_SKIP_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arm (or disarm) the skip path; any call clears stale requests.
+/// Arming is paired with the button relabel (see arm_skip_button).
+pub fn arm_verify_skip(armed: bool) {
+    use std::sync::atomic::Ordering;
+    VERIFY_SKIP_REQUESTED.store(false, Ordering::Relaxed);
+    VERIFY_SKIP_ARMED.store(armed, Ordering::Relaxed);
+}
+
+/// True while a running verify may be skipped (button relabeled).
+/// Gates the Cancel-button hijack so plain Cancel clicks never skip.
+pub(crate) fn verify_skip_armed() -> bool {
+    VERIFY_SKIP_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Request a skip (button click, console key). Only the running verify
+/// loop reads it; reset at each run start.
+pub fn request_verify_skip() {
+    VERIFY_SKIP_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn verify_skip_requested() -> bool {
+    VERIFY_SKIP_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Non-blocking console check: S (or Esc) pressed since the last call?
+/// GetAsyncKeyState's latch bit needs no focus, no handle, and consumes
+/// nothing - later prompts see clean input. Prime once (discard), then poll.
+/// False with no console, on error, or with no relevant key. Note the
+/// latch is system-wide: typing S in another app mid-verify also skips -
+/// documented on the button/status, and the consequence is benign (loud
+/// UNVERIFIED warnings, install otherwise complete).
+fn console_skip_key_pressed() -> bool {
+    use winapi::um::winuser::GetAsyncKeyState;
+    unsafe {
+        (GetAsyncKeyState(0x53) as u16 & 1) != 0 || (GetAsyncKeyState(0x1B) as u16 & 1) != 0
+    }
 }
 
 /// Timing + throughput metrics for the USB write + verify phases.
@@ -490,11 +539,20 @@ pub fn merged_mbr(mbr: &[u8; 512]) -> ([u8; 512], bool) {
 
 /// The grub4dos menu entry that loopback-boots the ISO via its own
 /// bootloader (isolinux / El Torito).
-pub fn menu_entry(title: &str, iso_rel: &str) -> String {
+/// Loopback chainload entry. `big_iso` (at/above 2 GiB) drops the `map
+/// --mem` fallback: loading gigabytes into RAM OOMs on most firmware
+/// (seen live on a 3 GB image), so a failed direct map fails fast instead.
+/// Small images keep it - genuinely useful there.
+pub fn menu_entry(title: &str, iso_rel: &str, big_iso: bool) -> String {
+    let map_line = if big_iso {
+        format!("map {iso_rel} (0xff)\n")
+    } else {
+        format!("map {iso_rel} (0xff) || map --mem {iso_rel} (0xff)\n")
+    };
     format!(
         "\ntitle {title}\n\
          find --set-root --ignore-floppies --ignore-cd {iso_rel}\n\
-         map {iso_rel} (0xff) || map --mem {iso_rel} (0xff)\n\
+         {map_line}\
          map --hook\n\
          root (0xff)\n\
          chainloader (0xff)\n\
@@ -554,6 +612,85 @@ pub fn upsert_menu(existing: &str, title: &str, entry: &str) -> (String, bool) {
     } else {
         (format!("{existing}{entry}"), true)
     }
+}
+
+/// Remove the `title {title}` entry block (title line through the line
+/// before the next real `title ` line or EOF). Commented `# title` example
+/// lines never match (same exact-line rule as upsert). Returns (menu,
+/// whether anything was removed) - used to clean stale entries whose files
+/// are gone instead of booting into "file not found".
+pub fn remove_menu_entry(existing: &str, title: &str) -> (String, bool) {
+    let want = format!("title {title}").trim().to_string();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut removed = false;
+    let mut skipping = false;
+    for line in existing.lines() {
+        if line.trim() == want {
+            skipping = true;
+            removed = true;
+            continue;
+        }
+        if skipping {
+            let t = line.trim_start();
+            if t.starts_with("title ") && !t.starts_with('#') {
+                skipping = false;
+            } else {
+                continue;
+            }
+        }
+        kept.push(line);
+    }
+    if !removed {
+        return (existing.to_string(), false);
+    }
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    (out, true)
+}
+
+/// Upsert with template-drift replacement: identical body renders the menu
+/// untouched; a same-title entry with a drifted body (template changed
+/// since install) is replaced so fixes propagate instead of fossilizing.
+/// Returns (menu, changed).
+pub fn refresh_menu_entry(existing: &str, title: &str, entry: &str) -> (String, bool) {
+    let (m, added) = upsert_menu(existing, title, entry);
+    if added || m.contains(entry.trim()) {
+        return (m, added);
+    }
+    let (stripped, _) = remove_menu_entry(&m, title);
+    upsert_menu(&stripped, title, entry)
+}
+
+/// Ensure the BIOS root menu initializes the USB stack before `find` runs:
+/// some BIOSes hide USB disks from grub4dos services until `usb --init`.
+/// Root menu ONLY, never the UEFI mirror (grub4dos-for-UEFI has no BIOS
+/// USB stack; an unknown top-level command could break its menu load).
+/// Returns (menu, whether it was added).
+pub fn ensure_usb_init(menu: &str) -> (String, bool) {
+    if menu.lines().any(|l| l.trim() == "usb --init") {
+        return (menu.to_string(), false);
+    }
+    // Insert after the `default N` line so settings stay grouped at top;
+    // fall back to prepending when there is none.
+    let mut out = String::new();
+    let mut inserted = false;
+    for line in menu.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if !inserted {
+            let t = line.trim_start();
+            if t.starts_with("default ") && !t.starts_with('#') {
+                out.push_str("usb --init\n");
+                inserted = true;
+            }
+        }
+    }
+    if !inserted {
+        out = format!("usb --init\n{}", out);
+    }
+    (out, true)
 }
 
 fn sanitize_iso_name(name: &str) -> String {
@@ -1049,7 +1186,6 @@ pub fn install_from_iso(
     want_uefi: bool,
     ui: Option<&dyn WriteUi>,
     preconfirmed: bool,
-    skip_verify: bool,
 ) -> Result<(UsbTarget, WriteMetrics, Option<PendingMbr>), String> {
     if !want_bios && !want_uefi {
         // Say WHY, not just that: the GUI greys out unsupported paths (the
@@ -1115,7 +1251,7 @@ pub fn install_from_iso(
         }
     }
 
-    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, active_uefi_loader(), ui, skip_verify)?;
+    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, active_uefi_loader(), ui)?;
     Ok((target, metrics, pending))
 }
 
@@ -1312,13 +1448,12 @@ fn write_menu_entries(
     let boot_dir_rel = format!("/_ISO/{}", stem);
     // Hoisted to outer scope so the same bodies can feed the UEFI mirror
     // below (same titles, same commands - both files must agree).
-    let mut dtitle = String::new();
-    let mut dentry = String::new();
+    let dtitle = format!("{} (direct kernel)", iso_name.trim_end_matches(".iso"));
+    let mut dentry_opt: Option<String> = None;
     match extract_casper_boot(iso_dst, &boot_dir_fs, &boot_dir_rel, ui) {
         Some((kern_rel, init_rel)) => {
-            dtitle = format!("{} (direct kernel)", iso_name.trim_end_matches(".iso"));
-            dentry = menu_entry_direct(&dtitle, iso_rel, &kern_rel, &init_rel);
-            let (m, added) = upsert_menu(&menu, &dtitle, &dentry);
+            let dentry = menu_entry_direct(&dtitle, iso_rel, &kern_rel, &init_rel);
+            let (m, added) = refresh_menu_entry(&menu, &dtitle, &dentry);
             menu = m;
             if added {
                 dirty = true;
@@ -1326,19 +1461,39 @@ fn write_menu_entries(
             } else {
                 out::info(&format!("menu.lst already contains an entry titled '{}'", dtitle));
             }
+            dentry_opt = Some(dentry);
         }
         None => {
             out::info("No casper kernel/initrd in this ISO - loopback entry only (BIOS boot; UEFI needs a casper-based ISO).");
+            // Files gone (or never extracted) with an entry still present:
+            // remove the stale pointer instead of booting into "not found".
+            let (m, removed) = remove_menu_entry(&menu, &dtitle);
+            menu = m;
+            if removed {
+                dirty = true;
+                out::info(&format!("removed stale menu.lst entry '{}' (kernel files missing)", dtitle));
+            }
         }
     }
-    let entry = menu_entry(&title, iso_rel);
-    let (m, added) = upsert_menu(&menu, &title, &entry);
+    // ISOs at/above 2 GiB lose the `map --mem` fallback: loading gigabytes
+    // into RAM OOMs on most firmware (seen live on 3 GB), so a failed direct
+    // map fails fast instead. Small images keep it (genuinely useful).
+    let big_iso = sys::file_size(iso_dst).unwrap_or(u64::MAX) >= 2 * sys::GB;
+    let entry = menu_entry(&title, iso_rel, big_iso);
+    let (m, added) = refresh_menu_entry(&menu, &title, &entry);
     menu = m;
     if added {
         dirty = true;
         out::info(&format!("menu.lst entry '{}' (BIOS chainload fallback)", title));
     } else {
         out::info(&format!("menu.lst already contains an entry titled '{}'", title));
+    }
+    // BIOS root menu only (NOT the UEFI mirror below): some BIOSes hide USB
+    // disks from grub4dos services until `usb --init` runs.
+    let (m, usb_added) = ensure_usb_init(&menu);
+    menu = m;
+    if usb_added {
+        dirty = true;
     }
     if dirty {
         std::fs::write(&menu_path, menu).map_err(|e| format!("write menu.lst: {}", e))?;
@@ -1358,12 +1513,19 @@ fn write_menu_entries(
             Err(_) => (default_menu(), false),
         };
         let mut udirty = false;
-        if !dtitle.is_empty() {
-            let (m, added) = upsert_menu(&um, &dtitle, &dentry);
-            um = m;
-            udirty |= added;
+        match &dentry_opt {
+            Some(dentry) => {
+                let (m, added) = refresh_menu_entry(&um, &dtitle, dentry);
+                um = m;
+                udirty |= added;
+            }
+            None => {
+                let (m, removed) = remove_menu_entry(&um, &dtitle);
+                um = m;
+                udirty |= removed;
+            }
         }
-        let (m, added) = upsert_menu(&um, &title, &entry);
+        let (m, added) = refresh_menu_entry(&um, &title, &entry);
         um = m;
         udirty |= added;
         if udirty {
@@ -1463,10 +1625,9 @@ fn install_files(
     iso_len: u64,
     uefi_bootx64: &str,
     with_bios_files: bool,
-    want_uefi: bool,
+    _want_uefi: bool,
     uefi_loader: UefiLoader,
     ui: Option<&dyn WriteUi>,
-    skip_verify: bool,
 ) -> Result<(String, bool, WriteMetrics), String> {
     let root = format!("{}:\\", t.letter);
     // Resolve the UEFI loader up front: the menu-mirror decision depends on
@@ -1519,7 +1680,7 @@ fn install_files(
     sys::create_dir_all(&format!("{}_ISO", root));
     let iso_dst = format!("{}_ISO\\{}", root, safe_name);
     let iso_rel = format!("/_ISO/{}", safe_name);
-    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui, skip_verify)?;
+    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui)?;
     // menu.lst uses grub4dos syntax; when the grub4dos-family loader is
     // used the same entries are mirrored to efi\grub\menu.lst (the only
     // menu location grub4dos-for-UEFI reads - no mirror = UEFI prompt);
@@ -1630,7 +1791,7 @@ pub fn commit_boot_sectors(p: &PendingMbr) -> Result<(), String> {
     Ok(())
 }
 
-fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
+fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
     let fs_uc = t.fs.to_ascii_uppercase();
     // grub4dos reads FAT12/16/32 and NTFS only. exFAT (the default on many
     // large sticks) is NOT readable by grub4dos, so a stick left exFAT cannot
@@ -1717,7 +1878,7 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         }
         out::step("GPT stick: files-only UEFI install (no raw sectors touched).");
         report_board(false, true);
-        let (title, uefi_ok, metrics) = install_files(t, iso, iso_len, uefi_bootx64, false, true, uefi_loader, ui, skip_verify)?;
+        let (title, uefi_ok, metrics) = install_files(t, iso, iso_len, uefi_bootx64, false, true, uefi_loader, ui)?;
         report_bootability(false, "GPT stick - grub4dos BIOS stage1 has nowhere to live (sectors 1-15 are the GPT header/table)", uefi_ok, &title);
         return Ok((metrics, None));
     }
@@ -1881,7 +2042,7 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     // copy (bad USB write, or a stale same-size file already on the stick)
     // would loopback-boot garbage. So the stick copy is SHA-256-verified
     // against the source in every case (unless verification was skipped).
-    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui, skip_verify)?;
+    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui)?;
 
     // menu.lst: direct-kernel entry (BIOS + UEFI grub4dos) first, then the
     // loopback chainload fallback (BIOS-only). Resolve the UEFI loader up
@@ -1997,7 +2158,6 @@ fn copy_file_progress(
     src: &str,
     dst: &str,
     ui: Option<&dyn WriteUi>,
-    do_hash: bool,
 ) -> Result<(String, WriteMetrics), String> {
     let mut r = open_for_hash(src, src)?;
     let total = r.metadata().map(|m| m.len()).unwrap_or(0);
@@ -2025,9 +2185,7 @@ fn copy_file_progress(
         if n == 0 {
             break;
         }
-        if do_hash {
-            h.update(&buf[..n]);
-        }
+        h.update(&buf[..n]);
         w.write_all(&buf[..n]).map_err(|e| format!("write {}: {}", dst, e))?;
         done += n as u64;
 
@@ -2052,11 +2210,7 @@ fn copy_file_progress(
 
     let write_seconds = t0.elapsed().as_secs_f64();
     let write_mbps = (done as f64 / sys::MB as f64) / write_seconds.max(0.001);
-    let hash = if do_hash {
-        format!("{:x}", h.finalize())
-    } else {
-        String::new()
-    };
+    let hash = format!("{:x}", h.finalize());
 
     out::info(&format!(
         "  copied {:.1} GB in {:.1}s ({:.1} MB/s)",
@@ -2117,6 +2271,16 @@ fn verify_file_progress(
     // CPU share of the pipeline, measured live: lets the status report the
     // disk's own speed instead of only the hash-bound combined rate.
     let hash_mbps = calibrate_hash_mbps();
+    // Mid-flight skip: arm the Cancel->Skip-verify button (GUI), reset
+    // stale requests, prime the S-key latch (older presses must not
+    // count), and advertise it (GUI has the button; console has this line).
+    arm_verify_skip(true);
+    if let Some(u) = ui {
+        u.arm_skip_button(true);
+    }
+    let _ = console_skip_key_pressed();
+    out::info("  (S key skips verification - the copy stays UNVERIFIED)");
+    let mut skipped = false;
 
     loop {
         let n = f.read(&mut buf).map_err(|e| format!("read {}: {}", path, e))?;
@@ -2129,6 +2293,13 @@ fn verify_file_progress(
         if last_ui.elapsed().as_millis() >= 300 {
             let elapsed = t0.elapsed().as_secs_f64().max(0.001);
             let mbps = (done as f64 / sys::MB as f64) / elapsed;
+            if console_skip_key_pressed() {
+                request_verify_skip();
+            }
+            if verify_skip_requested() {
+                skipped = true;
+                break;
+            }
             let est = estimate_disk_mbps(mbps, hash_mbps)
                 .map(|r| format!(", disk ~{:.0} MB/s", r))
                 .unwrap_or_default();
@@ -2147,6 +2318,26 @@ fn verify_file_progress(
         }
     }
     drop(f);
+    // Whatever happened next (done, skipped, about to error), the skip
+    // button goes back to a dead Cancel - never leave it armed.
+    arm_verify_skip(false);
+    if let Some(u) = ui {
+        u.arm_skip_button(false);
+    }
+    if skipped {
+        out::warn("USB verification SKIPPED mid-run - the stick copy is UNVERIFIED (size match only); corruption would only show up at boot.");
+        if let Some(u) = ui {
+            u.set_status("Verification SKIPPED - copy UNVERIFIED (size match only).");
+            u.pump();
+        }
+        return Ok(WriteMetrics {
+            bytes_verified: 0,
+            verify_seconds: t0.elapsed().as_secs_f64(),
+            verify_mbps: 0.0,
+            verify_disk_est_mbps: 0.0,
+            ..Default::default()
+        });
+    }
 
     let verify_seconds = t0.elapsed().as_secs_f64();
     let verify_mbps = (done as f64 / sys::MB as f64) / verify_seconds.max(0.001);
@@ -2255,7 +2446,6 @@ fn copy_and_verify_iso(
     iso_dst: &str,
     iso_len: u64,
     ui: Option<&dyn WriteUi>,
-    verify: bool,
 ) -> Result<(String, WriteMetrics), String> {
     // The Install handler hid the progress bar/label; re-show them so the
     // live write/verify speed has a bar to go with it. show_final hides
@@ -2264,29 +2454,6 @@ fn copy_and_verify_iso(
         u.show_progress(true);
     }
     let mut metrics = WriteMetrics::default();
-    if !verify {
-        out::warn("USB verification SKIPPED by request - the stick copy is UNVERIFIED (size match only); corruption would only show up at boot.");
-        if let Some(u) = ui {
-            u.set_status("USB verification skipped - stick copy UNVERIFIED (size match only).");
-            u.pump();
-        }
-        match sys::file_size(iso_dst) {
-            Some(sz) if sz == iso_len => {
-                out::info(&format!("Reusing existing same-size copy UNVERIFIED: {}", iso_dst));
-            }
-            _ => {
-                out::step(&format!(
-                    "Copying the ISO onto {} (no hashing - verification skipped)...",
-                    iso_dst
-                ));
-                let (_, m) = copy_file_progress(iso, iso_dst, ui, false)?;
-                metrics.bytes_copied = m.bytes_copied;
-                metrics.write_seconds = m.write_seconds;
-                metrics.write_mbps = m.write_mbps;
-            }
-        }
-        return Ok((String::new(), metrics));
-    }
     let mut src_hash: Option<String> = None;
     match sys::file_size(iso_dst) {
         Some(sz) if sz == iso_len => {
@@ -2319,7 +2486,7 @@ fn copy_and_verify_iso(
             "Copying the ISO onto {}: (files only, no formatting)...",
             iso_dst
         ));
-        let (hash, m) = copy_file_progress(iso, iso_dst, ui, true)?;
+        let (hash, m) = copy_file_progress(iso, iso_dst, ui)?;
         src_hash = Some(hash);
         metrics.bytes_copied = m.bytes_copied;
         metrics.write_seconds = m.write_seconds;
@@ -2430,7 +2597,7 @@ mod tests {
         // coexists with the loopback entry (different titles)
         let (m1, a1) = upsert_menu(&default_menu(), "Mint (direct kernel)", &e);
         assert!(a1);
-        let (m2, a2) = upsert_menu(&m1, "Mint (loopback ISO)", &menu_entry("Mint (loopback ISO)", "/_ISO/mint.iso"));
+        let (m2, a2) = upsert_menu(&m1, "Mint (loopback ISO)", &menu_entry("Mint (loopback ISO)", "/_ISO/mint.iso", false));
         assert!(a2);
         assert_eq!(
             m2.lines().filter(|l| l.trim_start().starts_with("title ")).count(),
@@ -2440,7 +2607,7 @@ mod tests {
 
     #[test]
     fn menu_lst_upsert_is_idempotent() {
-        let entry = menu_entry("Mint (loopback ISO)", "/_ISO/mint.iso");
+        let entry = menu_entry("Mint (loopback ISO)", "/_ISO/mint.iso", false);
         assert!(entry.contains("map /_ISO/mint.iso (0xff)"));
         assert!(entry.contains("chainloader (0xff)"));
         let (m1, added1) = upsert_menu(&default_menu(), "Mint (loopback ISO)", &entry);
@@ -2450,7 +2617,7 @@ mod tests {
         assert!(!added2);
         assert_eq!(m2, m1);
         // a different ISO gets its own entry
-        let (m3, added3) = upsert_menu(&m2, "Debian (loopback ISO)", &menu_entry("Debian (loopback ISO)", "/_ISO/debian.iso"));
+        let (m3, added3) = upsert_menu(&m2, "Debian (loopback ISO)", &menu_entry("Debian (loopback ISO)", "/_ISO/debian.iso", false));
         assert!(added3);
         // count only REAL title lines (the default menu's commented examples
         // contain "title " too and must not be counted)
@@ -2593,6 +2760,93 @@ mod tests {
     }
 
     #[test]
+    fn verify_skip_state_machine() {
+        // Any arm call resets: stale requests never leak between runs.
+        arm_verify_skip(false);
+        assert!(!verify_skip_armed());
+        request_verify_skip();
+        arm_verify_skip(true);
+        assert!(verify_skip_armed());
+        assert!(!verify_skip_requested());
+        // A request latches until the next arm/disarm.
+        request_verify_skip();
+        assert!(verify_skip_requested());
+        arm_verify_skip(false);
+        assert!(!verify_skip_armed());
+        assert!(!verify_skip_requested());
+    }
+
+    #[test]
+    fn menu_entry_removal_cleans_stale_direct_entries() {
+        let direct = menu_entry_direct("Mint (direct kernel)", "/_ISO/mint.iso", "/_ISO/mint/vmlinuz", "/_ISO/mint/initrd.lz");
+        let loopback = menu_entry("Mint (loopback ISO)", "/_ISO/mint.iso", false);
+        let (m, _) = upsert_menu(&default_menu(), "Mint (direct kernel)", &direct);
+        let (m, _) = upsert_menu(&m, "Mint (loopback ISO)", &loopback);
+        assert!(m.contains("title Mint (direct kernel)"));
+        // kernel files gone (failed re-extract deleted them): the entry goes
+        // away, the loopback entry and header comments survive, and the
+        // commented `# title` examples are never touched.
+        let (m2, removed) = remove_menu_entry(&m, "Mint (direct kernel)");
+        assert!(removed);
+        assert!(!m2.lines().any(|l| l.trim() == "title Mint (direct kernel)"));
+        assert!(m2.contains("title Mint (loopback ISO)"));
+        assert!(m2.contains("# title Ubuntu direct"));
+        // second removal is a no-op; unknown titles leave bytes identical.
+        let (m3, removed2) = remove_menu_entry(&m2, "Mint (direct kernel)");
+        assert!(!removed2);
+        assert_eq!(m3, m2);
+        let (m4, removed3) = remove_menu_entry(&m2, "Nope");
+        assert!(!removed3);
+        assert_eq!(m4, m2);
+    }
+
+    #[test]
+    fn usb_init_inserted_once_after_default() {
+        let (m, added) = ensure_usb_init(&default_menu());
+        assert!(added);
+        let lines: Vec<&str> = m.lines().collect();
+        let di = lines.iter().position(|l| l.trim_start().starts_with("default ")).unwrap();
+        assert_eq!(lines[di + 1].trim(), "usb --init");
+        let (m2, added2) = ensure_usb_init(&m);
+        assert!(!added2);
+        assert_eq!(m2, m);
+        // no default line: prepended.
+        let (m3, _) = ensure_usb_init("title X\nkernel /a\n");
+        assert_eq!(m3.lines().next(), Some("usb --init"));
+    }
+
+    #[test]
+    fn big_iso_drops_mem_fallback() {
+        let small = menu_entry("T (loopback ISO)", "/_ISO/t.iso", false);
+        assert!(small.contains("map --mem"));
+        let big = menu_entry("M (loopback ISO)", "/_ISO/m.iso", true);
+        assert!(big.contains("map /_ISO/m.iso (0xff)\n"));
+        assert!(!big.contains("--mem"));
+    }
+
+    #[test]
+    fn menu_refresh_replaces_drifted_body() {
+        let old = menu_entry("M (loopback ISO)", "/_ISO/m.iso", false);
+        let (m, added) = upsert_menu(&default_menu(), "M (loopback ISO)", &old);
+        assert!(added);
+        // Template drift (mem fallback gated): same title, new body.
+        let new = menu_entry("M (loopback ISO)", "/_ISO/m.iso", true);
+        let (m2, changed) = refresh_menu_entry(&m, "M (loopback ISO)", &new);
+        assert!(changed);
+        assert!(m2.contains("map /_ISO/m.iso (0xff)\n"));
+        // (the default menu's commented example keeps a --mem line;
+        // only real entry lines must lose it)
+        assert!(!m2
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .any(|l| l.contains("--mem")));
+        // Stable rerun: byte-identical, no churn.
+        let (m3, changed2) = refresh_menu_entry(&m2, "M (loopback ISO)", &new);
+        assert!(!changed2);
+        assert_eq!(m3, m2);
+    }
+
+    #[test]
     fn disk_estimate_decomposes_serial_pipeline() {
         // 50 MB/s combined with a 117 MB/s hasher: 50*117/67 ≈ 87.3.
         let r = estimate_disk_mbps(50.0, 117.0).unwrap();
@@ -2695,8 +2949,14 @@ mod tests {
         let uefi_menu = std::fs::read_to_string(format!("{}efi\\grub\\menu.lst", root)).unwrap();
         assert!(root_menu.contains("title fake (loopback ISO)"));
         assert!(uefi_menu.contains("title fake (loopback ISO)"));
-        // Fresh stick: both start from default_menu(), so the mirror is identical.
-        assert_eq!(uefi_menu, root_menu);
+        // Fresh stick: the mirror matches the root menu except the BIOS-only
+        // `usb --init` line (grub4dos-for-UEFI has no BIOS USB stack).
+        assert!(root_menu.lines().any(|l| l.trim() == "usb --init"));
+        assert!(!uefi_menu.lines().any(|l| l.trim() == "usb --init"));
+        assert_eq!(
+            root_menu.lines().filter(|l| l.trim() != "usb --init").collect::<Vec<_>>(),
+            uefi_menu.lines().collect::<Vec<_>>()
+        );
         // Re-running is idempotent: no duplicate titles, identical bytes.
         write_menu_entries(&root, &iso_dst, "/_ISO/fake.iso", "fake", "fake.iso", true, None).unwrap();
         assert_eq!(std::fs::read_to_string(format!("{}menu.lst", root)).unwrap(), root_menu);

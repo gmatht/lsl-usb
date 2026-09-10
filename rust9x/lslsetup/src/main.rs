@@ -63,6 +63,29 @@ pub extern "C" fn main() -> i32 {
 }
 
 
+/// The GUI wizard owns the Ctrl+Alt+B SYSTEM hotkey, which only ONE window
+/// in the entire OS may register (RegisterHotKey). With a second wizard open
+/// the newcomer's registration fails silently AND the combo is swallowed
+/// system-wide (no window reacts, not even the focused one), so refuse to
+/// start a second GUI. Headless runs are unaffected; the automated GUI tests
+/// set LSL_MULTI_INSTANCE=1 to run alongside a user's wizard on purpose.
+/// Returns true when this instance may open the wizard.
+fn claim_gui_singleton() -> bool {
+    if std::env::var("LSL_MULTI_INSTANCE").as_deref() == Ok("1") {
+        return true;
+    }
+    use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
+    use winapi::um::errhandlingapi::GetLastError;
+    use winapi::um::synchapi::CreateMutexW;
+    // Handle intentionally leaked: it must live for the process lifetime
+    // (the OS releases the name when the process exits, so a later run can
+    // open its own wizard again).
+    let name = crate::sys::wide("Local\\lslsetup-GUI-Singleton");
+    let _mutex = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+    let last = unsafe { GetLastError() };
+    last != ERROR_ALREADY_EXISTS
+}
+
 fn run() {
     // When launched via WSL interop the current directory can be a
     // \\wsl.localhost\... UNC path. ShellExecute (URL opening, Rufus
@@ -270,14 +293,14 @@ fn run() {
                 if fatal_gui(&e, ui) {
                     return gui::GuiWork::back();
                 }
-                unreachable!()
+                std::process::exit(1);
             }
         };
         if let Err(e) = validate_live_iso(&iso) {
             if fatal_gui(&e, ui) {
                 return gui::GuiWork::back();
             }
-            unreachable!()
+            std::process::exit(1);
         }
         // Arch consistency with the ISO page: a 64-bit image on a
         // 32-bit-only machine would not boot. Back-to-options returns to
@@ -302,7 +325,7 @@ fn run() {
             if fatal_gui(&msg, ui) {
                 return gui::GuiWork::back();
             }
-            unreachable!()
+            std::process::exit(1);
         }
         // the wizard's write-method radio is explicit by construction; on
         // pre-Win7 the Rufus radio is greyed out, so a "rufus" value here can
@@ -338,18 +361,17 @@ fn run() {
                     if fatal_gui("No target USB was selected on the INSTALL page.\nThe list is read when the wizard opens - a stick plugged in afterwards will not appear.\nPlug the stick in, restart the wizard, select it, and click Install again.", ui) {
                         return gui::GuiWork::back();
                     }
-                    unreachable!()
+                    std::process::exit(1);
                 }
                 let letter_hint = g.target_usb.as_deref().unwrap_or(opts.usb_letter.as_str());
                 // the wizard's BIOS/UEFI checkboxes AND the CLI flags must both allow a path
                 let want_bios = opts.bios_boot && g.bios_boot;
                 let want_uefi = opts.uefi_boot && g.uefi_boot;
-                let skip_verify = g.skip_verify || opts.skip_verify;
                 // The radio click IS the confirmation - re-typing the letter
                 // on the console would stall the working phase. Flag-pinned
                 // targets keep the typed gate (raw-sector writes must never
                 // hinge on a stale flag).
-                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some(), skip_verify) {
+                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some()) {
                     Ok((t, metrics, pending)) => {
                         // Whole-USB check while the wizard is still open
                         // (live status); a failure offers Back-to-options.
@@ -363,7 +385,7 @@ fn run() {
                                     if fatal_gui(&e, ui) {
                                         return gui::GuiWork::back();
                                     }
-                                    unreachable!()
+                                    std::process::exit(1);
                                 }
                             }
                             check_done = true;
@@ -397,7 +419,7 @@ fn run() {
                         if fatal_gui(&e, ui) {
                             return gui::GuiWork::back();
                         }
-                        unreachable!()
+                        std::process::exit(1);
                     }
                 }
             }
@@ -405,6 +427,7 @@ fn run() {
                 out::step("Skipping the USB write (wizard choice).");
                 out::info("Write the image yourself (e.g. with Rufus), then this step picks up the USB.");
                 ui.show_final("lslsetup - finished", &summary_for(&g, &opts, &iso, "skip", None, None), true);
+                ui.close();
                 gui::GuiWork {
                     iso,
                     mode,
@@ -427,7 +450,7 @@ fn run() {
                         if fatal_gui(&e, ui) {
                             return gui::GuiWork::back();
                         }
-                        unreachable!()
+                        std::process::exit(1);
                     }
                 };
                 // Do NOT swallow a launch failure: the window must not just
@@ -440,7 +463,7 @@ fn run() {
                         if fatal_gui(&e, ui) {
                             return gui::GuiWork::back();
                         }
-                        unreachable!()
+                        std::process::exit(1);
                     }
                 };
                 let known: Vec<String> = sys::list_volumes()
@@ -455,6 +478,7 @@ fn run() {
                     &summary_for(&g, &opts, &iso, "rufus", None, None),
                     true,
                 );
+                ui.close();
                 gui::GuiWork {
                     iso,
                     mode: "rufus".into(),
@@ -468,6 +492,16 @@ fn run() {
             }
         }
     };
+    // The wizard owns a SYSTEM-level hotkey (Ctrl+Alt+B) that only ONE
+    // window in the OS may register: a second wizard's registration fails
+    // silently AND the combo is then swallowed for every other window, so
+    // prevent multiple GUI instances outright (see claim_gui_singleton).
+    if !opts.no_gui && !claim_gui_singleton() {
+        crate::sys::out::info(
+            "Another lslsetup installer window is already open. Its wizard owns the one-window Ctrl+Alt+B system hotkey - a second instance would silently break it. Close the other installer window and re-run, or set LSL_MULTI_INSTANCE=1 to allow several windows.",
+        );
+        return;
+    }
     if !opts.no_gui {
         let Some((g, w)) = gui::run_gui(
             &wsl_vhdx,
@@ -655,7 +689,7 @@ fn run() {
             // Non-destructive grub4dos install: MBR boot-code area only,
             // ISO copied as a file, menu.lst loopback. The stick keeps its
             // filesystem and all existing files.
-            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false, opts.skip_verify) {
+            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false) {
                 Ok((t, _metrics, pending)) => {
                     pending_mbr = pending;
                     vol = sys::list_volumes()

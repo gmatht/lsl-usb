@@ -21,7 +21,6 @@ pub struct Opts {
     pub flatpak_apps: Vec<String>,
     pub skip_iso_download: bool,
     pub skip_rufus: bool,
-    pub skip_verify: bool,     // skip USB copy SHA-256 verification (faster; UNVERIFIED)
     pub no_gui: bool,
     pub dry_run: bool,
     pub rate_hardware: bool,
@@ -72,7 +71,6 @@ impl Default for Opts {
             flatpak_apps: Vec::new(),
             skip_iso_download: false,
             skip_rufus: false,
-            skip_verify: false,
             no_gui: false,
             dry_run: false,
             rate_hardware: false,
@@ -126,7 +124,6 @@ Options:
   --flatpak-apps <id>        Extra flatpak app id (repeatable)
   --skip-iso-download        Do not offer to download a Mint ISO
   --skip-rufus               Do not launch Rufus; wait for a Mint live USB
-  --skip-verify              Skip USB copy verification (faster; UNVERIFIED)
   --no-gui                   Console-only flow (no config dialog)
   --dry-run                  Detection-only mode; writes nothing
   --rate-hardware            With --dry-run: rate ALL PCI/USB devices
@@ -184,7 +181,6 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--flatpak-apps" => o.flatpak_apps.push(next()?),
             "--skip-iso-download" => o.skip_iso_download = true,
             "--skip-rufus" => o.skip_rufus = true,
-            "--skip-verify" => o.skip_verify = true,
             "--no-gui" => o.no_gui = true,
             "--dry-run" => o.dry_run = true,
             "--rate-hardware" => o.rate_hardware = true,

@@ -96,7 +96,6 @@ pub struct GuiResult {
     pub bios_boot: bool,                       // INSTALL-page "BIOS boot" checkbox (default: supported)
     pub uefi_boot: bool,                       // INSTALL-page "UEFI boot" checkbox (default: supported)
     pub check_usb: bool,                       // INSTALL-page "Check whole USB" checkbox (default: off, slow)
-    pub skip_verify: bool,                     // INSTALL-page "Skip verify" checkbox (default: off = verify)
 }
 
 /// Wizard pages: 0 hw, 1 iso, 2 flatpak, 3 system, 4 wifi, 5 install.
@@ -1190,8 +1189,7 @@ fn relayout(c: &LayoutCtx, cw: i32, ch: i32) {
     c.btn_back.set_size(90, 28);
     c.btn_reboot.set_position(8, ny);
     c.btn_reboot.set_size(90, 28);
-    let cancel_x = if c.btn_reboot.visible() { 8 + 90 + 8 } else { 8 };
-    c.btn_cancel.set_position(cancel_x, ny);
+    c.btn_cancel.set_position(106, ny);
     c.btn_cancel.set_size(90, 28);
 
     // persistent download progress ("Downloading {}-..." label + bar):
@@ -1202,7 +1200,7 @@ fn relayout(c: &LayoutCtx, cw: i32, ch: i32) {
     // the button row in the free middle between Cancel (left) and Back.
     c.lbl_dl.set_position(MARGIN, label_y);
     c.lbl_dl.set_size(fw as u32, label_h as u32);
-    let bar_x0 = cancel_x + 90 + 12;
+    let bar_x0 = 106 + 90 + 12;
     let bar_x1 = cw - MARGIN - 96 - 96 - 10;
     // MIN_CW guarantees room, but clamp anyway so a sub-minimum window
     // can only clip the bar, never push it under a button.
@@ -1682,9 +1680,12 @@ impl WorkingUi {
             self.repaint_window();
             return true;
         }
-        // the window's job is done - destroy it so the post-GUI (Rufus wait,
-        // lsl file drop) console phase isn't left with an orphan window.
-        self.close();
+        // FAILED page Close: destroy the window (user gives up).
+        // FINISHED page: the caller decides when to close
+        // (ask_boot_choice follows for nofmt; skip/rufus callers close).
+        if !ok {
+            self.close();
+        }
         false
     }
 
@@ -1860,6 +1861,26 @@ impl crate::nofmt::WriteUi for WorkingUi {
     fn show_progress(&self, visible: bool) {
         self.raw_show(self.dl, visible);
         self.raw_show(self.dlbar, visible);
+    }
+    fn arm_skip_button(&self, armed: bool) {
+        crate::nofmt::arm_verify_skip(armed);
+        // Repurpose the working-phase Cancel button (dead otherwise):
+        // enabled + relabeled while a verify can be skipped. Verify the
+        // enable took effect - a silently-stuck grey button is exactly how
+        // a broken skip path would hide.
+        if is_window(self.nav_cancel) {
+            set_wnd_text(self.nav_cancel, if armed { "Skip verify" } else { "Cancel" });
+            use winapi::um::winuser::{EnableWindow, IsWindowEnabled};
+            unsafe {
+                EnableWindow(self.nav_cancel as winapi::shared::windef::HWND, if armed { 1 } else { 0 });
+                if armed && IsWindowEnabled(self.nav_cancel as winapi::shared::windef::HWND) == 0 {
+                    let e = winapi::um::errhandlingapi::GetLastError();
+                    crate::sys::out::warn(&format!("Skip-verify button would not enable (winerr {}) - use the S key to skip.", e));
+                }
+            }
+        } else if armed {
+            crate::sys::out::warn("Skip-verify button handle invalid - use the S key to skip.");
+        }
     }
     fn pump(&self) {
         self.pump();
@@ -2163,6 +2184,7 @@ pub fn run_gui(
         .size((90, 28))
         .parent(&window)
         .build(&mut btn_reboot);
+    btn_reboot.set_visible(true);
     let btn_reboot = Rc::new(btn_reboot);
 
     // ---- page 1: ISO selection (all checkboxes, one column, scrollbar) ----
@@ -2776,20 +2798,6 @@ pub fn run_gui(
             items.push(PageItem { ctl: PageCtl::Check(cb, 8), x: 10, y: iy, w: -20, h: 20, idx: 0 });
             iy += 24;
         }
-        // Skip-verify checkbox (Check kind 9): off by default (verification
-        // stays on unless the user opts out; skipped copies are size-match
-        // only and corruption shows up at boot, not here).
-        {
-            let mut cb: Box<nwg::CheckBox> = Box::default();
-            let _ = nwg::CheckBox::builder()
-                .text("Skip USB copy verification (faster; corruption would only show at boot)")
-                .position((10, iy))
-                .size((780, 20))
-                .parent(&*frame_install)
-                .build(&mut cb);
-            items.push(PageItem { ctl: PageCtl::Check(cb, 9), x: 10, y: iy, w: -20, h: 20, idx: 0 });
-            iy += 24;
-        }
         let mut note: Box<nwg::Label> = Box::default();
         let note_text = if rufus_ok {
             "Rufus launches with the ISO pre-selected (you click START there). Built-in copies the image files with no format."
@@ -3152,12 +3160,107 @@ pub fn run_gui(
     let g_cell2 = g_cell.clone();
     let iso_arg2 = iso_arg.to_string();
     let browse_data_sys = sys_items.clone();
+    // Ctrl+Alt+B hotkey: RegisterHotKey gives a GLOBAL (single-slot) system
+    // hotkey - useful because focus usually sits on a child control whose
+    // keystrokes never reach the window proc. But the combo can be owned by
+    // only ONE window in the whole system: a second wizard instance (or any
+    // other app holding it) makes THIS window's registration fail silently,
+    // killing the hotkey here. So the same jump is ALSO reachable per-window
+    // via the raw key events below (Event::OnSysKeyPress reaches any focused
+    // child through the nwg subclassing), which needs no global exclusivity;
+    // the global hotkey stays as the primary fast path when registered OK.
+    let hotkey_registered = Rc::new(Cell::new(false));
+    if let Some(hwnd) = window.handle.hwnd() {
+        use winapi::um::winuser::{RegisterHotKey, MOD_ALT, MOD_CONTROL};
+        let ok = unsafe { RegisterHotKey(hwnd, INSTALL_HOTKEY_ID, (MOD_CONTROL | MOD_ALT) as u32, 0x42) };
+        hotkey_registered.set(ok != 0);
+        if ok == 0 {
+            use winapi::um::errhandlingapi::GetLastError;
+            glog(&format!(
+                "hotkey: global RegisterHotKey FAILED (error {}) - the per-window key fallback stays active",
+                unsafe { GetLastError() }
+            ));
+        } else {
+            glog("hotkey: global RegisterHotKey OK (per-window fallback disabled)");
+        }
+    }
+    // Shared jump: INSTALL page shown with the built-in non-destructive
+    // method preselected, ready to Install. Runs from the global WM_HOTKEY
+    // handler and from the per-window key-event fallback.
+    let jump_install: Rc<dyn Fn()> = Rc::new({
+        let page = page.clone();
+        let working = working.clone();
+        let frame_hw = frame_hw.clone();
+        let frame_iso = frame_iso.clone();
+        let frame_fp = frame_fp.clone();
+        let frame_sys = frame_sys.clone();
+        let frame_wifi = frame_wifi.clone();
+        let frame_install = frame_install.clone();
+        let btn_back = btn_back.clone();
+        let btn_next = btn_next.clone();
+        let btn_reboot = btn_reboot.clone();
+        let install_items = install_items.clone();
+        move || {
+            if working.get() {
+                return; // working/final phase: wizard pages are gone
+            }
+            glog("hotkey: jump to INSTALL");
+            page.set(INSTALL_PAGE);
+            frame_hw.set_visible(false);
+            frame_iso.set_visible(false);
+            frame_fp.set_visible(false);
+            frame_sys.set_visible(false);
+            frame_wifi.set_visible(false);
+            frame_install.set_visible(true);
+            btn_back.set_enabled(true);
+            btn_next.set_enabled(true);
+            btn_reboot.set_visible(false);
+            btn_next.set_text(nav_label(INSTALL_PAGE));
+            // ...with the built-in non-destructive method preselected, so
+            // the hotkey lands ready to Install (programmatic check needs
+            // the explicit uncheck - BM_SETCHECK has no group exclusivity,
+            // only clicks do).
+            for it in install_items.borrow().iter() {
+                if let PageCtl::Radio(rb, 3) = &it.ctl {
+                    let builtin = write_mode_from_label(&rb.text()) == "nofmt";
+                    rb.set_check_state(if builtin {
+                        nwg::RadioButtonState::Checked
+                    } else {
+                        nwg::RadioButtonState::Unchecked
+                    });
+                }
+            }
+        }
+    });
+    let _install_hotkey = nwg::bind_raw_event_handler(
+        &window.handle,
+        0x48_4B_42usize,
+        {
+            let working = working.clone();
+            let jump = jump_install.clone();
+            move |_, msg, w, _| {
+                use winapi::um::winuser::WM_HOTKEY;
+                if msg != WM_HOTKEY || w as usize != INSTALL_HOTKEY_ID as usize {
+                    return None;
+                }
+                if working.get() {
+                    return None; // working/final phase: wizard pages are gone
+                }
+                glog("hotkey: WM_HOTKEY received");
+                jump();
+                Some(0)
+            }
+        },
+    )
+    .expect("bind install hotkey handler");
     let _handlers = nwg::full_bind_event_handler(&window.handle, {
         // clones for the move closure; the outer harvest still uses the Rc originals
         let boot_usb_c = boot_usb.clone();
         let boot_adv_c = boot_adv.clone();
         let boot_fw_c = boot_fw.clone();
         let boot_none_c = boot_none.clone();
+        let hotkey_registered_c = hotkey_registered.clone();
+        let jump_install_c = jump_install.clone();
         let wifi_checks = wifi_checks.clone();
         let iso_items = iso_items.clone();
         let fp_items = fp_items.clone();
@@ -3198,72 +3301,39 @@ pub fn run_gui(
     let btn_everything_c = btn_everything.clone();
     let btn_reboot_c = btn_reboot.clone();
     let working_c = working.clone();
-    // Ctrl+Alt+B hotkey registration (see INSTALL_HOTKEY_ID): a real
-    // RegisterHotKey, because focus usually sits on a child control whose
-    // keystrokes never reach the window proc. Raw WM_HOTKEY handler jumps
-    // to the INSTALL page; ignored once the working phase owns the window.
-    if let Some(hwnd) = window.handle.hwnd() {
-        use winapi::um::winuser::{RegisterHotKey, MOD_ALT, MOD_CONTROL};
-        unsafe { RegisterHotKey(hwnd, INSTALL_HOTKEY_ID, (MOD_CONTROL | MOD_ALT) as u32, 0x42) };
-    }
-    let _install_hotkey = nwg::bind_raw_event_handler(
-        &window.handle,
-        0x48_4B_42usize,
-        {
-            let page = page.clone();
-            let working = working.clone();
-            let frame_hw = frame_hw.clone();
-            let frame_iso = frame_iso.clone();
-            let frame_fp = frame_fp.clone();
-            let frame_sys = frame_sys.clone();
-            let frame_wifi = frame_wifi.clone();
-            let frame_install = frame_install.clone();
-            let btn_back = btn_back.clone();
-            let btn_next = btn_next.clone();
-            let btn_reboot = btn_reboot.clone();
-            let install_items = install_items.clone();
-            move |_, msg, w, _| {
-                use winapi::um::winuser::WM_HOTKEY;
-                if msg != WM_HOTKEY || w as usize != INSTALL_HOTKEY_ID as usize {
-                    return None;
-                }
-                if working.get() {
-                    return None; // working/final phase: wizard pages are gone
-                }
-                glog("hotkey: jump to INSTALL");
-                page.set(INSTALL_PAGE);
-                frame_hw.set_visible(false);
-                frame_iso.set_visible(false);
-                frame_fp.set_visible(false);
-                frame_sys.set_visible(false);
-                frame_wifi.set_visible(false);
-                frame_install.set_visible(true);
-                btn_back.set_enabled(true);
-                btn_next.set_enabled(true);
-                btn_reboot.set_visible(false);
-                btn_next.set_text(nav_label(INSTALL_PAGE));
-                // ...with the built-in non-destructive method preselected,
-                // so the hotkey lands ready to Install (programmatic check
-                // needs the explicit uncheck - BM_SETCHECK has no group
-                // exclusivity, only clicks do).
-                for it in install_items.borrow().iter() {
-                    if let PageCtl::Radio(rb, 3) = &it.ctl {
-                        let builtin = write_mode_from_label(&rb.text()) == "nofmt";
-                        rb.set_check_state(if builtin {
-                            nwg::RadioButtonState::Checked
-                        } else {
-                            nwg::RadioButtonState::Unchecked
-                        });
-                    }
-                }
-                Some(0)
-            }
-        },
-    )
-    .expect("bind install hotkey handler");
+
         move |event, data, handle| {
         use nwg::Event;
         match event {
+            // Per-window Ctrl+Alt+B fallback: RegisterHotKey is a single-slot
+            // system resource - when another instance (or app) owns the combo,
+            // this window's global registration failed and the hotkey is dead
+            // here. React to the key event itself instead (focused children are
+            // subclassed by nwg, so WM_SYSKEYDOWN still reaches us). Guarded by
+            // the registration flag so a working global hotkey never double-jumps.
+            Event::OnSysKeyPress | Event::OnKeyPress => {
+                if let nwg::EventData::OnKey(code) = data {
+                    if code == 0x42 || code == 0x62 {
+                        use winapi::um::winuser::{GetKeyState, VK_CONTROL, VK_MENU};
+                        let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } as u16 & 0x8000 != 0;
+                        let alt = unsafe { GetKeyState(VK_MENU as i32) } as u16 & 0x8000 != 0;
+                        glog(&format!(
+                            "hotkey: B key code=0x{:02X} ctrl={} alt={} hk_reg={}",
+                            code, ctrl, alt, hotkey_registered_c.get()
+                        ));
+                        // Per-window Ctrl+Alt+B fallback: RegisterHotKey is a
+                        // single-slot system resource - when another app owns
+                        // the combo this window's global registration failed.
+                        // (A contender that is itself an lslsetup wizard also
+                        // swallows the raw key system-wide, so this path only
+                        // helps foreign contenders; harmless either way.)
+                        if !hotkey_registered_c.get() && ctrl && alt {
+                            glog("hotkey: per-window key fallback fired");
+                            jump_install_c();
+                        }
+                    }
+                }
+            }
             Event::OnResize | Event::OnWindowMaximize => {
                 if let Some(hwnd) = win_hwnd {
                     let (cw, ch) = client_size(hwnd);
@@ -3499,9 +3569,16 @@ pub fn run_gui(
                         btn_reboot_c.set_visible(p2.get() == 0);
                     }
                 } else if handle == btn_cancel_c.handle {
-                    glog("click cancel");
-                    c2.set(true);
-                    nwg::stop_thread_dispatch();
+                    if crate::nofmt::verify_skip_armed() {
+                        // Working-phase verify: Cancel is relabeled "Skip
+                        // verify" - bail out of the hash, not the wizard.
+                        glog("click skip-verify");
+                        crate::nofmt::request_verify_skip();
+                    } else {
+                        glog("click cancel");
+                        c2.set(true);
+                        nwg::stop_thread_dispatch();
+                    }
                 } else if click_hwnd == browse_hwnd {
                     // Folder picker -> convert to the /mnt/<drive>/... form
                     if let Some(wpath) = sys::browse_folder("Choose the LSL_DATA_DIR folder (a Windows path)") {
@@ -4071,17 +4148,6 @@ fn harvest_gui_result(
             let mut on = false;
             for it in install_items.borrow().iter() {
                 if let PageCtl::Check(cb, 8) = &it.ctl {
-                    on = cb.check_state() == nwg::CheckBoxState::Checked;
-                    break;
-                }
-            }
-            on
-        },
-        skip_verify: {
-            // INSTALL-page skip-verify checkbox (kind 9); default off
-            let mut on = false;
-            for it in install_items.borrow().iter() {
-                if let PageCtl::Check(cb, 9) = &it.ctl {
                     on = cb.check_state() == nwg::CheckBoxState::Checked;
                     break;
                 }

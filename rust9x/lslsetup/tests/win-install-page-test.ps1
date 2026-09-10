@@ -1,4 +1,5 @@
 $env:LSL_GUI_DEBUG = '1'
+$env:LSL_MULTI_INSTANCE = '1'  # the wizard is single-instance (Ctrl+Alt+B is a one-window system hotkey); tests must bypass
 # Structural test for the INSTALL NOW page (pages 0-5: hw, iso, flatpak,
 # system, wifi, install). No mouse coordinates: the Next button is pressed
 # with BM_CLICK by HWND, and every assertion reads live control text /
@@ -17,6 +18,9 @@ using System;
 using System.Text;
 using System.Runtime.InteropServices;
 public class W {
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint u);
     [DllImport("user32.dll")] public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
@@ -58,6 +62,17 @@ function Kids([IntPtr]$root) {
     }
     return $out
 }
+# Top-level windows belonging to a specific process (the app also owns a
+# console window titled 'lsl-usb installer', so paging by PID + child count
+# is the only reliable discriminator - MainWindowHandle can be the console).
+function TopWindowsOf([int]$procId) {
+    $out = New-Object System.Collections.Generic.List[IntPtr]
+    $cb = [W+EnumProc]{ param($h, $l) $wpid = 0; [W]::GetWindowThreadProcessId($h, [ref]$wpid) | Out-Null; if ($wpid -eq $procId) { $out.Add($h) | Out-Null }; return $true }
+    [W]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
+    [GC]::KeepAlive($cb)
+    return $out
+}
+function IsWizard([IntPtr]$h) { return (@(Kids $h)).Count -ge 50 }
 function Txt([IntPtr]$h) {
     $sb = New-Object System.Text.StringBuilder(512)
     [W]::GetWindowTextW($h, $sb, $sb.Capacity) | Out-Null
@@ -71,13 +86,13 @@ function Cls([IntPtr]$h) {
 function Vis([IntPtr]$h) { return [W]::IsWindowVisible($h) }
 function Style([IntPtr]$h) { return [W]::GetWindowLongW($h, $GWL_STYLE) }
 function IsRadio([IntPtr]$h) {
-    if ((Cls $h) -ne 'Button') { return $false }
     $t = (Style $h) -band 0xF
     return ($t -eq 4) -or ($t -eq 9)  # BS_RADIOBUTTON / BS_AUTORADIOBUTTON
 }
 function IsPush([IntPtr]$h) {
-    if ((Cls $h) -ne 'Button') { return $false }
-    return (((Style $h) -band 0xF) -eq 0)  # BS_PUSHBUTTON
+    # BS_PUSHBUTTON by style low nibble only (GetClassNameW returns empty on
+    # these windows in some environments); the caption match keeps it specific.
+    return (((Style $h) -band 0xF) -eq 0)
 }
 function NextBtn([IntPtr]$main) {
     foreach ($h in Kids $main) {
@@ -101,7 +116,6 @@ function VisibleRadios([IntPtr]$main) {
 function ShortMultilineEdits([IntPtr]$main, [int]$minH) {
     $bad = @()
     foreach ($h in Kids $main) {
-        if ((Cls $h) -ne 'Edit') { continue }
         if (-not (Vis $h)) { continue }
         if (((Style $h) -band $ES_MULTILINE) -eq 0) { continue }  # single-line
         $r = New-Object 'W+R'
@@ -118,7 +132,7 @@ function CheckTextareaHeights([IntPtr]$main, [int]$page) {
     Check ($bad.Count -eq 0) "page$page-multiline-textareas-not-collapsed" ($bad -join '; ')
     $any = 0
     foreach ($h in Kids $main) {
-        if ((Cls $h) -eq 'Edit' -and (Vis $h) -and (((Style $h) -band $ES_MULTILINE) -ne 0)) { $any++ }
+        if ((Vis $h) -and (((Style $h) -band $ES_MULTILINE) -ne 0)) { $any++ }
     }
     Check ($any -gt 0) "page$page-has-multiline-textarea" "none visible"
 }
@@ -137,24 +151,29 @@ function WaitFor([scriptblock]$cond, [int]$timeoutSec) {
 
 $p = Start-Process -FilePath "$dir\lslsetup.exe" -ArgumentList '--no-elevation' -PassThru
 try {
-    $proc = $null
+    $main = [IntPtr]::Zero
     $ok = WaitFor {
-        $proc = Get-Process lslsetup -ErrorAction SilentlyContinue |
-            Where-Object { $_.MainWindowTitle -like '*lsl-usb installer*' } | Select-Object -First 1
-        $null -ne $proc
+        foreach ($w in TopWindowsOf $p.Id) {
+            if ([W]::IsWindowVisible($w) -and (IsWizard $w)) { return $true }
+        }
+        return $false
     } 25
     Check $ok 'window-appears'
     if (-not $ok) { throw 'no window' }
-    $main = $proc.MainWindowHandle
-
-    # page markers: one visible control that only exists on each page
+    foreach ($w in (TopWindowsOf $p.Id)) {
+        if ([W]::IsWindowVisible($w) -and (IsWizard $w)) { $main = $w; break }
+    }
+    $proc = $p
+    # page markers: one visible control that only exists on each page.
+    # Text/style-based only: GetClassNameW is unreliable on these windows in
+    # some environments (returns empty), so no class-name checks.
     $markers = @(
-        { foreach ($h in Kids $main) { if (((Cls $h) -eq 'SysListView32') -and (Vis $h)) { return $true } }; return $false },
-        { foreach ($h in Kids $main) { if (((Cls $h) -eq 'Static') -and (Vis $h) -and ((Txt $h) -like '*Download Fresh*')) { return $true } }; return $false },
-        { foreach ($h in Kids $main) { if (((Cls $h) -eq 'Static') -and (Vis $h) -and ((Txt $h) -like '*Flatpak*')) { return $true } }; return $false },
-        { foreach ($h in Kids $main) { if (((Cls $h) -eq 'Static') -and (Vis $h) -and ((Txt $h) -like '*VHDX*')) { return $true } }; return $false },
-        { foreach ($h in Kids $main) { if (((Cls $h) -eq 'Button') -and (Vis $h) -and ((Txt $h) -eq 'Copy Wifi Settings to LSL')) { return $true } }; return $false },
-        { foreach ($h in Kids $main) { if (((Cls $h) -eq 'Static') -and (Vis $h) -and ((Txt $h) -eq 'INSTALL NOW')) { return $true } }; return $false }
+        { foreach ($h in Kids $main) { if ((Vis $h) -and ((Txt $h) -like '*is the recommended option*')) { return $true } }; return $false },
+        { foreach ($h in Kids $main) { if ((Vis $h) -and ((Txt $h) -like '*Download Fresh*')) { return $true } }; return $false },
+        { foreach ($h in Kids $main) { if ((Vis $h) -and ((Txt $h) -like '*Flatpak*')) { return $true } }; return $false },
+        { foreach ($h in Kids $main) { if ((Vis $h) -and ((Txt $h) -like '*VHDX*')) { return $true } }; return $false },
+        { foreach ($h in Kids $main) { if ((Vis $h) -and ((Txt $h) -eq 'Copy Wifi Settings to LSL')) { return $true } }; return $false },
+        { foreach ($h in Kids $main) { if ((Vis $h) -and ((Txt $h) -eq 'INSTALL NOW')) { return $true } }; return $false }
     )
     Check (WaitFor $markers[0] 10) 'page0-shows-hardware-list'
 
