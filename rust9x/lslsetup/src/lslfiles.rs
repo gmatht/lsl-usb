@@ -75,6 +75,45 @@ pub fn env_file_set(path: &str, key: &str, value: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Firstboot toolkit (nofmt path)
+// ---------------------------------------------------------------------------
+// The non-destructive install has no bundle dir (it works from the ISO plus
+// embedded assets), but the first boot needs the FAT-side toolkit
+// (bin/uproot, bin/squashfs_config.sh, bin/lsl-diag.sh,
+// bin/persist-wifi.sh, onboot.sh) - without it lsl-firstboot.service finds
+// "uproot missing" and can only stamp trivially. These are small text
+// files embedded at compile time from the repo; they are LF-normalized on
+// write because the guest runs them under /bin/bash, which chokes on the
+// CRLF that Windows checkouts produce (do not depend on checkout settings).
+static FIRSTBOOT_TOOLKIT: &[(&str, &str)] = &[
+    ("bin\\uproot", include_str!("../../../bin/uproot")),
+    ("bin\\squashfs_config.sh", include_str!("../../../bin/squashfs_config.sh")),
+    ("bin\\lsl-diag.sh", include_str!("../../../bin/lsl-diag.sh")),
+    ("bin\\persist-wifi.sh", include_str!("../../../bin/persist-wifi.sh")),
+    ("onboot.sh", include_str!("../../../onboot.sh")),
+];
+
+pub fn install_firstboot_toolkit(root: &str) -> Result<Vec<String>, String> {
+    let mut done = Vec::new();
+    for (rel, content) in FIRSTBOOT_TOOLKIT {
+        let dest = format!("{}\\{}", root.trim_end_matches('\\'), rel);
+        if let Some(parent) = std::path::Path::new(&dest).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create dir for {}: {}", rel, e))?;
+        }
+        let lf = content.replace("\r\n", "\n");
+        std::fs::write(&dest, lf.as_bytes()).map_err(|e| format!("write {}: {}", rel, e))?;
+        let back = std::fs::read(&dest).map_err(|e| format!("read back {}: {}", rel, e))?;
+        if back != lf.as_bytes() {
+            return Err(format!("verify failed for {} (readback mismatch)", rel));
+        }
+        done.push(rel.to_string());
+    }
+    out::info(&format!("first-boot toolkit ({} files) ready.", done.len()));
+    Ok(done)
+}
+
+// ---------------------------------------------------------------------------
 // Install-LslFiles
 // ---------------------------------------------------------------------------
 pub fn install_lsl_files(vol_letter: &str, bundle_dir: &str) -> Result<(), String> {
@@ -723,4 +762,24 @@ pub fn find_local_isos() -> Vec<String> {
     // the simple name ordering and cap at 20 like the PS version.
     hits.sort_by(|a, b| a.0.cmp(&b.0));
     hits.into_iter().map(|(p, _)| p).take(20).collect()
+}
+
+#[cfg(test)]
+mod firstboot_toolkit_tests {
+    use super::*;
+
+    #[test]
+    fn toolkit_embeds_lf_clean_scripts() {
+        assert!(!FIRSTBOOT_TOOLKIT.is_empty());
+        for (rel, content) in FIRSTBOOT_TOOLKIT {
+            assert!(!content.is_empty(), "{} embedded empty", rel);
+            // The write path LF-normalizes (working-tree checkouts may be
+            // CRLF); the normalized form is what the guest executes.
+            let lf = content.replace("\r\n", "\n");
+            assert!(!lf.contains('\r'), "{} contains CR after normalize", rel);
+        }
+        let ups = FIRSTBOOT_TOOLKIT.iter().find(|(r, _)| *r == "bin\\uproot");
+        assert!(ups.is_some());
+        assert!(ups.unwrap().1.replace("\r\n", "\n").starts_with("#!/bin/bash\n"));
+    }
 }

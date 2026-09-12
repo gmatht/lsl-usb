@@ -11,7 +11,15 @@ STAMP="${LSL_FIRSTBOOT_STAMP:-/cdrom/casper/lsl-firstboot.done}"
 STATUS="${LSL_FIRSTBOOT_STATUS:-/run/lsl-firstboot-status}"
 
 # Nothing to do if the stamp exists (setup already completed).
-[ -e "$STAMP" ] && exit 0
+# The service mounts the stick at /isodevice when /cdrom is the ISO loop;
+# accept the stamp at either place (or an explicit override).
+stamp_present() {
+    [ -n "${LSL_FIRSTBOOT_STAMP:-}" ] && [ -e "$STAMP" ] && return 0
+    [ -e /isodevice/casper/lsl-firstboot.done ] && return 0
+    [ -e /cdrom/casper/lsl-firstboot.done ] && return 0
+    return 1
+}
+stamp_present && exit 0
 command -v zenity >/dev/null 2>&1 || exit 0
 
 current_phase() {
@@ -24,7 +32,7 @@ current_phase() {
 
 (
     # Keep feeding zenity while the service is still working.
-    while [ ! -e "$STAMP" ]; do
+    while ! stamp_present; do
         echo "1000 # $(current_phase)"
         sleep 1
         if ! kill -0 "$PPID" 2>/dev/null; then break; fi

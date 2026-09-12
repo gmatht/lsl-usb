@@ -2131,6 +2131,10 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     }
     let title = write_menu_entries(&root, &iso_dst, &iso_rel, &safe_name, &iso_name, uefi_res.mirror_menu(), ui)?;
 
+    // First-boot toolkit (bin/uproot et al.): without it the first boot can
+    // only stamp trivially. Embedded, LF-normalized, read-back verified.
+    crate::lslfiles::install_firstboot_toolkit(&root)?;
+
     // UEFI side-load (files only; FAT32 stick). Signed shim -> GRUB2 works
     // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need
     // Secure Boot OFF. Skipped when UEFI boot is unchecked.

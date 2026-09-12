@@ -44,7 +44,7 @@ diag() { [ -x /cdrom/bin/lsl-diag.sh ] && bash /cdrom/bin/lsl-diag.sh "${1:-firs
 # Remove any appended layer that fails to list (partial/corrupt from an
 # interrupted mksquashfs) so we never boot a broken layer.
 lsl_firstboot_cleanup_partial_layers() {
-    for l in /cdrom/casper/filesystem_z[0-9][0-9][0-9][0-9]*.squashfs; do
+    for l in ${STICK_DIR:-/cdrom}/casper/filesystem_z[0-9][0-9][0-9][0-9]*.squashfs; do
         [ -e "$l" ] || continue
         if ! unsquashfs -l "$l" >/dev/null 2>&1; then
             echo "Removing corrupt/partial layer: $l" >&2
@@ -53,6 +53,77 @@ lsl_firstboot_cleanup_partial_layers() {
     done
 }
 
+if [ -e "$STAMP" ]; then
+    exit 0
+fi
+
+# --- locate the install stick -------------------------------------------
+# In iso-scan boots /cdrom is the ISO loop (read-only); the FAT partition
+# holding the ISO and our toolkit is usually NOT mounted post-boot. Find it
+# by content (the ISO path from the kernel cmdline) and mount it rw at
+# /isodevice. Falls back to /cdrom for direct-partition layouts.
+STICK_DIR=""
+iso_rel="$(sed -n 's/.*iso-scan\/filename=\([^ ]*\).*/\1/p' /proc/cmdline 2>/dev/null | head -n 1)"
+try_mount_stick() {
+    [ -n "$iso_rel" ] || return 1
+    mkdir -p /isodevice 2>/dev/null || true
+    if mountpoint -q /isodevice 2>/dev/null; then
+        if [ -e "/isodevice$iso_rel" ]; then STICK_DIR=/isodevice; return 0; fi
+        umount /isodevice 2>/dev/null || true
+    fi
+    for dev in /dev/sd*[0-9] /dev/vd*[0-9] /dev/nvme*n*p* /dev/mmcblk*p* /dev/hd*[0-9]; do
+        [ -b "$dev" ] || continue
+        mount | grep -q "^$dev " 2>/dev/null && continue
+        if mount -o ro "$dev" /isodevice 2>/dev/null; then
+            if [ -e "/isodevice$iso_rel" ]; then
+                mount -o remount,rw /isodevice 2>/dev/null || true
+                STICK_DIR=/isodevice
+                return 0
+            fi
+            umount /isodevice 2>/dev/null || true
+        fi
+    done
+    return 1
+}
+if ! try_mount_stick; then
+    # Direct-partition layout? /cdrom itself is the writable stick.
+    if mkdir -p /cdrom/casper 2>/dev/null && touch /cdrom/casper/.write-test 2>/dev/null; then
+        rm -f /cdrom/casper/.write-test 2>/dev/null || true
+        STICK_DIR=/cdrom
+    fi
+fi
+if [ -z "$STICK_DIR" ]; then
+    strikes="$(cat /run/lsl-firstboot.strikes 2>/dev/null || echo 0)"
+    strikes=$((strikes + 1))
+    echo "$strikes" > /run/lsl-firstboot.strikes 2>/dev/null || true
+    set_phase "failed - install stick not found (attempt $strikes/3)"
+    logger -t lsl-firstboot "FATAL: install stick (ISO $iso_rel) not found on any partition." 2>/dev/null || true
+    [ "$strikes" -ge 3 ] && exit 0
+    exit 1
+fi
+rm -f /run/lsl-firstboot.strikes 2>/dev/null || true
+# Bring the stick's toolkit into the /cdrom view every script expects:
+# bind the stick's casper/ and bin/ over the ISO loop's (the ISO has no
+# bin/, and its casper/ holds the same base squashfs we extracted). Writes
+# to /cdrom/casper/* and /cdrom/bin/* then land on the stick, while pool/
+# and .disk/ stay visible for apt-cdrom. The running overlay already holds
+# its lower layers open, so hiding their source paths is safe.
+if [ "$STICK_DIR" != /cdrom ]; then
+    if mount --bind "$STICK_DIR/casper" /cdrom/casper 2>/dev/null; then
+        logger -t lsl-firstboot "Bound stick casper/ over /cdrom/casper." 2>/dev/null || true
+    else
+        logger -t lsl-firstboot "WARNING: could not bind $STICK_DIR/casper over /cdrom/casper." 2>/dev/null || true
+    fi
+    if [ -d "$STICK_DIR/bin" ]; then
+        if mount --bind "$STICK_DIR/bin" /cdrom/bin 2>/dev/null; then
+            logger -t lsl-firstboot "Bound stick bin/ over /cdrom/bin." 2>/dev/null || true
+        else
+            logger -t lsl-firstboot "WARNING: could not bind $STICK_DIR/bin over /cdrom/bin." 2>/dev/null || true
+        fi
+    fi
+fi
+# A previous run may have stamped while bound; the default early check
+# above ran before the binds.
 if [ -e "$STAMP" ]; then
     exit 0
 fi
@@ -116,7 +187,7 @@ fi
 log "Network up."
 mem_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
 if [ "${mem_kb:-0}" -lt 3145728 ] 2>/dev/null; then
-    log "WARNING: low RAM ($( (mem_kb / 1024) ) MiB); first-boot apt + guestmount appliance may OOM. >=4 GiB recommended."
+    log "WARNING: low RAM ($((mem_kb / 1024)) MiB); first-boot apt + guestmount appliance may OOM. >=4 GiB recommended."
 fi
 log "Tooling: btrfs-progs=$(command -v mkfs.btrfs >/dev/null 2>&1 && echo yes || echo MISSING), hivex=$(command -v hivexget >/dev/null 2>&1 && echo yes || echo MISSING)"
 set_phase 'installing packages and packing layer (first boot)...'
