@@ -13,7 +13,7 @@
 # The script fetches:
 #   - chenall/grub4dos at the exact commit pinned in assets/BOOTX64.EFI.txt
 #   - Ubuntu shim source package (shim_15.8-0ubuntu2)
-#   - Ubuntu GRUB2 source package (grub2_2.14-2ubuntu1, or closest available)
+#   - Ubuntu GRUB2 source package (grub2_2.14-2ubuntu1, with fallback)
 #
 # Run this before creating a GitHub release, then attach the resulting tarball
 # to the release assets.
@@ -62,6 +62,22 @@ fetch() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: try multiple URLs, succeed if any works
+# ---------------------------------------------------------------------------
+fetch_any() {
+    local dest="$1"
+    shift
+    for url in "$@"; do
+        if curl -fsI "${url}" >/dev/null 2>&1; then
+            fetch "${url}" "${dest}"
+            return 0
+        fi
+    done
+    echo "    ERROR: none of the URLs were reachable for $(basename "${dest}")" >&2
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # 1. grub4dos (GPL v2) — exact git commit
 # ---------------------------------------------------------------------------
 echo "==> grub4dos (chenall/grub4dos)"
@@ -75,19 +91,16 @@ echo "    commit: ${GRUB4DOS_COMMIT}"
 GRUB4DOS_DIR="${SRC_DIR}/grub4dos-${GRUB4DOS_COMMIT}"
 mkdir -p "${GRUB4DOS_DIR}"
 
-# Shallow clone then unshallow just this commit's tree
-if ! git clone --depth 1 "https://github.com/chenall/grub4dos.git" "${GRUB4DOS_DIR}"; then
-    echo "ERROR: failed to clone grub4dos" >&2
-    exit 1
-fi
-
-# Fetch the specific commit if it's not the default branch HEAD
+# Fetch only the exact commit (shallow clone of specific ref)
 (
     cd "${GRUB4DOS_DIR}"
-    git fetch --depth 1 origin "${GRUB4DOS_COMMIT}" || true
-    git checkout "${GRUB4DOS_COMMIT}" || {
-        echo "WARNING: could not checkout ${GRUB4DOS_COMMIT}; using default branch HEAD" >&2
-    }
+    git init -q
+    git remote add origin "https://github.com/chenall/grub4dos.git"
+    if ! git fetch --depth 1 origin "${GRUB4DOS_COMMIT}"; then
+        echo "ERROR: failed to fetch grub4dos commit ${GRUB4DOS_COMMIT}" >&2
+        exit 1
+    fi
+    git checkout -q FETCH_HEAD
 )
 
 # Remove .git to save space in the tarball
@@ -98,16 +111,26 @@ rm -rf "${GRUB4DOS_DIR}/.git"
 # ---------------------------------------------------------------------------
 echo "==> shim (Ubuntu source package)"
 SHIM_VERSION="15.8-0ubuntu2"
-SHIM_BASE="https://archive.ubuntu.com/ubuntu/pool/main/s/shim"
+SHIM_ARCHIVE="https://archive.ubuntu.com/ubuntu/pool/main/s/shim"
+SHIM_OLD="https://old-releases.ubuntu.com/ubuntu/pool/main/s/shim"
 SHIM_DEST="${SRC_DIR}/shim-${SHIM_VERSION}"
 mkdir -p "${SHIM_DEST}"
 
-fetch "${SHIM_BASE}/shim_${SHIM_VERSION}.dsc"               "${SHIM_DEST}/shim_${SHIM_VERSION}.dsc"
-fetch "${SHIM_BASE}/shim_${SHIM_VERSION}.debian.tar.xz"     "${SHIM_DEST}/shim_${SHIM_VERSION}.debian.tar.xz"
-# The orig tarball may be shared across versions; try the exact name first
-if ! fetch "${SHIM_BASE}/shim_${SHIM_VERSION}.orig.tar.gz" "${SHIM_DEST}/shim_${SHIM_VERSION}.orig.tar.gz" 2>/dev/null; then
-    # Some packages use .tar.xz for orig
-    if ! fetch "${SHIM_BASE}/shim_${SHIM_VERSION}.orig.tar.xz" "${SHIM_DEST}/shim_${SHIM_VERSION}.orig.tar.xz" 2>/dev/null; then
+fetch_any "${SHIM_DEST}/shim_${SHIM_VERSION}.dsc" \
+    "${SHIM_ARCHIVE}/shim_${SHIM_VERSION}.dsc" \
+    "${SHIM_OLD}/shim_${SHIM_VERSION}.dsc"
+
+fetch_any "${SHIM_DEST}/shim_${SHIM_VERSION}.debian.tar.xz" \
+    "${SHIM_ARCHIVE}/shim_${SHIM_VERSION}.debian.tar.xz" \
+    "${SHIM_OLD}/shim_${SHIM_VERSION}.debian.tar.xz"
+
+# The orig tarball may be shared across versions; try multiple locations
+if ! fetch_any "${SHIM_DEST}/shim_${SHIM_VERSION}.orig.tar.gz" \
+    "${SHIM_ARCHIVE}/shim_${SHIM_VERSION}.orig.tar.gz" \
+    "${SHIM_OLD}/shim_${SHIM_VERSION}.orig.tar.gz" 2>/dev/null; then
+    if ! fetch_any "${SHIM_DEST}/shim_${SHIM_VERSION}.orig.tar.xz" \
+        "${SHIM_ARCHIVE}/shim_${SHIM_VERSION}.orig.tar.xz" \
+        "${SHIM_OLD}/shim_${SHIM_VERSION}.orig.tar.xz" 2>/dev/null; then
         echo "    WARNING: could not find shim orig tarball; .dsc + debian.tar.xz may be sufficient" >&2
     fi
 fi
@@ -117,27 +140,34 @@ fi
 # ---------------------------------------------------------------------------
 echo "==> GRUB2 (Ubuntu source package)"
 GRUB_VERSION="2.14-2ubuntu1"
-GRUB_BASE="https://archive.ubuntu.com/ubuntu/pool/main/g/grub2"
+GRUB_ARCHIVE="https://archive.ubuntu.com/ubuntu/pool/main/g/grub2"
+GRUB_OLD="https://old-releases.ubuntu.com/ubuntu/pool/main/g/grub2"
 GRUB_DEST="${SRC_DIR}/grub2-${GRUB_VERSION}"
 mkdir -p "${GRUB_DEST}"
 
-GRUB_DSC="${GRUB_BASE}/grub2_${GRUB_VERSION}.dsc"
-GRUB_DEBIAN="${GRUB_BASE}/grub2_${GRUB_VERSION}.debian.tar.xz"
-GRUB_ORIG="${GRUB_BASE}/grub2_2.14.orig.tar.xz"
+GRUB_DSC_URLS=("${GRUB_ARCHIVE}/grub2_${GRUB_VERSION}.dsc" "${GRUB_OLD}/grub2_${GRUB_VERSION}.dsc")
+GRUB_DEBIAN_URLS=("${GRUB_ARCHIVE}/grub2_${GRUB_VERSION}.debian.tar.xz" "${GRUB_OLD}/grub2_${GRUB_VERSION}.debian.tar.xz")
+GRUB_ORIG_URLS=("${GRUB_ARCHIVE}/grub2_2.14.orig.tar.xz" "${GRUB_OLD}/grub2_2.14.orig.tar.xz")
 
-if curl -fsI "${GRUB_DSC}" >/dev/null 2>&1; then
-    fetch "${GRUB_DSC}"       "${GRUB_DEST}/grub2_${GRUB_VERSION}.dsc"
-    fetch "${GRUB_DEBIAN}"    "${GRUB_DEST}/grub2_${GRUB_VERSION}.debian.tar.xz"
-    fetch "${GRUB_ORIG}"      "${GRUB_DEST}/grub2_2.14.orig.tar.xz"
+if fetch_any "${GRUB_DEST}/grub2_${GRUB_VERSION}.dsc" "${GRUB_DSC_URLS[@]}"; then
+    fetch_any "${GRUB_DEST}/grub2_${GRUB_VERSION}.debian.tar.xz" "${GRUB_DEBIAN_URLS[@]}"
+    fetch_any "${GRUB_DEST}/grub2_2.14.orig.tar.xz" "${GRUB_ORIG_URLS[@]}"
 else
-    echo "    WARNING: GRUB2 source ${GRUB_VERSION} no longer in Ubuntu archive" >&2
+    echo "    WARNING: GRUB2 source ${GRUB_VERSION} not in archive or old-releases" >&2
+    rmdir "${GRUB_DEST}" 2>/dev/null || true
     GRUB_FALLBACK="2.14-2ubuntu2"
     echo "    FALLING BACK to closest available version: ${GRUB_FALLBACK}" >&2
     GRUB_DEST="${SRC_DIR}/grub2-${GRUB_FALLBACK}"
     mkdir -p "${GRUB_DEST}"
-    fetch "${GRUB_BASE}/grub2_${GRUB_FALLBACK}.dsc"            "${GRUB_DEST}/grub2_${GRUB_FALLBACK}.dsc"
-    fetch "${GRUB_BASE}/grub2_${GRUB_FALLBACK}.debian.tar.xz"  "${GRUB_DEST}/grub2_${GRUB_FALLBACK}.debian.tar.xz"
-    fetch "${GRUB_BASE}/grub2_2.14.orig.tar.xz"                "${GRUB_DEST}/grub2_2.14.orig.tar.xz"
+    fetch_any "${GRUB_DEST}/grub2_${GRUB_FALLBACK}.dsc" \
+        "${GRUB_ARCHIVE}/grub2_${GRUB_FALLBACK}.dsc" \
+        "${GRUB_OLD}/grub2_${GRUB_FALLBACK}.dsc"
+    fetch_any "${GRUB_DEST}/grub2_${GRUB_FALLBACK}.debian.tar.xz" \
+        "${GRUB_ARCHIVE}/grub2_${GRUB_FALLBACK}.debian.tar.xz" \
+        "${GRUB_OLD}/grub2_${GRUB_FALLBACK}.debian.tar.xz"
+    fetch_any "${GRUB_DEST}/grub2_2.14.orig.tar.xz" \
+        "${GRUB_ARCHIVE}/grub2_2.14.orig.tar.xz" \
+        "${GRUB_OLD}/grub2_2.14.orig.tar.xz"
 fi
 
 # ---------------------------------------------------------------------------

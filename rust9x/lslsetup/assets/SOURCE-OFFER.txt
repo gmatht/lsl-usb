@@ -20,7 +20,7 @@ For every release of this software, a source archive containing the
 complete corresponding source code for all vendored third-party binaries
 is attached to the GitHub release page:
 
-  https://github.com/OWNER/REPO/releases
+  https://github.com/gmatht/lsl-usb/releases
 
 Look for the asset named:
   lslsetup-vendored-src-VERSION.tar.gz
