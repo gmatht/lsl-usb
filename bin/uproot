@@ -212,7 +212,7 @@ cleanup_mounts() {
     umount /tmp/squashfs/root/proc 2>/dev/null || true
     umount /tmp/squashfs/root/dev 2>/dev/null || true
     umount /tmp/squashfs/root/sys 2>/dev/null || true
-    umount /tmp/squashfs/root/cdrom 2>/dev/null || true
+    umount -R /tmp/squashfs/root/cdrom 2>/dev/null || umount -l /tmp/squashfs/root/cdrom 2>/dev/null || true
     umount /tmp/squashfs/root/ 2>/dev/null || true
 }
 trap cleanup_mounts EXIT
@@ -297,7 +297,11 @@ fi
 mount --bind /var/cache/apt/archives/ /tmp/squashfs/root/var/cache/apt/archives/ || true
 mount --bind /home/ /tmp/squashfs/root/home || true
 mkdir -p /tmp/squashfs/root/cdrom
-mount --bind /cdrom /tmp/squashfs/root/cdrom || true
+# Recursive bind: a plain --bind hides the /cdrom/casper and /cdrom/bin
+# submounts firstboot sets up, leaving the read-only ISO visible
+# inside the chroot (writes like the AppImage staging then fail).
+# --rbind propagates those submounts so the stick stays writable.
+mount --rbind /cdrom /tmp/squashfs/root/cdrom || true
 #mkdir -p /tmp/squashfs/root/persist
 #if mountpoint -q /persist 2>/dev/null; then
 #    mount --bind /persist /tmp/squashfs/root/persist || true
