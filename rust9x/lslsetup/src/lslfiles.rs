@@ -89,6 +89,7 @@ static FIRSTBOOT_TOOLKIT: &[(&str, &str)] = &[
     ("bin\\uproot", include_str!("../../../bin/uproot")),
     ("bin\\squashfs_config.sh", include_str!("../../../bin/squashfs_config.sh")),
     ("bin\\lsl-diag.sh", include_str!("../../../bin/lsl-diag.sh")),
+    ("bin\\lsl-common.sh", include_str!("../../../bin/lsl-common.sh")),
     ("bin\\persist-wifi.sh", include_str!("../../../bin/persist-wifi.sh")),
     ("onboot.sh", include_str!("../../../onboot.sh")),
 ];
