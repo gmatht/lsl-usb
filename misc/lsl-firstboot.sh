@@ -44,7 +44,7 @@ diag() { [ -x /cdrom/bin/lsl-diag.sh ] && bash /cdrom/bin/lsl-diag.sh "${1:-firs
 # Remove any appended layer that fails to list (partial/corrupt from an
 # interrupted mksquashfs) so we never boot a broken layer.
 lsl_firstboot_cleanup_partial_layers() {
-    for l in ${STICK_DIR:-/cdrom}/casper/filesystem_z[0-9][0-9][0-9][0-9]*.squashfs; do
+    for l in ${STICK_DIR:-/cdrom}/casper/filesystem.z0.[0-9]*.squashfs ${STICK_DIR:-/cdrom}/casper/filesystem_z[0-9][0-9][0-9][0-9]*.squashfs; do
         [ -e "$l" ] || continue
         if ! unsquashfs -l "$l" >/dev/null 2>&1; then
             echo "Removing corrupt/partial layer: $l" >&2

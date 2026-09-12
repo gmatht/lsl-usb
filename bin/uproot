@@ -167,10 +167,12 @@ prompt_choice() {
 write_append_layer() {
     local ts layer meta need sz
     ts="$(date +%Y%m%d%H%M%S)"
-    # Naming: make it sort LAST in /cdrom/casper/*.squashfs so casper's reverse-order logic
-    # gives it HIGHEST precedence (first in lowerdir=...).
-    layer="/cdrom/casper/filesystem_z${ts}.squashfs"
-    meta="/cdrom/casper/filesystem_z${ts}.sh"
+    # Naming: dot-chained (filesystem.z0.<ts>) so casper's layerfs-path
+    # parent walk stacks base + z0 + this layer. (An underscore stem
+    # like filesystem_z<ts> has NO dot-parents, so casper would boot
+    # the layer ALONE - no /sbin/init - and drop to initramfs.)
+    layer="/cdrom/casper/filesystem.z0.${ts}.squashfs"
+    meta="/cdrom/casper/filesystem.z0.${ts}.sh"
     # Free-space guard: avoid a cryptic mksquashfs failure on a full FAT partition.
     sz="$(du -sm /tmp/squashfs/upper 2>/dev/null | awk '{print $1}')"; sz="${sz:-0}"
     need="$(( sz + 64 ))"
