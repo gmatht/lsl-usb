@@ -144,14 +144,15 @@ if [ "$STICK_DIR" != /cdrom ]; then
     else
         logger -t lsl-firstboot "WARNING: could not bind $STICK_DIR/casper over /cdrom/casper." 2>/dev/null || true
     fi
-    if [ -d "$STICK_DIR/bin" ]; then
-        if mount --bind "$STICK_DIR/bin" /cdrom/bin 2>/dev/null; then
-            logger -t lsl-firstboot "Bound stick bin/ over /cdrom/bin." 2>/dev/null || true
-        else
-            logger -t lsl-firstboot "WARNING: could not bind $STICK_DIR/bin over /cdrom/bin." 2>/dev/null || true
-        fi
-    fi
+    # NOTE: bin/ cannot be bound over /cdrom/bin - the ISO loop is
+    # read-only, so the target dir cannot be created. UPROOT is re-pointed
+    # at the stick below instead (uproot finds squashfs_config.sh beside
+    # itself via SCRIPT_DIR, and all its /cdrom/casper paths use the bind).
 fi
+# Run the toolkit from the stick (the ISO loop has no bin/). Export the
+# config path too - uproot prefers $UPROOT_SQUASHFS_CONFIG when set.
+[ -z "${LSL_FIRSTBOOT_UPROOT:-}" ] && UPROOT="$STICK_DIR/bin/uproot"
+[ -z "${LSL_FIRSTBOOT_SQUASHFS_CONFIG:-}" ] && export UPROOT_SQUASHFS_CONFIG="$STICK_DIR/bin/squashfs_config.sh"
 # A previous run may have stamped while bound; the default early check
 # above ran before the binds.
 if [ -e "$STAMP" ]; then
