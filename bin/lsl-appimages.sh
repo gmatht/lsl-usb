@@ -1,5 +1,5 @@
 #!/bin/bash
-# lsl-appimages.sh - download curated AppImages to /cdrom/appimages/.
+# lsl-appimages.sh - download curated AppImages to /cdrom/casper/appimages/.
 #
 # Usage: sudo bin/lsl-appimages.sh [name ...]   (default: every entry in the list)
 #
@@ -13,8 +13,11 @@
 set -euo pipefail
 
 LIST="$(dirname "$0")/appimages.list"
-DEST="${LSL_APPIMAGE_DIR:-/cdrom/appimages}"
-CACHE="${LSL_DL_CACHE:-/cdrom/.lsl-downloads.cache}"
+# NOTE: /cdrom/casper (not bare /cdrom) - on iso-scan boots /cdrom itself
+# is the read-only ISO loop while /cdrom/casper is bind-mounted to the
+# writable stick. Same location the nvim AppImage block uses.
+DEST="${LSL_APPIMAGE_DIR:-/cdrom/casper/appimages}"
+CACHE="${LSL_DL_CACHE:-/cdrom/casper/.lsl-downloads.cache}"
 UA="lsl-usb-installer/1.0"
 
 [ -f "$LIST" ] || { echo "no appimage list at $LIST" >&2; exit 1; }

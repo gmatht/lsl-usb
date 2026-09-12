@@ -234,6 +234,9 @@ clear_mount_tree() {
         umount "$target/proc" 2>/dev/null || true
         umount "$target/dev" 2>/dev/null || true
         umount "$target/sys" 2>/dev/null || true
+        for stage in firmware drivers flatpaks snaps; do
+            umount "$target/cdrom/${stage}" 2>/dev/null || true
+        done
         umount "$target/cdrom" 2>/dev/null || true
         umount "$target" 2>/dev/null || true
     fi
@@ -304,6 +307,19 @@ mkdir -p /tmp/squashfs/root/cdrom
 # inside the chroot (writes like the AppImage staging then fail).
 # --rbind propagates those submounts so the stick stays writable.
 mount --rbind /cdrom /tmp/squashfs/root/cdrom || true
+# The stick root itself (/isodevice) is invisible inside the chroot: the
+# rbind above propagates only the casper/ and bin/ submounts firstboot
+# sets up, so /cdrom/{firmware,drivers,flatpaks,snaps} would resolve to
+# the read-only ISO and user-staged payloads would be silently skipped.
+# Shadow those staging dirs from the stick when it is mounted.
+if mountpoint -q /isodevice 2>/dev/null; then
+    for stage in firmware drivers flatpaks snaps; do
+        if [ -e "/isodevice/${stage}" ]; then
+            mkdir -p "/tmp/squashfs/root/cdrom/${stage}"
+            mount --bind "/isodevice/${stage}" "/tmp/squashfs/root/cdrom/${stage}" || true
+        fi
+    done
+fi
 #mkdir -p /tmp/squashfs/root/persist
 #if mountpoint -q /persist 2>/dev/null; then
 #    mount --bind /persist /tmp/squashfs/root/persist || true

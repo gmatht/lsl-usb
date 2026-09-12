@@ -29,7 +29,9 @@ esac
 LOCAL_DIR="$(dirname "$0")/../dist/rusttools-i686"
 
 DEST="${LSL_RUSTTOOL_DIR:-/cdrom/bin}"
-CACHE="${LSL_DL_CACHE:-/cdrom/.lsl-downloads.cache}"
+# NOTE: cache under /cdrom/casper (bind-mounted to the writable stick);
+# bare /cdrom is the read-only ISO loop on iso-scan boots.
+CACHE="${LSL_DL_CACHE:-/cdrom/casper/.lsl-downloads.cache}"
 UA="lsl-usb-installer/1.0"
 
 [ -f "$LIST" ] || { echo "no rusttools list at $LIST" >&2; exit 1; }

@@ -130,9 +130,14 @@ fi
 # where /cdrom itself is the read-only ISO loop. It persists, and updates
 # are just a file swap. A wrapper prefers it over the distro deb.
 APPIMG_DIR=/cdrom/casper/appimages
-if [ "$ARCH" = "amd64" ] && command -v curl >/dev/null 2>&1 && mkdir -p "$APPIMG_DIR"; then
-    curl -fsSL -o "$APPIMG_DIR/nvim.AppImage" \
-        https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.appimage || true
+if [ "$ARCH" = "amd64" ] && command -v curl >/dev/null 2>&1; then
+    if mkdir -p "$APPIMG_DIR"; then
+        curl -fsSL -o "$APPIMG_DIR/nvim.AppImage" \
+            https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.appimage \
+            || echo "WARNING: nvim AppImage download failed; using distro nvim"
+    else
+        echo "WARNING: cannot stage $APPIMG_DIR (read-only?); using distro nvim"
+    fi
     # Verify it is a real ELF (the GitHub API publishes no checksum; magic bytes
     # catch truncated/corrupt downloads - same check as lsl-appimages.sh).
     if [ -s "$APPIMG_DIR/nvim.AppImage" ] && \
@@ -150,11 +155,13 @@ fi
 exec /usr/bin/nvim "$@"
 NVIMEOF
         chmod +x /usr/local/bin/nvim
+    else
+        echo "WARNING: no usable nvim AppImage in $APPIMG_DIR; using distro nvim"
     fi
 fi
 
 # Optional curated AppImages (e.g. LSL_APPIMAGES="rustdesk keepassxc").
-# Downloads land on /cdrom/appimages (FAT) and persist across boots.
+# Downloads land on /cdrom/casper/appimages (stick, writable) and persist across boots.
 if [ "$ARCH" = "amd64" ] && [ -n "${LSL_APPIMAGES:-}" ]; then
     echo "Downloading requested AppImages: $LSL_APPIMAGES"
     bash /cdrom/bin/lsl-appimages.sh $LSL_APPIMAGES || true
