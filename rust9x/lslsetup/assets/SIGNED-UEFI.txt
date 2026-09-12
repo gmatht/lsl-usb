@@ -56,5 +56,6 @@ Build:     assets/*.gz are gzip -9 of the raw files (like assets/grldr.gz).
            .sha256 pins, then embeds the inflated bytes via OUT_DIR
            (uefi_embedded.rs: BUNDLED_SHIM/GRUB/MM); nofmt refuses a pinned
            mismatch at runtime. To update: replace the .gz, refresh the
-           .sha256 pin, rebuild. GPLv3+ for shim, GPLv3+ for GRUB2 (see
-           assets/COPYING and the Ubuntu package copyrights).
+           .sha256 pin, rebuild. GPL v3+ for GRUB2, BSD-2-Clause for shim/MokManager (see
+           assets/COPYING.GPLv3, assets/COPYRIGHT.shim, and
+           assets/SOURCE-OFFER.txt).

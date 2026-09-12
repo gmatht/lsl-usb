@@ -22,7 +22,8 @@ SHA-256:   d5229249db559d33933ae5c3ad9feffb1ad6635a505e49cd93e2225f93da52c2
 Why this binary: it reads the same menu.lst/ISO mapping the installer
 already writes for the BIOS path, so one menu serves both firmware modes;
 plain GRUB2 also works via the generated grub.cfg. Same upstream project
-as the vendored BIOS assets (grldr/grldr.mbr, GPL - see COPYING).
+as the vendored BIOS assets (grldr/grldr.mbr, GPL v2 - see assets/COPYING).
+License and source offer for all vendored binaries: see assets/SOURCE-OFFER.txt.
 
 Build:     build.rs embeds this file into lslsetup.exe via OUT_DIR/BOOTX64.EFI
            (include_bytes!). Absent file -> no UEFI vendoring and

@@ -1,0 +1,90 @@
+SOURCE CODE OFFER FOR VENDORED THIRD-PARTY BINARIES
+===================================================
+
+This file accompanies the binary files distributed in this directory
+(assets/).  In accordance with the GNU General Public License (GPL)
+version 2 and version 3, and the BSD-2-Clause license, the complete
+corresponding source code for each binary is identified below.
+
+A copy of each applicable license is included in this directory:
+  assets/COPYING          - GNU GPL version 2
+  assets/COPYING.GPLv3    - GNU GPL version 3
+  assets/COPYRIGHT.shim   - BSD-2-Clause (shim / MokManager)
+
+---
+
+PRIMARY SOURCE DISTRIBUTION
+---------------------------
+
+For every release of this software, a source archive containing the
+complete corresponding source code for all vendored third-party binaries
+is attached to the GitHub release page:
+
+  https://github.com/OWNER/REPO/releases
+
+Look for the asset named:
+  lslsetup-vendored-src-VERSION.tar.gz
+
+This archive includes:
+  - grub4dos source at the exact git commit used to build BOOTX64.EFI
+  - Ubuntu shim source package (.dsc + .orig.tar.* + .debian.tar.xz)
+  - Ubuntu GRUB2 source package (.dsc + .orig.tar.* + .debian.tar.xz)
+
+If the release attachment is unavailable, the exact upstream locations
+are listed below.  Should those upstream sources also become
+unavailable, a complete source archive can be requested by opening an
+issue at the project repository (see link above).
+
+This offer is valid for a period of not less than three (3) years from
+the date of distribution of this software.
+
+---
+
+UPSTREAM SOURCE LOCATIONS (fallback)
+------------------------------------
+
+1. BOOTX64.EFI, grldr, grldr.mbr
+   License: GNU General Public License version 2
+   Upstream: https://github.com/chenall/grub4dos
+   Exact source for the vendored build:
+     git clone https://github.com/chenall/grub4dos.git
+     git checkout a518a66
+   Release: grub4dos-for_UEFI-2026-05-07.7z (tag "for_UEFI")
+
+2. grubx64.efi
+   License: GNU General Public License version 3 or later (GPLv3+)
+   Upstream: GNU GRUB 2.14
+   Source package: grub-efi-amd64-signed_1.215+2.14-2ubuntu1_amd64.deb
+   Package URL:
+     https://archive.ubuntu.com/ubuntu/pool/main/g/grub2-signed/
+   Corresponding GRUB source:
+     https://archive.ubuntu.com/ubuntu/pool/main/g/grub2/
+   Upstream repository: https://git.savannah.gnu.org/cgit/grub.git
+
+3. shimx64.efi, mmx64.efi
+   License: BSD-2-Clause
+   Upstream: https://github.com/rhboot/shim
+   Source package: shim-signed_1.59+15.8-0ubuntu2_amd64.deb
+   Package URL:
+     https://archive.ubuntu.com/ubuntu/pool/main/s/shim-signed/
+   Corresponding shim source:
+     https://archive.ubuntu.com/ubuntu/pool/main/s/shim/
+   Upstream repository: https://github.com/rhboot/shim
+
+---
+
+BUILDING THE SOURCE ARCHIVE
+---------------------------
+
+To regenerate the vendored-source tarball for a new release, run:
+
+  ./scripts/bundle-vendored-source.sh [OUTPUT_NAME]
+
+See the script header for details.
+
+---
+
+For any of the above, if you received these binaries as part of a
+larger distribution and require the complete corresponding source code
+in a physical medium, you may request it by contacting the distributor.
+The source will be provided at no more than the cost of distribution.
