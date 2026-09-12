@@ -71,6 +71,12 @@ try_mount_stick() {
         if [ -e "/isodevice$iso_rel" ]; then STICK_DIR=/isodevice; return 0; fi
         umount /isodevice 2>/dev/null || true
     fi
+    # Best-effort partition-table re-read (slow/flaky media may not have
+    # partition nodes yet). Fails harmlessly when the disk is busy.
+    for disk in /dev/sd[a-z] /dev/vd[a-z] /dev/hd[a-z] /dev/nvme[0-9]n[0-9] /dev/mmcblk[0-9]; do
+        [ -b "$disk" ] || continue
+        blockdev --rereadpt "$disk" 2>/dev/null || true
+    done
     for dev in /dev/sd*[0-9] /dev/vd*[0-9] /dev/nvme*n*p* /dev/mmcblk*p* /dev/hd*[0-9]; do
         [ -b "$dev" ] || continue
         mount | grep -q "^$dev " 2>/dev/null && continue
@@ -82,6 +88,30 @@ try_mount_stick() {
             fi
             umount /isodevice 2>/dev/null || true
         fi
+    done
+    # Fallback: map each MBR partition via a loop device at its byte offset.
+    # In iso-scan boots the live media holds the stick partition open (the
+    # ISO loop pins it), so the partition node may be missing and the device
+    # busy - a loop mapping sidesteps both without needing /dev/sd*N.
+    for disk in /dev/sd[a-z] /dev/vd[a-z] /dev/hd[a-z] /dev/nvme[0-9]n[0-9] /dev/mmcblk[0-9]; do
+        [ -b "$disk" ] || continue
+        d="${disk##*/}"
+        for pdir in /sys/block/$d/$d*; do
+            [ -f "$pdir/start" ] || continue
+            start="$(cat "$pdir/start" 2>/dev/null || echo 0)"
+            [ "$start" -gt 0 ] 2>/dev/null || continue
+            loop="$(losetup -f --show -o $((start * 512)) "$disk" 2>/dev/null || true)"
+            [ -n "$loop" ] && [ -b "$loop" ] || continue
+            if mount -o ro "$loop" /isodevice 2>/dev/null; then
+                if [ -e "/isodevice$iso_rel" ]; then
+                    mount -o remount,rw /isodevice 2>/dev/null || true
+                    STICK_DIR=/isodevice
+                    return 0
+                fi
+                umount /isodevice 2>/dev/null || true
+            fi
+            losetup -d "$loop" 2>/dev/null || true
+        done
     done
     return 1
 }
