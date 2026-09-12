@@ -125,25 +125,27 @@ else
 fi
 
 # Latest official nvim AppImage (the noble deb is 0.9.x; the AppImage tracks
-# releases). Stored on the FAT partition: it persists, and updates are just a
-# file swap. A wrapper prefers it over the distro deb.
-if [ "$ARCH" = "amd64" ] && command -v curl >/dev/null 2>&1; then
-    mkdir -p /cdrom/appimages
-    curl -fsSL -o /cdrom/appimages/nvim.AppImage \
+# releases). Stored under /cdrom/casper/appimages: that directory is
+# bind-mounted to the stick, so it stays writable even on iso-scan boots
+# where /cdrom itself is the read-only ISO loop. It persists, and updates
+# are just a file swap. A wrapper prefers it over the distro deb.
+APPIMG_DIR=/cdrom/casper/appimages
+if [ "$ARCH" = "amd64" ] && command -v curl >/dev/null 2>&1 && mkdir -p "$APPIMG_DIR"; then
+    curl -fsSL -o "$APPIMG_DIR/nvim.AppImage" \
         https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.appimage || true
     # Verify it is a real ELF (the GitHub API publishes no checksum; magic bytes
     # catch truncated/corrupt downloads - same check as lsl-appimages.sh).
-    if [ -s /cdrom/appimages/nvim.AppImage ] && \
-       [ "$(head -c 4 /cdrom/appimages/nvim.AppImage | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
-        chmod +x /cdrom/appimages/nvim.AppImage
+    if [ -s "$APPIMG_DIR/nvim.AppImage" ] && \
+       [ "$(head -c 4 "$APPIMG_DIR/nvim.AppImage" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
+        chmod +x "$APPIMG_DIR/nvim.AppImage"
         cat > /usr/local/bin/nvim <<'NVIMEOF'
 #!/bin/bash
 # Prefer the official nvim AppImage (latest) over the distro deb.
-if [ -x /cdrom/appimages/nvim.AppImage ]; then
+if [ -x /cdrom/casper/appimages/nvim.AppImage ]; then
     if [ -e /dev/fuse ]; then
-        exec /cdrom/appimages/nvim.AppImage "$@"
+        exec /cdrom/casper/appimages/nvim.AppImage "$@"
     fi
-    exec /cdrom/appimages/nvim.AppImage --appimage-extract-and-run "$@"
+    exec /cdrom/casper/appimages/nvim.AppImage --appimage-extract-and-run "$@"
 fi
 exec /usr/bin/nvim "$@"
 NVIMEOF
