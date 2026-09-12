@@ -214,7 +214,14 @@ cleanup_mounts() {
     umount /tmp/squashfs/root/proc 2>/dev/null || true
     umount /tmp/squashfs/root/dev 2>/dev/null || true
     umount /tmp/squashfs/root/sys 2>/dev/null || true
-    umount -R /tmp/squashfs/root/cdrom 2>/dev/null || umount -l /tmp/squashfs/root/cdrom 2>/dev/null || true
+    # Detach ONLY uproot's own mounts, non-recursively, in reverse order.
+    # Never umount -R here: with no --rbind above there is nothing foreign
+    # underneath, and -R would detach firstboot's host binds if that ever
+    # changed (the crash-loop root cause: host /cdrom/casper silently lost).
+    for sub in snaps flatpaks drivers firmware bin casper; do
+        umount "/tmp/squashfs/root/cdrom/${sub}" 2>/dev/null || true
+    done
+    umount /tmp/squashfs/root/cdrom 2>/dev/null || true
     umount /tmp/squashfs/root/ 2>/dev/null || true
 }
 trap cleanup_mounts EXIT
@@ -234,8 +241,8 @@ clear_mount_tree() {
         umount "$target/proc" 2>/dev/null || true
         umount "$target/dev" 2>/dev/null || true
         umount "$target/sys" 2>/dev/null || true
-        for stage in firmware drivers flatpaks snaps; do
-            umount "$target/cdrom/${stage}" 2>/dev/null || true
+        for sub in snaps flatpaks drivers firmware bin casper; do
+            umount "$target/cdrom/${sub}" 2>/dev/null || true
         done
         umount "$target/cdrom" 2>/dev/null || true
         umount "$target" 2>/dev/null || true
@@ -302,16 +309,23 @@ fi
 mount --bind /var/cache/apt/archives/ /tmp/squashfs/root/var/cache/apt/archives/ || true
 mount --bind /home/ /tmp/squashfs/root/home || true
 mkdir -p /tmp/squashfs/root/cdrom
-# Recursive bind: a plain --bind hides the /cdrom/casper and /cdrom/bin
-# submounts firstboot sets up, leaving the read-only ISO visible
-# inside the chroot (writes like the AppImage staging then fail).
-# --rbind propagates those submounts so the stick stays writable.
-mount --rbind /cdrom /tmp/squashfs/root/cdrom || true
-# The stick root itself (/isodevice) is invisible inside the chroot: the
-# rbind above propagates only the casper/ and bin/ submounts firstboot
-# sets up, so /cdrom/{firmware,drivers,flatpaks,snaps} would resolve to
-# the read-only ISO and user-staged payloads would be silently skipped.
-# Shadow those staging dirs from the stick when it is mounted.
+# Stick visibility inside the chroot - deliberately NO --rbind here:
+# a plain --bind hides firstboot's /cdrom/casper + /cdrom/bin submounts,
+# leaving the read-only ISO visible, so re-bind exactly those submounts
+# as uproot's OWN mounts (a plain umount later detaches only ours).
+# --rbind would propagate firstboot's host binds into the chroot and any
+# recursive unmount (cleanup_mounts, clear_mount_tree) would then detach
+# them on the HOST too - silently breaking every later attempt (observed
+# in QEMU: attempts failing forever on read-only /cdrom/casper).
+# Same treatment for the staging dirs (firmware/drivers/flatpaks/snaps)
+# shadowed from /isodevice, whose root is otherwise invisible in-chroot.
+mount --bind /cdrom /tmp/squashfs/root/cdrom || true
+for sub in casper bin; do
+    if mountpoint -q "/cdrom/${sub}" 2>/dev/null; then
+        mkdir -p "/tmp/squashfs/root/cdrom/${sub}"
+        mount --bind "/cdrom/${sub}" "/tmp/squashfs/root/cdrom/${sub}" || true
+    fi
+done
 if mountpoint -q /isodevice 2>/dev/null; then
     for stage in firmware drivers flatpaks snaps; do
         if [ -e "/isodevice/${stage}" ]; then

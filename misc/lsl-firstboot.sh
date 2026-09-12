@@ -239,9 +239,19 @@ else
     nice -n 10 bash "$UPROOT" --auto-append >>"$LOG" 2>&1 || rc=$?
 fi
 if [ "$rc" -ne 0 ]; then
-    attempts="$(cat "$ATTEMPT_FILE" 2>/dev/null || echo 0)"
+    # The counter must stay bounded even when the stick is unreachable:
+    # if its write fails, every retry reads back a stale value and the
+    # loop runs forever (observed: endless "attempt 1/5" on read-only
+    # /cdrom/casper). Mirror to /run (always writable tmpfs); the stick
+    # copy stays the cross-boot store, /run is the within-boot fallback.
+    # Take the max so a stale-but-readable stick copy cannot rewind it.
+    a_stick="$(cat "$ATTEMPT_FILE" 2>/dev/null || echo 0)"
+    a_run="$(cat /run/lsl-firstboot.attempts 2>/dev/null || echo 0)"
+    attempts="$a_stick"
+    [ "$a_run" -gt "$attempts" ] 2>/dev/null && attempts="$a_run"
     attempts=$((attempts + 1))
     echo "$attempts" > "$ATTEMPT_FILE" 2>/dev/null || true
+    echo "$attempts" > /run/lsl-firstboot.attempts 2>/dev/null || true
     if [ "$attempts" -ge "$MAX_ATTEMPTS" ]; then
         set_phase "setup failed after $attempts attempts - see $LOG"
         log "uproot --auto-append FAILED $attempts times; giving up (see $LOG)."
