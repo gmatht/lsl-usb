@@ -1,10 +1,19 @@
+# Guest-executed trees: everything under bin/, misc/, systemd/, initramfs/
+# (plus onboot.sh) runs under /bin/bash or systemd on the live stick, where
+# CRLF from Windows checkouts is fatal. These dir rules come FIRST so the
+# two Windows-side files in bin/ keep CRLF via the later overrides below
+# (in .gitattributes the LAST matching line wins).
+bin/** text eol=lf
+misc/** text eol=lf
+systemd/** text eol=lf
+initramfs/** text eol=lf
+onboot.sh text eol=lf
 # Keep Windows scripts as CRLF on checkout but store normalised (LF) in git
 # so diffs stay minimal. cmd/.bat require CRLF line endings to run on Windows.
 *.bat text eol=crlf
 *.ps1 text eol=crlf
 *.hta text eol=crlf
 *.sh text eol=lf
-# Guest-executed files: /bin/bash chokes on CRLF from Windows checkouts.
 *.service text eol=lf
 *.desktop text eol=lf
 *.list text eol=lf
