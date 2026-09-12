@@ -994,26 +994,32 @@ pub fn downloads_dir() -> String {
 }
 
 pub fn create_dir_all(p: &str) {
-    let mut cur = String::new();
-    for part in p.split('\\') {
-        if part.is_empty() {
+    if p.is_empty() {
+        return;
+    }
+    // Create every leading prefix ending in a separator, plus the full
+    // path, as EXACT slices of the input: rebuilding from split components
+    // mangled roots (`\\?\C:\...` became `?\C:\...`, UNC lost its
+    // server) and failed every call with ERROR_INVALID_NAME. Errors are
+    // ignored throughout (already-exists races, roots, files in the way).
+    let p = p.replace('/', "\\");
+    let b = p.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            let prefix = &p[..=i];
+            unsafe {
+                CreateDirectoryW(wide(prefix).as_ptr(), std::ptr::null_mut());
+            }
+            while i < b.len() && b[i] == b'\\' {
+                i += 1;
+            }
             continue;
         }
-        // Re-add the separator after a drive root too ("C:" -> "C:\Users"):
-        // the previous `!cur.ends_with(':')` guard built drive-relative paths
-        // like "C:Users", which only happened to resolve while the drive's
-        // current directory was its root and failed for every other absolute
-        // path (e.g. a temp dir on C: whose CWD is elsewhere).
-        if !cur.is_empty() && !cur.ends_with('\\') {
-            cur.push('\\');
-        }
-        cur.push_str(part);
-        if cur.len() == 2 {
-            continue; // drive root ("C:") itself: nothing to create
-        }
-        unsafe {
-            CreateDirectoryW(wide(&cur).as_ptr(), std::ptr::null_mut());
-        }
+        i += 1;
+    }
+    unsafe {
+        CreateDirectoryW(wide(&p).as_ptr(), std::ptr::null_mut());
     }
 }
 

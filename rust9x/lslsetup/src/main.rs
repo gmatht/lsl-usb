@@ -371,7 +371,7 @@ fn run() {
                 // on the console would stall the working phase. Flag-pinned
                 // targets keep the typed gate (raw-sector writes must never
                 // hinge on a stale flag).
-                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some()) {
+                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some(), opts.skip_verify) {
                     Ok((t, metrics, pending)) => {
                         // Whole-USB check while the wizard is still open
                         // (live status); a failure offers Back-to-options.
@@ -689,7 +689,7 @@ fn run() {
             // Non-destructive grub4dos install: MBR boot-code area only,
             // ISO copied as a file, menu.lst loopback. The stick keeps its
             // filesystem and all existing files.
-            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false) {
+            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false, opts.skip_verify) {
                 Ok((t, _metrics, pending)) => {
                     pending_mbr = pending;
                     vol = sys::list_volumes()

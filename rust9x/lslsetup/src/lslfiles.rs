@@ -7,30 +7,47 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 
 pub fn sha256_file(path: &str) -> Option<String> {
-    sha256_file_progress(path, &mut |_, _| {})
+    match sha256_file_progress(path, &mut |_, _| true) {
+        Ok(HashResult::Hash(h)) => Some(h),
+        _ => None,
+    }
 }
 
-/// SHA-256 of a file with live (done, total) progress. Same result as
-/// `sha256_file`; use it for multi-GB files so callers can drive a
-/// progress bar and pump the GUI — a silent 3 GB hash over USB looks
-/// exactly like a freeze.
-pub fn sha256_file_progress(path: &str, progress: &mut dyn FnMut(u64, u64)) -> Option<String> {
-    let mut f = std::fs::File::open(path).ok()?;
+/// Outcome of a cancellable file hash.
+pub enum HashResult {
+    Hash(String),
+    Aborted,
+}
+
+/// SHA-256 of a file with live (done, total) progress. `progress` returns
+/// false to abort early (mid-flight skip). Same hash as `sha256_file` on
+/// completion; use it for multi-GB files so callers can drive a progress
+/// bar and pump the GUI — a silent 3 GB hash over USB looks exactly like
+/// a freeze.
+pub fn sha256_file_progress(
+    path: &str,
+    progress: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<HashResult, String> {
+    let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
     let total = f.metadata().map(|m| m.len()).unwrap_or(0);
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     let mut done = 0u64;
-    progress(0, total);
+    if !progress(0, total) {
+        return Ok(HashResult::Aborted);
+    }
     loop {
-        let n = f.read(&mut buf).unwrap_or(0);
+        let n = f.read(&mut buf).map_err(|e| format!("read {}: {}", path, e))?;
         if n == 0 {
             break;
         }
         h.update(&buf[..n]);
         done += n as u64;
-        progress(done, total);
+        if !progress(done, total) {
+            return Ok(HashResult::Aborted);
+        }
     }
-    Some(format!("{:x}", h.finalize()))
+    Ok(HashResult::Hash(format!("{:x}", h.finalize())))
 }
 
 /// Set (or append) a KEY=value line in an env file, leaving the rest intact.
@@ -73,6 +90,12 @@ pub fn install_lsl_files(vol_letter: &str, bundle_dir: &str) -> Result<(), Strin
         sys::copy_file(&layer, &format!("{}\\filesystem_z0_firstboot.squashfs", casper))
             .map_err(|e| format!("copy layer: {}", e))?;
         copied.push("filesystem_z0_firstboot.squashfs".into());
+        // Dotted twin for casper's multi-layer dotted-chain walk (the
+        // `layerfs-path=` on direct entries needs exactly this name; 8 KB,
+        // and every existing `_firstboot` reader keeps working untouched).
+        sys::copy_file(&layer, &format!("{}\\filesystem.z0.squashfs", casper))
+            .map_err(|e| format!("copy dotted layer: {}", e))?;
+        copied.push("filesystem.z0.squashfs".into());
     } else {
         out::warn("filesystem_z0_firstboot.squashfs not found in bundle; layer not copied.");
     }

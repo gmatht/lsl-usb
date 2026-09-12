@@ -17,6 +17,7 @@ pub struct Opts {
     pub bios_boot: bool,        // nofmt: install the grub4dos BIOS path (default on)
     pub uefi_boot: bool,        // nofmt: install the UEFI files (default on)
     pub check_usb: bool,        // fill free space with PRNG data + read-back verify (default off: slow)
+    pub skip_verify: bool,      // skip the post-copy ISO re-read (default off: faster, less safe)
     pub wsl_vhdx: Vec<String>,
     pub flatpak_apps: Vec<String>,
     pub skip_iso_download: bool,
@@ -67,6 +68,7 @@ impl Default for Opts {
             bios_boot: true,
             uefi_boot: true,
             check_usb: false,
+            skip_verify: false,
             wsl_vhdx: Vec::new(),
             flatpak_apps: Vec::new(),
             skip_iso_download: false,
@@ -119,6 +121,8 @@ Options:
   --check-usb                After writing: fill free space with PRNG test
                              data in DeleteMe, read it all back uncached
                              (bypasses the OS cache), then delete it
+  --skip-verify              Skip the post-copy ISO re-read (fresh copies
+                             only; reuse always verifies. Faster, less safe)
   --volume-label <label>     USB volume label to target
   --wsl-vhdx <path>          Extra WSL VHDX path (repeatable)
   --flatpak-apps <id>        Extra flatpak app id (repeatable)
@@ -177,6 +181,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--no-bios-boot" => o.bios_boot = false,
             "--no-uefi-boot" => o.uefi_boot = false,
             "--check-usb" => o.check_usb = true,
+            "--skip-verify" => o.skip_verify = true,
             "--wsl-vhdx" => o.wsl_vhdx.push(next()?),
             "--flatpak-apps" => o.flatpak_apps.push(next()?),
             "--skip-iso-download" => o.skip_iso_download = true,

@@ -562,6 +562,9 @@ pub fn menu_entry(title: &str, iso_rel: &str, big_iso: bool) -> String {
 
 /// Kernel/initrd filenames probed under casper/ (first hit wins).
 const CASPER_KERNEL_CANDIDATES: &[&str] = &["casper/vmlinuz", "casper/vmlinuz.efi"];
+/// Base squashfs probed under casper/ (first hit wins). Extracted next to
+/// the z0 layer so casper's multi-layer chain finds base + z0 side by side.
+const CASPER_BASE_CANDIDATES: &[&str] = &["casper/filesystem.squashfs"];
 const CASPER_INITRD_CANDIDATES: &[&str] = &[
     "casper/initrd",
     "casper/initrd.lz",
@@ -582,7 +585,7 @@ pub fn menu_entry_direct(title: &str, iso_rel: &str, kern_rel: &str, init_rel: &
     format!(
         "\ntitle {title}\n\
          find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
-         kernel {kern_rel} boot=casper iso-scan/filename={iso_rel} quiet splash\n\
+         kernel {kern_rel} boot=casper iso-scan/filename={iso_rel} layerfs-path=/isodevice/casper/filesystem.z0.squashfs rootdelay=15 quiet splash\n\
          initrd {init_rel}\n\
          boot\n"
     )
@@ -1186,6 +1189,7 @@ pub fn install_from_iso(
     want_uefi: bool,
     ui: Option<&dyn WriteUi>,
     preconfirmed: bool,
+    skip_verify: bool,
 ) -> Result<(UsbTarget, WriteMetrics, Option<PendingMbr>), String> {
     if !want_bios && !want_uefi {
         // Say WHY, not just that: the GUI greys out unsupported paths (the
@@ -1251,7 +1255,7 @@ pub fn install_from_iso(
         }
     }
 
-    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, active_uefi_loader(), ui)?;
+    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, active_uefi_loader(), ui, skip_verify)?;
     Ok((target, metrics, pending))
 }
 
@@ -1422,6 +1426,60 @@ fn extract_casper_boot(
 /// set, the identical entries are mirrored to \efi\grub\menu.lst — the only
 /// menu location grub4dos-for-UEFI reads. Returns the loopback title (used
 /// for the install summary).
+/// Extract the base squashfs next to the z0 layer (`casper/` on the
+/// stick) so casper's multi-layer dotted-chain walk finds base + z0 side
+/// by side. Size-checked reuse, progress-tracked copy, delete-on-mismatch
+/// - same contract as the kernel/initrd extract. Soft-fail (warn) so the
+/// loopback fallback survives without it. Returns true when present after.
+fn extract_base_squashfs(iso_path: &str, casper_dir_fs: &str, ui: Option<&dyn WriteUi>) -> bool {
+    let mut iso = match crate::iso::Iso::open(iso_path) {
+        Ok(i) => i,
+        Err(_) => return false,
+    };
+    let src = match CASPER_BASE_CANDIDATES
+        .iter()
+        .find(|c| iso.file_size(c).map(|s| s > 0).unwrap_or(false))
+    {
+        Some(s) => s.to_string(),
+        None => return false,
+    };
+    let want = iso.file_size(&src).unwrap_or(0);
+    let dest_fs = format!("{}\\filesystem.squashfs", casper_dir_fs);
+    if crate::sys::file_size(&dest_fs).map(|s| s == want).unwrap_or(false) {
+        out::info(&format!("base squashfs already on stick ({} bytes).", want));
+        return true;
+    }
+    out::step(&format!(
+        "Extracting base squashfs from the ISO ({:.1} GB)...",
+        want as f64 / sys::GB as f64
+    ));
+    if let Some(u) = ui {
+        u.show_progress(true);
+    }
+    let mut last_pct = 0u64;
+    let r = iso.extract_file(&src, &dest_fs, &mut |done, total| {
+        if let Some(u) = ui {
+            u.set_progress(done, total);
+        }
+        let pct = done * 100 / total.max(1);
+        if pct >= last_pct + 10 {
+            last_pct = pct;
+            out::info(&format!("  {}%", pct));
+        }
+    });
+    match r {
+        Ok(n) if n == want => {
+            out::info("base squashfs extracted next to the z0 layer.");
+            true
+        }
+        _ => {
+            crate::sys::delete_file(&dest_fs);
+            out::warn("base squashfs extraction failed - loopback fallback only (no layered boot).");
+            false
+        }
+    }
+}
+
 fn write_menu_entries(
     root: &str,
     iso_dst: &str,
@@ -1475,6 +1533,9 @@ fn write_menu_entries(
             }
         }
     }
+    // Base squashfs next to z0 (independent of the menu below): the file
+    // casper's multi-layer chain stacks under the z0 entry.
+    extract_base_squashfs(iso_dst, &format!("{}casper", root), ui);
     // ISOs at/above 2 GiB lose the `map --mem` fallback: loading gigabytes
     // into RAM OOMs on most firmware (seen live on 3 GB), so a failed direct
     // map fails fast instead. Small images keep it (genuinely useful).
@@ -1628,6 +1689,7 @@ fn install_files(
     _want_uefi: bool,
     uefi_loader: UefiLoader,
     ui: Option<&dyn WriteUi>,
+    skip_verify: bool,
 ) -> Result<(String, bool, WriteMetrics), String> {
     let root = format!("{}:\\", t.letter);
     // Resolve the UEFI loader up front: the menu-mirror decision depends on
@@ -1680,7 +1742,7 @@ fn install_files(
     sys::create_dir_all(&format!("{}_ISO", root));
     let iso_dst = format!("{}_ISO\\{}", root, safe_name);
     let iso_rel = format!("/_ISO/{}", safe_name);
-    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui)?;
+    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui, skip_verify)?;
     // menu.lst uses grub4dos syntax; when the grub4dos-family loader is
     // used the same entries are mirrored to efi\grub\menu.lst (the only
     // menu location grub4dos-for-UEFI reads - no mirror = UEFI prompt);
@@ -1731,6 +1793,8 @@ pub fn commit_boot_sectors(p: &PendingMbr) -> Result<(), String> {
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
                     "access denied on the physical drive - run the installer as Administrator".to_string()
+                } else if e.raw_os_error() == Some(32) {
+                    format!("cannot open {}: locked by another process (QEMU, VirtualBox, Rufus, disk manager?) - close it and re-run", p.phys_path)
                 } else {
                     format!("cannot open {}: {}", p.phys_path, e)
                 }
@@ -1791,7 +1855,7 @@ pub fn commit_boot_sectors(p: &PendingMbr) -> Result<(), String> {
     Ok(())
 }
 
-fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
+fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
     let fs_uc = t.fs.to_ascii_uppercase();
     // grub4dos reads FAT12/16/32 and NTFS only. exFAT (the default on many
     // large sticks) is NOT readable by grub4dos, so a stick left exFAT cannot
@@ -1835,6 +1899,8 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 "access denied on the physical drive - run the installer as Administrator".to_string()
+            } else if e.raw_os_error() == Some(32) {
+                format!("cannot open {}: locked by another process (QEMU, VirtualBox, Rufus, disk manager?) - close it and re-run", phys_path)
             } else {
                 format!("cannot open {}: {}", phys_path, e)
             }
@@ -1878,7 +1944,7 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         }
         out::step("GPT stick: files-only UEFI install (no raw sectors touched).");
         report_board(false, true);
-        let (title, uefi_ok, metrics) = install_files(t, iso, iso_len, uefi_bootx64, false, true, uefi_loader, ui)?;
+        let (title, uefi_ok, metrics) = install_files(t, iso, iso_len, uefi_bootx64, false, true, uefi_loader, ui, skip_verify)?;
         report_bootability(false, "GPT stick - grub4dos BIOS stage1 has nowhere to live (sectors 1-15 are the GPT header/table)", uefi_ok, &title);
         return Ok((metrics, None));
     }
@@ -2042,7 +2108,7 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     // copy (bad USB write, or a stale same-size file already on the stick)
     // would loopback-boot garbage. So the stick copy is SHA-256-verified
     // against the source in every case (unless verification was skipped).
-    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui)?;
+    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui, skip_verify)?;
 
     // menu.lst: direct-kernel entry (BIOS + UEFI grub4dos) first, then the
     // loopback chainload fallback (BIOS-only). Resolve the UEFI loader up
@@ -2110,7 +2176,7 @@ fn uefi_cfg(title: &str, iso_rel: &str) -> String {
          \x20   search --no-floppy --set=root --file {iso_rel}\n\
          \x20   loopback loop {iso_rel}\n\
          \x20   # Adjust kernel/initrd paths & params for your distro (Ubuntu example):\n\
-         \x20   linux (loop)/casper/vmlinuz boot=casper iso-scan/filename={iso_rel} quiet splash\n\
+         \x20   linux (loop)/casper/vmlinuz boot=casper iso-scan/filename={iso_rel} layerfs-path=/isodevice/casper/filesystem.z0.squashfs rootdelay=15 quiet splash\n\
          \x20   initrd (loop)/casper/initrd\n\
          }}\n"
     )
@@ -2242,18 +2308,32 @@ fn copy_file_progress(
 
 /// Flush the volume caches, then read the file back computing SHA-256 with
 /// live progress so the user sees the verification read speed.
+/// Best-effort volume cache drop (flush + purge standby) so the next read
+/// is a TRUE uncached pass over the flash, not page cache. Returns true
+/// when the volume handle opened (needs Administrator); false leaves every
+/// caller on today's behavior (hash anyway, verify anyway).
+fn drop_volume_cache(path: &str) -> bool {
+    let letter = match path.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    let vol = format!(r"\\.\{}:", letter);
+    match std::fs::OpenOptions::new().write(true).open(&vol) {
+        Ok(v) => {
+            let _ = v.sync_all();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 fn verify_file_progress(
     path: &str,
     expected_hash: &str,
     ui: Option<&dyn WriteUi>,
 ) -> Result<WriteMetrics, String> {
     // Drop cache: flush the volume before reopening for read.
-    if let Some(letter) = path.chars().next() {
-        let vol = format!(r"\\.\{}:", letter);
-        if let Ok(v) = std::fs::OpenOptions::new().write(true).open(&vol) {
-            let _ = v.sync_all();
-        }
-    }
+    drop_volume_cache(path);
 
     let mut f = open_for_hash(path, path)?;
     let total = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -2389,18 +2469,27 @@ fn verify_file_progress(
 /// Copy when needed, then flush cache and verify.  Returns (source hash, metrics).
 /// SHA-256 one file with live GUI progress + console milestones. Used by
 /// the ISO-reuse path (stick copy and source both get fully hashed before
-/// the reuse is accepted).
+/// the reuse is accepted). Mid-flight skippable like `verify_file_progress`
+/// (Skip-verify button + S key): Ok(None) = user skipped.
 fn hash_reuse_file(
     path: &str,
     label: &str,
     total: u64,
     ui: Option<&dyn WriteUi>,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
+    // Arm the skip path (button relabel + clear stale + prime S-key),
+    // exactly like verify_file_progress.
+    arm_verify_skip(true);
+    if let Some(u) = ui {
+        u.arm_skip_button(true);
+    }
+    let _ = console_skip_key_pressed();
+    out::info("  (S key or Skip-verify button skips - reuse accepted UNVERIFIED on size match)");
     if let Some(u) = ui {
         u.show_progress(true);
         u.set_progress(0, total);
         u.set_status(&format!(
-            "{}... 0 / {:.0} MB",
+            "{}... 0 / {:.0} MB (S key / Skip button to skip)",
             label,
             total as f64 / sys::MB as f64
         ));
@@ -2409,11 +2498,17 @@ fn hash_reuse_file(
     let t0 = std::time::Instant::now();
     let mut last_ui = std::time::Instant::now();
     let mut last_pct = 0u64;
-    let hash = crate::lslfiles::sha256_file_progress(path, &mut |done, total| {
+    let outcome = crate::lslfiles::sha256_file_progress(path, &mut |done, total| {
         let pct = done * 100 / total.max(1);
         if pct >= last_pct + 25 {
             last_pct = pct;
             out::info(&format!("  {}% ({}...)", pct, label));
+        }
+        if console_skip_key_pressed() {
+            request_verify_skip();
+        }
+        if verify_skip_requested() {
+            return false;
         }
         if last_ui.elapsed().as_millis() >= 300 {
             last_ui = std::time::Instant::now();
@@ -2421,7 +2516,7 @@ fn hash_reuse_file(
                 let mbps = (done as f64 / sys::MB as f64) / t0.elapsed().as_secs_f64().max(0.001);
                 u.set_progress(done, total);
                 u.set_status(&format!(
-                    "{}... {:.0} / {:.0} MB  ({:.1} MB/s)",
+                    "{}... {:.0} / {:.0} MB  ({:.1} MB/s) (S key / Skip button to skip)",
                     label,
                     done as f64 / sys::MB as f64,
                     total as f64 / sys::MB as f64,
@@ -2430,15 +2525,44 @@ fn hash_reuse_file(
                 u.pump();
             }
         }
+        true
     });
-    if hash.is_some() {
-        out::info(&format!(
-            "  {} done in {:.0}s.",
-            label,
-            t0.elapsed().as_secs_f64()
-        ));
+    // Never leave the button armed.
+    arm_verify_skip(false);
+    if let Some(u) = ui {
+        u.arm_skip_button(false);
     }
-    hash
+    match outcome {
+        Ok(crate::lslfiles::HashResult::Hash(h)) => {
+            out::info(&format!(
+                "  {} done in {:.0}s.",
+                label,
+                t0.elapsed().as_secs_f64()
+            ));
+            Ok(Some(h))
+        }
+        Ok(crate::lslfiles::HashResult::Aborted) => {
+            out::warn(&format!("  {} SKIPPED.", label));
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Mid-flight skip during reuse hashing: accept the size match WITHOUT
+/// any hash proof, loudly. Same semantics as verify_file_progress's skip
+/// (UNVERIFIED, size match only) - the stick may hold garbage that only
+/// shows up at boot.
+fn reuse_unverified(
+    why: &str,
+    iso_len: u64,
+    metrics: WriteMetrics,
+) -> Result<(String, WriteMetrics), String> {
+    out::warn(&format!(
+        "{} - reuse accepted UNVERIFIED (size match only, {} bytes). Corruption would only show up at boot; re-run without skipping to verify.",
+        why, iso_len
+    ));
+    Ok(("SKIPPED-UNVERIFIED".to_string(), metrics))
 }
 
 fn copy_and_verify_iso(
@@ -2446,6 +2570,7 @@ fn copy_and_verify_iso(
     iso_dst: &str,
     iso_len: u64,
     ui: Option<&dyn WriteUi>,
+    skip_verify: bool,
 ) -> Result<(String, WriteMetrics), String> {
     // The Install handler hid the progress bar/label; re-show them so the
     // live write/verify speed has a bar to go with it. show_final hides
@@ -2461,18 +2586,40 @@ fn copy_and_verify_iso(
                 "ISO already on stick: {} (same size; verifying before reuse)",
                 iso_dst
             ));
-            // Two full multi-GB hashes follow (stick copy, then source).
-            // Both MUST drive the progress bar and pump the GUI, or the
-            // window freezes for minutes on USB2 with zero feedback.
-            let dst = hash_reuse_file(iso_dst, "Verifying existing ISO on stick (1/2: USB copy)", iso_len, ui)
-                .ok_or_else(|| format!("cannot hash {} for verification", iso_dst))?;
+            // Drop the volume cache FIRST so the hash below is a TRUE
+            // uncached read of the flash (a cache-served hash proves
+            // nothing about the stick). When the drop succeeds the hash
+            // IS the verification and the post-copy re-read is skipped,
+            // saving a full multi-GB USB pass; otherwise we fall through
+            // to verify_file_progress as before.
+            // Both hashes MUST drive the progress bar and pump the GUI,
+            // or the window freezes for minutes on USB2 with zero feedback.
+            let uncached = drop_volume_cache(iso_dst);
+            let t0 = std::time::Instant::now();
+            let dst = match hash_reuse_file(iso_dst, "Verifying existing ISO on stick (1/2: USB copy)", iso_len, ui)? {
+                Some(h) => h,
+                None => {
+                    return reuse_unverified("reuse USB-copy hash skipped by user", iso_len, metrics);
+                }
+            };
+            let usb_seconds = t0.elapsed().as_secs_f64();
             let src_len = sys::file_size(iso).unwrap_or(iso_len);
-            src_hash = Some(
-                hash_reuse_file(iso, "Verifying existing ISO on stick (2/2: source file)", src_len, ui)
-                    .ok_or_else(|| format!("cannot hash {} for verification", iso))?,
-            );
+            src_hash = Some(match hash_reuse_file(iso, "Verifying existing ISO on stick (2/2: source file)", src_len, ui)? {
+                Some(h) => h,
+                None => {
+                    return reuse_unverified("reuse source hash skipped by user", iso_len, metrics);
+                }
+            });
             if dst == src_hash.clone().unwrap() {
                 out::info("  existing copy verified (SHA-256 matches the source).");
+                if uncached {
+                    out::info("  (read was uncached - no second USB pass needed.)");
+                    metrics.bytes_verified = iso_len;
+                    metrics.verify_seconds = usb_seconds.max(0.001);
+                    metrics.verify_mbps =
+                        (iso_len as f64 / sys::MB as f64) / metrics.verify_seconds;
+                    return Ok((src_hash.unwrap(), metrics));
+                }
             } else {
                 out::warn("  existing copy is CORRUPT (SHA-256 mismatch) - re-copying from the source.");
                 sys::delete_file(iso_dst);
@@ -2493,6 +2640,14 @@ fn copy_and_verify_iso(
         metrics.write_mbps = m.write_mbps;
     }
     let src = src_hash.unwrap();
+    if skip_verify {
+        // Fresh copy only: the copy hashed the source while writing, but
+        // NOTHING has proven the stick holds it. Reuse always verifies
+        // (single uncached read above), so this flag only ever skips the
+        // post-copy re-read.
+        out::warn("--skip-verify: post-copy re-read SKIPPED. The copy was hashed while writing, but a bad/flaky stick can still corrupt it - if this stick misbehaves, re-run without --skip-verify.");
+        return Ok((src, metrics));
+    }
     let verify = verify_file_progress(iso_dst, &src, ui)?;
     metrics.bytes_verified = verify.bytes_verified;
     metrics.verify_seconds = verify.verify_seconds;
@@ -2589,11 +2744,12 @@ mod tests {
             "/_ISO/mint/initrd",
         );
         assert!(e.contains("title Mint (direct kernel)"));
-        assert!(e.contains("kernel /_ISO/mint/vmlinuz boot=casper iso-scan/filename=/_ISO/mint.iso"));
+        assert!(e.contains("kernel /_ISO/mint/vmlinuz boot=casper iso-scan/filename=/_ISO/mint.iso layerfs-path=/isodevice/casper/filesystem.z0.squashfs rootdelay=15"));
         assert!(e.contains("initrd /_ISO/mint/initrd"));
         assert!(e.contains("\nboot\n"));
         assert!(!e.contains("map "), "direct entry must not use map: {}", e);
         assert!(!e.contains("chainloader"), "direct entry must not chainload: {}", e);
+        assert!(e.contains("layerfs-path=/isodevice/casper/filesystem.z0.squashfs"), "direct entry must stack z0: {}", e);
         // coexists with the loopback entry (different titles)
         let (m1, a1) = upsert_menu(&default_menu(), "Mint (direct kernel)", &e);
         assert!(a1);
