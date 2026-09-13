@@ -206,6 +206,20 @@ fn run() {
         std::process::exit(0);
     }
 
+    // GUI click-path probe (tests/win-gui-test.ps1 drives it with real
+    // mouse events): show ONLY the standalone boot-choice dialog, print
+    // the result, exit. Needs no admin, writes nothing.
+    if opts.gui_test_boot_dialog {
+        let c = boot::show_boot_choice_dialog();
+        out::plain(&format!("boot-dialog-choice: {}", match c {
+            boot::BootChoice::Usb => "usb",
+            boot::BootChoice::Adv => "adv",
+            boot::BootChoice::Fw => "fw",
+            boot::BootChoice::None => "none",
+        }));
+        std::process::exit(0);
+    }
+
     // Pre-flight: this installer writes to the USB and launches Rufus, both of
     // which require Administrator rights, and the DD-mode live USB interacts
     // with Secure Boot - confirm with the user before any destructive step.

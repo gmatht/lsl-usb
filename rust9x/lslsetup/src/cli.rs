@@ -28,6 +28,7 @@ pub struct Opts {
     pub no_elevation: bool,
     pub preload_rust_tools: bool,
     pub probe_os: bool,
+    pub gui_test_boot_dialog: bool,
     // settings the GUI also collects, exposed as flags so a FINISHED-page
     // command line can reproduce the exact wizard choices headlessly
     pub data_dir: String,
@@ -79,6 +80,7 @@ impl Default for Opts {
             no_elevation: false,
             preload_rust_tools: false,
             probe_os: false,
+            gui_test_boot_dialog: false,
             data_dir: String::new(),
             wifi: true,
             wifi_networks: Vec::new(),
@@ -132,6 +134,7 @@ Options:
   --dry-run                  Detection-only mode; writes nothing
   --rate-hardware            With --dry-run: rate ALL PCI/USB devices
   --no-elevation             Skip the administrator check
+  --gui-test-boot-dialog     (test) show only the boot-choice dialog, print the choice, exit
   --preload-rust-tools       Download fd/bat/zoxide onto <USB>:\\bin
   --data-dir <path>           LSL_DATA_DIR to write into lsl-usb.env
   --no-wifi                   Do not copy wifi profiles
@@ -192,6 +195,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--no-elevation" => o.no_elevation = true,
             "--preload-rust-tools" => o.preload_rust_tools = true,
             "--probe-os" => o.probe_os = true,
+            "--gui-test-boot-dialog" => o.gui_test_boot_dialog = true,
             "--data-dir" => o.data_dir = next()?,
             "--no-wifi" => o.wifi = false,
             "--wifi-network" => o.wifi_networks.push(next()?),

@@ -1719,11 +1719,11 @@ impl WorkingUi {
             self.raw_show(self.sum_btn, false);
         }
         y += 36;
-        set_wnd_text(self.sum_copy, "Firmware boot menu");
+        set_wnd_text(self.sum_copy, "Advanced startup menu");
         set_ctl_rect(self.sum_copy, MARGIN + 10, y, bw, 28);
         self.raw_show(self.sum_copy, true);
         y += 36;
-        set_wnd_text(self.sum_open, "Advanced startup menu");
+        set_wnd_text(self.sum_open, "Firmware boot menu");
         set_ctl_rect(self.sum_open, MARGIN + 10, y, bw, 28);
         self.raw_show(self.sum_open, true);
         y += 36;
@@ -1748,6 +1748,7 @@ impl WorkingUi {
         self.boot_adv.set(false);
         self.boot_fw.set(false);
         self.boot_none.set(false);
+        glog(&format!("boot page shown (can_usb={})", can_usb));
         let mut choice: Option<BootChoice> = None;
         while choice.is_none() {
             // raw keys: Escape declines, Return takes the primary action
@@ -1783,8 +1784,15 @@ impl WorkingUi {
         }
         // page's job is done - destroy the window; the console tail and the
         // reboot itself follow (both need no window).
+        let picked = choice.unwrap_or(BootChoice::None);
+        glog(&format!("boot choice: {}", match picked {
+            BootChoice::Usb => "usb",
+            BootChoice::Adv => "adv",
+            BootChoice::Fw => "fw",
+            BootChoice::None => "none",
+        }));
         self.close();
-        choice.unwrap_or(BootChoice::None)
+        picked
     }
 
     fn repaint_window(&self) {

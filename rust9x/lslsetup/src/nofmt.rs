@@ -109,6 +109,31 @@ fn verify_skip_requested() -> bool {
     VERIFY_SKIP_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Throttled live UI for the extract phases (mirrors the copy loop): bar
+/// + status with MB/s + pump, at most ~3x/sec. Without the pump the window
+/// sits unresponsive for the whole multi-minute base-squashfs pull and the
+/// status label never repaints (the bar self-paints, the label doesn't).
+fn extract_ui_tick(
+    u: Option<&dyn WriteUi>,
+    label: &str,
+    done: u64,
+    total: u64,
+    t0: std::time::Instant,
+    last: &mut std::time::Instant,
+) {
+    if last.elapsed().as_millis() < 300 {
+        return;
+    }
+    *last = std::time::Instant::now();
+    let (dm, tm) = (done as f64 / sys::MB as f64, total as f64 / sys::MB as f64);
+    let mbps = dm / t0.elapsed().as_secs_f64().max(0.001);
+    if let Some(u) = u {
+        u.set_progress(done, total);
+        u.set_status(&format!("{} {:.0} / {:.0} MB  ({:.1} MB/s)", label, dm, tm, mbps));
+        u.pump();
+    }
+}
+
 /// Non-blocking console check: S (or Esc) pressed since the last call?
 /// GetAsyncKeyState's latch bit needs no focus, no handle, and consumes
 /// nothing - later prompts see clean input. Prime once (discard), then poll.
@@ -1395,11 +1420,15 @@ fn extract_casper_boot(
             return Some(dest_rel);
         }
         out::step(&format!("Extracting {} from the ISO...", src));
+        let t0 = std::time::Instant::now();
+        let mut last_ui = std::time::Instant::now();
+        if let Some(u) = ui {
+            u.set_status(&format!("Extracting {}...", name));
+            u.pump();
+        }
         let mut last_pct = 0u64;
         let r = iso.extract_file(src, &dest_fs, &mut |done, total| {
-            if let Some(u) = ui {
-                u.set_progress(done, total);
-            }
+            extract_ui_tick(ui, &format!("Extracting {}", name), done, total, t0, &mut last_ui);
             let pct = done * 100 / total.max(1);
             if pct >= last_pct + 10 {
                 last_pct = pct;
@@ -1455,12 +1484,14 @@ fn extract_base_squashfs(iso_path: &str, casper_dir_fs: &str, ui: Option<&dyn Wr
     ));
     if let Some(u) = ui {
         u.show_progress(true);
+        u.set_status("Extracting base squashfs from the ISO...");
+        u.pump();
     }
     let mut last_pct = 0u64;
+    let t0 = std::time::Instant::now();
+    let mut last_ui = std::time::Instant::now();
     let r = iso.extract_file(&src, &dest_fs, &mut |done, total| {
-        if let Some(u) = ui {
-            u.set_progress(done, total);
-        }
+        extract_ui_tick(ui, "Extracting base squashfs", done, total, t0, &mut last_ui);
         let pct = done * 100 / total.max(1);
         if pct >= last_pct + 10 {
             last_pct = pct;
