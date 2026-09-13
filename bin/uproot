@@ -309,30 +309,33 @@ fi
 mount --bind /var/cache/apt/archives/ /tmp/squashfs/root/var/cache/apt/archives/ || true
 mount --bind /home/ /tmp/squashfs/root/home || true
 mkdir -p /tmp/squashfs/root/cdrom
-# Stick visibility inside the chroot - deliberately NO --rbind here:
-# a plain --bind hides firstboot's /cdrom/casper + /cdrom/bin submounts,
-# leaving the read-only ISO visible, so re-bind exactly those submounts
-# as uproot's OWN mounts (a plain umount later detaches only ours).
-# --rbind would propagate firstboot's host binds into the chroot and any
-# recursive unmount (cleanup_mounts, clear_mount_tree) would then detach
-# them on the HOST too - silently breaking every later attempt (observed
-# in QEMU: attempts failing forever on read-only /cdrom/casper).
-# Same treatment for the staging dirs (firmware/drivers/flatpaks/snaps)
-# shadowed from /isodevice, whose root is otherwise invisible in-chroot.
-mount --bind /cdrom /tmp/squashfs/root/cdrom || true
-for sub in casper bin; do
-    if mountpoint -q "/cdrom/${sub}" 2>/dev/null; then
-        mkdir -p "/tmp/squashfs/root/cdrom/${sub}"
-        mount --bind "/cdrom/${sub}" "/tmp/squashfs/root/cdrom/${sub}" || true
-    fi
-done
+# Assemble the chroot's cdrom view from explicit own mounts only - never
+# bind the /cdrom top itself, and never --rbind. Both older shapes failed
+# in QEMU crash-loops:
+#  * plain --bind /cdrom hides firstboot's /cdrom/casper + /cdrom/bin
+#    submounts, leaving the read-only ISO visible in-chroot, so mkdirs
+#    under ISO-covered paths die EROFS (flatpaks staging killed attempt 3);
+#  * --rbind propagates firstboot's host binds into the chroot, and any
+#    recursive unmount then detaches them on the HOST, breaking every
+#    later attempt with read-only /cdrom/casper.
+# Binding the stick's own dirs directly also frees the chroot from
+# depending on firstboot's binds at all. Every mkdir below runs on the
+# writable overlay upper before anything covers it, so EROFS is
+# impossible. Direct-partition layout (/cdrom IS the writable stick,
+# no /isodevice) falls back to the host /cdrom view.
 if mountpoint -q /isodevice 2>/dev/null; then
-    for stage in firmware drivers flatpaks snaps; do
-        if [ -e "/isodevice/${stage}" ]; then
-            mkdir -p "/tmp/squashfs/root/cdrom/${stage}"
-            mount --bind "/isodevice/${stage}" "/tmp/squashfs/root/cdrom/${stage}" || true
+    for sub in casper bin firmware drivers flatpaks snaps; do
+        if [ -e "/isodevice/${sub}" ]; then
+            mkdir -p "/tmp/squashfs/root/cdrom/${sub}"
+            mount --bind "/isodevice/${sub}" "/tmp/squashfs/root/cdrom/${sub}" || true
+        else
+            case "$sub" in
+                firmware|drivers|flatpaks|snaps) mkdir -p "/tmp/squashfs/root/cdrom/${sub}" ;;
+            esac
         fi
     done
+else
+    mount --bind /cdrom /tmp/squashfs/root/cdrom || true
 fi
 #mkdir -p /tmp/squashfs/root/persist
 #if mountpoint -q /persist 2>/dev/null; then
