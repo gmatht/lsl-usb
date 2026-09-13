@@ -71,6 +71,8 @@ pub fn show_dry_run_report(opts: &crate::cli::Opts) {
         out::step("Write mode: non-destructive (nofmt)");
         let uefi_src = crate::nofmt::uefi_source_name(&opts.uefi_bootx64);
         out::info("Would copy grldr + the ISO as a regular file, generate menu.lst (loopback boot),");
+        out::info("drop the first-boot toolkit (bin/uproot et al.), extract the base squashfs,");
+        out::info("and write the embedded z0 firstboot layer to casper\\filesystem.z0.squashfs,");
         if uefi_src != Some("vendored signed shim+GRUB2") {
             out::info("mirror the entries to efi\\grub\\menu.lst for grub4dos-for-UEFI,");
         }

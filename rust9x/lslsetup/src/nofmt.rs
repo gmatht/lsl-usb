@@ -2134,6 +2134,9 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     // First-boot toolkit (bin/uproot et al.): without it the first boot can
     // only stamp trivially. Embedded, LF-normalized, read-back verified.
     crate::lslfiles::install_firstboot_toolkit(&root)?;
+    // z0 firstboot layer (lsl-firstboot.service et al.): the menu's
+    // layerfs-path points at it, so it ships embedded, not hand-staged.
+    crate::lslfiles::install_z0_layer(&root)?;
 
     // UEFI side-load (files only; FAT32 stick). Signed shim -> GRUB2 works
     // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need

@@ -114,6 +114,38 @@ pub fn install_firstboot_toolkit(root: &str) -> Result<Vec<String>, String> {
     Ok(done)
 }
 
+/// Embedded z0 firstboot layer (casper/filesystem.z0.squashfs).
+///
+/// Built from misc/ by misc/build-z0.sh (mksquashfs, WSL) and committed
+/// beside the other embedded assets; the nofmt installer has no mksquashfs
+/// on Windows, so it ships this blob instead of building it. Rebuild
+/// whenever misc/ changes - the blob carries lsl-firstboot.service, and a
+/// stale blob means a stale firstboot. Content-proven in QEMU (layer
+/// stacks base+z0+appended, firstboot stamps, relayer boots Brave/nvim).
+static Z0_BLOB: &[u8] = include_bytes!("../assets/filesystem.z0.squashfs");
+
+/// Write the embedded z0 layer to casper\ on the stick (always overwrite:
+/// 12 KB, and this guarantees the firstboot service stays fresh). The
+/// menu's layerfs-path points at exactly this file, so a missing/stale z0
+/// is a boot failure, not a warning.
+pub fn install_z0_layer(root: &str) -> Result<u64, String> {
+    let dest = format!("{}\\casper\\filesystem.z0.squashfs", root.trim_end_matches('\\'));
+    if Z0_BLOB.len() < 4096 || Z0_BLOB[0..4] != [0x68, 0x73, 0x71, 0x73] {
+        return Err("embedded z0 layer is not a squashfs blob (bad magic/size)".into());
+    }
+    if let Some(parent) = std::path::Path::new(&dest).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create casper dir: {}", e))?;
+    }
+    std::fs::write(&dest, Z0_BLOB).map_err(|e| format!("write z0 layer: {}", e))?;
+    let back = std::fs::read(&dest).map_err(|e| format!("read back z0 layer: {}", e))?;
+    if back != Z0_BLOB {
+        return Err("verify failed for z0 layer (readback mismatch)".into());
+    }
+    out::info(&format!("z0 firstboot layer ready ({} bytes).", Z0_BLOB.len()));
+    Ok(Z0_BLOB.len() as u64)
+}
+
 // ---------------------------------------------------------------------------
 // Install-LslFiles
 // ---------------------------------------------------------------------------
@@ -782,5 +814,13 @@ mod firstboot_toolkit_tests {
         let ups = FIRSTBOOT_TOOLKIT.iter().find(|(r, _)| *r == "bin\\uproot");
         assert!(ups.is_some());
         assert!(ups.unwrap().1.replace("\r\n", "\n").starts_with("#!/bin/bash\n"));
+    }
+
+    #[test]
+    fn z0_blob_is_shippable_squashfs() {
+        // Rebuild via misc/build-z0.sh whenever misc/ changes; this blob is
+        // what the nofmt installer drops as casper/filesystem.z0.squashfs.
+        assert!(Z0_BLOB.len() >= 4096 && Z0_BLOB.len() <= 1 << 20, "z0 size implausible: {}", Z0_BLOB.len());
+        assert_eq!(&Z0_BLOB[0..4], &[0x68, 0x73, 0x71, 0x73], "z0 must start with hsqs magic");
     }
 }

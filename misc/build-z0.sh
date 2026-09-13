@@ -1,14 +1,14 @@
 #!/bin/bash
 # build-z0.sh - rebuild the firstboot stub layer from misc/ sources.
 # ============================================================================
-# The installer ships the output as casper/filesystem.z0.squashfs (dotted
-# twin of the bundle's filesystem_z0_firstboot.squashfs) via
-# lslsetup's install_lsl_files; casper's layerfs-path parent walk stacks
-# base + z0 + firstboot-built layers. Rebuild whenever misc/ changes and
-# commit the blob beside this script's repo root.
+# The nofmt installer ships the output as casper/filesystem.z0.squashfs
+# (embedded from rust9x/lslsetup/assets/filesystem.z0.squashfs via
+# include_bytes! in src/lslfiles.rs); casper's layerfs-path parent walk
+# stacks base + z0 + firstboot-built layers. Rebuild whenever misc/ changes
+# and commit the blob (cargo test checks hsqs magic/size).
 #
 # Usage: ./misc/build-z0.sh [OUTPUT]
-#   default OUTPUT: <repo-root>/filesystem_z0_firstboot.squashfs
+#   default OUTPUT: <repo-root>/rust9x/lslsetup/assets/filesystem.z0.squashfs
 #
 # Requires: mksquashfs, unsquashfs (WSL: sudo apt install squashfs-tools).
 # Runs unprivileged; all inputs are plain files.
@@ -17,7 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 M="$REPO_ROOT/misc"
-OUT="${1:-$REPO_ROOT/filesystem_z0_firstboot.squashfs}"
+OUT="${1:-$REPO_ROOT/rust9x/lslsetup/assets/filesystem.z0.squashfs}"
 
 for f in lsl-firstboot.sh lsl-firstboot-progress.sh lsl-firstboot.service \
          lsl-firstboot-progress.desktop lsl-boot-time.desktop \
