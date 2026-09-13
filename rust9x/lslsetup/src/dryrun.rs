@@ -73,6 +73,7 @@ pub fn show_dry_run_report(opts: &crate::cli::Opts) {
         out::info("Would copy grldr + the ISO as a regular file, generate menu.lst (loopback boot),");
         out::info("drop the first-boot toolkit (bin/uproot et al.), extract the base squashfs,");
         out::info("and write the embedded z0 firstboot layer to casper\\filesystem.z0.squashfs,");
+        out::info("offering first to delete h2testw leftovers (*.h2w) when space runs short,");
         if uefi_src != Some("vendored signed shim+GRUB2") {
             out::info("mirror the entries to efi\\grub\\menu.lst for grub4dos-for-UEFI,");
         }

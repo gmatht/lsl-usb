@@ -1855,6 +1855,129 @@ pub fn commit_boot_sectors(p: &PendingMbr) -> Result<(), String> {
     Ok(())
 }
 
+/// h2testw leftovers (*.h2w in the volume root): the verifier fills the
+/// stick with numbered 1 GB chunks and leaves them behind, so a "full"
+/// stick is often just test data. Root only (that is where h2testw puts
+/// them); never recursive, never anything but *.h2w.
+fn h2w_files_in(dir_fs: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let w = sys::wide(&format!("{}\\*.h2w", dir_fs));
+    unsafe {
+        let mut fd: winapi::um::minwinbase::WIN32_FIND_DATAW = std::mem::zeroed();
+        let h = winapi::um::fileapi::FindFirstFileW(w.as_ptr(), &mut fd);
+        if h != winapi::um::handleapi::INVALID_HANDLE_VALUE {
+            loop {
+                let name = sys::from_wide(&fd.cFileName);
+                if name != "." && name != ".." {
+                    let size = ((fd.nFileSizeHigh as u64) << 32) | fd.nFileSizeLow as u64;
+                    out.push((format!("{}\\{}", dir_fs, name), size));
+                }
+                if winapi::um::fileapi::FindNextFileW(h, &mut fd) == 0 {
+                    break;
+                }
+            }
+            winapi::um::fileapi::FindClose(h);
+            return out;
+        }
+    }
+    // Win95: FindFirstFileW is a no-op stub; fall back to ANSI.
+    for (name, size) in sys::list_files_ansi(&format!("{}\\*.h2w", dir_fs)) {
+        out.push((format!("{}\\{}", dir_fs, name), size));
+    }
+    out
+}
+
+/// Confirm the .h2w deletion: typed DELETE on the console (matches the
+/// repo's typed-OK convention), modal Yes/No in the GUI (no console to
+/// read there). Thin + interactive: deliberately untested - the logic
+/// around it (scan/delete/recheck) is what the tests pin down.
+fn confirm_h2w_delete(letter: &str, ui: Option<&dyn WriteUi>, summary: &str) -> bool {
+    match ui {
+        None => {
+            out::info(&format!(
+                "{}\nh2testw writes these to verify flash; they are safe to delete.", summary
+            ));
+            out::prompt("Type DELETE to remove them and continue, or press Enter to abort: ") == "DELETE"
+        }
+        Some(_) => {
+            use winapi::um::winuser::{MB_ICONQUESTION, MB_YESNO, MessageBoxW};
+            let text = format!(
+                "{}\n\nh2testw writes these files to verify flash; they are safe to delete.\n\nDelete them and continue?",
+                summary
+            );
+            let (wt, ww) = (sys::wide(&text), sys::wide("lslsetup - USB full of h2testw files?"));
+            let _ = letter;
+            let r = unsafe {
+                MessageBoxW(
+                    std::ptr::null_mut(),
+                    wt.as_ptr(),
+                    ww.as_ptr(),
+                    MB_YESNO | MB_ICONQUESTION,
+                )
+            };
+            r == 6 // IDYES
+        }
+    }
+}
+
+/// Delete the confirmed .h2w files, then re-check space. `free_now` is a
+/// parameter (not queried inside) so tests can inject values; production
+/// passes `sys::free_bytes(letter)`.
+fn h2w_delete_and_recheck(letter: &str, found: &[(String, u64)], need: u64, free_now: Option<u64>) -> Result<bool, String> {
+    let mut failed = 0;
+    for (path, _) in found {
+        if std::fs::remove_file(path).is_err() {
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        out::warn(&format!("{} .h2w file(s) could not be deleted (in use?) - continuing with what was freed.", failed));
+    }
+    match free_now {
+        Some(now) if now >= need => {
+            out::info(&format!(
+                "Deleted {} h2testw file(s) - continuing.",
+                found.len() - failed
+            ));
+            Ok(true)
+        }
+        Some(now) => Err(format!(
+            "Deleted the h2testw files but {}: still has only {:.1} GB free (needs {:.1} GB) - free more space, then re-run.",
+            letter, now as f64 / sys::GB as f64, need as f64 / sys::GB as f64
+        )),
+        None => Err(format!("Deleted the h2testw files but could not re-check free space on {}: - re-run to continue.", letter)),
+    }
+}
+
+/// Offer to delete h2testw leftovers when the stick is too full.
+/// Ok(true) = deleted and space now suffices (caller continues);
+/// Ok(false) = nothing to offer (caller emits the plain full-disk error);
+/// Err = declined, still short after delete, or delete-doesn't-cover.
+fn offer_h2w_cleanup(letter: &str, ui: Option<&dyn WriteUi>, free: u64, need: u64) -> Result<bool, String> {
+    let root = format!("{}:\\", letter);
+    let found = h2w_files_in(&root);
+    if found.is_empty() {
+        return Ok(false);
+    }
+    let reclaim: u64 = found.iter().map(|(_, s)| s).sum();
+    let shortfall = need.saturating_sub(free);
+    let summary = format!(
+        "{}: only {:.1} GB free but {:.1} GB needed. Found {} h2testw leftover file(s) (*.h2w, {:.1} GB) in the drive root.",
+        letter, free as f64 / sys::GB as f64, need as f64 / sys::GB as f64,
+        found.len(), reclaim as f64 / sys::GB as f64
+    );
+    if reclaim < shortfall {
+        return Err(format!(
+            "{}\nEven deleting all of them would still leave the stick {:.1} GB short - free more space (or use a bigger stick), then re-run.",
+            summary, (shortfall - reclaim) as f64 / sys::GB as f64
+        ));
+    }
+    if !confirm_h2w_delete(letter, ui, &summary) {
+        return Err(format!("{}\nAborted - the h2testw files were left alone.", summary));
+    }
+    h2w_delete_and_recheck(letter, &found, need, sys::free_bytes(letter))
+}
+
 fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
     let fs_uc = t.fs.to_ascii_uppercase();
     // grub4dos reads FAT12/16/32 and NTFS only. exFAT (the default on many
@@ -1882,12 +2005,17 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         );
     }
     if t.free < iso_len + sys::MB {
-        return Err(format!(
-            "{:.1} GB free on {}:, the ISO needs {:.1} GB - not enough space for the no-reformat method.",
-            t.free as f64 / sys::GB as f64,
-            t.letter,
-            iso_len as f64 / sys::GB as f64
-        ));
+        // A "full" stick is often just h2testw leftovers (*.h2w) - offer
+        // to delete those instead of refusing outright.
+        let cleaned = offer_h2w_cleanup(&t.letter, ui, t.free, iso_len + sys::MB)?;
+        if !cleaned {
+            return Err(format!(
+                "{:.1} GB free on {}:, the ISO needs {:.1} GB - not enough space for the no-reformat method.",
+                t.free as f64 / sys::GB as f64,
+                t.letter,
+                iso_len as f64 / sys::GB as f64
+            ));
+        }
     }
 
     // ---- open the physical disk ----
@@ -2665,6 +2793,62 @@ fn copy_and_verify_iso(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn h2w_scan_finds_only_dot_h2w() {
+        let dir = format!("{}lsl-h2w-test-{}", sys::temp_dir(), std::process::id());
+        sys::create_dir_all(&dir);
+        std::fs::write(format!("{}\\1.h2w", dir), vec![0u8; 100]).unwrap();
+        std::fs::write(format!("{}\\2.H2W", dir), vec![0u8; 50]).unwrap();
+        std::fs::write(format!("{}\\keep.txt", dir), vec![0u8; 60]).unwrap();
+        let mut found = h2w_files_in(&dir);
+        found.sort();
+        // Windows FS is case-insensitive: both casings match, .txt ignored.
+        assert_eq!(found.len(), 2, "unexpected: {:?}", found);
+        assert_eq!(found.iter().map(|(_, s)| s).sum::<u64>(), 150);
+        for (p, _) in &found {
+            std::fs::remove_file(p).unwrap();
+        }
+        std::fs::remove_file(format!("{}\\keep.txt", dir)).unwrap();
+        assert!(h2w_files_in(&dir).is_empty());
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn h2w_delete_frees_only_dot_h2w() {
+        let dir = format!("{}lsl-h2w-del-{}", sys::temp_dir(), std::process::id());
+        sys::create_dir_all(&dir);
+        std::fs::write(format!("{}\\1.h2w", dir), vec![7u8; 100]).unwrap();
+        std::fs::write(format!("{}\\keep.txt", dir), vec![7u8; 60]).unwrap();
+        let found = h2w_files_in(&dir);
+        assert_eq!(found.len(), 1);
+        // Enough space after delete: Ok(true), .h2w gone, .txt kept.
+        assert!(h2w_delete_and_recheck("T", &found, 50, Some(200)).unwrap());
+        assert!(h2w_files_in(&dir).is_empty());
+        assert!(std::path::Path::new(&format!("{}\\keep.txt", dir)).exists());
+        std::fs::remove_file(format!("{}\\keep.txt", dir)).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn h2w_delete_reports_still_short() {
+        let dir = format!("{}lsl-h2w-short-{}", sys::temp_dir(), std::process::id());
+        sys::create_dir_all(&dir);
+        std::fs::write(format!("{}\\9.h2w", dir), vec![7u8; 10]).unwrap();
+        let found = h2w_files_in(&dir);
+        // Delete happens (user confirmed), but space still short: loud Err.
+        let err = h2w_delete_and_recheck("T", &found, u64::MAX, Some(1)).unwrap_err();
+        assert!(err.contains("still has only"), "unexpected: {err}");
+        assert!(h2w_files_in(&dir).is_empty());
+        std::fs::remove_dir(&dir).unwrap();
+        // Unqueryable free space: loud Err, not silent success.
+        sys::create_dir_all(&dir);
+        std::fs::write(format!("{}\\9.h2w", dir), vec![7u8; 10]).unwrap();
+        let found = h2w_files_in(&dir);
+        let err = h2w_delete_and_recheck("T", &found, 1, None).unwrap_err();
+        assert!(err.contains("could not re-check"), "unexpected: {err}");
+        let _ = std::fs::remove_dir(&dir);
+    }
 
     fn valid_mbr() -> [u8; 512] {
         let mut m = [0u8; 512];

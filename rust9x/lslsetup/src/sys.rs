@@ -1029,6 +1029,26 @@ pub fn delete_file(p: &str) {
     }
 }
 
+/// Fresh free-bytes query for a drive letter (post-cleanup re-check: the
+/// UsbTarget snapshot goes stale the moment the user deletes anything).
+pub fn free_bytes(letter: &str) -> Option<u64> {
+    let root = format!("{}:\\", letter);
+    let mut wroot = wide(&root);
+    let mut freeq: winapi::shared::ntdef::ULARGE_INTEGER = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wroot.as_mut_ptr(),
+            &mut freeq,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(unsafe { *freeq.QuadPart() } as u64)
+}
+
 pub fn copy_file(src: &str, dst: &str) -> SysResult<()> {
     let (s, d) = (wide(src), wide(dst));
     unsafe {
