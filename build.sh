@@ -202,7 +202,14 @@ repack_initrd() {
 }
 repack_initrd || { echo "ERROR: initrd repack failed." >&2; exit 1; }
 # Ship both initrds in the bundle so install.ps1 copies them onto the USB.
-cp -a "$DIST/casper" "$BUNDLE/casper"
+# Guarded: without a base initrd (normal in CI) the repack skips and
+# $DIST/casper never exists - preflight already treats absent initrds as
+# optional, so only a failed repack (above) is fatal.
+if [ -d "$DIST/casper" ]; then
+    cp -a "$DIST/casper" "$BUNDLE/casper"
+else
+    echo "No repacked initrds (skipped) - bundle ships without casper/." >&2
+fi
 
 # --- 3. zip it ---------------------------------------------------------------
 # rm first: zip -qr updates an existing archive and leaves stale entries behind.

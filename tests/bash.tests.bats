@@ -612,6 +612,9 @@ EOF
     # point them at scratch too.
     mkdir -p "$TMPDIR_TEST/lower" "$TMPDIR_TEST/upper" "$TMPDIR_TEST/work"
     run env LSL_DATA_DIR="$CD/lsl-data" LSL_HOME_LOWER="$TMPDIR_TEST/lower" LSL_HOME_UPPER="$TMPDIR_TEST/upper" LSL_HOME_WORK="$TMPDIR_TEST/work" bash "$TMPDIR_TEST/flush.sh"
+    # Print captured output on failure: bats otherwise shows only the assert
+    # line, which cannot diagnose container-only failures like this one.
+    if [ "$status" -ne 0 ]; then printf '--- flush.sh output:\n%s\n--- end\n' "$output"; fi
     [ "$status" -eq 0 ]
     [ -f "$CD/home.sfs" ]
 }
