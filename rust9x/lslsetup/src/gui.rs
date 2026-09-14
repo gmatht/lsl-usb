@@ -191,6 +191,80 @@ pub(crate) fn apply_boot_caps(items: &PageItems, letter: &str, uefi_flag: &str, 
     refresh_fw_note(items);
 }
 
+/// Tech tooltips for the BIOS/UEFI checkboxes (single source: build-time
+/// register and method-restore below must never drift apart).
+const BIOS_TT: &str = "grub4dos boots via BIOS/CSM firmware from the MBR boot code + sectors 1-15. Needs FAT/NTFS on an MBR-partitioned stick.";
+const UEFI_TT: &str = "UEFI boot needs a FAT32 stick plus a BOOTX64.EFI loader (vendored assets/BOOTX64.EFI at build time, or --uefi-bootx64). NTFS/GPT+NTFS single-partition sticks cannot UEFI-boot without a separate FAT32 ESP - that is also how Windows does it.";
+/// Tooltip while the write method is not the built-in installer.
+const METHOD_TT: &str = "Used by the built-in installer only - pick Built-in non-destructive above to configure BIOS/UEFI boot.";
+
+/// Drive letter of the checked kind-4 target radio ("" when none).
+fn checked_target_letter(items: &PageItems) -> String {
+    for it in items.borrow().iter() {
+        if let PageCtl::Radio(rb, 4) = &it.ctl {
+            if rb.check_state() == nwg::RadioButtonState::Checked {
+                return rb.text().split(':').next().unwrap_or("").trim().to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Write mode of the checked kind-3 method radio ("rufus" fallback).
+fn checked_method(items: &PageItems) -> &'static str {
+    for it in items.borrow().iter() {
+        if let PageCtl::Radio(rb, 3) = &it.ctl {
+            if rb.check_state() == nwg::RadioButtonState::Checked {
+                return write_mode_from_label(&rb.text());
+            }
+        }
+    }
+    "rufus"
+}
+
+/// Gate the BIOS/UEFI checkboxes (kinds 5/6) on the write method: only
+/// the built-in (nofmt) installer uses them - Rufus/skip set up boot
+/// themselves, so there the boxes grey out, uncheck, and explain via
+/// label + tooltip. For nofmt the tech tooltips are restored and the
+/// target stick decides via apply_boot_caps.
+pub(crate) fn apply_method_caps(
+    items: &PageItems,
+    bios_tt: &nwg::Tooltip,
+    uefi_tt: &nwg::Tooltip,
+    mode: &str,
+    letter: &str,
+) {
+    if mode == "nofmt" {
+        for it in items.borrow().iter() {
+            match &it.ctl {
+                PageCtl::Check(cb, 5) => bios_tt.set_text(&cb.handle, BIOS_TT),
+                PageCtl::Check(cb, 6) => uefi_tt.set_text(&cb.handle, UEFI_TT),
+                _ => {}
+            }
+        }
+        apply_boot_caps(items, letter, "", false);
+        return;
+    }
+    for it in items.borrow().iter() {
+        match &it.ctl {
+            PageCtl::Check(cb, 5) => {
+                cb.set_enabled(false);
+                cb.set_check_state(nwg::CheckBoxState::Unchecked);
+                cb.set_text("BIOS/CSM boot (built-in installer only)");
+                bios_tt.set_text(&cb.handle, METHOD_TT);
+            }
+            PageCtl::Check(cb, 6) => {
+                cb.set_enabled(false);
+                cb.set_check_state(nwg::CheckBoxState::Unchecked);
+                cb.set_text("UEFI boot (built-in installer only)");
+                uefi_tt.set_text(&cb.handle, METHOD_TT);
+            }
+            _ => {}
+        }
+    }
+    refresh_fw_note(items);
+}
+
 /// Map a write-method radio label to its mode ("rufus" | "nofmt" | "skip").
 /// Pure helper so the mapping is unit-testable (harvest itself needs live
 /// Win32 controls and is covered by the win-install-page GUI test).
@@ -2726,6 +2800,16 @@ pub fn run_gui(
     let wifi_content = WIFI_Y0 + (wifi_checks.borrow().len() as i32).max(1) * 20 + 10;
 
     // ---- page 5: INSTALL NOW (USB write method + target USB picker) ----
+    // Tooltip windows die with the struct: created + Rc-wrapped OUTSIDE
+    // the build block so the method-click handler can rewrite their text
+    // for the life of the wizard (previously they died at block end and
+    // the BIOS/UEFI tooltips never showed at all).
+    let mut __bios_tt: nwg::Tooltip = Default::default();
+    let _ = nwg::Tooltip::builder().build(&mut __bios_tt);
+    let bios_tt = Rc::new(__bios_tt);
+    let mut __uefi_tt: nwg::Tooltip = Default::default();
+    let _ = nwg::Tooltip::builder().build(&mut __uefi_tt);
+    let uefi_tt = Rc::new(__uefi_tt);
     let _ = nwg::Frame::builder()
         .position((MARGIN, 88))
         .size((DEF_CW - 2 * MARGIN, DEF_CH - 88 - NAV_H))
@@ -2755,6 +2839,7 @@ pub fn run_gui(
             .build(&mut help);
         items.push(PageItem { ctl: PageCtl::Lbl(help, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
         iy += 26;
+        // (created + Rc-wrapped outside the build block - see above)
         // target USB picker (kind 4): FIRST on the page - the stick is
         // chosen before the method, so the BIOS/UEFI defaults below can
         // follow it. Removable volumes, first pre-checked.
@@ -2861,10 +2946,6 @@ pub fn run_gui(
         // the selected stick supports them, greyed out with the reason in
         // the label when not (e.g. GPT disables BIOS, NTFS/exFAT or a
         // missing loader disables UEFI). Refreshed on target clicks.
-        let mut bios_tt: nwg::Tooltip = Default::default();
-        let _ = nwg::Tooltip::builder().build(&mut bios_tt);
-        let mut uefi_tt: nwg::Tooltip = Default::default();
-        let _ = nwg::Tooltip::builder().build(&mut uefi_tt);
         for (kind, text) in [(5u8, "BIOS/CSM boot (grub4dos MBR, no reformat)"), (6u8, "UEFI boot (BOOTX64.EFI, Secure Boot off)")] {
             let mut cb: Box<nwg::CheckBox> = Box::default();
             let _ = nwg::CheckBox::builder()
@@ -2875,9 +2956,9 @@ pub fn run_gui(
                 .build(&mut cb);
             cb.set_check_state(nwg::CheckBoxState::Checked);
             if kind == 5 {
-                bios_tt.register(cb.as_ref(), "grub4dos boots via BIOS/CSM firmware from the MBR boot code + sectors 1-15. Needs FAT/NTFS on an MBR-partitioned stick.");
+                bios_tt.register(cb.as_ref(), BIOS_TT);
             } else {
-                uefi_tt.register(cb.as_ref(), "UEFI boot needs a FAT32 stick plus a BOOTX64.EFI loader (vendored assets/BOOTX64.EFI at build time, or --uefi-bootx64). NTFS/GPT+NTFS single-partition sticks cannot UEFI-boot without a separate FAT32 ESP - that is also how Windows does it.");
+                uefi_tt.register(cb.as_ref(), UEFI_TT);
             }
             items.push(PageItem { ctl: PageCtl::Check(cb, kind), x: 10, y: iy, w: -20, h: 20, idx: 0 });
             iy += 24;
@@ -2900,6 +2981,8 @@ pub fn run_gui(
         // Runs after the write for Rufus AND built-in alike.
         let mut check_tt: nwg::Tooltip = Default::default();
         let _ = nwg::Tooltip::builder().build(&mut check_tt);
+        // Same lifetime fix (static text, never rewritten - leak it).
+        let check_tt: &'static mut nwg::Tooltip = Box::leak(Box::new(check_tt));
         {
             let mut cb: Box<nwg::CheckBox> = Box::default();
             let _ = nwg::CheckBox::builder()
@@ -2925,11 +3008,12 @@ pub fn run_gui(
             .parent(&*frame_install)
             .build(&mut note);
         items.push(PageItem { ctl: PageCtl::Lbl(note, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
-        iy += 26;
-        // default the BIOS/UEFI checkboxes to the preselected stick
+        // default the BIOS/UEFI checkboxes to the preselected stick,
+        // then gate them on the preselected write method
         let first_letter = targets.first().map(|u| u.letter.clone()).unwrap_or_default();
         drop(items); // release the borrow_mut above: apply re-borrows
         apply_boot_caps(&install_items, &first_letter, "", true);
+        apply_method_caps(&install_items, &bios_tt, &uefi_tt, effective_pre, &first_letter);
     }
     let install_content = {
         let items = install_items.borrow();
@@ -3268,6 +3352,8 @@ pub fn run_gui(
         let btn_next = btn_next.clone();
         let btn_reboot = btn_reboot.clone();
         let install_items = install_items.clone();
+        let bios_tt_j = bios_tt.clone();
+        let uefi_tt_j = uefi_tt.clone();
         move || {
             if working.get() {
                 return; // working/final phase: wizard pages are gone
@@ -3298,6 +3384,9 @@ pub fn run_gui(
                     });
                 }
             }
+            // Hotkey preselects built-in: restore its BIOS/UEFI boxes too.
+            let letter = checked_target_letter(&install_items);
+            apply_method_caps(&install_items, &bios_tt_j, &uefi_tt_j, "nofmt", &letter);
         }
     });
     let _install_hotkey = nwg::bind_raw_event_handler(
@@ -3344,6 +3433,8 @@ pub fn run_gui(
         let sys_off = sys_off.clone();
         let wifi_off = wifi_off.clone();
         let install_off = install_off.clone();
+        let bios_tt_c = bios_tt.clone();
+        let uefi_tt_c = uefi_tt.clone();
         let iso_geom = iso_geom.clone();
         let fp_geom = fp_geom.clone();
         let sys_geom = sys_geom.clone();
@@ -3709,14 +3800,33 @@ pub fn run_gui(
                             }
                         }
                     }
+                    // INSTALL-page method click: BIOS/UEFI boxes belong
+                    // to the built-in installer - grey out elsewhere.
+                    for it in install_items.borrow().iter() {
+                        if let PageCtl::Radio(rb, 3) = &it.ctl {
+                            if rb.handle.hwnd().map(|h| h as usize) == Some(click_hwnd) {
+                                let mode = write_mode_from_label(&rb.text());
+                                let letter = checked_target_letter(&install_items);
+                                apply_method_caps(&install_items, &bios_tt_c, &uefi_tt_c, mode, &letter);
+                                glog(&format!("method click mode={}", mode));
+                                break;
+                            }
+                        }
+                    }
                     // INSTALL-page target click: refresh the BIOS/UEFI
                     // checkboxes for the newly selected stick (grey out +
-                    // reason when unsupported).
+                    // reason when unsupported) - via the method gate so a
+                    // Rufus/skip selection keeps them greyed out.
                     for it in install_items.borrow().iter() {
                         if let PageCtl::Radio(rb, 4) = &it.ctl {
                             if rb.handle.hwnd().map(|h| h as usize) == Some(click_hwnd) {
                                 let letter = rb.text().split(':').next().unwrap_or("").trim().to_string();
-                                apply_boot_caps(&install_items, &letter, "", false);
+                                let mode = checked_method(&install_items);
+                                if mode == "nofmt" {
+                                    apply_boot_caps(&install_items, &letter, "", false);
+                                } else {
+                                    apply_method_caps(&install_items, &bios_tt_c, &uefi_tt_c, mode, &letter);
+                                }
                                 break;
                             }
                         }
