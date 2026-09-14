@@ -14,23 +14,42 @@
 #
 # Requirements (clean SKIP if missing):
 #   - LSL_ISO (or $1): path to a Mint 22.x ISO
-#   - qemu-system-x86_64 + /dev/kvm
+#   - a QEMU binary (QEMU_BIN, default qemu-system-x86_64) + acceleration
+#     (--accel kvm|whpx|tcg|auto, or LSL_ACCEL; auto takes /dev/kvm else WHPX
+#     when the binary offers it - run the whole script in WSL2 as root with
+#     QEMU_BIN pointing at Windows QEMU for WHPX; no nested virtualization,
+#     QEMU runs on the host. See tests/qemu-boot-test.sh --help.)
 #   - sfdisk, mkfs.vfat (dosfstools), losetup, mksquashfs, unzip, cpio
 #   - root (for losetup/mount)
 #   - a source initrd (LSL_BASE_INITRD or /cdrom/casper/initrd.lz or the ISO initrd)
 set -uo pipefail
 
-ISO="${1:-${LSL_ISO:-}}"
+ACCEL="${LSL_ACCEL:-auto}"
+QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
+POS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --accel) ACCEL="${2:-}"; [ -n "$ACCEL" ] || { echo "--accel needs a value" >&2; exit 2; }; shift 2 ;;
+        --help|-h) echo "Usage: $0 [--accel kvm|whpx|tcg|auto] [ISO_PATH] [EXTRA_KERNEL_ARGS]"; exit 0 ;;
+        --) shift; while [ $# -gt 0 ]; do POS+=("$1"); shift; done; break ;;
+        -*) echo "Unknown option: $1" >&2; exit 2 ;;
+        *) POS+=("$1"); shift ;;
+    esac
+done
+ISO="${POS[0]:-${LSL_ISO:-}}"
+LSL_ACCEL="$ACCEL"
+EXTRA="${POS[1]:-lsl_hdd_mirror_debug}"   # extra kernel args for the boot
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$REPO_ROOT/dist"
 HOOK="$REPO_ROOT/initramfs/lsl_hdd_mirror.sh"
 
 skip() { echo "SKIP: $1"; exit 0; }
+# shellcheck disable=SC1091
+. "$REPO_ROOT/tests/qemu-accel.sh"
 [ -n "$ISO" ]      || skip "LSL_ISO not set (pass the ISO path as \$1 or \$LSL_ISO)"
 [ -f "$ISO" ]      || skip "ISO not found: $ISO"
-command -v qemu-system-x86_64 >/dev/null 2>&1 || skip "qemu-system-x86_64 not installed"
-echo "ARCH: qemu = $(command -v qemu-system-x86_64) (x86_64)"
-[ -c /dev/kvm ]    || skip "/dev/kvm unavailable (need hardware virtualization)"
+command -v "$QEMU_BIN" >/dev/null 2>&1 || skip "$QEMU_BIN not installed"
+echo "ARCH: qemu = $(command -v "$QEMU_BIN") (x86_64)"
 command -v sfdisk  >/dev/null 2>&1 || skip "sfdisk not installed"
 command -v mkfs.vfat >/dev/null 2>&1 || skip "mkfs.vfat (dosfstools) not installed"
 command -v losetup >/dev/null 2>&1 || skip "losetup not installed"
@@ -127,19 +146,27 @@ cat "$HMNT/sfs/manifest.txt"
 umount "$HMNT"; losetup -d "$LOOP2"; sync
 
 # --- boot -------------------------------------------------------------------
-EXTRA="${2:-lsl_hdd_mirror_debug}"   # pass "lsl_no_hdd_mirror lsl_hdd_mirror_debug" to test fallback
-echo "Booting under KVM (console) - waiting up to ~6 min for the hook message ..."
-qemu-system-x86_64 -enable-kvm -m 4096 -smp 4 \
-  -drive file="$DISK",format=raw,if=virtio \
-  -drive file="$HDD",format=raw,if=virtio \
-  -kernel "$WORK/vmlinuz" -initrd "$WORK/initrd.lz" \
+EXTRA="${EXTRA:-lsl_hdd_mirror_debug}"   # pass "lsl_no_hdd_mirror lsl_hdd_mirror_debug" to test fallback
+accel="$(qemu_resolve_accel)" || { echo "No hardware acceleration available - refusing (pass --accel tcg to run unaccelerated)." >&2; exit 1; }
+if [ "$accel" = kvm ] && [ ! -c /dev/kvm ]; then
+    skip "/dev/kvm unavailable for explicit --accel kvm"
+fi
+[ "$accel" = tcg ] && echo "WARNING: unaccelerated TCG boot - expect hours, not minutes." >&2
+echo "Booting with $accel (console) - waiting up to ~6 min for the hook message ..."
+accel_argv=(); qemu_accel_argv accel_argv "$accel" || exit 1
+qdisk="$(qemu_host_path "$DISK")"; qhdd="$(qemu_host_path "$HDD")"
+qkern="$(qemu_host_path "$WORK/vmlinuz")"; qinitrd="$(qemu_host_path "$WORK/initrd.lz")"
+timeout 600 "$QEMU_BIN" "${accel_argv[@]}" -m 4096 -smp 4 \
+  -drive file="$qdisk",format=raw,if=virtio \
+  -drive file="$qhdd",format=raw,if=virtio \
+  -kernel "$qkern" -initrd "$qinitrd" \
   -append "boot=casper username=mint hostname=mint console=ttyS0 noprompt systemd.journald.forward_to_console=1 $EXTRA --" \
   -netdev user,id=n -device virtio-net-pci,netdev=n \
   -nographic -serial mon:stdio >"$WORK/boot.log" 2>&1 &
 QEMU_PID=$!
 
 RC=1
-for i in $(seq 1 36); do   # up to 6 min
+for ((i = 0; i < 36; i++)); do   # up to 6 min
   if grep -q "lsl-hdd-mirror: ADOPTED" "$WORK/boot.log" 2>/dev/null; then
     echo "PASS: hook ADOPTED the HDD mirror (LAYERFS_PATH set)."
     RC=0; break

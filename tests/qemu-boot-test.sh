@@ -75,43 +75,13 @@ case "$ACCEL" in
 esac
 
 # --- accelerator -----------------------------------------------------------
-# auto: kvm when /dev/kvm exists, else whpx when the qemu binary offers it
-# (`-accel help`), else refuse - TCG turns the 30-50 min first boot into
-# many hours. Explicit --accel skips probing (and the refusal).
-qemu_accel_list() {
-    "$QEMU_BIN" -accel help 2>/dev/null || true
-}
-resolve_accel() {
-    if [ "$ACCEL" != "auto" ]; then
-        printf '%s' "$ACCEL"
-        return 0
-    fi
-    if [ -c /dev/kvm ]; then
-        printf 'kvm'
-        return 0
-    fi
-    if qemu_accel_list | grep -qi whpx; then
-        printf 'whpx'
-        return 0
-    fi
-    return 1
-}
-# (Boot builds -accel/-enable-kvm args inline as an array so `-accel whpx`
-# stays two words without unquoted splitting.)
-
-# --- guest path translation --------------------------------------------------
-# A Windows QEMU (qemu-system-x86_64.exe, or QEMU_BIN pointing at one) needs
-# Windows paths. From WSL2 use wslpath, from MSYS2/Cygwin cygpath; anywhere
-# else the paths are assumed already native.
-host_path() {
-    case "$QEMU_BIN" in
-        *.exe|*.EXE)
-            if command -v wslpath >/dev/null 2>&1; then wslpath -w "$1";
-            elif command -v cygpath >/dev/null 2>&1; then cygpath -w "$1";
-            else printf '%s' "$1"; fi ;;
-        *) printf '%s' "$1" ;;
-    esac
-}
+# Shared selection/translation (tests/qemu-accel.sh): auto takes /dev/kvm,
+# else whpx when the qemu binary offers it, else refuses unless tcg is
+# explicit (TCG turns the 30-50 min first boot into many hours).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/qemu-accel.sh"
+# This script's --accel flag feeds the lib via LSL_ACCEL.
+LSL_ACCEL="$ACCEL"
 
 # --- assemble: build the FAT32 USB image + extract kernel/initrd ------------
 phase_assemble() {
@@ -170,7 +140,7 @@ phase_boot() {
     [ -f "$KERNEL" ] || { echo "kernel not found: $KERNEL (run --phase assemble)" >&2; exit 1; }
     [ -f "$INITRD" ] || { echo "initrd not found: $INITRD (run --phase assemble)" >&2; exit 1; }
     local accel
-    accel="$(resolve_accel)" || {
+    accel="$(qemu_resolve_accel)" || {
         echo "No hardware acceleration available (/dev/kvm missing, no whpx in \`$QEMU_BIN -accel help\`)." >&2
         echo "TCG would turn this 30-50 min boot into many hours - refusing. Pass --accel tcg to run unaccelerated anyway." >&2
         exit 1
@@ -188,12 +158,9 @@ phase_boot() {
     # TERM to QEMU, which matters for .exe children whose PIDs kill -0
     # cannot reliably track.
     local qdisk qkern qinitrd
-    qdisk="$(host_path "$DISK")"; qkern="$(host_path "$KERNEL")"; qinitrd="$(host_path "$INITRD")"
+    qdisk="$(qemu_host_path "$DISK")"; qkern="$(qemu_host_path "$KERNEL")"; qinitrd="$(qemu_host_path "$INITRD")"
     local -a accel_args=()
-    case "$accel" in
-        kvm) accel_args=(-enable-kvm) ;;
-        whpx|tcg) accel_args=(-accel "$accel") ;;
-    esac
+    qemu_accel_argv accel_args "$accel" || exit 1
     timeout 3600 "$QEMU_BIN" "${accel_args[@]}" -m 8192 -smp 4 \
       -drive file="$qdisk",format=raw \
       -kernel "$qkern" -initrd "$qinitrd" \

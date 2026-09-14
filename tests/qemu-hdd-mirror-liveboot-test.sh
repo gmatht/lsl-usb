@@ -13,21 +13,39 @@
 # live image; only the kernel/initrd binaries differ. (antiX uses a different
 # live-init fork - see README - and needs its own layout/hook.)
 #
-# Requirements (clean SKIP if missing): qemu-system-x86_64, /dev/kvm, root,
-# unmkinitramfs, cpio, mkfs.ext4, losetup, and a Debian live-boot ISO.
+# Requirements (clean SKIP if missing): a QEMU binary (QEMU_BIN, default
+# qemu-system-x86_64) + acceleration (--accel kvm|whpx|tcg|auto, LSL_ACCEL;
+# whole script runs in WSL2 as root for WHPX, QEMU on host Windows),
+# root, unmkinitramfs, cpio, mkfs.ext4, losetup, and a Debian live-boot ISO.
 set -uo pipefail
 
-ISO="${1:-${LSL_ISO:-/mnt/g/OtherIsos/debian-live-13.6.0-amd64-xfce.iso}}"
+ACCEL="${LSL_ACCEL:-auto}"
+QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
+POS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --accel) ACCEL="${2:-}"; [ -n "$ACCEL" ] || { echo "--accel needs a value" >&2; exit 2; }; shift 2 ;;
+        --help|-h) echo "Usage: $0 [--accel kvm|whpx|tcg|auto] [ISO_PATH] [EXTRA_KERNEL_ARGS] [adopt|fallback]"; exit 0 ;;
+        --) shift; while [ $# -gt 0 ]; do POS+=("$1"); shift; done; break ;;
+        -*) echo "Unknown option: $1" >&2; exit 2 ;;
+        *) POS+=("$1"); shift ;;
+    esac
+done
+ISO="${POS[0]:-${LSL_ISO:-/mnt/g/OtherIsos/debian-live-13.6.0-amd64-xfce.iso}}"
+LSL_ACCEL="$ACCEL"
+EXTRA="${POS[1]:-lsl_hdd_mirror_debug}"
+MODE="${POS[2]:-adopt}"   # "adopt" or "fallback"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$REPO_ROOT/dist"
 HOOK="$REPO_ROOT/initramfs/lsl_liveboot_mirror.sh"
 
 skip() { echo "SKIP: $1"; exit 0; }
+# shellcheck disable=SC1091
+. "$REPO_ROOT/tests/qemu-accel.sh"
 [ -n "$ISO" ]      || skip "LSL_ISO not set (pass the Debian live ISO path as \$1 or \$LSL_ISO)"
 [ -f "$ISO" ]      || skip "ISO not found: $ISO"
-command -v qemu-system-x86_64 >/dev/null 2>&1 || skip "qemu-system-x86_64 not installed"
-echo "ARCH: qemu = $(command -v qemu-system-x86_64) (x86_64)"
-[ -c /dev/kvm ]    || skip "/dev/kvm unavailable (need hardware virtualization)"
+command -v "$QEMU_BIN" >/dev/null 2>&1 || skip "$QEMU_BIN not installed"
+echo "ARCH: qemu = $(command -v "$QEMU_BIN") (x86_64)"
 command -v unmkinitramfs >/dev/null 2>&1 || skip "unmkinitramfs not installed"
 command -v cpio   >/dev/null 2>&1 || skip "cpio not installed"
 command -v losetup >/dev/null 2>&1 || skip "losetup not installed"
@@ -103,28 +121,35 @@ cat "$HMNT/sfs/manifest.txt"
 umount "$HMNT"; losetup -d "$LOOP"; sync
 
 # --- boot (adopt) -----------------------------------------------------------
-EXTRA="${2:-lsl_hdd_mirror_debug}"
-MODE="${3:-adopt}"   # "adopt" or "fallback"
+# EXTRA/MODE already resolved from positionals above.
+iso_args=()
 if [ "$MODE" = "fallback" ]; then
     # Attach the ISO so live-boot can fall back to it (live/filesystem.squashfs).
-    ISO_ARG="-cdrom $ISO"
+    # Only the path is translated (never the -cdrom flag itself).
+    iso_args=(-cdrom "$(qemu_host_path "$ISO")")
     EXPECT="NO ADOPT"
 else
-    ISO_ARG=""
     EXPECT="ADOPT"
 fi
-echo "Booting under KVM ($MODE) - waiting up to ~6 min ..."
-qemu-system-x86_64 -enable-kvm -m 4096 -smp 4 \
-  -drive file="$HDD",format=raw,if=virtio \
-  $ISO_ARG \
-  -kernel "$WORK/vmlinuz" -initrd "$WORK/initrd.lz" \
+accel="$(qemu_resolve_accel)" || { echo "No hardware acceleration available - refusing (pass --accel tcg to run unaccelerated)." >&2; exit 1; }
+if [ "$accel" = kvm ] && [ ! -c /dev/kvm ]; then
+    skip "/dev/kvm unavailable for explicit --accel kvm"
+fi
+[ "$accel" = tcg ] && echo "WARNING: unaccelerated TCG boot - expect hours, not minutes." >&2
+echo "Booting with $accel ($MODE) - waiting up to ~6 min ..."
+accel_argv=(); qemu_accel_argv accel_argv "$accel" || exit 1
+qhdd="$(qemu_host_path "$HDD")"; qkern="$(qemu_host_path "$WORK/vmlinuz")"; qinitrd="$(qemu_host_path "$WORK/initrd.lz")"
+timeout 600 "$QEMU_BIN" "${accel_argv[@]}" -m 4096 -smp 4 \
+  -drive file="$qhdd",format=raw,if=virtio \
+  "${iso_args[@]}" \
+  -kernel "$qkern" -initrd "$qinitrd" \
   -append "boot=live console=ttyS0 systemd.journald.forward_to_console=1 $EXTRA --" \
   -netdev user,id=n -device virtio-net-pci,netdev=n \
   -nographic -serial mon:stdio >"$WORK/boot.log" 2>&1 &
 QEMU_PID=$!
 
 RC=1
-for i in $(seq 1 36); do   # up to 6 min
+for ((i = 0; i < 36; i++)); do   # up to 6 min
   if grep -q "lsl-liveboot-mirror: ADOPTED" "$WORK/boot.log" 2>/dev/null; then
     if [ "$EXPECT" = "ADOPT" ]; then echo "PASS: live-boot hook ADOPTED the HDD mirror (LIVE_MEDIA_PATH=sfs)."; RC=0; fi
     break

@@ -11,21 +11,38 @@
 #
 # This boots under qemu-system-i386 (real 32-bit x86) to prove the 32-bit path.
 #
-# Requirements (clean SKIP if missing): qemu-system-i386, /dev/kvm, root,
-# unmkinitramfs, cpio, mkfs.ext4, losetup, and an antiX live ISO.
+# Requirements (clean SKIP if missing): a QEMU i386 binary (QEMU_BIN, default
+# qemu-system-i386) + acceleration (--accel kvm|whpx|tcg|auto, LSL_ACCEL;
+# whole script runs in WSL2 as root for WHPX, QEMU on host Windows),
+# root, unmkinitramfs, cpio, mkfs.ext4, losetup, and an antiX live ISO.
 set -uo pipefail
 
-ISO="${1:-${LSL_ISO:-/root/Downloads/antiX-26_386-full.iso}}"
+ACCEL="${LSL_ACCEL:-auto}"
+QEMU_BIN="${QEMU_BIN:-qemu-system-i386}"
+POS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --accel) ACCEL="${2:-}"; [ -n "$ACCEL" ] || { echo "--accel needs a value" >&2; exit 2; }; shift 2 ;;
+        --help|-h) echo "Usage: $0 [--accel kvm|whpx|tcg|auto] [ISO_PATH] [EXTRA_KERNEL_ARGS] [adopt|fallback]"; exit 0 ;;
+        --) shift; while [ $# -gt 0 ]; do POS+=("$1"); shift; done; break ;;
+        -*) echo "Unknown option: $1" >&2; exit 2 ;;
+        *) POS+=("$1"); shift ;;
+    esac
+done
+ISO="${POS[0]:-${LSL_ISO:-/root/Downloads/antiX-26_386-full.iso}}"
+LSL_ACCEL="$ACCEL"
+EXTRA="${POS[1]:-lsl_hdd_mirror_debug}"
+MODE="${POS[2]:-adopt}"   # "adopt" or "fallback"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST="$REPO_ROOT/dist"
 HOOK="$REPO_ROOT/initramfs/lsl_antix_mirror.sh"
 
 skip() { echo "SKIP: $1"; exit 0; }
+# shellcheck disable=SC1091
+. "$REPO_ROOT/tests/qemu-accel.sh"
 [ -n "$ISO" ]      || skip "LSL_ISO not set (pass the antiX ISO path as \$1 or \$LSL_ISO)"
 [ -f "$ISO" ]      || skip "ISO not found: $ISO"
-command -v qemu-system-i386 >/dev/null 2>&1 || skip "qemu-system-i386 not installed"
-echo "ARCH: qemu = $(command -v qemu-system-i386) (i386 / 32-bit x86)"
-[ -c /dev/kvm ]    || skip "/dev/kvm unavailable (need hardware virtualization)"
+command -v "$QEMU_BIN" >/dev/null 2>&1 || skip "$QEMU_BIN not installed"
+echo "ARCH: qemu = $(command -v "$QEMU_BIN") (i386 / 32-bit x86)"
 command -v unmkinitramfs >/dev/null 2>&1 || skip "unmkinitramfs not installed"
 command -v cpio   >/dev/null 2>&1 || skip "cpio not installed"
 command -v losetup >/dev/null 2>&1 || skip "losetup not installed"
@@ -89,27 +106,33 @@ cat "$HMNT/sfs/manifest.txt"
 umount "$HMNT"; losetup -d "$LOOP"; sync
 
 # --- boot ----------------------------------------------------------------
-EXTRA="${2:-lsl_hdd_mirror_debug}"
-MODE="${3:-adopt}"   # "adopt" or "fallback"
+# EXTRA/MODE already resolved from positionals above.
+iso_args=()
 if [ "$MODE" = "fallback" ]; then
-    ISO_ARG="-cdrom $ISO"
+    iso_args=(-cdrom "$(qemu_host_path "$ISO")")
     EXPECT="NO ADOPT"
 else
-    ISO_ARG=""
     EXPECT="ADOPT"
 fi
-echo "Booting under KVM (i386, $MODE) - waiting up to ~6 min ..."
-qemu-system-i386 -enable-kvm -m 2048 -smp 2 \
-  -drive file="$HDD",format=raw,if=ide \
-  $ISO_ARG \
-  -kernel "$WORK/vmlinuz" -initrd "$WORK/initrd.lz" \
+accel="$(qemu_resolve_accel)" || { echo "No hardware acceleration available - refusing (pass --accel tcg to run unaccelerated)." >&2; exit 1; }
+if [ "$accel" = kvm ] && [ ! -c /dev/kvm ]; then
+    skip "/dev/kvm unavailable for explicit --accel kvm"
+fi
+[ "$accel" = tcg ] && echo "WARNING: unaccelerated TCG boot - expect hours, not minutes." >&2
+echo "Booting with $accel (i386, $MODE) - waiting up to ~6 min ..."
+accel_argv=(); qemu_accel_argv accel_argv "$accel" || exit 1
+qhdd="$(qemu_host_path "$HDD")"; qkern="$(qemu_host_path "$WORK/vmlinuz")"; qinitrd="$(qemu_host_path "$WORK/initrd.lz")"
+timeout 600 "$QEMU_BIN" "${accel_argv[@]}" -m 2048 -smp 2 \
+  -drive file="$qhdd",format=raw,if=ide \
+  "${iso_args[@]}" \
+  -kernel "$qkern" -initrd "$qinitrd" \
   -append "console=ttyS0 $EXTRA --" \
   -netdev user,id=n -device virtio-net-pci,netdev=n \
   -nographic -serial mon:stdio >"$WORK/boot.log" 2>&1 &
 QP=$!
 
 RC=1
-for i in $(seq 1 36); do   # up to 6 min
+for ((i = 0; i < 36; i++)); do   # up to 6 min
   if grep -q "lsl-antix-mirror: ADOPTED" "$WORK/boot.log" 2>/dev/null; then
     if [ "$EXPECT" = "ADOPT" ]; then echo "PASS: antiX hook ADOPTED the HDD mirror (SQFILE_FILE=/sfs/filesystem.squashfs)."; RC=0; fi
     break
