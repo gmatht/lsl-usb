@@ -1,8 +1,14 @@
 name: release
 
-# Builds the Windows installer bundle (dist/lsl-usb-win.zip) and publishes it as
-# a GitHub Release asset, so install.bat can auto-fetch the latest bundle via the
-# GitHub API (no hardcoded download URL needed on the user's machine).
+# Publishes the release assets so users can fetch them without building:
+#  - dist/lsl-usb-win.zip (Ubuntu bundle; install.bat auto-fetches the
+#    latest bundle via the GitHub API, no hardcoded URL needed), and
+#  - the rust9x-built lslsetup.exe (Win95->11 installer, Secure-Boot-isolated
+#    nofmt flow). Tag v* (or dispatch) to publish.
+#
+# NOTE: release tags double as the first full end-to-end exercise of this
+# workflow (it has only ever run green via the v0.2.0-ci-test dry run) -
+# check both assets appear before announcing.
 on:
   push:
     tags: ['v*']
@@ -35,5 +41,40 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist/lsl-usb-win.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  rust-exe:
+    # Win95->11 lslsetup.exe via the repo's own script (fetches the vintage
+    # link toolset itself; patches + PE-verify + --help smoke-run included).
+    # Pinned rust9x beta-v2: the toolchain the exe was developed/tested
+    # against (bump deliberately, then re-verify the PE + smoke steps).
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: rust9x/lslsetup
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rust9x toolchain
+        run: |
+          $tag = 'rust9x-1.99-beta-v2'
+          $url = "https://github.com/rust9x/rust/releases/download/$tag/$tag-x86_64-pc-windows-msvc.7z"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\rust9x.7z"
+          & 7z x "$env:TEMP\rust9x.7z" -oC:\opt\rust9x | Out-Null
+          rustup toolchain link rust9x "C:\opt\rust9x\$tag-x86_64-pc-windows-msvc"
+          cargo +rust9x --version
+
+      - name: Build the Win95 exe (release)
+        run: .\win95.ps1 -Release
+
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: rust9x/lslsetup/dist/lslsetup-win95.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -46,10 +46,25 @@ try_grow() {
     fi
 
     # Locate the live loop device backing this mount. Prefer findmnt (gives the
-    # actual /dev/loopN for the mountpoint) over losetup -j, which can miss the
-    # device when the backing-file path is a symlink or was resolved differently.
-    local loop_dev new_size loop_size
+    # actual /dev/loopN for the mountpoint); fall back to losetup -j on the
+    # canonicalized image path for when findmnt shows no loop line at all
+    # (old findmnt, or $mp buried under another mount). readlink first: a
+    # symlinked backing path is exactly what makes a bare -j miss.
+    local loop_dev new_size loop_size fs_mp lower
     loop_dev="$(findmnt -n -o SOURCE "$mp" 2>/dev/null | grep -E '^/dev/loop' | head -1)"
+    if [ -z "$loop_dev" ]; then
+        loop_dev="$(losetup -j "$(readlink -f "$img" 2>/dev/null || printf '%s' "$img")" 2>/dev/null | head -1 | cut -d: -f1)"
+    fi
+
+    # Resize the filesystem where the loop device itself is mounted, not $mp:
+    # $mp can be an overlay/bind stacked on top (session overlay on ro /home),
+    # and resizing there is a silent no-op while the real fs stays full.
+    # Identical to $mp in the normal (direct btrfs loop mount) case.
+    fs_mp="$mp"
+    if [ -n "$loop_dev" ]; then
+        lower="$(findmnt -rn -o TARGET -S "$loop_dev" 2>/dev/null | head -1)"
+        [ -n "$lower" ] && fs_mp="$lower"
+    fi
 
     # PRIMARY (online): make the live loop device pick up the new file size with
     # losetup -c. No unmount needed, so this works even while /home is busy.
@@ -58,8 +73,9 @@ try_grow() {
     fi
 
     # Grow the btrfs filesystem to fill the (now larger) device. This is the step
-    # that actually changes the usable space on a busy mount.
-    if ! btrfs filesystem resize max "$mp"; then
+    # that actually changes the usable space on a busy mount. Target the fs
+    # mount ($fs_mp), never an overlay stacked above it.
+    if ! btrfs filesystem resize max "$fs_mp"; then
         echo "lsl-btrfs-growd: btrfs resize failed (${label}); a reboot may be required to apply the growth." >&2
     fi
 
@@ -85,11 +101,12 @@ try_grow() {
         fi
     fi
 
-    # Re-check: did the usable space actually increase? On kernels that silently
+    # Re-check: did the usable space actually increase? Measure the fs mount
+    # ($fs_mp), not a possible overlay above it. On kernels that silently
     # ignore losetup -c AND with a busy mount, the resize cannot take effect
     # online. Report that clearly and leave a persistent marker so the user
     # knows a reboot (or unmount) is the only fix.
-    after_fp="$(free_pct "$mp")" || after_fp=""
+    after_fp="$(free_pct "$fs_mp")" || after_fp=""
     case "$after_fp" in
         ''|*[!0-9]*) after_fp="$fp" ;;
     esac

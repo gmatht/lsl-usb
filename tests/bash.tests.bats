@@ -576,6 +576,51 @@ EOF
     grep -q "resize max" "$TMPDIR_TEST/btrfs.log"
 }
 
+@test "lsl-btrfs-growd: discovers the loop via losetup -j when findmnt shows no loop" {
+    eval "$(sed -n '/^free_pct()/,/^}/p' bin/lsl-btrfs-growd)"
+    eval "$(sed -n '/^try_grow()/,/^}/p' bin/lsl-btrfs-growd)"
+    IMG="$TMPDIR_TEST/home.btrfs"
+    touch "$IMG"
+    MIN_PCT=10
+    CHUNK_MIB=1024
+    mountpoint() { return 0; }
+    df() { echo "Filesystem 1K-blocks Used Available Use% Mounted on"; echo "/dev/loop0 1048576 950000 48576 95% /home"; }
+    btrfs() { echo "btrfs $*" >> "$TMPDIR_TEST/btrfs.log"; }
+    truncate() { :; }
+    # Old findmnt (or another mount stacked above): no loop line at all.
+    findmnt() { case "$*" in *TARGET*) printf '/lower\n' ;; *) printf 'overlay\n' ;; esac; }
+    # ... so the image path (canonicalized) is the only lead.
+    losetup() { case "$1" in -j) echo "/dev/loop0: [2049]:12345 ($IMG)" ;; -c) echo "losetup -c $2" >> "$TMPDIR_TEST/losetup.log" ;; esac; }
+    run try_grow /home "$IMG" home
+    [ "$status" -eq 0 ]
+    grep -q "losetup -c /dev/loop0" "$TMPDIR_TEST/losetup.log"
+    grep -q "resize max /lower" "$TMPDIR_TEST/btrfs.log"
+}
+
+@test "lsl-btrfs-growd: resizes the underlying fs mount, not a stacked overlay" {
+    eval "$(sed -n '/^free_pct()/,/^}/p' bin/lsl-btrfs-growd)"
+    eval "$(sed -n '/^try_grow()/,/^}/p' bin/lsl-btrfs-growd)"
+    IMG="$TMPDIR_TEST/home.btrfs"
+    touch "$IMG"
+    MIN_PCT=10
+    CHUNK_MIB=1024
+    mountpoint() { return 0; }
+    df() { echo "Filesystem 1K-blocks Used Available Use% Mounted on"; echo "/dev/loop0 1048576 950000 48576 95% /home"; }
+    btrfs() { echo "btrfs $*" >> "$TMPDIR_TEST/btrfs.log"; }
+    truncate() { :; }
+    # findmnt lists every mount stacked on the path (verified live:
+    # loop line first, overlay second) - plus the loop's own mountpoint.
+    findmnt() { case "$*" in *TARGET*) printf '/lower\n' ;; *) printf '/dev/loop0\noverlay\n' ;; esac; }
+    losetup() { case "$1" in -c) echo "losetup -c $2" >> "$TMPDIR_TEST/losetup.log" ;; esac; }
+    run try_grow /home "$IMG" home
+    [ "$status" -eq 0 ]
+    grep -q "losetup -c /dev/loop0" "$TMPDIR_TEST/losetup.log"
+    # The resize must name the lower fs mount: `resize max /home` would hit
+    # the overlay and silently do nothing while the btrfs stays full.
+    grep -q "resize max /lower" "$TMPDIR_TEST/btrfs.log"
+    ! grep -q "resize max /home" "$TMPDIR_TEST/btrfs.log"
+}
+
 # --- bin/uphome / lsl-flush-home.sh / lsl-home-flushd -----------------------
 @test "uphome: HDD mode syncs btrfs" {
     btrfs() { echo "btrfs $*" >> "$TMPDIR_TEST/btrfs.log"; }
