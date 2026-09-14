@@ -390,11 +390,20 @@ fn run() {
                 // the wizard's BIOS/UEFI checkboxes AND the CLI flags must both allow a path
                 let want_bios = opts.bios_boot && g.bios_boot;
                 let want_uefi = opts.uefi_boot && g.uefi_boot;
+                // Extra multiboot ISOs: page-1 checkboxes plus any
+                // --extra-iso flags (deduped; install-time validation
+                // drops the primary again once downloads resolve).
+                let mut extra_isos = g.extra_isos.clone();
+                for e in &opts.extra_isos {
+                    if !extra_isos.iter().any(|q: &String| q.eq_ignore_ascii_case(e)) {
+                        extra_isos.push(e.clone());
+                    }
+                }
                 // The radio click IS the confirmation - re-typing the letter
                 // on the console would stall the working phase. Flag-pinned
                 // targets keep the typed gate (raw-sector writes must never
                 // hinge on a stale flag).
-                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some(), opts.skip_verify) {
+                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some(), opts.skip_verify, &extra_isos) {
                     Ok((t, metrics, pending)) => {
                         // Whole-USB check while the wizard is still open
                         // (live status); a failure offers Back-to-options.
@@ -711,8 +720,15 @@ fn run() {
             } else if write_mode.eq_ignore_ascii_case("nofmt") {
             // Non-destructive grub4dos install: MBR boot-code area only,
             // ISO copied as a file, menu.lst loopback. The stick keeps its
-            // filesystem and all existing files.
-            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false, opts.skip_verify) {
+            // filesystem and all existing files. Other local ISOs are
+            // offered as loopback-only extra boots (no firstboot); an
+            // explicit --extra-iso skips the question.
+            let extra_isos = if opts.extra_isos.is_empty() {
+                offer_extra_isos(&iso)
+            } else {
+                opts.extra_isos.clone()
+            };
+            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false, opts.skip_verify, &extra_isos) {
                 Ok((t, _metrics, pending)) => {
                     pending_mbr = pending;
                     vol = sys::list_volumes()
@@ -1163,6 +1179,49 @@ fn select_existing_usb(label: &str) -> Option<sys::Volume> {
     None
 }
 
+/// Multiboot offer (console nofmt flow): other local ISOs ride along as
+/// loopback-only extra boots - no firstboot, no squashfs unpack. Lists the
+/// detected candidates with sizes; "1,3" picks, empty skips. Never
+/// prompts when there is nothing to offer.
+fn offer_extra_isos(primary_iso: &str) -> Vec<String> {
+    let others = nofmt::detect_other_isos(primary_iso);
+    if others.is_empty() {
+        return Vec::new();
+    }
+    out::step("Other local ISOs detected (optional multiboot)");
+    for (i, p) in others.iter().enumerate() {
+        let sz = sys::file_size(p).unwrap_or(0);
+        out::info(&format!(
+            "  {:2}. {}  ({:.2} GB)",
+            i + 1,
+            p,
+            sz as f64 / sys::GB as f64
+        ));
+    }
+    out::info("Extras boot loopback-only (their own bootloader; no firstboot, no squashfs unpack).");
+    let ans = out::prompt("Add extras as boot entries? Enter numbers (e.g. 1,3), or press Enter to skip: ");
+    if ans.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut picked = Vec::new();
+    for tok in ans.split(|c| c == ',' || c == ' ' || c == ';') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        match tok.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= others.len() => {
+                let p = others[n - 1].clone();
+                if !picked.iter().any(|q: &String| q.eq_ignore_ascii_case(&p)) {
+                    picked.push(p);
+                }
+            }
+            _ => out::warn(&format!("ignoring '{}' (not 1..{})", tok, others.len())),
+        }
+    }
+    picked
+}
+
 /// Pick the desktop installer ISO out of an Ubuntu-flavor cdimage directory
 /// listing (Apache autoindex HTML). Returns (file_url, file_name), preferring
 /// the 64-bit desktop live image (`*-desktop-amd64.iso`, what the USB write
@@ -1338,6 +1397,12 @@ fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str, metr
     if !g.wsl_vhdx.is_empty() {
         lines.push(format!("  - {} WSL VHDX path(s)", g.wsl_vhdx.len()));
     }
+    if !g.extra_isos.is_empty() {
+        lines.push(format!(
+            "  - extra multiboot ISO(s) (loopback-only, no firstboot): {}",
+            g.extra_isos.join(", ")
+        ));
+    }
     if !g.data_dir.is_empty() {
         lines.push(format!("  - LSL_DATA_DIR: {}", g.data_dir));
     }
@@ -1402,6 +1467,9 @@ fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str, metr
     }
     for v in &g.wsl_vhdx {
         a.push(format!("--wsl-vhdx \"{}\"", v));
+    }
+    for e in &g.extra_isos {
+        a.push(format!("--extra-iso \"{}\"", e));
     }
     if !g.data_dir.is_empty() {
         a.push(format!("--data-dir \"{}\"", g.data_dir));

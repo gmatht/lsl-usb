@@ -86,6 +86,22 @@ pub fn show_dry_run_report(opts: &crate::cli::Opts) {
         out::info("and, after every other drop below, flip the MBR boot code (bytes 0..440; signature + partition table kept).");
         out::info("No formatting; existing files untouched. Target must be a removable USB drive,");
         out::info("FAT32/NTFS, MBR-partitioned (--allow-fixed overrides the removable check).");
+        if opts.extra_isos.is_empty() {
+            let others = crate::nofmt::detect_other_isos(&opts.iso_path);
+            if others.is_empty() {
+                out::info("No other local ISOs detected for multiboot extras (--extra-iso to add any).");
+            } else {
+                out::info("Other local ISOs (console offer: loopback-only extras, no firstboot):");
+                for p in &others {
+                    out::info(&format!("  extra candidate: {}", p));
+                }
+            }
+        } else {
+            out::info("Extra loopback-only ISOs (no firstboot, no squashfs unpack):");
+            for p in &opts.extra_isos {
+                out::info(&format!("  extra: {}", p));
+            }
+        }
         if !opts.usb_letter.is_empty() {
             out::info(&format!("Target pin: --usb-letter {}", opts.usb_letter));
         }

@@ -20,6 +20,7 @@ pub struct Opts {
     pub skip_verify: bool,      // skip the post-copy ISO re-read (default off: faster, less safe)
     pub wsl_vhdx: Vec<String>,
     pub flatpak_apps: Vec<String>,
+    pub extra_isos: Vec<String>,
     pub skip_iso_download: bool,
     pub skip_rufus: bool,
     pub no_gui: bool,
@@ -73,6 +74,7 @@ impl Default for Opts {
             skip_verify: false,
             wsl_vhdx: Vec::new(),
             flatpak_apps: Vec::new(),
+            extra_isos: Vec::new(),
             skip_iso_download: false,
             skip_rufus: false,
             no_gui: false,
@@ -130,6 +132,9 @@ Options:
   --volume-label <label>     USB volume label to target
   --wsl-vhdx <path>          Extra WSL VHDX path (repeatable)
   --flatpak-apps <id>        Extra flatpak app id (repeatable)
+  --extra-iso <path>         Extra ISO to add as a loopback-only boot entry
+                             (repeatable; no firstboot, no squashfs unpack -
+                             the primary --iso-path keeps firstboot)
   --skip-iso-download        Do not offer to download a Mint ISO
   --skip-rufus               Do not launch Rufus; wait for a Mint live USB
   --no-gui                   Console-only flow (no config dialog)
@@ -190,6 +195,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--skip-verify" => o.skip_verify = true,
             "--wsl-vhdx" => o.wsl_vhdx.push(next()?),
             "--flatpak-apps" => o.flatpak_apps.push(next()?),
+            "--extra-iso" => o.extra_isos.push(next()?),
             "--skip-iso-download" => o.skip_iso_download = true,
             "--skip-rufus" => o.skip_rufus = true,
             "--no-gui" => o.no_gui = true,
@@ -234,6 +240,8 @@ mod tests {
             "--sfs-hdd-cache",
             "--reclaim-win-swap",
             "--preload-rust-tools",
+            "--extra-iso", "D:\\a.iso",
+            "--extra-iso", "D:\\b.iso",
         ]))
         .unwrap();
         assert_eq!(o.data_dir, "D:\\lsl");
@@ -244,6 +252,7 @@ mod tests {
         assert!(o.sfs_hdd);
         assert!(o.reclaim_win_swap);
         assert!(o.preload_rust_tools);
+        assert_eq!(o.extra_isos, vec!["D:\\a.iso".to_string(), "D:\\b.iso".to_string()]);
     }
 
     #[test]
@@ -256,5 +265,6 @@ mod tests {
         assert!(!o.reclaim_win_swap);
         assert!(o.data_dir.is_empty());
         assert!(o.wifi_networks.is_empty());
+        assert!(o.extra_isos.is_empty());
     }
 }

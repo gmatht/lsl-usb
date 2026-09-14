@@ -1215,6 +1215,7 @@ pub fn install_from_iso(
     ui: Option<&dyn WriteUi>,
     preconfirmed: bool,
     skip_verify: bool,
+    extra_isos: &[String],
 ) -> Result<(UsbTarget, WriteMetrics, Option<PendingMbr>), String> {
     if !want_bios && !want_uefi {
         // Say WHY, not just that: the GUI greys out unsupported paths (the
@@ -1241,6 +1242,9 @@ pub fn install_from_iso(
     out::step("Non-destructive write (no reformat):");
     out::info(&format!("  target: {}", target.describe()));
     out::info(&format!("  iso   : {}", iso));
+    for e in extra_isos {
+        out::info(&format!("  extra : {} (loopback-only, no firstboot)", e));
+    }
     let uefi_plan = resolve_uefi(active_uefi_loader(), uefi_bootx64);
     let uefi_plan_txt = if want_uefi {
         format!("ON ({})", uefi_plan.describe())
@@ -1280,7 +1284,7 @@ pub fn install_from_iso(
         }
     }
 
-    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, active_uefi_loader(), ui, skip_verify)?;
+    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, active_uefi_loader(), ui, skip_verify, extra_isos)?;
     Ok((target, metrics, pending))
 }
 
@@ -1633,9 +1637,211 @@ fn write_menu_entries(
     Ok(title)
 }
 
+/// Same-path comparison for ISO dedupe (Windows: case-insensitive,
+/// slash-insensitive). Pure so the multiboot offer logic is unit-testable.
+fn is_same_iso(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.replace('/', "\\").to_ascii_lowercase();
+    norm(a) == norm(b)
+}
+
+/// Other local ISOs that could ride along as loopback-only extra boots
+/// (primary excluded). Same sources as the primary picker: the Everything
+/// index first, filesystem fallback when it is unavailable. Used by the
+/// console offer and `--extra-iso` validation.
+pub fn detect_other_isos(primary_iso: &str) -> Vec<String> {
+    let mut v = crate::lslfiles::find_everything_isos();
+    if v.is_empty() {
+        v = crate::lslfiles::find_local_isos();
+    }
+    v.into_iter()
+        .filter(|p| !is_same_iso(p, primary_iso))
+        .filter(|p| crate::sys::file_size(p).unwrap_or(0) > 0)
+        .take(20)
+        .collect()
+}
+
+/// Validated extra ISO: (source path, byte length, stick file name).
+/// Fails loud on missing files and FAT32-impossible sizes so a bad
+/// `--extra-iso` aborts before anything is written; the primary itself is
+/// deduped here (same path or same stick name).
+fn validate_extra_isos(
+    extra: &[String],
+    primary_iso: &str,
+    primary_safe: &str,
+    fs_uc: &str,
+) -> Result<Vec<(String, u64, String)>, String> {
+    let mut out = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for e in extra {
+        if is_same_iso(e, primary_iso) {
+            out::info(&format!("extra ISO is the primary install - skipping: {}", e));
+            continue;
+        }
+        let len = crate::sys::file_size(e).unwrap_or(0);
+        if len == 0 {
+            return Err(format!("extra ISO not found or empty: {}", e));
+        }
+        if fs_uc.starts_with("FAT") && len >= 4 * sys::GB {
+            return Err(format!(
+                "extra ISO {} is {:.1} GB - it cannot exist on FAT32. Use an NTFS stick or drop it.",
+                e,
+                len as f64 / sys::GB as f64
+            ));
+        }
+        let safe = sanitize_iso_name(
+            &std::path::Path::new(e)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "image.iso".to_string()),
+        );
+        if safe.eq_ignore_ascii_case(primary_safe)
+            || seen.iter().any(|s: &String| s.eq_ignore_ascii_case(&safe))
+        {
+            out::info(&format!(
+                "extra ISO collides on the stick name '{}' - skipping: {}",
+                safe, e
+            ));
+            continue;
+        }
+        seen.push(safe.clone());
+        out.push((e.clone(), len, safe));
+    }
+    Ok(out)
+}
+
+/// Loopback-only boot entries for one extra ISO (no firstboot): the BIOS
+/// chainload entry in menu.lst (+ the grub4dos-for-UEFI mirror when
+/// `mirror_grub4dos`), and — for casper-shaped ISOs only, once a UEFI
+/// loader is actually installed — a plain (no-z0) entry upserted into
+/// EFI/BOOT/grub.cfg. Nothing is extracted, so the primary's unpacked
+/// squashfs and z0 layer are untouched, and the foreign kernel never stacks
+/// this stick's firstboot layer (which would fire lsl-firstboot.service
+/// against the wrong base). Non-casper extras boot BIOS-only with a
+/// warning, mirroring the primary's loopback-only fallback.
+/// Returns the loopback title.
+pub fn write_extra_iso_entries(
+    root: &str,
+    iso_dst: &str,
+    iso_rel: &str,
+    iso_name: &str,
+    mirror_grub4dos: bool,
+) -> Result<String, String> {
+    let title = format!("{} (loopback ISO)", iso_name.trim_end_matches(".iso"));
+    let menu_path = format!("{}menu.lst", root);
+    let (mut menu, existed) = match std::fs::read_to_string(&menu_path) {
+        Ok(s) => (s, true),
+        Err(_) => (default_menu(), false),
+    };
+    let big_iso = sys::file_size(iso_dst).unwrap_or(u64::MAX) >= 2 * sys::GB;
+    let (m, added) = refresh_menu_entry(&menu, &title, &menu_entry(&title, iso_rel, big_iso));
+    menu = m;
+    let mut dirty = added;
+    if added {
+        out::info(&format!("menu.lst extra entry '{}' (loopback-only, no firstboot)", title));
+    } else {
+        out::info(&format!("menu.lst already contains an entry titled '{}'", title));
+    }
+    let (m, usb_added) = ensure_usb_init(&menu);
+    menu = m;
+    dirty |= usb_added;
+    if dirty {
+        std::fs::write(&menu_path, menu).map_err(|e| format!("write menu.lst: {}", e))?;
+        if !existed {
+            out::info("Created menu.lst.");
+        }
+    }
+    if mirror_grub4dos {
+        let uefi_menu_path = format!("{}efi\\grub\\menu.lst", root);
+        sys::create_dir_all(&format!("{}efi\\grub", root));
+        let (um, uexisted) = match std::fs::read_to_string(&uefi_menu_path) {
+            Ok(s) => (s, true),
+            Err(_) => (default_menu(), false),
+        };
+        let (m, added) = refresh_menu_entry(&um, &title, &menu_entry(&title, iso_rel, big_iso));
+        if added {
+            std::fs::write(&uefi_menu_path, m)
+                .map_err(|e| format!("write efi\\grub\\menu.lst: {}", e))?;
+            out::info(&format!(
+                "{} efi\\grub\\menu.lst extra entry '{}'.",
+                if uexisted { "Updated" } else { "Created" },
+                title
+            ));
+        }
+    }
+    // UEFI signed-GRUB2 entry: only when a loader is actually on the stick
+    // (primary UEFI phase ran) and only for casper-shaped extras, whose
+    // kernel lives at the hardcoded (loop)/casper path. Deliberately
+    // plain (no layerfs-path): see the fn docs.
+    if sys::path_exists(&format!("{}EFI\\BOOT\\BOOTX64.EFI", root)) {
+        if crate::iso::check_live_iso(iso_dst).is_ok() {
+            let cfg_path = format!("{}EFI\\BOOT\\grub.cfg", root);
+            let (existing, existed) = match std::fs::read_to_string(&cfg_path) {
+                Ok(s) => (s, true),
+                Err(_) => ("set timeout=5\n".to_string(), false),
+            };
+            let (cfg, added) =
+                upsert_grub_entry(&existing, &title, &uefi_cfg_entry(&title, iso_rel, false));
+            if added {
+                std::fs::write(&cfg_path, cfg)
+                    .map_err(|e| format!("write grub.cfg: {}", e))?;
+                out::info(&format!(
+                    "{} grub.cfg extra entry '{}' (plain loopback, no z0).",
+                    if existed { "Updated" } else { "Created" },
+                    title
+                ));
+            }
+        } else {
+            out::warn(&format!(
+                "extra '{}' is not casper-shaped - BIOS loopback entry only (UEFI needs a casper-based ISO).",
+                iso_name
+            ));
+        }
+    }
+    Ok(title)
+}
+
+/// Copy each validated extra ISO onto the stick (verified, like the
+/// primary) and add its loopback-only entries. Returns the extra titles.
+/// A failed copy aborts loud (disk-full mid-multiboot must not look like
+/// success); the per-ISO entries are idempotent, so re-running resumes.
+fn install_extra_isos(
+    root: &str,
+    validated: &[(String, u64, String)],
+    mirror_grub4dos: bool,
+    ui: Option<&dyn WriteUi>,
+    skip_verify: bool,
+    metrics: &mut WriteMetrics,
+) -> Result<Vec<String>, String> {
+    let mut titles = Vec::new();
+    for (src, len, safe) in validated {
+        let iso_name = std::path::Path::new(src)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| safe.clone());
+        sys::create_dir_all(&format!("{}_ISO", root));
+        let iso_dst = format!("{}_ISO\\{}", root, safe);
+        let iso_rel = format!("/_ISO/{}", safe);
+        let (_src, m) = copy_and_verify_iso(src, &iso_dst, *len, ui, skip_verify)?;
+        metrics.bytes_copied += m.bytes_copied;
+        metrics.bytes_verified += m.bytes_verified;
+        titles.push(write_extra_iso_entries(root, &iso_dst, &iso_rel, &iso_name, mirror_grub4dos)?);
+    }
+    if !titles.is_empty() {
+        out::info(&format!(
+            "{} extra ISO(s) installed loopback-only (no firstboot): {}.",
+            titles.len(),
+            titles.join(", ")
+        ));
+    }
+    Ok(titles)
+}
+
 /// Write the \EFI\BOOT payload: BOOTX64.EFI (the loader) plus, for the
 /// signed chain, grubx64.efi (GRUB2, verified by shim) and mmx64.efi
-/// (MokManager), and always the generated grub.cfg (the GRUB2 menu).
+/// (MokManager), and upsert this ISO's entry into grub.cfg (the GRUB2
+/// menu). grub.cfg is read-modify-written per title, so installing a second
+/// ISO appends its entry (multiboot) instead of clobbering the first — the
+/// same contract as menu.lst's upsert_menu.
 fn write_efi_bootdir(
     root: &str,
     bootx64: &[u8],
@@ -1653,8 +1859,24 @@ fn write_efi_bootdir(
         std::fs::write(format!("{}\\mmx64.efi", bootdir), mm)
             .map_err(|e| format!("write mmx64.efi: {}", e))?;
     }
-    std::fs::write(format!("{}\\grub.cfg", bootdir), uefi_cfg(title, iso_rel))
-        .map_err(|e| format!("write grub.cfg: {}", e))?;
+    let cfg_path = format!("{}\\grub.cfg", bootdir);
+    match std::fs::read_to_string(&cfg_path) {
+        Err(_) => {
+            // Fresh file: the legacy single-entry layout (header + primary).
+            std::fs::write(&cfg_path, uefi_cfg(title, iso_rel))
+                .map_err(|e| format!("write grub.cfg: {}", e))?;
+            out::info(&format!("Created grub.cfg entry '{}'.", title));
+        }
+        Ok(existing) => {
+            let (cfg, added) = upsert_grub_entry(&existing, title, &uefi_cfg_entry(title, iso_rel, true));
+            if added {
+                std::fs::write(&cfg_path, cfg).map_err(|e| format!("write grub.cfg: {}", e))?;
+                out::info(&format!("Updated grub.cfg entry '{}' (multiboot-safe upsert).", title));
+            } else {
+                out::info(&format!("grub.cfg already contains an entry titled '{}'", title));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1721,6 +1943,7 @@ fn install_files(
     uefi_loader: UefiLoader,
     ui: Option<&dyn WriteUi>,
     skip_verify: bool,
+    extra_isos: &[String],
 ) -> Result<(String, bool, WriteMetrics), String> {
     let root = format!("{}:\\", t.letter);
     // Resolve the UEFI loader up front: the menu-mirror decision depends on
@@ -1770,10 +1993,13 @@ fn install_files(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "image.iso".to_string());
     let safe_name = sanitize_iso_name(&iso_name);
+    // Extras validated up front (bad paths abort before the slow copy).
+    let fs_here = t.fs.to_ascii_uppercase();
+    let validated_extra = validate_extra_isos(extra_isos, iso, &safe_name, &fs_here)?;
     sys::create_dir_all(&format!("{}_ISO", root));
     let iso_dst = format!("{}_ISO\\{}", root, safe_name);
     let iso_rel = format!("/_ISO/{}", safe_name);
-    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui, skip_verify)?;
+    let (_src, mut metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui, skip_verify)?;
     // menu.lst uses grub4dos syntax; when the grub4dos-family loader is
     // used the same entries are mirrored to efi\grub\menu.lst (the only
     // menu location grub4dos-for-UEFI reads - no mirror = UEFI prompt);
@@ -1783,6 +2009,10 @@ fn install_files(
     // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need
     // Secure Boot OFF (see assets/SIGNED-UEFI.txt).
     let uefi_ok = install_uefi_resolved(&root, &title, &iso_rel, uefi_bootx64, uefi_loader)?;
+    // Extra loopback-only ISOs (no firstboot, no extraction) ride along
+    // after the primary's UEFI files, so their grub.cfg entries land in an
+    // already-multiboot-safe file.
+    install_extra_isos(&root, &validated_extra, uefi_res.mirror_menu(), ui, skip_verify, &mut metrics)?;
     Ok((title, uefi_ok, metrics))
 }
 
@@ -2009,7 +2239,7 @@ fn offer_h2w_cleanup(letter: &str, ui: Option<&dyn WriteUi>, free: u64, need: u6
     h2w_delete_and_recheck(letter, &found, need, sys::free_bytes(letter))
 }
 
-fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
+fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool, extra_isos: &[String]) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
     let fs_uc = t.fs.to_ascii_uppercase();
     // grub4dos reads FAT12/16/32 and NTFS only. exFAT (the default on many
     // large sticks) is NOT readable by grub4dos, so a stick left exFAT cannot
@@ -2035,16 +2265,29 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
                 .into(),
         );
     }
-    if t.free < iso_len + sys::MB {
+    // Extra loopback-only ISOs ride along: validate before anything is
+    // written (a bad --extra-iso aborts here, not mid-install) and include
+    // them in the space gate alongside the primary.
+    let primary_safe = sanitize_iso_name(
+        &std::path::Path::new(iso)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "image.iso".to_string()),
+    );
+    let validated_extra = validate_extra_isos(extra_isos, iso, &primary_safe, &fs_uc)?;
+    let extra_bytes: u64 = validated_extra.iter().map(|(_, n, _)| n).sum();
+    let need_bytes = iso_len + extra_bytes + sys::MB;
+    if t.free < need_bytes {
         // A "full" stick is often just h2testw leftovers (*.h2w) - offer
         // to delete those instead of refusing outright.
-        let cleaned = offer_h2w_cleanup(&t.letter, ui, t.free, iso_len + sys::MB)?;
+        let cleaned = offer_h2w_cleanup(&t.letter, ui, t.free, need_bytes)?;
         if !cleaned {
             return Err(format!(
-                "{:.1} GB free on {}:, the ISO needs {:.1} GB - not enough space for the no-reformat method.",
+                "{:.1} GB free on {}:, the ISO{} needs {:.1} GB - not enough space for the no-reformat method.",
                 t.free as f64 / sys::GB as f64,
                 t.letter,
-                iso_len as f64 / sys::GB as f64
+                if validated_extra.is_empty() { String::new() } else { format!(" + {} extra(s)", validated_extra.len()) },
+                need_bytes as f64 / sys::GB as f64
             ));
         }
     }
@@ -2103,7 +2346,7 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         }
         out::step("GPT stick: files-only UEFI install (no raw sectors touched).");
         report_board(false, true);
-        let (title, uefi_ok, metrics) = install_files(t, iso, iso_len, uefi_bootx64, false, true, uefi_loader, ui, skip_verify)?;
+        let (title, uefi_ok, metrics) = install_files(t, iso, iso_len, uefi_bootx64, false, true, uefi_loader, ui, skip_verify, extra_isos)?;
         report_bootability(false, "GPT stick - grub4dos BIOS stage1 has nowhere to live (sectors 1-15 are the GPT header/table)", uefi_ok, &title);
         return Ok((metrics, None));
     }
@@ -2255,11 +2498,12 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     } // end if want_bios (grldr)
 
     // ISO as a regular file under \_ISO\ (skip when an equal-sized copy exists).
+    // `primary_safe` (computed for the space gate above) is this same name.
     let iso_name = std::path::Path::new(iso)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "image.iso".to_string());
-    let safe_name = sanitize_iso_name(&iso_name);
+    let safe_name = primary_safe.clone();
     sys::create_dir_all(&format!("{}_ISO", root));
     let iso_dst = format!("{}_ISO\\{}", root, safe_name);
     let iso_rel = format!("/_ISO/{}", safe_name);
@@ -2267,7 +2511,7 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     // copy (bad USB write, or a stale same-size file already on the stick)
     // would loopback-boot garbage. So the stick copy is SHA-256-verified
     // against the source in every case (unless verification was skipped).
-    let (_src, metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui, skip_verify)?;
+    let (_src, mut metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui, skip_verify)?;
 
     // menu.lst: direct-kernel entry (BIOS + UEFI grub4dos) first, then the
     // loopback chainload fallback (BIOS-only). Resolve the UEFI loader up
@@ -2306,6 +2550,11 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         out::info("UEFI boot not selected - EFI files skipped.");
     }
 
+    // Extra loopback-only ISOs (no firstboot, no extraction) ride along
+    // after the primary's UEFI files, so their grub.cfg entries land in an
+    // already-multiboot-safe file.
+    install_extra_isos(&root, &validated_extra, uefi_res.mirror_menu(), ui, skip_verify, &mut metrics)?;
+
     // Flush the volume: file data must be durable before the boot-code flip.
     if let Ok(v) = std::fs::OpenOptions::new()
         .write(true)
@@ -2335,17 +2584,93 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     Ok((metrics, Some(pending)))
 }
 
-fn uefi_cfg(title: &str, iso_rel: &str) -> String {
+/// One GRUB2 menuentry for a loopback ISO. `with_z0` stacks the firstboot
+/// layer (primary install only); extra loopback-only ISOs pass false so a
+/// foreign kernel never loads this stick's z0 — which would also fire
+/// lsl-firstboot.service against the wrong base. Non-casper ISOs should not
+/// get a grub.cfg entry at all (their kernel lives outside casper/).
+fn uefi_cfg_entry(title: &str, iso_rel: &str, with_z0: bool) -> String {
+    let params = if with_z0 {
+        format!("boot=casper iso-scan/filename={iso_rel} layerfs-path=/isodevice/casper/filesystem.z0.squashfs rootdelay=15 quiet splash")
+    } else {
+        format!("boot=casper iso-scan/filename={iso_rel} rootdelay=15 quiet splash")
+    };
     format!(
-        "set timeout=5\n\
-         menuentry \"{title}\" {{\n\
+        "menuentry \"{title}\" {{\n\
          \x20   search --no-floppy --set=root --file {iso_rel}\n\
          \x20   loopback loop {iso_rel}\n\
          \x20   # Adjust kernel/initrd paths & params for your distro (Ubuntu example):\n\
-         \x20   linux (loop)/casper/vmlinuz boot=casper iso-scan/filename={iso_rel} layerfs-path=/isodevice/casper/filesystem.z0.squashfs rootdelay=15 quiet splash\n\
+         \x20   linux (loop)/casper/vmlinuz {params}\n\
          \x20   initrd (loop)/casper/initrd\n\
          }}\n"
     )
+}
+
+fn uefi_cfg(title: &str, iso_rel: &str) -> String {
+    format!("set timeout=5\n{}", uefi_cfg_entry(title, iso_rel, true))
+}
+
+/// Upsert a `menuentry "TITLE" { ... }` block in a grub.cfg. Same contract
+/// as `upsert_menu` (per-title idempotence, drift replacement), but for
+/// brace-delimited GRUB blocks instead of `title `-led grub4dos stanzas.
+/// Returns (new content, whether it was added or replaced).
+fn upsert_grub_entry(existing: &str, title: &str, entry: &str) -> (String, bool) {
+    if existing.contains(entry.trim()) {
+        return (existing.to_string(), false);
+    }
+    let (stripped, _) = remove_grub_entry(existing, title);
+    let mut out = stripped;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    // Keep the `set timeout=` header grouped at the top when present;
+    // entries append after it in install order (multiboot list).
+    out.push_str(entry);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    (out, true)
+}
+
+/// Remove the `menuentry "TITLE" { ... }` block (header line through the
+/// closing `}` line). Returns (content, whether anything was removed).
+fn remove_grub_entry(existing: &str, title: &str) -> (String, bool) {
+    let want = format!("menuentry \"{title}\"");
+    // A header line matches when it opens a block for exactly this title:
+    // `menuentry "T" {`, `menuentry "T"{`, or bare `menuentry "T"`.
+    fn is_header(line: &str, want: &str) -> bool {
+        let t = line.trim_start();
+        if !t.starts_with(want) {
+            return false;
+        }
+        matches!(t[want.len()..].trim_start().chars().next(), None | Some('{'))
+    }
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut removed = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if is_header(lines[i], &want) {
+            removed = true;
+            // skip to and past the closing brace line (ours is bare `}`)
+            i += 1;
+            while i < lines.len() && lines[i].trim() != "}" {
+                i += 1;
+            }
+            i += 1; // past `}` (or EOF)
+            continue;
+        }
+        kept.push(lines[i]);
+        i += 1;
+    }
+    if !removed {
+        return (existing.to_string(), false);
+    }
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    (out, true)
 }
 
 /// Buffered chunk copy with MB progress on the console. Returns the
@@ -3010,6 +3335,94 @@ mod tests {
     #[test]
     fn iso_name_sanitized() {
         assert_eq!(sanitize_iso_name("linux mint 22.iso"), "linux_mint_22.iso");
+    }
+
+    #[test]
+    fn grub_cfg_upsert_is_idempotent_and_multiboot() {
+        let a = uefi_cfg_entry("Mint (loopback ISO)", "/_ISO/mint.iso", true);
+        let b = uefi_cfg_entry("Debian (loopback ISO)", "/_ISO/debian.iso", false);
+        // primary keeps the firstboot stack; extras must not load it.
+        assert!(a.contains("layerfs-path=/isodevice/casper/filesystem.z0.squashfs"));
+        assert!(a.contains("iso-scan/filename=/_ISO/mint.iso"));
+        assert!(!b.contains("layerfs-path"));
+        assert!(b.contains("iso-scan/filename=/_ISO/debian.iso"));
+        // legacy single-entry helper is the primary entry plus header.
+        assert_eq!(uefi_cfg("Mint (loopback ISO)", "/_ISO/mint.iso"), format!("set timeout=5\n{}", a));
+        // fresh file: header kept, one entry.
+        let (g1, added1) = upsert_grub_entry("set timeout=5\n", "Mint (loopback ISO)", &a);
+        assert!(added1);
+        assert!(g1.starts_with("set timeout=5\n"));
+        assert_eq!(g1.matches("menuentry").count(), 1);
+        // same entry again: untouched.
+        let (g2, added2) = upsert_grub_entry(&g1, "Mint (loopback ISO)", &a);
+        assert!(!added2);
+        assert_eq!(g2, g1);
+        // second ISO appends (multiboot) instead of clobbering.
+        let (g3, added3) = upsert_grub_entry(&g2, "Debian (loopback ISO)", &b);
+        assert!(added3);
+        assert_eq!(g3.matches("menuentry").count(), 2);
+        assert!(g3.contains("/_ISO/mint.iso") && g3.contains("/_ISO/debian.iso"));
+        // drifted body under the same title replaces instead of duplicating.
+        let a2 = uefi_cfg_entry("Mint (loopback ISO)", "/_ISO/mint2.iso", true);
+        let (g4, changed) = upsert_grub_entry(&g3, "Mint (loopback ISO)", &a2);
+        assert!(changed);
+        assert_eq!(g4.matches("menuentry").count(), 2);
+        assert!(g4.contains("/_ISO/mint2.iso") && !g4.contains("/_ISO/mint.iso"));
+        // removal drops exactly one block.
+        let (g5, removed) = remove_grub_entry(&g4, "Debian (loopback ISO)");
+        assert!(removed);
+        assert_eq!(g5.matches("menuentry").count(), 1);
+        assert!(!g5.contains("Debian"));
+        let (_, removed2) = remove_grub_entry(&g5, "Nope");
+        assert!(!removed2);
+    }
+
+    #[test]
+    fn extra_iso_entries_are_loopback_only() {
+        // No BOOTX64.EFI here and no casper ISO on disk: BIOS menu.lst (+ the
+        // grub4dos mirror) only, no direct-kernel entry, no grub.cfg.
+        let dir = format!("{}lsl-extra-test-{}", sys::temp_dir(), std::process::id());
+        sys::create_dir_all(&dir);
+        let root = format!("{}\\", dir);
+        let fake_dst = format!("{}_ISO\\debian.iso", root);
+        let t = write_extra_iso_entries(&root, &fake_dst, "/_ISO/debian.iso", "debian.iso", true).unwrap();
+        assert_eq!(t, "debian (loopback ISO)");
+        let menu = std::fs::read_to_string(format!("{}menu.lst", root)).unwrap();
+        assert!(menu.contains("title debian (loopback ISO)"));
+        assert!(menu.contains("map /_ISO/debian.iso (0xff)"));
+        assert!(!menu.contains("(direct kernel)"), "extras must not extract kernels: {}", menu);
+        let mirror = std::fs::read_to_string(format!("{}efi\\grub\\menu.lst", root)).unwrap();
+        assert!(mirror.contains("title debian (loopback ISO)"));
+        assert!(!std::path::Path::new(&format!("{}EFI\\BOOT\\grub.cfg", root)).exists());
+        // idempotent: a second run changes nothing.
+        let before = menu.clone();
+        write_extra_iso_entries(&root, &fake_dst, "/_ISO/debian.iso", "debian.iso", true).unwrap();
+        assert_eq!(std::fs::read_to_string(format!("{}menu.lst", root)).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extra_iso_validation_dedupes_and_rejects_missing() {
+        let dir = format!("{}lsl-extra-val-{}", sys::temp_dir(), std::process::id());
+        sys::create_dir_all(&dir);
+        let a = format!("{}\\a.iso", dir);
+        let b = format!("{}\\b.iso", dir);
+        std::fs::write(&a, b"fake-iso-a").unwrap();
+        std::fs::write(&b, b"fake-iso-b".to_vec()).unwrap();
+        let primary = format!("{}\\mint.iso", dir);
+        std::fs::write(&primary, b"fake-primary".to_vec()).unwrap();
+        // same path as primary skipped; missing file is a hard error.
+        let v = validate_extra_isos(&[primary.clone(), a.clone()], &primary, "mint.iso", "NTFS").unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].0, a);
+        assert!(validate_extra_isos(&[format!("{}\\nope.iso", dir)], &primary, "mint.iso", "NTFS").is_err());
+        // FAT32 refuses >= 4 GiB (validation only checks the header rule;
+        // small files pass on both filesystems).
+        assert!(validate_extra_isos(&[b.clone()], &primary, "mint.iso", "FAT32").is_ok());
+        // same-path comparison is slash/case-insensitive.
+        assert!(is_same_iso("C:/ISO/mint.iso", "c:\\iso\\MINT.iso"));
+        assert!(!is_same_iso(&a, &b));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
