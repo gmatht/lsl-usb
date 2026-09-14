@@ -123,7 +123,10 @@ if [ -n "${LSL_FIRSTBOOT_STICK:-}" ]; then
     # create /cdrom. Production never sets this; behavior unchanged.
     STICK_DIR="$LSL_FIRSTBOOT_STICK"
 elif ! try_mount_stick; then
-    # Direct-partition layout? /cdrom itself is the writable stick.
+    # Direct-partition layout? /cdrom itself is the stick - but casper
+    # mounts live media read-only (ISO habit), so remount rw first: vfat
+    # remounts fine, an ISO loop refuses and we fall through correctly.
+    mount /cdrom -o remount,rw 2>/dev/null || true
     if mkdir -p /cdrom/casper 2>/dev/null && touch /cdrom/casper/.write-test 2>/dev/null; then
         rm -f /cdrom/casper/.write-test 2>/dev/null || true
         STICK_DIR=/cdrom
