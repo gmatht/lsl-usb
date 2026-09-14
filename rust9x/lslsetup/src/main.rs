@@ -220,6 +220,15 @@ fn run() {
         std::process::exit(0);
     }
 
+    // Modal-loop click probe: bare nwg window + posted mouse click through
+    // pump_pending (the exact loop the summary/boot pages use). Headless-
+    // safe, needs no admin, writes nothing.
+    if opts.gui_test_modal_clicks {
+        let ok = gui::test_modal_clicks();
+        out::plain(if ok { "modal-clicks: CLICK-OK" } else { "modal-clicks: CLICK-DEAD" });
+        std::process::exit(0);
+    }
+
     // Pre-flight: this installer writes to the USB and launches Rufus, both of
     // which require Administrator rights, and the DD-mode live USB interacts
     // with Secure Boot - confirm with the user before any destructive step.

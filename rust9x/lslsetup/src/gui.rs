@@ -1706,7 +1706,7 @@ impl WorkingUi {
         set_wnd_text(self.sum_heading, "lslsetup - boot the USB");
         set_ctl_rect(self.sum_heading, MARGIN + 10, top + 6, bw, 22);
         self.raw_show(self.sum_heading, true);
-        set_wnd_text(self.sum_body, body);
+        set_wnd_text(self.sum_body, &format!("{}\n\nKeys 1-4 choose directly (Enter = first button, Esc = Don't reboot).", body));
         set_ctl_rect(self.sum_body, MARGIN + 10, top + 34, bw, 60);
         self.raw_show(self.sum_body, true);
         // stacked actions, same order as the standalone dialog
@@ -1749,6 +1749,14 @@ impl WorkingUi {
         self.boot_fw.set(false);
         self.boot_none.set(false);
         glog(&format!("boot page shown (can_usb={})", can_usb));
+        // Visible action order (mirrors the stacked buttons): number keys
+        // 1-4 choose directly, no matter what focus/click delivery does.
+        // (Raw WM_KEYDOWN peek - same channel as the Escape/Return below.)
+        let actions: Vec<BootChoice> = if can_usb {
+            vec![BootChoice::Usb, BootChoice::Adv, BootChoice::Fw, BootChoice::None]
+        } else {
+            vec![BootChoice::Adv, BootChoice::Fw, BootChoice::None]
+        };
         let mut choice: Option<BootChoice> = None;
         while choice.is_none() {
             // raw keys: Escape declines, Return takes the primary action
@@ -1765,6 +1773,18 @@ impl WorkingUi {
                     choice = Some(BootChoice::None);
                 } else if vk == VK_RETURN as u32 {
                     choice = Some(if can_usb { BootChoice::Usb } else { BootChoice::None });
+                } else {
+                    // 1-4 (top row and numpad) pick the nth visible action.
+                    let n = if (0x31..=0x34).contains(&vk) {
+                        vk - 0x30
+                    } else if (0x61..=0x64).contains(&vk) {
+                        vk - 0x60
+                    } else {
+                        0
+                    };
+                    if n >= 1 && (n as usize) <= actions.len() {
+                        choice = Some(actions[n as usize - 1].clone());
+                    }
                 }
             }
             self.pump();
@@ -4163,6 +4183,72 @@ fn harvest_gui_result(
             on
         },
     }
+}
+
+/// Headless click-path probe (--gui-test-modal-clicks): a bare nwg
+/// window + one button driven by the EXACT modal-loop pump
+/// (pump_pending). A helper thread posts a real queued mouse click at the
+/// button; success = the bound OnButtonClick cell sets within 5s.
+/// Distinguishes "pump never delivers clicks" (mechanism dead) from
+/// "page-specific" causes (layout/focus/stale HWNDs).
+pub fn test_modal_clicks() -> bool {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    nwg::init().expect("nwg init for click probe");
+    let clicked: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let clicked_c = clicked.clone();
+    let btn_h: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+    let btn_h_c = btn_h.clone();
+    let mut window: nwg::Window = Default::default();
+    let mut btn: nwg::Button = Default::default();
+    let _ = nwg::Window::builder()
+        .size((300, 200))
+        .title("lsl-click-probe")
+        .build(&mut window);
+    let _ = nwg::Button::builder()
+        .text("Probe")
+        .position((50, 50))
+        .size((200, 40))
+        .parent(&window)
+        .build(&mut btn);
+    window.set_visible(true);
+    let bh = btn.handle.hwnd().map(|h| h as usize).unwrap_or(0);
+    btn_h.set(bh);
+    let main = window.handle.hwnd().map(|h| h as usize).unwrap_or(0);
+    if bh == 0 || main == 0 {
+        return false;
+    }
+    let _handlers = nwg::full_bind_event_handler(&window.handle, move |event, _, handle| {
+        use nwg::Event;
+        match event {
+            Event::OnButtonClick => {
+                let ch = handle.hwnd().map(|h| h as usize).unwrap_or(0);
+                if ch != 0 && ch == btn_h_c.get() {
+                    clicked_c.set(true);
+                }
+            }
+            _ => {}
+        }
+    });
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        unsafe {
+            use winapi::um::winuser::{PostMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON};
+            let lp = (20 << 16) | 100;
+            PostMessageW(bh as _, WM_LBUTTONDOWN, MK_LBUTTON as _, lp as _);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            PostMessageW(bh as _, WM_LBUTTONUP, 0, lp as _);
+        }
+    });
+    let t0 = std::time::Instant::now();
+    while t0.elapsed().as_secs() < 5 {
+        pump_pending(main);
+        if clicked.get() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    clicked.get()
 }
 
 #[cfg(test)]
