@@ -273,19 +273,26 @@ $vol2 = Wait-UsbReady -RufusProc $null -Label '' -KnownVolumes @('E')
 Assert-True ($vol2 -and $vol2.DriveLetter -eq 'G') 'Wait-UsbReady prefers the freshly-written volume over a known one'
 Remove-Item function:global:Start-Sleep -ErrorAction SilentlyContinue
 
-# --- 11. GUI layout bounds (static check: controls fit the 640x760 ClientSize) ---
+# --- 11. GUI layout bounds (static check: controls fit the form's ClientSize) ---
 Write-Host '== GUI layout bounds =='
+# Bounds come from the form's own ClientSize line, so growing the window on
+# purpose (860x760 today) cannot rot this test again - only a control that
+# truly overflows the window fails it.
+$clientW = 640; $clientH = 760
+if ($src -match '\$form\.ClientSize = New-Object System\.Drawing\.Size\((\d+), (\d+)\)') {
+    $clientW = [int]$Matches[1]; $clientH = [int]$Matches[2]
+}
 $layoutOk = $true
 $layoutBad = @()
 foreach ($m in [regex]::Matches($src, 'System\.Drawing\.Point\((\d+), (\d+)\)')) {
     $x = [int]$m.Groups[1].Value; $y = [int]$m.Groups[2].Value
-    if ($x -gt 640 -or $y -gt 760) { $layoutOk = $false; $layoutBad += "Point($x,$y)" }
+    if ($x -gt $clientW -or $y -gt $clientH) { $layoutOk = $false; $layoutBad += "Point($x,$y)" }
 }
 foreach ($m in [regex]::Matches($src, 'System\.Drawing\.Size\((\d+), (\d+)\)')) {
     $w = [int]$m.Groups[1].Value; $h = [int]$m.Groups[2].Value
-    if ($w -gt 640 -or $h -gt 760) { $layoutOk = $false; $layoutBad += "Size($w,$h)" }
+    if ($w -gt $clientW -or $h -gt $clientH) { $layoutOk = $false; $layoutBad += "Size($w,$h)" }
 }
-Assert-True $layoutOk "all GUI control positions/sizes within the 640x760 ClientSize$(if ($layoutBad) { ' - ' + ($layoutBad -join ', ') })"
+Assert-True $layoutOk "all GUI control positions/sizes within the ${clientW}x${clientH} ClientSize$(if ($layoutBad) { ' - ' + ($layoutBad -join ', ') })"
 
 # --- 12. Install-LslFiles (the drop-in) ---
 Write-Host '== Install-LslFiles =='
@@ -332,6 +339,16 @@ function global:Invoke-RestMethod {
 }
 $script:mockDownloaded = @()
 function global:Download { param([string]$Url, [string]$Destination) $script:mockDownloaded += $Url; Set-Content -Path $Destination -Value 'fake-tarball' }
+# The code guards against partial downloads (Test-Path $tmp + non-empty),
+# and Test-Path is mocked to membership-only: register the temp tarballs
+# the mocked Download "writes", or every download reads back as empty
+# (same Join-Path slash-normalizing the code goes through).
+$tmpBase = (($env:TEMP -replace '\\','/') -replace '/+$','')
+$script:mockPaths = @(
+    "$tmpBase/sharkdp_fd-i686-unknown-linux-musl.tar.gz",
+    "$tmpBase/sharkdp_bat-i686-unknown-linux-musl.tar.gz",
+    "$tmpBase/ajeetdsouza_zoxide-i686-unknown-linux-musl.tar.gz"
+)
 $script:mockCopied = @()
 $vol5 = [pscustomobject]@{ DriveLetter = 'G' }
 Install-RustTools -Vol $vol5

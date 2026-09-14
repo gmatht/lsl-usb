@@ -8,6 +8,7 @@ jobs:
   pwsh-tests:
     name: PowerShell harness
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -20,6 +21,7 @@ jobs:
   shellcheck:
     name: ShellCheck
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install shellcheck
@@ -35,6 +37,7 @@ jobs:
   bats:
     name: Bash tests (bats)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Install bats
@@ -45,6 +48,7 @@ jobs:
   build:
     name: Build bundle
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install build deps

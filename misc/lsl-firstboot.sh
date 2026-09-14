@@ -63,7 +63,9 @@ fi
 # by content (the ISO path from the kernel cmdline) and mount it rw at
 # /isodevice. Falls back to /cdrom for direct-partition layouts.
 STICK_DIR=""
-iso_rel="$(sed -n 's/.*iso-scan\/filename=\([^ ]*\).*/\1/p' /proc/cmdline 2>/dev/null | head -n 1)"
+# `|| true`: without /proc/cmdline (MSYS2, unmounted /proc) sed fails and
+# `set -euo pipefail` would kill the script here with no log line at all.
+iso_rel="$(sed -n 's/.*iso-scan\/filename=\([^ ]*\).*/\1/p' /proc/cmdline 2>/dev/null | head -n 1 || true)"
 try_mount_stick() {
     [ -n "$iso_rel" ] || return 1
     mkdir -p /isodevice 2>/dev/null || true
@@ -115,7 +117,12 @@ try_mount_stick() {
     done
     return 1
 }
-if ! try_mount_stick; then
+if [ -n "${LSL_FIRSTBOOT_STICK:-}" ]; then
+    # Test seam (bats): point the stick at a scratch dir instead of
+    # scanning partitions - CI runners are non-root and cannot mount or
+    # create /cdrom. Production never sets this; behavior unchanged.
+    STICK_DIR="$LSL_FIRSTBOOT_STICK"
+elif ! try_mount_stick; then
     # Direct-partition layout? /cdrom itself is the writable stick.
     if mkdir -p /cdrom/casper 2>/dev/null && touch /cdrom/casper/.write-test 2>/dev/null; then
         rm -f /cdrom/casper/.write-test 2>/dev/null || true

@@ -174,7 +174,10 @@ setup_firstboot() {
     export LSL_FIRSTBOOT_ATTEMPT="$TMPDIR_TEST/attempts"
     export LSL_FIRSTBOOT_NET_TRIES=1
     export LSL_FIRSTBOOT_REBOOT=0
-    mkdir -p "$TMPDIR_TEST/bin"
+    # Stick location seam (misc/lsl-firstboot.sh): the partition scan and
+    # the /cdrom fallback both need root; CI runners are non-root.
+    mkdir -p "$TMPDIR_TEST/stick/casper" "$TMPDIR_TEST/bin"
+    export LSL_FIRSTBOOT_STICK="$TMPDIR_TEST/stick"
     printf '#!/bin/bash\necho full\n' > "$TMPDIR_TEST/bin/nmcli"
     chmod +x "$TMPDIR_TEST/bin/nmcli"
     export PATH="$TMPDIR_TEST/bin:$PATH"
@@ -248,7 +251,11 @@ setup_firstboot() {
     cat > "$TMPDIR_TEST/bin/zenity" <<'EOF'
 #!/bin/bash
 head -n 3 > "$ZENITY_INPUT"
-touch "$STAMP"
+# Signal the stamp the progress script actually watches: it polls
+# $LSL_FIRSTBOOT_STAMP (default /cdrom/casper/lsl-firstboot.done), never
+# a bare $STAMP (unset here) - touching that hung the suite to the CI
+# timeout with the stamp never appearing.
+touch "$LSL_FIRSTBOOT_STAMP"
 EOF
     chmod +x "$TMPDIR_TEST/bin/zenity"
     export PATH="$TMPDIR_TEST/bin:$PATH"

@@ -240,6 +240,9 @@ if [ -x /cdrom/bin/wsl-boot-setup ]; then
 fi
 
 # --- LSL data dir / home / cache ---
+# Consumed cross-file by lsl_load_config (bin/lsl-common.sh); shellcheck
+# only sees this file, so the "unused" warning is a false positive.
+# shellcheck disable=SC2034
 LSL_ENV_FILE=/cdrom/lsl-usb.env
 lsl_load_config
 
