@@ -33,7 +33,11 @@ tmp_sfs="/cdrom/home_new_${ts}.sfs"
 
 echo "Writing merged /home to ${tmp_sfs}..."
 # Free-space guard: a full FAT partition makes mksquashfs fail cryptically.
-sz="$(du -sm /home 2>/dev/null | awk '{print $1}')"; sz="${sz:-0}"
+# `|| true`: du exits nonzero (with stderr already suppressed) if ANY entry
+# under /home is unreadable - without this, pipefail + set -e abort the
+# flush silently right here. An unknown size falls back to 0 and the df
+# check below still guards the write.
+sz="$(du -sm /home 2>/dev/null | awk '{print $1}' || true)"; sz="${sz:-0}"
 need_mib="$(( sz + 64 ))"
 if ! lsl_ensure_cdrom_space "$need_mib"; then
     echo "lsl-flush-home.sh: only $(lsl_cdrom_free_mib) MiB free on /cdrom; need ~${need_mib} MiB to flush /home. Aborting." >&2
