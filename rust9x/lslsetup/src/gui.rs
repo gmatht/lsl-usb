@@ -108,6 +108,7 @@ pub struct GuiResult {
     pub uefi_boot: bool,                       // INSTALL-page "UEFI boot" checkbox (default: supported)
     pub check_usb: bool,                       // INSTALL-page "Check whole USB" checkbox (default: off, slow)
     pub extra_isos: Vec<String>,               // page-1 "extra boot" checkboxes (loopback-only, no firstboot)
+    pub download_extras: Vec<(String, String)>, // page-1 kind-11 ticks: (url, name) to download, then loopback-only
 }
 
 /// Wizard pages: 0 hw, 1 iso, 2 flatpak, 3 system, 4 wifi, 5 install.
@@ -2439,9 +2440,49 @@ pub fn run_gui(
     // pre-select it (the harvest re-checks this at Install time too)
     let mint_iso_name = format!("linuxmint-{}-cinnamon-64bit.iso", mint_version);
     let have_mint = find_matching_local_iso(&mint_iso_name, MIN_ISO_SIZE);
-    add_label("Download Fresh (Ram required/recommend):", &mut y);
+    add_label("Download Fresh (Ram required/recommend) - tick extra for multiboot:", &mut y);
     for (i, (name, _url)) in DISTRO_OPTIONS.iter().enumerate() {
-        add_radio(name, i == rec && have_mint.is_none(), 0, i == 0, &mut y);
+        // main radio keeps the distro name (harvest + bg-download match on
+        // it); the extra checkbox (kind 11) rides the same row.
+        let mut rb: Box<nwg::RadioButton> = Box::default();
+        let _ = nwg::RadioButton::builder()
+            .flags(if i == 0 {
+                nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
+            } else {
+                nwg::RadioButtonFlags::VISIBLE
+            })
+            .text(name)
+            .position((10, y))
+            .size((640, 20))
+            .parent(&*frame_iso)
+            .build(&mut rb);
+        if i == rec && have_mint.is_none() {
+            rb.set_check_state(nwg::RadioButtonState::Checked);
+        }
+        iso_items.borrow_mut().push(PageItem {
+            ctl: PageCtl::Radio(rb, 0),
+            x: 10,
+            y,
+            w: 640,
+            h: 20,
+            idx: 0,
+        });
+        let mut cb: Box<nwg::CheckBox> = Box::default();
+        let _ = nwg::CheckBox::builder()
+            .text("extra")
+            .position((660, y))
+            .size((110, 20))
+            .parent(&*frame_iso)
+            .build(&mut cb);
+        iso_items.borrow_mut().push(PageItem {
+            ctl: PageCtl::Check(cb, 11),
+            x: 660,
+            y,
+            w: 110,
+            h: 20,
+            idx: 0,
+        });
+        y += 24;
     }
     // Local ISOs: ONE merged row each - a bold "main" radio (the default
     // boot entry + firstboot layer) plus an "extra" checkbox
@@ -4219,6 +4260,39 @@ fn harvest_gui_result(
         }
     }
 
+    // Download-fresh extras (page-1 kind-11 checkboxes): the nth kind-11
+    // in build order is DISTRO_OPTIONS[n]. (url, name) pairs for main to
+    // download before the install; the primary download is excluded.
+    let primary_url = download_iso.as_ref().map(|(u, _)| u.clone());
+    let mut download_extras: Vec<(String, String)> = Vec::new();
+    {
+        let mut n = 0usize;
+        for it in iso_items.borrow().iter() {
+            if let PageCtl::Check(cb, 11) = &it.ctl {
+                let idx = n;
+                n += 1;
+                if cb.check_state() != nwg::CheckBoxState::Checked {
+                    continue;
+                }
+                if let Some((_, url)) = DISTRO_OPTIONS.get(idx) {
+                    let url = url.to_string();
+                    if primary_url.as_deref() == Some(url.as_str()) {
+                        continue;
+                    }
+                    let name = url
+                        .rsplit('/')
+                        .next()
+                        .filter(|s| s.ends_with(".iso"))
+                        .unwrap_or("downloaded.iso")
+                        .to_string();
+                    if !download_extras.iter().any(|(u, _)| u == &url) {
+                        download_extras.push((url, name));
+                    }
+                }
+            }
+        }
+    }
+
     // Fresh download selected, but an up-to-date, right-sized local copy of
     // the same ISO exists? Reuse it instead of re-downloading (only when the
     // user did not explicitly pick another ISO).
@@ -4331,6 +4405,7 @@ fn harvest_gui_result(
     GuiResult {
         iso_path,
         extra_isos,
+        download_extras,
         flatpak_ids: [flatpak_ids, extra].concat(),
         wsl_vhdx,
         data_dir: data_text,

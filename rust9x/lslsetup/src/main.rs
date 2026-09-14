@@ -399,6 +399,27 @@ fn run() {
                         extra_isos.push(e.clone());
                     }
                 }
+                // Download-fresh extras (page-1 kind-11 ticks): resolve +
+                // download now (synchronous, with progress), then treat the
+                // files as loopback-only extras. A failed extra warns loud
+                // but never kills the main install.
+                let dl_dir = if opts.download_dir.is_empty() {
+                    sys::downloads_dir()
+                } else {
+                    opts.download_dir.clone()
+                };
+                for (url, _name) in &g.download_extras {
+                    match resolve_extra_download(url, &dl_dir, Some(ui)) {
+                        Some(p) => {
+                            if p.eq_ignore_ascii_case(&iso) {
+                                out::info(&format!("Extra download '{}' is the primary ISO - skipping duplicate.", p));
+                            } else if !extra_isos.iter().any(|q: &String| q.eq_ignore_ascii_case(&p)) {
+                                extra_isos.push(p);
+                            }
+                        }
+                        None => out::warn(&format!("Extra download skipped (see above): {}", url)),
+                    }
+                }
                 // The radio click IS the confirmation - re-typing the letter
                 // on the console would stall the working phase. Flag-pinned
                 // targets keep the typed gate (raw-sector writes must never
@@ -1506,6 +1527,59 @@ fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str, metr
 
 /// Resolve-Iso: provided path -> existing ISO picker -> download (Mint or the
 /// GUI-chosen distro URL).
+/// Download one extra multiboot ISO (GUI kind-11 ticks). Mirrors the
+/// resolve+download half of resolve_iso but never prompts and never fails
+/// the install: page-type URLs (antiX/Zorin HTML) and transport-less
+/// machines warn-and-skip (None). Returns the local path on success
+/// (existing files are reused, like the primary).
+fn resolve_extra_download(
+    url: &str,
+    download_dir: &str,
+    ui: Option<&crate::gui::WorkingUi>,
+) -> Option<String> {
+    let (real_url, real_name) = match resolve_page_iso(url) {
+        Some(r) => r,
+        None => {
+            out::warn(&format!("Extra '{}': not a direct ISO link - download it manually and tick it under 'Local ISOs' instead.", url));
+            return None;
+        }
+    };
+    let dest = format!("{}\\{}", download_dir, real_name);
+    if sys::path_exists(&dest) {
+        out::info(&format!("Extra ISO already downloaded: {}", dest));
+        return Some(dest);
+    }
+    if !net::has_transport() {
+        out::warn(&format!("Extra '{}': no HTTP transport - download manually to {} and tick it under 'Local ISOs'.", real_url, dest));
+        return None;
+    }
+    sys::create_dir_all(download_dir);
+    out::step(&format!("Downloading extra {} ...", real_name));
+    let mut last = 0u64;
+    match net::download_to_file(&real_url, &dest, net::user_agent(), &mut |n| {
+        let mb = n / sys::MB;
+        if mb >= last + 200 {
+            last = mb;
+            out::info(&format!("  {} MB...", mb));
+        }
+        if let Some(u) = ui {
+            u.set_status(&format!("Downloading extra {} - {} MB...", real_name, mb));
+            u.pump();
+        }
+    }) {
+        Ok(n) if n > 0 => Some(dest),
+        Ok(_) => {
+            sys::delete_file(&dest);
+            out::warn(&format!("Extra download was empty, skipped: {}", real_name));
+            None
+        }
+        Err(e) => {
+            out::warn(&format!("Extra download failed ({}): {}", real_name, e));
+            None
+        }
+    }
+}
+
 fn resolve_iso(
     path: &str,
     mint_version: &str,
