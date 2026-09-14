@@ -47,6 +47,7 @@ fn is_visible_entry(n: &str) -> bool {
 /// device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`9`, `LPT1`-`9`).
 /// Deterministic; same-directory collisions (including case-only ones on
 /// case-insensitive filesystems) are resolved by the walker with `~n`.
+#[cfg(test)]
 pub fn sanitize_component(name: &str) -> String {
     let mut s = String::with_capacity(name.len());
     for c in name.chars() {
@@ -83,6 +84,7 @@ pub fn sanitize_component(name: &str) -> String {
 /// `\\?\` verbatim prefix for absolute Windows paths (lifts MAX_PATH for
 /// deep ISO trees). Already-verbatim, relative, and non-drive paths pass
 /// through untouched.
+#[cfg(test)]
 pub fn verbatim_path(path: &str) -> String {
     if path.starts_with(r"\\?\") {
         return path.to_string();
@@ -145,6 +147,7 @@ fn parse_entries(dir: &[u8]) -> Vec<(String, u32, u32, bool)> {
 /// One enumerated entry: original ISO-rel path plus its location.
 /// (Kept private: dest mapping needs the collision sets, which live
 /// for exactly one `extract_tree` run.)
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct TreeEntry {
     iso_rel: String, // forward slashes, original ISO names
@@ -306,6 +309,7 @@ impl Iso {
     /// Depth-first walk from a directory extent; each directory read once.
     /// Skips the El Torito `[BOOT]` pseudo-directory (boot catalog images,
     /// not part of the live system). Returns (entries, saw_boot_dir).
+    #[cfg(test)]
     fn enumerate(&mut self) -> Result<(Vec<TreeEntry>, bool), IsoErr> {
         let mut out = Vec::new();
         let mut saw_boot = false;
@@ -345,6 +349,7 @@ impl Iso {
     /// Matching is exact-first, case-insensitive fallback: relaxed-ISO trees
     /// can hold names differing only by case (`File.TxT` vs `FILE.TXT`), and
     /// first-insensitive-match would return the wrong extent for the second.
+    #[cfg(test)]
     fn locate(&mut self, path: &str) -> Result<(u64, u64), IsoErr> {
         fn pick(entries: Vec<(String, u32, u32, bool)>, want: &str, dir: bool) -> Option<(u32, u32)> {
             entries
@@ -408,12 +413,14 @@ impl Iso {
 /// size. Returned so callers can verify (compare against the ISO) and
 /// generate boot entries pointing at the tree.
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub struct ExtractedFile {
     pub iso_rel: String,
     pub dest: String,
     pub size: u64,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub struct ExtractStats {
     pub files: Vec<ExtractedFile>,
@@ -425,6 +432,7 @@ pub struct ExtractStats {
 }
 
 /// Split `name` into (stem, extension) at the last dot for `~n` suffixing.
+#[cfg(test)]
 fn split_suffix(name: &str) -> (String, String) {
     match name.rfind('.') {
         Some(i) if i > 0 => (name[..i].to_string(), name[i..].to_string()),
@@ -432,6 +440,9 @@ fn split_suffix(name: &str) -> (String, String) {
     }
 }
 
+/// Test-only tree API (extract/verify whole ISO trees): prototype used by
+/// the test module; production extracts single files (extract_file).
+#[cfg(test)]
 impl Iso {
     /// Extract the whole tree to `dest_root` (created), skipping `[BOOT]`.
     /// Two passes: enumerate for true totals, then stream each file once.
