@@ -8,8 +8,11 @@
 # Description: Safely repairs an NTFS partition only if it passes strict safety checks.
 # -----------------------------------------------------------------------------
 
-# 1. Root Check
-if [[ "$(id -u)" -ne 0 ]]; then
+# 1. Root Check (skipped under the bats seam: CI runners are non-root and
+# /dev/sdXn does not exist there. The seam unlocks the safety/state logic
+# below for testing; production never sets it, so shipped behavior is
+# unchanged.)
+if [[ "$(id -u)" -ne 0 && -z "${SAFE_NTFSFIX_TEST:-}" ]]; then
    echo "Error: This script must be run as root." 
    exit 1
 fi
@@ -21,8 +24,8 @@ if [[ -z "$DEVICE" ]]; then
     exit 1
 fi
 
-# 3. Device Existence Check
-if [[ ! -b "$DEVICE" ]]; then
+# 3. Device Existence Check (same bats seam as above).
+if [[ ! -b "$DEVICE" && -z "${SAFE_NTFSFIX_TEST:-}" ]]; then
     echo "Error: Device $DEVICE not found."
     exit 1
 fi

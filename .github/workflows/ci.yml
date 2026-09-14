@@ -41,7 +41,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install bats
-        run: sudo apt-get update && sudo apt-get install -y bats
+        # test 29 runs the real build.sh: it hard-requires mksquashfs/zip
+        # (plus unzip/cpio further down) - install the same set as Build bundle.
+        run: sudo apt-get update && sudo apt-get install -y bats squashfs-tools zip unzip cpio
       - name: Run bats
         run: bats tests/bash.tests.bats
 
@@ -52,7 +54,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y squashfs-tools zip
+        # unzip/cpio are hard requirements of build.sh's verify/initrd steps;
+        # installing (not assuming preinstalled) keeps both bundle-building
+        # jobs hermetic.
+        run: sudo apt-get update && sudo apt-get install -y squashfs-tools zip unzip cpio
       - name: Run build.sh
         run: ./build.sh
       - name: Verify artifacts

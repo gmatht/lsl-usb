@@ -73,7 +73,7 @@ function global:Get-Item { param($Path) [pscustomobject]@{ Length = 3GB } }
 function global:Get-Command { param([string]$Name, [string]$ErrorAction) if ($Name -eq 'netsh') { return [pscustomobject]@{ Name = 'netsh' } }; return $null }
 function global:Get-ItemProperty { param([string]$Path, [string]$ErrorAction) $script:mockRegProps[$Path] }
 $script:mockRegProps = @{}
-function global:Get-ChildItem { param([string]$Path, [string]$Recurse, [string]$Filter, [string]$ErrorAction) if ($script:mockChildren.ContainsKey($Path)) { $script:mockChildren[$Path] } else { @() } }
+function global:Get-ChildItem { param([string]$Path, [switch]$Recurse, [string]$Filter, [string]$ErrorAction) if ($script:mockChildren.ContainsKey($Path)) { $script:mockChildren[$Path] } else { @() } }
 $script:mockChildren = @{}
 function global:Get-FileHash { param([string]$Algorithm, [string]$Path) [pscustomobject]@{ Hash = $script:mockHash } }
 $script:mockHash = 'a' * 64
@@ -315,7 +315,7 @@ $script:mockPaths = @()
 function global:New-Item { param([string]$ItemType, [switch]$Force, [string]$Path) }
 function global:Copy-Item { param([string]$Path, [string]$Destination, [switch]$Force) $script:mockCopied += $Destination }
 function global:Get-ChildItem {
-    param([string]$Path, [string]$Recurse, [string]$Filter, [string]$ErrorAction)
+    param([string]$Path, [switch]$Recurse, [string]$Filter, [string]$ErrorAction)
     if ($Filter -eq 'fd' -or $Filter -eq 'bat' -or $Filter -eq 'zoxide') {
         return @([pscustomobject]@{ FullName = ($Path + '\' + $Filter); PSIsContainer = $false })
     }

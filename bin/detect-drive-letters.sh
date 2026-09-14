@@ -1,12 +1,8 @@
 #!/bin/bash
 
-# Ensure the script is run as root (required for mounting)
-if [ "$EUID" -ne 0 ]; then
-  echo "Please run as root (e.g., sudo $0)"
-  exit 1
-fi
-
-# Check for required tools
+# Check for required tools FIRST (before the root check): only builtins
+# are used here, so this also works with an empty PATH and tells the user
+# what is missing before any privilege escalation dance.
 for cmd in blkid mount umount mktemp hivexregedit fdisk xxd; do
     if ! command -v $cmd &> /dev/null; then
         echo "Error: '$cmd' is required but not installed."
@@ -14,6 +10,12 @@ for cmd in blkid mount umount mktemp hivexregedit fdisk xxd; do
         exit 1
     fi
 done
+
+# Ensure the script is run as root (required for mounting)
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root (e.g., sudo $0)"
+  exit 1
+fi
 
 echo "[1/3] Scanning NTFS partitions for Windows installations..."
 best_part=""
@@ -46,7 +48,9 @@ echo "    Found most recently booted Windows on: $best_part"
 
 # Setup a safe mount point
 MOUNT_POINT=$(mktemp -d)
-trap "umount '$MOUNT_POINT' 2>/dev/null; rmdir '$MOUNT_POINT' 2>/dev/null" EXIT
+# Single quotes: expand at signal time, not now (SC2064). Matters the day
+# this variable is ever reassigned; today it also documents the intent.
+trap 'umount "$MOUNT_POINT" 2>/dev/null; rmdir "$MOUNT_POINT" 2>/dev/null' EXIT
 
 echo "[2/3] Mounting $best_part and extracting registry..."
 mount -o ro "$best_part" "$MOUNT_POINT" 2>/dev/null || { echo "Error: Failed to mount $best_part."; exit 1; }

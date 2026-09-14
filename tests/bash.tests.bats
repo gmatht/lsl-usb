@@ -579,6 +579,8 @@ EOF
 # --- bin/uphome / lsl-flush-home.sh / lsl-home-flushd -----------------------
 @test "uphome: HDD mode syncs btrfs" {
     btrfs() { echo "btrfs $*" >> "$TMPDIR_TEST/btrfs.log"; }
+    # Function mocks do not cross into `bash bin/uphome` unless exported.
+    export -f btrfs
     run env LSL_DATA_DIR=/mnt/c/Users/lsl-usb bash bin/uphome
     [ "$status" -eq 0 ]
     grep -q "sync /home" "$TMPDIR_TEST/btrfs.log"
@@ -593,13 +595,23 @@ EOF
 @test "lsl-flush-home: flushes home to home.sfs" {
     CD="$TMPDIR_TEST/cdrom"
     mkdir -p "$CD"
-    cp bin/lsl-flush-home.sh "$TMPDIR_TEST/flush.sh"
-    sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/flush.sh"
+    # The script sources lsl-common.sh SCRIPT_DIR-relative, and both files
+    # hardcode /cdrom (paths, df volume, usb-mode match) - rewrite the pair
+    # to the scratch dir and point LSL_DATA_DIR inside it too.
+    cp bin/lsl-flush-home.sh bin/lsl-common.sh "$TMPDIR_TEST/"
+    sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/lsl-flush-home.sh" "$TMPDIR_TEST/lsl-common.sh"
+    mv "$TMPDIR_TEST/lsl-flush-home.sh" "$TMPDIR_TEST/flush.sh"
+    # Function mocks only affect the child bash when exported.
+    mountpoint() { return 0; }
     mount() { :; }
     umount() { :; }
     mksquashfs() { touch "$2"; }
     find() { :; }
-    run env LSL_DATA_DIR=/cdrom/lsl-data bash "$TMPDIR_TEST/flush.sh"
+    export -f mountpoint mount umount mksquashfs find
+    # Overlay work dirs default to /run (unwritable for non-root CI) -
+    # point them at scratch too.
+    mkdir -p "$TMPDIR_TEST/lower" "$TMPDIR_TEST/upper" "$TMPDIR_TEST/work"
+    run env LSL_DATA_DIR="$CD/lsl-data" LSL_HOME_LOWER="$TMPDIR_TEST/lower" LSL_HOME_UPPER="$TMPDIR_TEST/upper" LSL_HOME_WORK="$TMPDIR_TEST/work" bash "$TMPDIR_TEST/flush.sh"
     [ "$status" -eq 0 ]
     [ -f "$CD/home.sfs" ]
 }
@@ -656,8 +668,12 @@ EOF
     printf '#!/bin/bash\ntrue\n' > "$MOCKS/dmesg"
     printf '#!/bin/bash\necho 0\n' > "$MOCKS/cat"
     printf '#!/bin/bash\ntrue\n' > "$MOCKS/ntfs-3g.probe"
+    printf '#!/bin/bash\nexit 0\n' > "$MOCKS/ntfsfix"
     chmod +x "$MOCKS"/*
-    run env PATH="$MOCKS:$PATH" /bin/bash bin/safe_ntfsfix.sh /dev/sdb1
+    # SAFE_NTFSFIX_TEST skips the root + block-device guards (CI runners
+    # are non-root and /dev/sdb1 does not exist there); the safety/state
+    # logic below is what is under test.
+    run env PATH="$MOCKS:$PATH" SAFE_NTFSFIX_TEST=1 /bin/bash bin/safe_ntfsfix.sh /dev/sdb1
     [ "$status" -eq 1 ]
     [[ "$output" == *"BitLocker"* ]]
 }
@@ -670,8 +686,9 @@ EOF
     printf '#!/bin/bash\ntrue\n' > "$MOCKS/dmesg"
     printf '#!/bin/bash\necho 0\n' > "$MOCKS/cat"
     printf '#!/bin/bash\nexit 0\n' > "$MOCKS/ntfs-3g.probe"
+    printf '#!/bin/bash\nexit 0\n' > "$MOCKS/ntfsfix"
     chmod +x "$MOCKS"/*
-    run env PATH="$MOCKS:$PATH" /bin/bash bin/safe_ntfsfix.sh /dev/sdb1
+    run env PATH="$MOCKS:$PATH" SAFE_NTFSFIX_TEST=1 /bin/bash bin/safe_ntfsfix.sh /dev/sdb1
     [ "$status" -eq 0 ]
     [[ "$output" == *"clean"* ]]
 }
@@ -699,7 +716,7 @@ EOF
     printf '#!/bin/bash\necho "volume is dirty"\n' > "$MOCKS/ntfs-3g.probe"
     printf '#!/bin/bash\necho "ntfsfix $*" > "$NTFSFIX_LOG"\n' > "$MOCKS/ntfsfix"
     chmod +x "$MOCKS"/*
-    run bash -c "printf 'y\n' | env PATH=\"$MOCKS:\$PATH\" NTFSFIX_LOG=\"$TMPDIR_TEST/ntfsfix.log\" /bin/bash bin/safe_ntfsfix.sh /dev/sdb1"
+    run bash -c "printf 'y\n' | env PATH=\"$MOCKS:\$PATH\" SAFE_NTFSFIX_TEST=1 NTFSFIX_LOG=\"$TMPDIR_TEST/ntfsfix.log\" /bin/bash bin/safe_ntfsfix.sh /dev/sdb1"
     [ "$status" -eq 0 ]
     grep -q "ntfsfix -d" "$TMPDIR_TEST/ntfsfix.log"
 }
@@ -710,6 +727,10 @@ EOF
     eval "$(sed -n '/^is_windows_system_volume()/,/^}/p' bin/wsl-boot-setup)"
     eval "$(python3 tests/extract_fn.py bin/wsl-boot-setup pick_partitions)"
     lsblk() { printf '/dev/sda1\tntfs\tpart\n/dev/sdb1\texfat\tpart\n'; }
+    # blkid is deliberately mocked empty: should_probe_ntfs_for_c falls back
+    # to it, and the real blkid would probe the RUNNER's own /dev/sda1 (which
+    # exists there), making the test host-dependent.
+    blkid() { return 1; }
     mount_ro() { return 0; }
     is_windows_system_volume() { return 0; }
     run pick_partitions
@@ -788,7 +809,10 @@ EOF
 
 # --- bin/add-steam-libraries -------------------------------------------------
 @test "add-steam-libraries: adds a library to libraryfolders.vdf" {
-    eval "$(sed -n '/^add_library_to_config()/,/^}/p' bin/add-steam-libraries)"
+    # Brace-aware extraction (tests/extract_fn.py): the function contains a
+    # heredoc with a column-0 `}` (the VDF closing brace), which truncates
+    # the naive sed '/^fn/,/^}/' range mid-heredoc into a syntax error.
+    eval "$(python3 tests/extract_fn.py bin/add-steam-libraries add_library_to_config)"
     STEAM_USER="testuser"
     STEAM_CONFIG_DIR="$TMPDIR_TEST/steam"
     mkdir -p "$STEAM_CONFIG_DIR/steamapps"
@@ -822,6 +846,11 @@ EOF
     touch "$REPO/onboot.sh" "$REPO/install.sh" "$REPO/bin/uproot"
     cp bin/lsl-update-bin "$REPO/bin/lsl-update-bin"
     sed -i "s|/cdrom|$CD|g" "$REPO/bin/lsl-update-bin"
+    # The copy re-escalates via sudo when non-root; under CI sudo that
+    # leaves root-owned files teardown cannot remove. The sync logic (not
+    # privilege escalation) is under test, so no-op the re-exec line here
+    # (replacing, not deleting: an empty `then` clause is a syntax error).
+    sed -i 's|exec sudo "$0" "$@"|: test-seam: stay non-root|' "$REPO/bin/lsl-update-bin"
     mount() { :; }
     install() { cp "$1" "$2"; }
     run bash "$REPO/bin/lsl-update-bin"

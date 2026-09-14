@@ -11,12 +11,15 @@
 #   defaults: 300 seconds -> /cdrom/lsl-precache.list
 set -euo pipefail
 
+# Tool check first: only builtins are used here, so this also reports
+# cleanly with an empty PATH (and before creating any temp files).
+command -v fatrace >/dev/null 2>&1 || { echo "ERROR: fatrace not installed (apt install fatrace)" >&2; exit 1; }
+
 SECS="${1:-300}"
 OUT="${2:-/cdrom/lsl-precache.list}"
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
-command -v fatrace >/dev/null 2>&1 || { echo "ERROR: fatrace not installed (apt install fatrace)" >&2; exit 1; }
 mount /cdrom -o remount,rw 2>/dev/null || true
 
 echo "Recording file reads for ${SECS}s. Use the machine normally; the desktop must be up."
