@@ -822,6 +822,34 @@ fn client_size(hwnd: winapi::shared::windef::HWND) -> (i32, i32) {
 }
 
 /// Position + size a raw HWND (as usize).
+/// Bring the summary/boot action buttons above every sibling (frame,
+/// labels, leftover wizard controls) without moving them. Win32 hit-test
+/// picks the topmost child: anything above a button (e.g. the groupbox
+/// frame, which sends no click notification) swallows real-mouse clicks
+/// silently - no OnButtonClick, no log line - while BM_CLICK and keyboard
+/// keep working. Proven live: real clicks on the boot page missed until
+/// the buttons were re-topped (see --gui-test-boot-page). SWP_NOZORDER is
+/// used everywhere else, so Z would otherwise stay frozen at creation
+/// order forever. Hidden buttons stay hidden (no SWP_SHOWWINDOW).
+fn bring_buttons_top(hs: &[usize]) {
+    use winapi::um::winuser::{SetWindowPos, HWND_TOP, SWP_NOMOVE, SWP_NOSIZE};
+    for &h in hs {
+        if h != 0 && is_window(h) {
+            unsafe {
+                SetWindowPos(
+                    h as winapi::shared::windef::HWND,
+                    HWND_TOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE,
+                );
+            }
+        }
+    }
+}
+
 fn set_ctl_rect(h: usize, x: i32, y: i32, w: i32, hpx: i32) {
     use winapi::um::winuser::{SetWindowPos, HWND_TOP, SWP_NOZORDER};
     if h == 0 || !is_window(h) {
@@ -1729,6 +1757,9 @@ impl WorkingUi {
         self.raw_show(self.status, false); // working-status label
         self.raw_show(self.dl, false);
         self.raw_show(self.dlbar, false);
+        // action buttons above every sibling or real-mouse clicks die
+        // silently on the covering control (see bring_buttons_top).
+        bring_buttons_top(&[self.sum_btn, self.sum_copy, self.sum_open, self.sum_back]);
         self.repaint_window();
 
         // Give the Finish/Close button focus so Enter/Space dismisses the
@@ -1842,6 +1873,10 @@ impl WorkingUi {
         self.raw_show(self.status, false);
         self.raw_show(self.dl, false);
         self.raw_show(self.dlbar, false);
+        // same silent-click-eater guard as the summary page: the four
+        // stacked actions must be the topmost siblings (see
+        // bring_buttons_top). Hidden (can_usb=false) buttons stay hidden.
+        bring_buttons_top(&[self.sum_btn, self.sum_copy, self.sum_open, self.sum_back]);
         self.repaint_window();
 
         use winapi::um::winuser::SetFocus;
@@ -4568,6 +4603,108 @@ pub fn test_modal_clicks() -> bool {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     clicked.get()
+}
+
+/// Wizard boot-page click probe (--gui-test-boot-page): builds the REAL
+/// WorkingUi control set + the REAL ask_boot_choice modal loop (same HWND
+/// reuse, same boot_* cells, same pump) with a canned body, no install.
+/// A real mouse click on any of the four buttons must resolve the choice;
+/// success = the clicked action returns. Distinguishes wizard-page
+/// delivery faults from the standalone dialog (boot.rs, already proven).
+/// Prints nothing; main.rs prints the choice. Needs no admin.
+pub fn test_boot_page() -> crate::boot::BootChoice {
+    use std::cell::{Cell, RefCell};
+    nwg::init().expect("nwg init for boot-page probe");
+    let boot_usb: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let boot_adv: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let boot_fw: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let boot_none: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let boot_usb_c = boot_usb.clone();
+    let boot_adv_c = boot_adv.clone();
+    let boot_fw_c = boot_fw.clone();
+    let boot_none_c = boot_none.clone();
+    let mut window: nwg::Window = Default::default();
+    let mut frame: nwg::Frame = Default::default();
+    let mut heading: nwg::Label = Default::default();
+    let mut body: nwg::Label = Default::default();
+    let mut b_usb: nwg::Button = Default::default();
+    let mut b_adv: nwg::Button = Default::default();
+    let mut b_fw: nwg::Button = Default::default();
+    let mut b_none: nwg::Button = Default::default();
+    let _ = nwg::Window::builder()
+        .size((700, 460))
+        .center(true)
+        .title("lsl-bootpage-probe")
+        .build(&mut window);
+    // NOTE: position+size are REQUIRED at build (nwg fails silently
+    // without them and every later setter becomes a no-op on HWND 0).
+    // ask_boot_choice re-lays everything out anyway; these just bind.
+    let _ = nwg::Frame::builder().position((12, 78)).size((652, 316)).parent(&window).build(&mut frame);
+    let _ = nwg::Label::builder().position((22, 84)).size((632, 22)).parent(&window).build(&mut heading);
+    let _ = nwg::Label::builder().position((22, 112)).size((632, 60)).parent(&window).build(&mut body);
+    let _ = nwg::Button::builder().text("usb").position((22, 178)).size((632, 28)).parent(&window).build(&mut b_usb);
+    let _ = nwg::Button::builder().text("adv").position((22, 214)).size((632, 28)).parent(&window).build(&mut b_adv);
+    let _ = nwg::Button::builder().text("fw").position((22, 250)).size((632, 28)).parent(&window).build(&mut b_fw);
+    let _ = nwg::Button::builder().text("none").position((22, 286)).size((632, 28)).parent(&window).build(&mut b_none);
+    window.set_visible(true);
+    let main_h = window.handle.hwnd().map(|x| x as usize).unwrap_or(0);
+    let frame_h = frame.handle.hwnd().map(|x| x as usize).unwrap_or(0);
+    let head_h = heading.handle.hwnd().map(|x| x as usize).unwrap_or(0);
+    let body_h = body.handle.hwnd().map(|x| x as usize).unwrap_or(0);
+    let usb_h = b_usb.handle.hwnd().map(|x| x as usize).unwrap_or(0);
+    let adv_h = b_adv.handle.hwnd().map(|x| x as usize).unwrap_or(0);
+    let fw_h = b_fw.handle.hwnd().map(|x| x as usize).unwrap_or(0);
+    let none_h = b_none.handle.hwnd().map(|x| x as usize).unwrap_or(0);
+    let _handlers = nwg::full_bind_event_handler(&window.handle, move |event, _, handle| {
+        use nwg::Event;
+        if !matches!(event, Event::OnButtonClick) {
+            return;
+        }
+        let ch = handle.hwnd().map(|x| x as usize).unwrap_or(0);
+        // same HWND-compare shape as the wizard handler (gui.rs OnButtonClick)
+        if usb_h != 0 && ch == usb_h {
+            boot_usb_c.set(true);
+            blog("click boot-usb");
+        }
+        if adv_h != 0 && ch == adv_h {
+            boot_adv_c.set(true);
+            blog("click boot-advanced");
+        }
+        if fw_h != 0 && ch == fw_h {
+            boot_fw_c.set(true);
+            blog("click boot-firmware");
+        }
+        if none_h != 0 && ch == none_h {
+            boot_none_c.set(true);
+            blog("click boot-none");
+        }
+    });
+    let ui = WorkingUi {
+        main: main_h,
+        status: 0,
+        bg: Rc::new(RefCell::new(Vec::new())),
+        sum_frame: frame_h,
+        sum_heading: head_h,
+        sum_body: body_h,
+        sum_btn: usb_h,
+        sum_copy: adv_h,
+        sum_open: fw_h,
+        nav_back: 0,
+        nav_next: 0,
+        nav_cancel: 0,
+        dl: 0,
+        dlbar: 0,
+        done: Rc::new(Cell::new(false)),
+        copy_clicked: Rc::new(Cell::new(false)),
+        open_clicked: Rc::new(Cell::new(false)),
+        sum_back: none_h,
+        back_clicked: Rc::new(Cell::new(false)),
+        boot_usb: boot_usb.clone(),
+        boot_adv: boot_adv.clone(),
+        boot_fw: boot_fw.clone(),
+        boot_none: boot_none.clone(),
+    };
+    ui.ask_boot_choice("TEST probe - click any button.", true)
 }
 
 #[cfg(test)]

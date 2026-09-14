@@ -31,6 +31,7 @@ pub struct Opts {
     pub probe_os: bool,
     pub gui_test_boot_dialog: bool,
     pub gui_test_modal_clicks: bool,
+    pub gui_test_boot_page: bool,
     // settings the GUI also collects, exposed as flags so a FINISHED-page
     // command line can reproduce the exact wizard choices headlessly
     pub data_dir: String,
@@ -85,6 +86,7 @@ impl Default for Opts {
             probe_os: false,
             gui_test_boot_dialog: false,
             gui_test_modal_clicks: false,
+            gui_test_boot_page: false,
             data_dir: String::new(),
             wifi: true,
             wifi_networks: Vec::new(),
@@ -143,6 +145,7 @@ Options:
   --no-elevation             Skip the administrator check
   --gui-test-boot-dialog     (test) show only the boot-choice dialog, print the choice, exit
   --gui-test-modal-clicks    (test) headless modal-loop click probe, print CLICK-OK/CLICK-DEAD
+  --gui-test-boot-page       (test) real wizard boot page (no install), print the clicked choice, exit
   --preload-rust-tools       Download fd/bat/zoxide onto <USB>:\\bin
   --data-dir <path>           LSL_DATA_DIR to write into lsl-usb.env
   --no-wifi                   Do not copy wifi profiles
@@ -206,6 +209,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--probe-os" => o.probe_os = true,
             "--gui-test-boot-dialog" => o.gui_test_boot_dialog = true,
             "--gui-test-modal-clicks" => o.gui_test_modal_clicks = true,
+            "--gui-test-boot-page" => o.gui_test_boot_page = true,
             "--data-dir" => o.data_dir = next()?,
             "--no-wifi" => o.wifi = false,
             "--wifi-network" => o.wifi_networks.push(next()?),

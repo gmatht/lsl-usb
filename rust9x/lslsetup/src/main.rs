@@ -220,6 +220,20 @@ fn run() {
         std::process::exit(0);
     }
 
+    // Wizard boot-page probe (tests drive it with a real mouse click on
+    // one of the four stacked buttons): the REAL ask_boot_choice loop on
+    // a REAL WorkingUi, no install. Needs no admin, writes nothing.
+    if opts.gui_test_boot_page {
+        let c = gui::test_boot_page();
+        out::plain(&format!("boot-page-choice: {}", match c {
+            boot::BootChoice::Usb => "usb",
+            boot::BootChoice::Adv => "adv",
+            boot::BootChoice::Fw => "fw",
+            boot::BootChoice::None => "none",
+        }));
+        std::process::exit(0);
+    }
+
     // Modal-loop click probe: bare nwg window + posted mouse click through
     // pump_pending (the exact loop the summary/boot pages use). Headless-
     // safe, needs no admin, writes nothing.
