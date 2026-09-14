@@ -25,7 +25,8 @@ mkdir -p "$DEST"
 mount /cdrom -o remount,rw 2>/dev/null || true
 
 want=("$@")
-[ "${#want[@]}" -eq 0 ] && want=($(cut -f1 "$LIST"))
+# mapfile (not word-splitting) so names with spaces/globs survive intact.
+[ "${#want[@]}" -eq 0 ] && mapfile -t want < <(cut -f1 "$LIST")
 
 resolve_asset() {
     # $1=repo $2=substring -> prints the browser_download_url of the first

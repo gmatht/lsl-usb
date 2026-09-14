@@ -614,7 +614,9 @@ EOF
     run env LSL_DATA_DIR="$CD/lsl-data" LSL_HOME_LOWER="$TMPDIR_TEST/lower" LSL_HOME_UPPER="$TMPDIR_TEST/upper" LSL_HOME_WORK="$TMPDIR_TEST/work" bash "$TMPDIR_TEST/flush.sh"
     # Print captured output on failure: bats otherwise shows only the assert
     # line, which cannot diagnose container-only failures like this one.
-    if [ "$status" -ne 0 ]; then printf '--- flush.sh output:\n%s\n--- end\n' "$output"; fi
+    # (Single %s format: a leading --- in the format trips bash printf
+    # option parsing.)
+    if [ "$status" -ne 0 ]; then printf '%s\n' "--- flush.sh output:" "$output" "--- end"; fi
     [ "$status" -eq 0 ]
     [ -f "$CD/home.sfs" ]
 }
