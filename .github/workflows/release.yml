@@ -9,6 +9,8 @@ name: release
 # NOTE: release tags double as the first full end-to-end exercise of this
 # workflow (it has only ever run green via the v0.2.0-ci-test dry run) -
 # check both assets appear before announcing.
+# Tag only green main: unlike the old ci.yml release job, this workflow
+# cannot gate on CI - it rebuilds and verifies everything itself.
 on:
   push:
     tags: ['v*']
@@ -28,9 +30,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mksquashfs-tools zip pwsh shellcheck
+        # NOTE: package names matter (mksquashfs-tools does not exist) and
+        # pwsh/shellcheck are intentionally absent: build.sh skips those
+        # gates gracefully when missing, and CI proper enforces them.
+        run: sudo apt-get update && sudo apt-get install -y squashfs-tools zip unzip cpio
 
       - name: Build the Windows installer bundle
         run: bash build.sh
@@ -66,6 +69,12 @@ jobs:
           & 7z x "$env:TEMP\rust9x.7z" -oC:\opt\rust9x | Out-Null
           rustup toolchain link rust9x "C:\opt\rust9x\$tag-x86_64-pc-windows-msvc"
           cargo +rust9x --version
+
+      - name: Warm the cargo registry cache
+        # win95.ps1 builds --offline (deterministic, no network stalls), so
+        # resolve + prefetch first: a cold runner has an empty registry and
+        # offline resolution fails immediately ("no matching package").
+        run: cargo +rust9x fetch
 
       - name: Build the Win95 exe (release)
         run: .\win95.ps1 -Release
