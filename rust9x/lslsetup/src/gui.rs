@@ -65,6 +65,17 @@ fn glog(msg: &str) {
     if std::env::var("LSL_GUI_DEBUG").as_deref() != Ok("1") {
         return;
     }
+    glog_write(msg);
+}
+
+// DIAG-TEMP (revert once the boot-page click fault is found): boot-page
+// lines bypass the LSL_GUI_DEBUG gate so a repro needs zero setup -
+// six lines max per install, same file.
+fn blog(msg: &str) {
+    glog_write(msg);
+}
+
+fn glog_write(msg: &str) {
     use std::io::Write;
     let path = format!("{}\\lsl-gui-debug.log", sys::temp_dir());
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
@@ -1748,7 +1759,7 @@ impl WorkingUi {
         self.boot_adv.set(false);
         self.boot_fw.set(false);
         self.boot_none.set(false);
-        glog(&format!("boot page shown (can_usb={})", can_usb));
+        blog(&format!("boot page shown (can_usb={})", can_usb)); // DIAG-TEMP: ungated
         // Visible action order (mirrors the stacked buttons): number keys
         // 1-4 choose directly, no matter what focus/click delivery does.
         // (Raw WM_KEYDOWN peek - same channel as the Escape/Return below.)
@@ -1805,7 +1816,7 @@ impl WorkingUi {
         // page's job is done - destroy the window; the console tail and the
         // reboot itself follow (both need no window).
         let picked = choice.unwrap_or(BootChoice::None);
-        glog(&format!("boot choice: {}", match picked {
+        blog(&format!("boot choice: {}", match picked { // DIAG-TEMP: ungated
             BootChoice::Usb => "usb",
             BootChoice::Adv => "adv",
             BootChoice::Fw => "fw",
@@ -3445,7 +3456,7 @@ pub fn run_gui(
                 }
             }
             Event::OnButtonClick => {
-                glog("click");
+                blog("click"); // DIAG-TEMP: ungated (see blog)
                 let click_hwnd = handle.hwnd().map(|h| h as usize).unwrap_or(0);
                 // FINISHED / FAILED summary-page button: dismiss it. This is the
                 // only action available once the working phase has ended.
@@ -3469,19 +3480,19 @@ pub fn run_gui(
                 // cells - the summary loop ignores these and vice versa.
                 if sum_btn_h.get() != 0 && click_hwnd == sum_btn_h.get() {
                     boot_usb_c.set(true);
-                    glog("click boot-usb");
+                    blog("click boot-usb"); // DIAG-TEMP: ungated
                 }
                 if sum_copy_h.get() != 0 && click_hwnd == sum_copy_h.get() {
                     boot_adv_c.set(true);
-                    glog("click boot-advanced");
+                    blog("click boot-advanced"); // DIAG-TEMP: ungated
                 }
                 if sum_open_h.get() != 0 && click_hwnd == sum_open_h.get() {
                     boot_fw_c.set(true);
-                    glog("click boot-firmware");
+                    blog("click boot-firmware"); // DIAG-TEMP: ungated
                 }
                 if sum_back_h.get() != 0 && click_hwnd == sum_back_h.get() {
                     boot_none_c.set(true);
-                    glog("click boot-none");
+                    blog("click boot-none"); // DIAG-TEMP: ungated
                 }
                 // master wifi switch: toggling it checks/unchecks every network
                 if click_hwnd == master_hwnd {
