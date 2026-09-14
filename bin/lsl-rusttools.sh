@@ -39,7 +39,8 @@ mkdir -p "$DEST"
 mount /cdrom -o remount,rw 2>/dev/null || true
 
 want=("$@")
-[ "${#want[@]}" -eq 0 ] && want=($(cut -f1 "$LIST"))
+# mapfile (not word-splitting) so names with spaces/globs survive intact.
+[ "${#want[@]}" -eq 0 ] && mapfile -t want < <(cut -f1 "$LIST")
 
 resolve_asset() {
     # $1=repo $2=substring -> prints the browser_download_url of the first
@@ -127,4 +128,10 @@ for name in "${want[@]}"; do
 done
 
 echo "Installed tools in $DEST:"
-ls -lh "$DEST" 2>/dev/null | grep -E "rg|rgr|rga|fd|bat|eza|zoxide|delta|lazygit|starship|just|hyperfine|btm|dust|duf|tealdeer|sd|tokei|xh|gping" || true
+# No ls|grep (SC2010: breaks on odd filenames): build the file list from
+# our fixed tool names, then a single ls for the familiar listing format.
+show=()
+for t in rg rgr rga fd bat eza zoxide delta lazygit starship just hyperfine btm dust duf tealdeer sd tokei xh gping; do
+    [ -e "$DEST/$t" ] && show+=("$DEST/$t")
+done
+[ "${#show[@]}" -gt 0 ] && ls -lh "${show[@]}" 2>/dev/null || true

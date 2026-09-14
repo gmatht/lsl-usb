@@ -286,7 +286,6 @@ done
 parse_wsl_report() {
     local vhdx_file=""
     local rootfs_path=""
-    local distro_name=""
     local registry_name=""
 
     ensure_wsl_report
@@ -360,7 +359,6 @@ parse_wsl_report() {
                     flush_entry
                     vhdx_file=""
                     rootfs_path=""
-                    distro_name=""
                     registry_name=""
                 fi
             done <"$WSL_REPORT"
@@ -434,7 +432,8 @@ find_vhdx_by_distro() {
 
 # Function to get first available VHDX
 get_first_vhdx() {
-    local first=$(parse_wsl_report | head -n 1)
+    local first
+    first=$(parse_wsl_report | head -n 1)
     if [ -n "$first" ]; then
         IFS='|' read -r name vhdx rootfs <<< "$first"
         echo "$vhdx|$rootfs"

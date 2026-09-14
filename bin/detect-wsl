@@ -13,8 +13,8 @@ LSL_DESKTOP_USER="$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)"
 [ -n "$LSL_DESKTOP_USER" ] || LSL_DESKTOP_USER="$(ls -1 /home 2>/dev/null | head -n1 || true)"
 [ -n "$LSL_DESKTOP_USER" ] || LSL_DESKTOP_USER="mint"
 
-# Clear existing report
-> "$WSL_REPORT"
+# Clear existing report (no-op command: a bare redirect trips SC2188).
+: > "$WSL_REPORT"
 
 win_path_to_linux() {
     # Convert a Windows path like C:\Foo\Bar to /mnt/c/Foo/Bar.

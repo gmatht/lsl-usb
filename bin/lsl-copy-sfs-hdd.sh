@@ -17,7 +17,6 @@
 #   lsl-copy-sfs-hdd.sh --verify   # re-check copied layers vs the USB (size+sha)
 #   lsl-copy-sfs-hdd.sh --use      # enable the HDD-cache speed-up (sets env flag)
 #   lsl-copy-sfs-hdd.sh --no-use   # disable it
-#   lsl-copy-sfs-hdd.sh --checksum # also verify sha256 (slower) on copy/verify
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,7 +30,6 @@ ENV_FILE="$CDROM/lsl-usb.env"
 MANIFEST="$DEST/manifest.txt"
 
 MODE="offer"
-CHECKSUM=0
 for a in "$@"; do
     case "$a" in
         --yes|-y) MODE=yes ;;
@@ -39,7 +37,6 @@ for a in "$@"; do
         --verify) MODE=verify ;;
         --use|-u) MODE=use ;;
         --no-use) MODE=nouse ;;
-        --checksum) CHECKSUM=1 ;;
         -h|--help) MODE=help ;;
         *) echo "Unknown option: $a" >&2; MODE=help ;;
     esac

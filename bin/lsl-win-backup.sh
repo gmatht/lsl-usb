@@ -159,7 +159,8 @@ parse_config() {
 incr_threshold() {
     local job="$1" window="${2:-}" now
     now="$(date +%s)"
-    local lastf="$STATE_DIR/last_$(safe_name "$job").ts"
+    local lastf
+    lastf="$STATE_DIR/last_$(safe_name "$job").ts"
     if [ -f "$lastf" ]; then
         local last; last="$(cat "$lastf" 2>/dev/null || echo 0)"
         case "$last" in ''|*[!0-9]*) last=0 ;; esac
@@ -180,7 +181,8 @@ record_ratio() {
 }
 
 learned_ratio() {
-    local f="$STATE_DIR/ratio_$(safe_name "$1").tsv"
+    local f
+    f="$STATE_DIR/ratio_$(safe_name "$1").tsv"
     [ -f "$f" ] || { printf ''; return; }
     awk -F'\t' 'NF>=2 && $1>0 {printf "%.4f", $2/$1; exit}' "$f"
 }
