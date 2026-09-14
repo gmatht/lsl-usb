@@ -129,7 +129,10 @@ fn main() {
     // tolerated) and verified here, so a corrupt/foreign blob fails the build
     // instead of shipping a bootloader that cannot be trusted. A present .gz
     // WITHOUT its pin is a hard error - an unverifiable signed chain must
-    // never sneak into the binary.
+    // never sneak into the binary. The .gz bytes (not the raw binary) are
+    // embedded via OUT_DIR and inflated once at runtime (same OnceLock
+    // pattern as grldr): ~2.4 MB smaller exe for milliseconds of startup.
+    // Runtime re-verifies the inflated bytes against the pin before use.
     for name in ["shimx64.efi", "grubx64.efi", "mmx64.efi"] {
         let gz_path = Path::new(&manifest).join("assets").join(format!("{}.gz", name));
         let pin_path = Path::new(&manifest).join("assets").join(format!("{}.sha256", name));
@@ -161,12 +164,12 @@ fn main() {
                 "assets/{}.gz ({} bytes) is no smaller than the raw binary ({} bytes) - recompress it",
                 name, gz.len(), raw.len()
             );
-            let dst = Path::new(&out_dir).join(name);
-            fs::write(&dst, &raw).unwrap();
+            let dst = Path::new(&out_dir).join(format!("{}.gz", name));
+            fs::write(&dst, &gz).unwrap();
             println!("cargo:warning={} OK: {} -> {} bytes, sha256 {}", name, raw.len(), gz.len(), &hex[..16]);
             (
                 format!(
-                    "pub static BUNDLED_{}: Option<&[u8]> = Some(include_bytes!(\"{}\"));",
+                    "pub static BUNDLED_{}_GZ: Option<&[u8]> = Some(include_bytes!(\"{}\"));",
                     upper,
                     dst.to_string_lossy().replace('\\', "/")
                 ),
@@ -174,7 +177,7 @@ fn main() {
             )
         } else {
             (
-                format!("pub static BUNDLED_{}: Option<&[u8]> = None;", upper),
+                format!("pub static BUNDLED_{}_GZ: Option<&[u8]> = None;", upper),
                 format!("pub static BUNDLED_{}_SHA256: Option<&str> = None;", upper),
             )
         };

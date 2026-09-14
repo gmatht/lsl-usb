@@ -53,9 +53,11 @@ SHA-256:   5f9fc41db3dfe3b581fc20cae696af82c5ca21e96071ec9c4c28ee4a15f989d8
 
 Build:     assets/*.gz are gzip -9 of the raw files (like assets/grldr.gz).
            build.rs inflates each and verifies the raw SHA-256 against the
-           .sha256 pins, then embeds the inflated bytes via OUT_DIR
-           (uefi_embedded.rs: BUNDLED_SHIM/GRUB/MM); nofmt refuses a pinned
-           mismatch at runtime. To update: replace the .gz, refresh the
+           .sha256 pins (a corrupt blob fails the build), then embeds the
+           .gz bytes via OUT_DIR (uefi_embedded.rs: BUNDLED_SHIM/GRUB/MM_GZ
+           plus the raw pins); nofmt inflates once at runtime (OnceLock)
+           and re-verifies the pin before use, refusing mismatches. To
+           update: replace the .gz, refresh the
            .sha256 pin, rebuild. GPL v3+ for GRUB2, BSD-2-Clause for shim/MokManager (see
            assets/COPYING.GPLv3, assets/COPYRIGHT.shim, and
            assets/SOURCE-OFFER.txt).

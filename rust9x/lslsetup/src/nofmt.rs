@@ -254,27 +254,47 @@ fn active_uefi_loader() -> UefiLoader {
     UEFI_LOADER_OVERRIDE.get().copied().unwrap_or(UefiLoader::Auto)
 }
 
-/// The vendored signed chain, verified: (shim, Canonical-signed GRUB2,
-/// MokManager). Any pin mismatch or missing component disables the whole
+/// Inflate one vendored signed-chain component (stored deflated, see
+/// build.rs) and verify it against its raw SHA-256 pin. Inflated once per
+/// process (same OnceLock pattern as grldr()); any failure (missing blob,
+/// bad gzip, pin mismatch) yields None, which disables the whole chain -
+/// an unverifiable signed loader must never be installed.
+fn inflate_verified(
+    lock: &'static std::sync::OnceLock<Option<Vec<u8>>>,
+    gz: Option<&'static [u8]>,
+    pin: Option<&'static str>,
+) -> Option<&'static [u8]> {
+    lock.get_or_init(|| match (gz, pin) {
+        (Some(g), Some(p)) => {
+            let mut dec = flate2::read::GzDecoder::new(&g[..]);
+            let mut raw = Vec::new();
+            use std::io::Read;
+            if dec.read_to_end(&mut raw).is_err() {
+                return None;
+            }
+            if !sha256_hex(&raw).eq_ignore_ascii_case(p) {
+                return None;
+            }
+            Some(raw)
+        }
+        _ => None,
+    })
+    .as_deref()
+}
+
+static SHIM_RAW: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+static GRUB_RAW: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+static MM_RAW: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+
+/// The vendored signed chain, inflated and verified: (shim,
+/// Canonical-signed GRUB2, MokManager). Any failure disables the whole
 /// chain (assets/*.sha256; an unverifiable signed loader must never be
 /// installed).
 pub fn bundled_signed() -> Option<(&'static [u8], &'static [u8], &'static [u8])> {
-    let ok = |data: Option<&'static [u8]>, pin: Option<&'static str>| -> bool {
-        match (data, pin) {
-            (Some(d), Some(p)) => sha256_hex(d).eq_ignore_ascii_case(p),
-            _ => false,
-        }
-    };
-    if !ok(BUNDLED_SHIMX64_EFI, BUNDLED_SHIMX64_EFI_SHA256)
-        || !ok(BUNDLED_GRUBX64_EFI, BUNDLED_GRUBX64_EFI_SHA256)
-        || !ok(BUNDLED_MMX64_EFI, BUNDLED_MMX64_EFI_SHA256)
-    {
-        return None;
-    }
     Some((
-        BUNDLED_SHIMX64_EFI.unwrap(),
-        BUNDLED_GRUBX64_EFI.unwrap(),
-        BUNDLED_MMX64_EFI.unwrap(),
+        inflate_verified(&SHIM_RAW, BUNDLED_SHIMX64_EFI_GZ, BUNDLED_SHIMX64_EFI_SHA256)?,
+        inflate_verified(&GRUB_RAW, BUNDLED_GRUBX64_EFI_GZ, BUNDLED_GRUBX64_EFI_SHA256)?,
+        inflate_verified(&MM_RAW, BUNDLED_MMX64_EFI_GZ, BUNDLED_MMX64_EFI_SHA256)?,
     ))
 }
 
@@ -1171,14 +1191,14 @@ fn verify_assets() -> Result<(), String> {
             return Err("embedded grldr.mbr is truncated".into());
         }
     }
-    // Signed UEFI chain: the pins were checked by bundled_signed(); also
+    // Signed UEFI chain: inflated + pin-verified by bundled_signed(); also
     // require each component to be a plausible EFI application so a wrong-
     // arch or truncated blob fails here (and in tests) instead of on a PC.
-    if bundled_signed().is_some() {
+    if let Some((shim, grub, mm)) = bundled_signed() {
         for (name, data) in [
-            ("shimx64.efi", BUNDLED_SHIMX64_EFI.unwrap()),
-            ("grubx64.efi", BUNDLED_GRUBX64_EFI.unwrap()),
-            ("mmx64.efi", BUNDLED_MMX64_EFI.unwrap()),
+            ("shimx64.efi", shim),
+            ("grubx64.efi", grub),
+            ("mmx64.efi", mm),
         ] {
             if !pe_efi_ok(data) {
                 return Err(format!(
