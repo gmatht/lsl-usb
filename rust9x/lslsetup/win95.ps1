@@ -48,6 +48,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
+# PowerShell's location is per-runspace: .NET file APIs ([IO.File]) and
+# native children (cargo, which finds Cargo.toml from the process CWD)
+# resolve relative paths against the Win32 process directory instead.
+# Sync it, or a shell launched elsewhere (e.g. $HOME invoking this script
+# by path) fails with 'Could not find file ... Cargo.toml'.
+[IO.Directory]::SetCurrentDirectory($PSScriptRoot)
 
 # rustup proxies (cargo +rust9x) live in $HOME/.cargo/bin — ensure on PATH.
 $cargoBin = Join-Path $HOME '.cargo\bin'
