@@ -618,19 +618,24 @@ const CASPER_INITRD_CANDIDATES: &[&str] = &[
     "casper/initrd-generic",
 ];
 
-/// The grub4dos menu entry that boots a casper ISO's kernel directly.
-/// Unlike `menu_entry` (whose `map (0xff)` + `chainloader (0xff)` build on
-/// BIOS INT 13h CD emulation), this uses only `find`/`kernel`/`initrd`/
-/// `boot` — commands grub4dos-for-UEFI implements — so it boots on BOTH
-/// firmwares. casper locates the squashfs itself via `iso-scan/filename`
-/// (the big filesystem stays inside the ISO; only ~100 MB of
-/// kernel+initrd is extracted to the stick). All paths are grub4dos-style
-/// (`/_ISO/...`, forward slashes).
-pub fn menu_entry_direct(title: &str, iso_rel: &str, kern_rel: &str, init_rel: &str) -> String {
+/// The grub4dos menu entry that boots the extracted casper kernel
+/// directly. Unlike `menu_entry` (whose `map (0xff)` + `chainloader`
+/// build on BIOS INT 13h CD emulation), this uses only `find`/`kernel`/
+/// `initrd`/`boot` — commands grub4dos-for-UEFI implements — so it boots
+/// on BOTH firmwares. File-less main: casper finds the extracted base by
+/// device scan and stacks z0 beside it (no iso-scan, no loopback).
+/// All paths are grub4dos-style (`/_ISO/...`, forward slashes).
+/// Direct-kernel entry (BIOS + UEFI grub4dos): boots the kernel extracted
+/// next to the ISO stem with the base+z0 stack on the FAT partition.
+/// File-less main: no ISO file on the stick, so no iso-scan and no
+/// loopback - casper's device scan finds /casper/filesystem.squashfs and
+/// layerfs-path stacks the z0 beside it (/cdrom IS the stick here, not an
+/// ISO loop, so the layer path points at /cdrom, not /isodevice).
+pub fn menu_entry_direct(title: &str, kern_rel: &str, init_rel: &str) -> String {
     format!(
         "\ntitle {title}\n\
          find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
-         kernel {kern_rel} boot=casper iso-scan/filename={iso_rel} layerfs-path=/isodevice/casper/filesystem.z0.squashfs rootdelay=15 quiet splash\n\
+         kernel {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs rootdelay=15 quiet splash\n\
          initrd {init_rel}\n\
          boot\n"
     )
@@ -640,15 +645,12 @@ pub fn menu_entry_direct(title: &str, iso_rel: &str, kern_rel: &str, init_rel: &
 /// kernel/initrd pattern for ISOs the chainloader path does not like).
 pub fn default_menu() -> String {
     "timeout 5\ndefault 0\n\
-     # 'chainloader (0xff)' boots the ISO's own isolinux/El Torito bootloader.\n\
-     # If a distro dislikes that, use a direct entry, e.g. (Ubuntu/Mint):\n\
+     # 'chainloader (0xff)' boots an ISO file's own isolinux/El Torito bootloader.\n\
+     # The main entry boots the extracted kernel directly (no ISO file), e.g.:\n\
      # title Ubuntu direct\n\
-     # find --set-root --ignore-floppies --ignore-cd /_ISO/ubuntu.iso\n\
-     # map /_ISO/ubuntu.iso (0xff) || map --mem /_ISO/ubuntu.iso (0xff)\n\
-     # map --hook\n\
-     # root (0xff)\n\
-     # kernel /casper/vmlinuz boot=casper quiet splash\n\
-     # initrd /casper/initrd\n"
+     # find --set-root --ignore-floppies --ignore-cd /_ISO/ubuntu/vmlinuz\n\
+     # kernel /_ISO/ubuntu/vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs quiet splash\n\
+     # initrd /_ISO/ubuntu/initrd\n"
         .to_string()
 }
 
@@ -1277,7 +1279,7 @@ pub fn install_from_iso(
         "menu.lst, grub.cfg (signed GRUB2)"
     };
     out::info(&format!(
-        "  plan  : BIOS boot {} + UEFI boot {} (files always: ISO as a file, {}).",
+        "  plan  : BIOS boot {} + UEFI boot {} (files always: kernel + base extracts, {}; the source ISO itself is never copied).",
         if want_bios { "ON (grub4dos MBR bytes 0..440 ONLY, signature + partition table kept)" } else { "OFF" },
         uefi_plan_txt, menu_files
     ));
@@ -1485,6 +1487,11 @@ fn extract_casper_boot(
 /// - same contract as the kernel/initrd extract. Soft-fail (warn) so the
 /// loopback fallback survives without it. Returns true when present after.
 fn extract_base_squashfs(iso_path: &str, casper_dir_fs: &str, ui: Option<&dyn WriteUi>) -> bool {
+    // Own the destination dir: on a fresh stick nothing created casper/
+    // yet (toolkit/z0 drops run later), and File::create does not invent
+    // parents - without this the base silently never lands and z0 stacks
+    // alone into an initramfs failure.
+    sys::create_dir_all(casper_dir_fs);
     let mut iso = match crate::iso::Iso::open(iso_path) {
         Ok(i) => i,
         Err(_) => return false,
@@ -1535,74 +1542,78 @@ fn extract_base_squashfs(iso_path: &str, casper_dir_fs: &str, ui: Option<&dyn Wr
     }
 }
 
+/// File-less main entries: the direct-kernel stanza (BIOS + UEFI
+/// grub4dos) from the kernel/initrd extracted out of the SOURCE iso, plus
+/// the base squashfs beside z0 for casper's stack. Returns (direct title,
+/// kernel rel, initrd rel) for the UEFI side. There is deliberately NO
+/// main loopback entry (no ISO file to chainload); stale main-loopback
+/// stanzas from pre-conversion sticks are removed so they can't boot into
+/// "file not found". Hard-errors when the ISO has no casper kernel -
+/// without extracts a file-less main cannot boot, and the Rufus flow
+/// covers non-casper ISOs.
 fn write_menu_entries(
     root: &str,
-    iso_dst: &str,
-    iso_rel: &str,
+    iso_src: &str,
     safe_name: &str,
     iso_name: &str,
     uefi: bool,
     ui: Option<&dyn WriteUi>,
-) -> Result<String, String> {
-    let title = format!("{} (loopback ISO)", iso_name.trim_end_matches(".iso"));
+) -> Result<(String, String, String), String> {
+    let stem = safe_name.trim_end_matches(".iso");
+    let ltitle = format!("{} (loopback ISO)", iso_name.trim_end_matches(".iso"));
     let menu_path = format!("{}menu.lst", root);
     let (mut menu, existed) = match std::fs::read_to_string(&menu_path) {
         Ok(s) => (s, true),
         Err(_) => (default_menu(), false),
     };
     let mut dirty = false;
-    // Direct-kernel entry FIRST (default): `kernel`/`initrd` work on both
-    // BIOS and UEFI grub4dos, while the loopback chainload below is
-    // BIOS-only (INT 13h `(0xff)` emulation). Without this, UEFI boots
-    // drop to a grub4dos prompt. The squashfs stays inside the ISO;
-    // casper loop-mounts it via iso-scan/filename=.
-    let stem = safe_name.trim_end_matches(".iso");
+    // Direct-kernel entry (default): `kernel`/`initrd` work on both
+    // BIOS and UEFI grub4dos. The kernel comes from the source ISO (never
+    // copied to the stick); casper finds the base by device scan and
+    // stacks z0 beside it - no iso-scan, no loopback, no ISO file.
     let boot_dir_fs = format!("{}_ISO\\{}", root, stem);
     let boot_dir_rel = format!("/_ISO/{}", stem);
-    // Hoisted to outer scope so the same bodies can feed the UEFI mirror
-    // below (same titles, same commands - both files must agree).
     let dtitle = format!("{} (direct kernel)", iso_name.trim_end_matches(".iso"));
-    let mut dentry_opt: Option<String> = None;
-    match extract_casper_boot(iso_dst, &boot_dir_fs, &boot_dir_rel, ui) {
-        Some((kern_rel, init_rel)) => {
-            let dentry = menu_entry_direct(&dtitle, iso_rel, &kern_rel, &init_rel);
-            let (m, added) = refresh_menu_entry(&menu, &dtitle, &dentry);
-            menu = m;
-            if added {
-                dirty = true;
-                out::info(&format!("menu.lst entry '{}' (boots BIOS + UEFI)", dtitle));
-            } else {
-                out::info(&format!("menu.lst already contains an entry titled '{}'", dtitle));
-            }
-            dentry_opt = Some(dentry);
-        }
+    let (kern_rel, init_rel) = match extract_casper_boot(iso_src, &boot_dir_fs, &boot_dir_rel, ui) {
+        Some(v) => v,
         None => {
-            out::info("No casper kernel/initrd in this ISO - loopback entry only (BIOS boot; UEFI needs a casper-based ISO).");
-            // Files gone (or never extracted) with an entry still present:
-            // remove the stale pointer instead of booting into "not found".
-            let (m, removed) = remove_menu_entry(&menu, &dtitle);
-            menu = m;
-            if removed {
-                dirty = true;
-                out::info(&format!("removed stale menu.lst entry '{}' (kernel files missing)", dtitle));
-            }
+            return Err(format!(
+                "{} has no casper kernel/initrd - the file-less main needs them (BIOS + UEFI boot the extracted kernel). Use the Rufus flow for non-casper ISOs, or add this ISO as an extra file on an existing stick.",
+                iso_name
+            ));
         }
-    }
-    // Base squashfs next to z0 (independent of the menu below): the file
-    // casper's multi-layer chain stacks under the z0 entry.
-    extract_base_squashfs(iso_dst, &format!("{}casper", root), ui);
-    // ISOs at/above 2 GiB lose the `map --mem` fallback: loading gigabytes
-    // into RAM OOMs on most firmware (seen live on 3 GB), so a failed direct
-    // map fails fast instead. Small images keep it (genuinely useful).
-    let big_iso = sys::file_size(iso_dst).unwrap_or(u64::MAX) >= 2 * sys::GB;
-    let entry = menu_entry(&title, iso_rel, big_iso);
-    let (m, added) = refresh_menu_entry(&menu, &title, &entry);
+    };
+    let dentry = menu_entry_direct(&dtitle, &kern_rel, &init_rel);
+    let (m, added) = refresh_menu_entry(&menu, &dtitle, &dentry);
     menu = m;
     if added {
         dirty = true;
-        out::info(&format!("menu.lst entry '{}' (BIOS chainload fallback)", title));
+        out::info(&format!("menu.lst entry '{}' (boots BIOS + UEFI)", dtitle));
     } else {
-        out::info(&format!("menu.lst already contains an entry titled '{}'", title));
+        out::info(&format!("menu.lst already contains an entry titled '{}'", dtitle));
+    }
+    // Main loopback is gone with the ISO file: drop stale stanzas so a
+    // re-run over a pre-conversion stick can't chainload a missing file.
+    let (m, removed) = remove_menu_entry(&menu, &ltitle);
+    menu = m;
+    if removed {
+        dirty = true;
+        out::info(&format!("removed stale menu.lst entry '{}' (main is file-less now)", ltitle));
+    }
+    // Base squashfs next to z0 (independent of the menu above): the file
+    // casper's multi-layer chain stacks under the z0 entry.
+    extract_base_squashfs(iso_src, &format!("{}casper", root), ui);
+    // The source ISO itself is never copied for the main entry; if a file
+    // with the old file-copy name lingers from a pre-conversion install
+    // it is orphaned (never booted) - say so, never delete user data.
+    let orphan = format!("{}_ISO\\{}", root, safe_name);
+    if sys::path_exists(&orphan) {
+        if let Some(sz) = sys::file_size(&orphan) {
+            out::info(&format!(
+                "{} ({:.1} GB) is no longer referenced by the menu (main is file-less) - delete it yourself to reclaim the space.",
+                orphan, sz as f64 / sys::GB as f64
+            ));
+        }
     }
     // BIOS root menu only (NOT the UEFI mirror below): some BIOSes hide USB
     // disks from grub4dos services until `usb --init` runs.
@@ -1629,21 +1640,12 @@ fn write_menu_entries(
             Err(_) => (default_menu(), false),
         };
         let mut udirty = false;
-        match &dentry_opt {
-            Some(dentry) => {
-                let (m, added) = refresh_menu_entry(&um, &dtitle, dentry);
-                um = m;
-                udirty |= added;
-            }
-            None => {
-                let (m, removed) = remove_menu_entry(&um, &dtitle);
-                um = m;
-                udirty |= removed;
-            }
-        }
-        let (m, added) = refresh_menu_entry(&um, &title, &entry);
+        let (m, added) = refresh_menu_entry(&um, &dtitle, &dentry);
         um = m;
         udirty |= added;
+        let (m, removed) = remove_menu_entry(&um, &ltitle);
+        um = m;
+        udirty |= removed;
         if udirty {
             std::fs::write(&uefi_menu_path, um).map_err(|e| format!("write efi\\grub\\menu.lst: {}", e))?;
             out::info(&format!(
@@ -1654,7 +1656,7 @@ fn write_menu_entries(
             out::info("efi\\grub\\menu.lst already has the entries (grub4dos-for-UEFI menu up to date).");
         }
     }
-    Ok(title)
+    Ok((dtitle, kern_rel, init_rel))
 }
 
 /// Same-path comparison for ISO dedupe (Windows: case-insensitive,
@@ -1800,7 +1802,7 @@ pub fn write_extra_iso_entries(
                 Err(_) => ("set timeout=5\n".to_string(), false),
             };
             let (cfg, added) =
-                upsert_grub_entry(&existing, &title, &uefi_cfg_entry(&title, iso_rel, false));
+                upsert_grub_entry(&existing, &title, &uefi_cfg_loopback(&title, iso_rel));
             if added {
                 std::fs::write(&cfg_path, cfg)
                     .map_err(|e| format!("write grub.cfg: {}", e))?;
@@ -1867,7 +1869,8 @@ fn write_efi_bootdir(
     bootx64: &[u8],
     signed: Option<(&[u8], &[u8])>,
     title: &str,
-    iso_rel: &str,
+    kern_rel: &str,
+    init_rel: &str,
 ) -> Result<(), String> {
     let bootdir = format!("{}EFI\\BOOT", root);
     sys::create_dir_all(&bootdir);
@@ -1882,13 +1885,13 @@ fn write_efi_bootdir(
     let cfg_path = format!("{}\\grub.cfg", bootdir);
     match std::fs::read_to_string(&cfg_path) {
         Err(_) => {
-            // Fresh file: the legacy single-entry layout (header + primary).
-            std::fs::write(&cfg_path, uefi_cfg(title, iso_rel))
+            // Fresh file: header + the file-less direct entry.
+            std::fs::write(&cfg_path, format!("set timeout=5\n{}", uefi_cfg_direct(title, kern_rel, init_rel)))
                 .map_err(|e| format!("write grub.cfg: {}", e))?;
             out::info(&format!("Created grub.cfg entry '{}'.", title));
         }
         Ok(existing) => {
-            let (cfg, added) = upsert_grub_entry(&existing, title, &uefi_cfg_entry(title, iso_rel, true));
+            let (cfg, added) = upsert_grub_entry(&existing, title, &uefi_cfg_direct(title, kern_rel, init_rel));
             if added {
                 std::fs::write(&cfg_path, cfg).map_err(|e| format!("write grub.cfg: {}", e))?;
                 out::info(&format!("Updated grub.cfg entry '{}' (multiboot-safe upsert).", title));
@@ -1908,27 +1911,28 @@ fn write_efi_bootdir(
 fn install_uefi_resolved(
     root: &str,
     title: &str,
-    iso_rel: &str,
+    kern_rel: &str,
+    init_rel: &str,
     uefi_bootx64: &str,
     loader: UefiLoader,
 ) -> Result<bool, String> {
     match resolve_uefi(loader, uefi_bootx64) {
         ResolvedUefi::Signed => {
             let (shim, grub, mm) = bundled_signed().expect("resolve said Signed but the chain is gone");
-            write_efi_bootdir(root, shim, Some((grub, mm)), title, iso_rel)?;
+            write_efi_bootdir(root, shim, Some((grub, mm)), title, kern_rel, init_rel)?;
             out::info("UEFI: signed shim -> GRUB2 chain installed (Secure Boot ON works too).");
             Ok(true)
         }
         ResolvedUefi::Grub4dos => {
             let bytes = bundled_uefi().expect("resolve said Grub4dos but nothing is bundled");
-            write_efi_bootdir(root, bytes, None, title, iso_rel)?;
+            write_efi_bootdir(root, bytes, None, title, kern_rel, init_rel)?;
             out::info("UEFI: grub4dos-for-UEFI BOOTX64.EFI installed (Secure Boot must be OFF).");
             Ok(true)
         }
         ResolvedUefi::Custom => {
             let bytes =
                 std::fs::read(uefi_bootx64).map_err(|e| format!("read {}: {}", uefi_bootx64, e))?;
-            write_efi_bootdir(root, &bytes, None, title, iso_rel)?;
+            write_efi_bootdir(root, &bytes, None, title, kern_rel, init_rel)?;
             out::info(&format!(
                 "UEFI: BOOTX64.EFI (--uefi-bootx64 {}) + grub.cfg installed.",
                 uefi_bootx64
@@ -1949,14 +1953,14 @@ fn install_uefi_resolved(
 }
 
 /// File phase for the no-reformat methods: grldr (BIOS, when
-/// `with_bios_files`), ISO as a file (SHA-256 verified), `menu.lst` (+ the
-/// \efi\grub\menu.lst mirror when the grub4dos-family loader is used), and
-/// the optional UEFI side-load. Returns (menu title, whether UEFI files
-/// were installed).
+/// `with_bios_files`), the file-less main extracts (kernel/initrd/base out
+/// of the SOURCE iso - the ISO file itself is never copied), `menu.lst`
+/// (+ the \efi\grub\menu.lst mirror when the grub4dos-family loader is
+/// used), and the optional UEFI side-load. Returns (menu title, whether
+/// UEFI files were installed).
 fn install_files(
     t: &UsbTarget,
     iso: &str,
-    iso_len: u64,
     uefi_bootx64: &str,
     with_bios_files: bool,
     _want_uefi: bool,
@@ -2013,22 +2017,20 @@ fn install_files(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "image.iso".to_string());
     let safe_name = sanitize_iso_name(&iso_name);
-    // Extras validated up front (bad paths abort before the slow copy).
+    // Extras validated up front (bad paths abort before the slow extracts).
     let fs_here = t.fs.to_ascii_uppercase();
     let validated_extra = validate_extra_isos(extra_isos, iso, &safe_name, &fs_here)?;
-    sys::create_dir_all(&format!("{}_ISO", root));
-    let iso_dst = format!("{}_ISO\\{}", root, safe_name);
-    let iso_rel = format!("/_ISO/{}", safe_name);
-    let (_src, mut metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui, skip_verify)?;
+    let mut metrics = WriteMetrics::default();
     // menu.lst uses grub4dos syntax; when the grub4dos-family loader is
     // used the same entries are mirrored to efi\grub\menu.lst (the only
     // menu location grub4dos-for-UEFI reads - no mirror = UEFI prompt);
     // the signed GRUB2 chain reads grub.cfg instead.
-    let title = write_menu_entries(&root, &iso_dst, &iso_rel, &safe_name, &iso_name, uefi_res.mirror_menu(), ui)?;
+    let (title, kern_rel, init_rel) =
+        write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui)?;
     // UEFI side-load (files only; FAT32 stick). Signed shim -> GRUB2 works
     // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need
     // Secure Boot OFF (see assets/SIGNED-UEFI.txt).
-    let uefi_ok = install_uefi_resolved(&root, &title, &iso_rel, uefi_bootx64, uefi_loader)?;
+    let uefi_ok = install_uefi_resolved(&root, &title, &kern_rel, &init_rel, uefi_bootx64, uefi_loader)?;
     // Extra loopback-only ISOs (no firstboot, no extraction) ride along
     // after the primary's UEFI files, so their grub.cfg entries land in an
     // already-multiboot-safe file.
@@ -2303,6 +2305,39 @@ fn offer_h2w_cleanup(letter: &str, ui: Option<&dyn WriteUi>, free: u64, need: u6
     h2w_delete_and_recheck(letter, &found, need, sys::free_bytes(letter), free)
 }
 
+/// Bytes the file-less main pulls out of the source ISO (kernel +
+/// initrd + base squashfs). Probed from the ISO itself with the same
+/// first-hit candidate lists the extracts use, so the gate matches
+/// reality. Falls back to the whole ISO size (safe direction:
+/// over-estimates) when the probe fails.
+fn main_extract_bytes(iso_path: &str) -> u64 {
+    let whole = sys::file_size(iso_path).unwrap_or(u64::MAX);
+    let Ok(mut iso) = crate::iso::Iso::open(iso_path) else {
+        return whole;
+    };
+    let mut need = 0u64;
+    for cands in [
+        CASPER_KERNEL_CANDIDATES,
+        CASPER_INITRD_CANDIDATES,
+        CASPER_BASE_CANDIDATES,
+    ] {
+        let mut hit = 0u64;
+        for c in cands {
+            if let Some(sz) = iso.file_size(c) {
+                if sz > 0 {
+                    hit = sz;
+                    break;
+                }
+            }
+        }
+        if hit == 0 {
+            return whole;
+        }
+        need += hit;
+    }
+    need
+}
+
 fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool, extra_isos: &[String]) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
     let fs_uc = t.fs.to_ascii_uppercase();
     // grub4dos reads FAT12/16/32 and NTFS only. exFAT (the default on many
@@ -2322,16 +2357,13 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
             t.fs, hint
         ));
     }
-    let iso_len = sys::file_size(iso).ok_or_else(|| format!("ISO not found: {}", iso))?;
-    if fs_uc.starts_with("FAT") && iso_len >= 4 * sys::GB {
-        return Err(
-            "ISOs >= 4 GiB cannot exist on FAT32. Use an NTFS stick, or the Rufus flow (which repartitions)."
-                .into(),
-        );
-    }
+    sys::file_size(iso).ok_or_else(|| format!("ISO not found: {}", iso))?;
+    // File-less main: no ISO file lands on the stick, so the FAT32 4 GiB
+    // file rule does not apply to the primary (per-extra files are gated
+    // in validate_extra_isos). What must fit is the extracts.
     // Extra loopback-only ISOs ride along: validate before anything is
     // written (a bad --extra-iso aborts here, not mid-install) and include
-    // them in the space gate alongside the primary.
+    // them in the space gate alongside the primary extracts.
     let primary_safe = sanitize_iso_name(
         &std::path::Path::new(iso)
             .file_name()
@@ -2340,18 +2372,23 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     );
     let validated_extra = validate_extra_isos(extra_isos, iso, &primary_safe, &fs_uc)?;
     let extra_bytes: u64 = validated_extra.iter().map(|(_, n, _)| n).sum();
-    let need_bytes = iso_len + extra_bytes + sys::MB;
+    let main_need = main_extract_bytes(iso);
+    let need_bytes = main_need + extra_bytes + sys::MB;
     if t.free < need_bytes {
         // A "full" stick is often just h2testw leftovers (*.h2w) - offer
         // to delete those instead of refusing outright.
         let cleaned = offer_h2w_cleanup(&t.letter, ui, t.free, need_bytes)?;
         if !cleaned {
+            let what = if validated_extra.is_empty() {
+                "main extracts".to_string()
+            } else {
+                format!("main extracts + {} extra(s)", validated_extra.len())
+            };
             return Err(format!(
-                "{:.1} GB free ({}) on {}:, the ISO{} needs {:.1} GB ({}) - not enough space for the no-reformat method.",
+                "{:.1} GB free ({}) on {}:, the install needs {:.1} GB ({}) - not enough space for the no-reformat method.",
                 t.free as f64 / sys::GB as f64, mb_str(t.free),
                 t.letter,
-                if validated_extra.is_empty() { String::new() } else { format!(" + {} extra(s)", validated_extra.len()) },
-                need_bytes as f64 / sys::GB as f64, mb_str(need_bytes)
+                need_bytes as f64 / sys::GB as f64, what
             ));
         }
     }
@@ -2410,7 +2447,7 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         }
         out::step("GPT stick: files-only UEFI install (no raw sectors touched).");
         report_board(false, true);
-        let (title, uefi_ok, metrics) = install_files(t, iso, iso_len, uefi_bootx64, false, true, uefi_loader, ui, skip_verify, extra_isos)?;
+        let (title, uefi_ok, metrics) = install_files(t, iso, uefi_bootx64, false, true, uefi_loader, ui, skip_verify, extra_isos)?;
         report_bootability(false, "GPT stick - grub4dos BIOS stage1 has nowhere to live (sectors 1-15 are the GPT header/table)", uefi_ok, &title);
         return Ok((metrics, None));
     }
@@ -2561,28 +2598,22 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     }
     } // end if want_bios (grldr)
 
-    // ISO as a regular file under \_ISO\ (skip when an equal-sized copy exists).
-    // `primary_safe` (computed for the space gate above) is this same name.
+    // File-less main: the kernel/initrd/base come straight out of the
+    // SOURCE iso (never copied to the stick). `primary_safe` (space gate
+    // above) is only the menu stem + orphan check now.
     let iso_name = std::path::Path::new(iso)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "image.iso".to_string());
     let safe_name = primary_safe.clone();
-    sys::create_dir_all(&format!("{}_ISO", root));
-    let iso_dst = format!("{}_ISO\\{}", root, safe_name);
-    let iso_rel = format!("/_ISO/{}", safe_name);
-    // The whole point of this mode is a *bootable* stick: a corrupted ISO
-    // copy (bad USB write, or a stale same-size file already on the stick)
-    // would loopback-boot garbage. So the stick copy is SHA-256-verified
-    // against the source in every case (unless verification was skipped).
-    let (_src, mut metrics) = copy_and_verify_iso(iso, &iso_dst, iso_len, ui, skip_verify)?;
+    let mut metrics = WriteMetrics::default();
 
-    // menu.lst: direct-kernel entry (BIOS + UEFI grub4dos) first, then the
-    // loopback chainload fallback (BIOS-only). Resolve the UEFI loader up
-    // front: the efi\grub\menu.lst mirror applies to the grub4dos-family
-    // loaders only (the signed GRUB2 chain reads grub.cfg), and an
-    // explicitly requested-but-unavailable loader must fail here, before
-    // the remaining file work.
+    // menu.lst: the direct-kernel entry (BIOS + UEFI grub4dos) extracted
+    // from the source ISO - no ISO file, no loopback. Resolve the UEFI
+    // loader up front: the efi\grub\menu.lst mirror applies to the
+    // grub4dos-family loaders only (the signed GRUB2 chain reads grub.cfg),
+    // and an explicitly requested-but-unavailable loader must fail here,
+    // before the remaining file work.
     if !uefi_bootx64.is_empty() && !sys::path_exists(uefi_bootx64) {
         out::warn(&format!(
             "--uefi-bootx64 not found: {} (falling back to the selected loader)",
@@ -2596,7 +2627,8 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
                 .into(),
         );
     }
-    let title = write_menu_entries(&root, &iso_dst, &iso_rel, &safe_name, &iso_name, uefi_res.mirror_menu(), ui)?;
+    let (title, kern_rel, init_rel) =
+        write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui)?;
 
     // First-boot toolkit (bin/uproot et al.): without it the first boot can
     // only stamp trivially. Embedded, LF-normalized, read-back verified.
@@ -2609,7 +2641,7 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need
     // Secure Boot OFF. Skipped when UEFI boot is unchecked.
     if want_uefi {
-        install_uefi_resolved(&root, &title, &iso_rel, uefi_bootx64, uefi_loader)?;
+        install_uefi_resolved(&root, &title, &kern_rel, &init_rel, uefi_bootx64, uefi_loader)?;
     } else {
         out::info("UEFI boot not selected - EFI files skipped.");
     }
@@ -2648,17 +2680,28 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     Ok((metrics, Some(pending)))
 }
 
-/// One GRUB2 menuentry for a loopback ISO. `with_z0` stacks the firstboot
-/// layer (primary install only); extra loopback-only ISOs pass false so a
-/// foreign kernel never loads this stick's z0 — which would also fire
-/// lsl-firstboot.service against the wrong base. Non-casper ISOs should not
-/// get a grub.cfg entry at all (their kernel lives outside casper/).
-fn uefi_cfg_entry(title: &str, iso_rel: &str, with_z0: bool) -> String {
-    let params = if with_z0 {
-        format!("boot=casper iso-scan/filename={iso_rel} layerfs-path=/isodevice/casper/filesystem.z0.squashfs rootdelay=15 quiet splash")
-    } else {
-        format!("boot=casper iso-scan/filename={iso_rel} rootdelay=15 quiet splash")
-    };
+/// Direct-kernel GRUB2 entry (file-less main): search the loose kernel
+/// and boot it with the base+z0 stack. No loopback (no ISO file), no
+/// iso-scan - casper's device scan finds /casper on the stick, and
+/// /cdrom IS the stick here, so the layer path points at /cdrom.
+fn uefi_cfg_direct(title: &str, kern_rel: &str, init_rel: &str) -> String {
+    format!(
+        "menuentry \"{title}\" {{\n\
+         \x20   search --no-floppy --set=root --file {kern_rel}\n\
+         \x20   linux {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs rootdelay=15 quiet splash\n\
+         \x20   initrd {init_rel}\n\
+         }}\n"
+    )
+}
+
+/// Loopback GRUB2 entry (extras, which ship as ISO files): the stock
+/// chainload shape - iso-scan target + in-ISO kernel, deliberately no
+/// layerfs-path so a foreign kernel never stacks this stick's z0 (which
+/// would also fire lsl-firstboot.service against the wrong base).
+/// Non-casper ISOs get no grub.cfg entry at all (their kernel lives
+/// outside casper/).
+fn uefi_cfg_loopback(title: &str, iso_rel: &str) -> String {
+    let params = format!("boot=casper iso-scan/filename={iso_rel} rootdelay=15 quiet splash");
     format!(
         "menuentry \"{title}\" {{\n\
          \x20   search --no-floppy --set=root --file {iso_rel}\n\
@@ -2668,10 +2711,6 @@ fn uefi_cfg_entry(title: &str, iso_rel: &str, with_z0: bool) -> String {
          \x20   initrd (loop)/casper/initrd\n\
          }}\n"
     )
-}
-
-fn uefi_cfg(title: &str, iso_rel: &str) -> String {
-    format!("set timeout=5\n{}", uefi_cfg_entry(title, iso_rel, true))
 }
 
 /// Upsert a `menuentry "TITLE" { ... }` block in a grub.cfg. Same contract
@@ -3375,24 +3414,26 @@ mod tests {
     fn menu_entry_direct_uses_kernel_not_map() {
         // The UEFI path: grub4dos-for-UEFI has no INT 13h `(0xff)`
         // emulation, so the direct entry must avoid map/chainloader and
-        // boot the extracted kernel with iso-scan pointing at the ISO.
+        // boot the extracted kernel with the base+z0 stack. File-less
+        // main: no iso-scan, no loopback - layerfs-path points at /cdrom
+        // (the stick itself), not /isodevice (no ISO loop anymore).
         let e = menu_entry_direct(
             "Mint (direct kernel)",
-            "/_ISO/mint.iso",
             "/_ISO/mint/vmlinuz",
             "/_ISO/mint/initrd",
         );
         assert!(e.contains("title Mint (direct kernel)"));
-        assert!(e.contains("kernel /_ISO/mint/vmlinuz boot=casper iso-scan/filename=/_ISO/mint.iso layerfs-path=/isodevice/casper/filesystem.z0.squashfs rootdelay=15"));
+        assert!(e.contains("kernel /_ISO/mint/vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs rootdelay=15"));
         assert!(e.contains("initrd /_ISO/mint/initrd"));
         assert!(e.contains("\nboot\n"));
         assert!(!e.contains("map "), "direct entry must not use map: {}", e);
         assert!(!e.contains("chainloader"), "direct entry must not chainload: {}", e);
-        assert!(e.contains("layerfs-path=/isodevice/casper/filesystem.z0.squashfs"), "direct entry must stack z0: {}", e);
-        // coexists with the loopback entry (different titles)
+        assert!(!e.contains("iso-scan"), "file-less main has no ISO to scan: {}", e);
+        assert!(e.contains("layerfs-path=/cdrom/casper/filesystem.z0.squashfs"), "direct entry must stack z0: {}", e);
+        // coexists with an extra's loopback entry (different titles)
         let (m1, a1) = upsert_menu(&default_menu(), "Mint (direct kernel)", &e);
         assert!(a1);
-        let (m2, a2) = upsert_menu(&m1, "Mint (loopback ISO)", &menu_entry("Mint (loopback ISO)", "/_ISO/mint.iso", false));
+        let (m2, a2) = upsert_menu(&m1, "Debian (loopback ISO)", &menu_entry("Debian (loopback ISO)", "/_ISO/debian.iso", false));
         assert!(a2);
         assert_eq!(
             m2.lines().filter(|l| l.trim_start().starts_with("title ")).count(),
@@ -3431,35 +3472,36 @@ mod tests {
 
     #[test]
     fn grub_cfg_upsert_is_idempotent_and_multiboot() {
-        let a = uefi_cfg_entry("Mint (loopback ISO)", "/_ISO/mint.iso", true);
-        let b = uefi_cfg_entry("Debian (loopback ISO)", "/_ISO/debian.iso", false);
-        // primary keeps the firstboot stack; extras must not load it.
-        assert!(a.contains("layerfs-path=/isodevice/casper/filesystem.z0.squashfs"));
-        assert!(a.contains("iso-scan/filename=/_ISO/mint.iso"));
+        let a = uefi_cfg_direct("Mint (direct kernel)", "/_ISO/mint/vmlinuz", "/_ISO/mint/initrd");
+        let b = uefi_cfg_loopback("Debian (loopback ISO)", "/_ISO/debian.iso");
+        // file-less main stacks z0 at /cdrom with no iso-scan; extras
+        // loopback their own ISO file and must not load the layer.
+        assert!(a.contains("layerfs-path=/cdrom/casper/filesystem.z0.squashfs"));
+        assert!(!a.contains("iso-scan") && !a.contains("loopback loop"));
         assert!(!b.contains("layerfs-path"));
         assert!(b.contains("iso-scan/filename=/_ISO/debian.iso"));
-        // legacy single-entry helper is the primary entry plus header.
-        assert_eq!(uefi_cfg("Mint (loopback ISO)", "/_ISO/mint.iso"), format!("set timeout=5\n{}", a));
-        // fresh file: header kept, one entry.
-        let (g1, added1) = upsert_grub_entry("set timeout=5\n", "Mint (loopback ISO)", &a);
+        assert!(b.contains("loopback loop /_ISO/debian.iso"));
+        // fresh file: header + direct entry.
+        let fresh = format!("set timeout=5\n{}", a);
+        let (g1, added1) = upsert_grub_entry("set timeout=5\n", "Mint (direct kernel)", &a);
         assert!(added1);
-        assert!(g1.starts_with("set timeout=5\n"));
+        assert_eq!(g1, fresh);
         assert_eq!(g1.matches("menuentry").count(), 1);
         // same entry again: untouched.
-        let (g2, added2) = upsert_grub_entry(&g1, "Mint (loopback ISO)", &a);
+        let (g2, added2) = upsert_grub_entry(&g1, "Mint (direct kernel)", &a);
         assert!(!added2);
         assert_eq!(g2, g1);
         // second ISO appends (multiboot) instead of clobbering.
         let (g3, added3) = upsert_grub_entry(&g2, "Debian (loopback ISO)", &b);
         assert!(added3);
         assert_eq!(g3.matches("menuentry").count(), 2);
-        assert!(g3.contains("/_ISO/mint.iso") && g3.contains("/_ISO/debian.iso"));
+        assert!(g3.contains("/_ISO/mint/vmlinuz") && g3.contains("/_ISO/debian.iso"));
         // drifted body under the same title replaces instead of duplicating.
-        let a2 = uefi_cfg_entry("Mint (loopback ISO)", "/_ISO/mint2.iso", true);
-        let (g4, changed) = upsert_grub_entry(&g3, "Mint (loopback ISO)", &a2);
+        let a2 = uefi_cfg_direct("Mint (direct kernel)", "/_ISO/mint2/vmlinuz", "/_ISO/mint2/initrd");
+        let (g4, changed) = upsert_grub_entry(&g3, "Mint (direct kernel)", &a2);
         assert!(changed);
         assert_eq!(g4.matches("menuentry").count(), 2);
-        assert!(g4.contains("/_ISO/mint2.iso") && !g4.contains("/_ISO/mint.iso"));
+        assert!(g4.contains("/_ISO/mint2/vmlinuz") && !g4.contains("/_ISO/mint/vmlinuz"));
         // removal drops exactly one block.
         let (g5, removed) = remove_grub_entry(&g4, "Debian (loopback ISO)");
         assert!(removed);
@@ -3491,6 +3533,68 @@ mod tests {
         write_extra_iso_entries(&root, &fake_dst, "/_ISO/debian.iso", "debian.iso", true).unwrap();
         assert_eq!(std::fs::read_to_string(format!("{}menu.lst", root)).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Minimal ISO9660 with a casper/ payload used by the file-less-main
+    /// tests: PVD(16) root->20, root: CASPER dir(21), casper/:
+    /// vmlinuz(22,vmlinuz_sz) initrd.lz(23,init_sz)
+    /// filesystem.squashfs(24,base_sz). Returns the written path.
+    fn write_casper_test_iso(dir: &str, vmlinuz_sz: usize, init_sz: usize, base_sz: usize) -> String {
+        fn rec(name: &[u8], extent: u32, size: u32, is_dir: bool) -> Vec<u8> {
+            let total = 33 + name.len() + (33 + name.len()) % 2;
+            let mut r = vec![0u8; total];
+            r[0] = total as u8;
+            r[2..6].copy_from_slice(&extent.to_le_bytes());
+            r[6..10].copy_from_slice(&extent.to_be_bytes());
+            r[10..14].copy_from_slice(&size.to_le_bytes());
+            r[14..18].copy_from_slice(&size.to_be_bytes());
+            r[25] = if is_dir { 2 } else { 0 };
+            r[32] = name.len() as u8;
+            r[33..33 + name.len()].copy_from_slice(name);
+            r
+        }
+        let mut img = vec![0u8; 25 * 2048];
+        img[16 * 2048] = 1;
+        img[16 * 2048 + 1..16 * 2048 + 6].copy_from_slice(b"CD001");
+        img[16 * 2048 + 6] = 1;
+        let mut rr = vec![0u8; 34];
+        rr[0] = 34;
+        rr[2..6].copy_from_slice(&20u32.to_le_bytes());
+        rr[10..14].copy_from_slice(&2048u32.to_le_bytes());
+        img[16 * 2048 + 156..16 * 2048 + 190].copy_from_slice(&rr);
+        let mut root = Vec::new();
+        root.extend(rec(b"CASPER", 21, 2048, true));
+        img[20 * 2048..20 * 2048 + root.len()].copy_from_slice(&root);
+        let mut casper = Vec::new();
+        casper.extend(rec(b"vmlinuz", 22, vmlinuz_sz as u32, false));
+        casper.extend(rec(b"initrd.lz", 23, init_sz as u32, false));
+        casper.extend(rec(b"filesystem.squashfs", 24, base_sz as u32, false));
+        img[21 * 2048..21 * 2048 + casper.len()].copy_from_slice(&casper);
+        // Content bytes don't matter (only sizes are probed/extracted),
+        // but give each extent nonzero data anyway.
+        for (ext, len) in [(22, vmlinuz_sz), (23, init_sz), (24, base_sz)] {
+            for b in img[ext * 2048..ext * 2048 + len].iter_mut() {
+                *b = 0xA5;
+            }
+        }
+        let iso = format!("{}\\casper.iso", dir);
+        std::fs::write(&iso, &img).unwrap();
+        iso
+    }
+
+    #[test]
+    fn main_extract_bytes_sums_casper_payload() {
+        let dir = format!("{}lsl-main-need-{}", sys::temp_dir(), std::process::id());
+        sys::create_dir_all(&dir);
+        let iso = write_casper_test_iso(&dir, 100, 200, 300);
+        assert_eq!(main_extract_bytes(&iso), 600);
+        // Unreadable ISO: falls back to the whole file (safe direction).
+        let bad = format!("{}\\bad.iso", dir);
+        std::fs::write(&bad, vec![0u8; 4096]).unwrap();
+        assert_eq!(main_extract_bytes(&bad), 4096);
+        std::fs::remove_file(&iso).unwrap();
+        std::fs::remove_file(&bad).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]
@@ -3661,7 +3765,7 @@ mod tests {
 
     #[test]
     fn menu_entry_removal_cleans_stale_direct_entries() {
-        let direct = menu_entry_direct("Mint (direct kernel)", "/_ISO/mint.iso", "/_ISO/mint/vmlinuz", "/_ISO/mint/initrd.lz");
+        let direct = menu_entry_direct("Mint (direct kernel)", "/_ISO/mint/vmlinuz", "/_ISO/mint/initrd.lz");
         let loopback = menu_entry("Mint (loopback ISO)", "/_ISO/mint.iso", false);
         let (m, _) = upsert_menu(&default_menu(), "Mint (direct kernel)", &direct);
         let (m, _) = upsert_menu(&m, "Mint (loopback ISO)", &loopback);
@@ -3822,16 +3926,29 @@ mod tests {
             let s = d.to_string_lossy().replace('/', "\\");
             if s.ends_with('\\') { s } else { format!("{}\\", s) }
         };
-        // Not a real ISO: no casper kernel, so only the loopback entry lands.
-        let iso_dst = format!("{}fake.iso", root);
-        std::fs::write(&iso_dst, b"not a real iso - no casper kernel").unwrap();
-        // UEFI install: BOTH the BIOS root menu and the efi\grub mirror exist.
-        let t = write_menu_entries(&root, &iso_dst, "/_ISO/fake.iso", "fake", "fake.iso", true, None).unwrap();
-        assert_eq!(t, "fake (loopback ISO)");
+        let flat = root.trim_end_matches('\\').to_string();
+        let iso = write_casper_test_iso(&flat, 100, 200, 300);
+        // Seed a stale main-loopback stanza (pre-conversion stick): the
+        // file-less rewrite must remove it, not chainload a missing file.
+        std::fs::write(
+            format!("{}menu.lst", root),
+            format!("{}\ntitle casper (loopback ISO)\nmap /_ISO/casper.iso (0xff)\nboot\n", default_menu()),
+        )
+        .unwrap();
+        // UEFI install: direct entry in BOTH menus, base beside casper.
+        let (t, kern, init) =
+            write_menu_entries(&root, &iso, "casper.iso", "casper.iso", true, None).unwrap();
+        assert_eq!(t, "casper (direct kernel)");
+        assert!(kern.ends_with("/vmlinuz"), "unexpected {}", kern);
+        assert!(init.ends_with("initrd.lz"), "unexpected {}", init);
         let root_menu = std::fs::read_to_string(format!("{}menu.lst", root)).unwrap();
         let uefi_menu = std::fs::read_to_string(format!("{}efi\\grub\\menu.lst", root)).unwrap();
-        assert!(root_menu.contains("title fake (loopback ISO)"));
-        assert!(uefi_menu.contains("title fake (loopback ISO)"));
+        assert!(root_menu.contains("title casper (direct kernel)"));
+        assert!(!root_menu.contains("title casper (loopback ISO)"), "stale main loopback must go: {}", root_menu);
+        assert!(uefi_menu.contains("title casper (direct kernel)"));
+        assert!(!uefi_menu.contains("(loopback ISO)"));
+        assert!(std::path::Path::new(&format!("{}casper\\filesystem.squashfs", root)).exists());
+        assert!(std::path::Path::new(&format!("{}_ISO\\casper\\vmlinuz", root)).exists());
         // Fresh stick: the mirror matches the root menu except the BIOS-only
         // `usb --init` line (grub4dos-for-UEFI has no BIOS USB stack).
         assert!(root_menu.lines().any(|l| l.trim() == "usb --init"));
@@ -3841,16 +3958,21 @@ mod tests {
             uefi_menu.lines().collect::<Vec<_>>()
         );
         // Re-running is idempotent: no duplicate titles, identical bytes.
-        write_menu_entries(&root, &iso_dst, "/_ISO/fake.iso", "fake", "fake.iso", true, None).unwrap();
+        write_menu_entries(&root, &iso, "casper.iso", "casper.iso", true, None).unwrap();
         assert_eq!(std::fs::read_to_string(format!("{}menu.lst", root)).unwrap(), root_menu);
         assert_eq!(std::fs::read_to_string(format!("{}efi\\grub\\menu.lst", root)).unwrap(), uefi_menu);
         // BIOS-only install: the mirror must not exist at all.
         let _ = std::fs::remove_dir_all(format!("{}efi", root));
-        write_menu_entries(&root, &iso_dst, "/_ISO/fake.iso", "fake", "fake.iso", false, None).unwrap();
+        write_menu_entries(&root, &iso, "casper.iso", "casper.iso", false, None).unwrap();
         assert!(
             !std::path::Path::new(&format!("{}efi\\grub\\menu.lst", root)).exists(),
             "efi\\grub\\menu.lst must not be created for a BIOS-only install"
         );
+        // Non-casper ISO is a hard error now (file-less main needs the
+        // kernel; loopback needs the file, which no longer ships).
+        let bad = format!("{}\\plain.iso", flat);
+        std::fs::write(&bad, b"not a real iso - no casper kernel").unwrap();
+        assert!(write_menu_entries(&root, &bad, "plain", "plain.iso", false, None).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

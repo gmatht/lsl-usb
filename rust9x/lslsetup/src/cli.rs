@@ -106,9 +106,9 @@ Options:
   --bundle-dir <dir>         lsl files to drop onto the USB (default: exe dir)
   --rufus-path <path>        Path to rufus.exe (auto-downloaded if missing)
   --write-mode <mode>        rufus (default, DD-style write) or nofmt
-                             (non-destructive: grub4dos MBR-code write + the
-                             ISO copied as a file + menu.lst loopback +
-                             BOOTX64.EFI/grub.cfg for UEFI (BIOS + UEFI);
+                             (non-destructive: grub4dos MBR-code write +
+                             kernel/base extracts (no ISO file) + direct-kernel
+                             menu.lst + BOOTX64.EFI/grub.cfg for UEFI (BIOS + UEFI);
                              the stick must already be FAT32/NTFS)
   --usb-letter <X>           Drive letter for the nofmt target (else a picker)
   --allow-fixed              Allow non-removable targets in nofmt mode

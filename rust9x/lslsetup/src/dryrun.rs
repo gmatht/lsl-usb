@@ -70,7 +70,8 @@ pub fn show_dry_run_report(opts: &crate::cli::Opts) {
     if opts.write_mode.eq_ignore_ascii_case("nofmt") {
         out::step("Write mode: non-destructive (nofmt)");
         let uefi_src = crate::nofmt::uefi_source_name(&opts.uefi_bootx64);
-        out::info("Would copy grldr + the ISO as a regular file, generate menu.lst (loopback boot),");
+        out::info("Would copy grldr, extract the kernel + base squashfs out of the source ISO (the ISO file itself is never copied),");
+        out::info("write the direct-kernel menu.lst entries,");
         out::info("drop the first-boot toolkit (bin/uproot et al.), extract the base squashfs,");
         out::info("and write the embedded z0 firstboot layer to casper\\filesystem.z0.squashfs,");
         out::info("offering first to delete h2testw leftovers (*.h2w) when space runs short,");
