@@ -2983,7 +2983,18 @@ pub fn run_gui(
             items.push(PageItem { ctl: PageCtl::Radio(rb, 4), x: 10, y: iy, w: -20, h: 20, idx: 0 });
             iy += 24;
         }
-        // write-method radios (kind 3): one group, exactly one checked
+        // write-method radios (kind 3): one group, exactly one checked.
+        // Bold heading above the method list (matches the section captions).
+        let mut method_cap: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text("Write method:")
+            .position((10, iy))
+            .size((560, 18))
+            .parent(&*frame_install)
+            .build(&mut method_cap);
+        method_cap.set_font(Some(&font_bold));
+        items.push(PageItem { ctl: PageCtl::Lbl(method_cap, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
+        iy += 22;
         // Rufus (any version, incl. the Win7-compatible 3.22) requires
         // Windows 7 or later. On older Windows the radio is greyed out with
         // an explanatory tooltip and the default falls back to the built-in
