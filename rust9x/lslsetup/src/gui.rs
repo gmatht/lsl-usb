@@ -210,6 +210,24 @@ fn checked_target_letter(items: &PageItems) -> String {
     String::new()
 }
 
+/// ISO path for a merged local-ISO row: the kind-9 path label following
+/// item `from` (radio "main" / checkbox "extra" carry no path text).
+/// Stops at the next radio so a malformed row can never steal the
+/// following row's path. "" when absent.
+fn iso_row_path(items: &PageItems, from: usize) -> String {
+    let b = items.borrow();
+    for it in b.iter().skip(from + 1) {
+        match &it.ctl {
+            PageCtl::Lbl(l, 9) => {
+                return l.text().split("  (").next().unwrap_or("").trim().to_string();
+            }
+            PageCtl::Radio(_, _) => break,
+            _ => {}
+        }
+    }
+    String::new()
+}
+
 /// Write mode of the checked kind-3 method radio ("rufus" fallback).
 fn checked_method(items: &PageItems) -> &'static str {
     for it in items.borrow().iter() {
@@ -2425,7 +2443,12 @@ pub fn run_gui(
     for (i, (name, _url)) in DISTRO_OPTIONS.iter().enumerate() {
         add_radio(name, i == rec && have_mint.is_none(), 0, i == 0, &mut y);
     }
-    add_label("Use Already Downloaded ISO:", &mut y);
+    // Local ISOs: ONE merged row each - a bold "main" radio (the default
+    // boot entry + firstboot layer) plus an "extra" checkbox
+    // (loopback-only multiboot entry, no firstboot). The harvest drops
+    // whichever extra is also the selected main, so ticking everything
+    // is harmless.
+    add_label("Local ISOs (one main + any extras for multiboot):", &mut y);
     let found_isos = {
         let mut v = crate::lslfiles::find_everything_isos();
         if v.is_empty() {
@@ -2438,42 +2461,73 @@ pub fn run_gui(
     // there, and a 64-bit live USB would not boot. Unknown-arch ISOs are
     // left alone (treated as compatible).
     let cpu64 = is_64bit_capable();
+    if found_isos.is_empty() {
+        add_plain("(none found)", &mut y);
+    }
     for (n, iso) in found_isos.iter().take(10).enumerate() {
         let sz = sys::file_size(iso).unwrap_or(0);
         let is_the_mint = have_mint.as_deref() == Some(iso.as_str());
         let too_new = !cpu64 && iso_arch_64(iso) == Some(true);
-        let mut label = format!("{}  ({:.2} GB)", iso, sz as f64 / sys::GB as f64);
-        if too_new {
-            label.push_str("  <- 64-bit: will NOT boot this 32-bit machine");
-        } else if is_the_mint {
-            label.push_str("  <- recommended (up-to-date, reuse instead of downloading)");
+        // main radio: bold, labelled "main"
+        let mut rb: Box<nwg::RadioButton> = Box::default();
+        let _ = nwg::RadioButton::builder()
+            .flags(if n == 0 {
+                nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
+            } else {
+                nwg::RadioButtonFlags::VISIBLE
+            })
+            .text("main")
+            .position((10, y))
+            .size((64, 20))
+            .parent(&*frame_iso)
+            .build(&mut rb);
+        rb.set_font(Some(&font_bold));
+        if is_the_mint && !too_new {
+            rb.set_check_state(nwg::RadioButtonState::Checked);
         }
-        add_radio(&label, is_the_mint && !too_new, 1, n == 0, &mut y);
-    }
-    if found_isos.is_empty() {
-        add_plain("(none found)", &mut y);
-    }
-    // Extra multiboot entries (loopback-only, no firstboot): same local
-    // ISO list as checkboxes (kind 3). The harvest drops whichever one is
-    // also the selected primary, so ticking everything is harmless.
-    add_label("Extra boot entries (multiboot, loopback-only, no firstboot):", &mut y);
-    if found_isos.is_empty() {
-        add_plain("(none found)", &mut y);
-    }
-    for iso in found_isos.iter().take(10) {
-        let sz = sys::file_size(iso).unwrap_or(0);
+        iso_items.borrow_mut().push(PageItem {
+            ctl: PageCtl::Radio(rb, 1),
+            x: 10,
+            y,
+            w: 64,
+            h: 20,
+            idx: 0,
+        });
+        // extra checkbox: same row
         let mut cb: Box<nwg::CheckBox> = Box::default();
         let _ = nwg::CheckBox::builder()
-            .text(&format!("{}  ({:.2} GB)", iso, sz as f64 / sys::GB as f64))
-            .position((10, y))
-            .size((780, 20))
+            .text("extra")
+            .position((80, y))
+            .size((64, 20))
             .parent(&*frame_iso)
             .build(&mut cb);
         iso_items.borrow_mut().push(PageItem {
             ctl: PageCtl::Check(cb, 3),
-            x: 10,
+            x: 80,
             y,
-            w: -20,
+            w: 64,
+            h: 20,
+            idx: 0,
+        });
+        // path label (kind 9): the harvest reads the ISO path from here
+        let mut path_label = format!("{}  ({:.2} GB)", iso, sz as f64 / sys::GB as f64);
+        if too_new {
+            path_label.push_str("  <- 64-bit: will NOT boot this 32-bit machine");
+        } else if is_the_mint {
+            path_label.push_str("  <- recommended (up-to-date, reuse instead of downloading)");
+        }
+        let mut pl: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text(&path_label)
+            .position((150, y))
+            .size((630, 20))
+            .parent(&*frame_iso)
+            .build(&mut pl);
+        iso_items.borrow_mut().push(PageItem {
+            ctl: PageCtl::Lbl(pl, 9),
+            x: 150,
+            y,
+            w: -170,
             h: 20,
             idx: 0,
         });
@@ -4088,7 +4142,7 @@ fn harvest_gui_result(
     let mut chosen_iso: Option<String> = None;
     let mut download_iso: Option<(String, String)> = None;
     let mut distro_arch: Option<&'static str> = None;
-    for it in iso_items.borrow().iter() {
+    for (idx, it) in iso_items.borrow().iter().enumerate() {
         let (cb, kind) = match &it.ctl {
             PageCtl::Radio(cb, k) => (cb, *k),
             _ => continue,
@@ -4105,7 +4159,11 @@ fn harvest_gui_result(
             }
             1 => {
                 if chosen_iso.is_none() {
-                    chosen_iso = Some(text.split("  (").next().unwrap_or("").trim().to_string());
+                    // path lives in the row's kind-9 label (radio says "main")
+                    let p = iso_row_path(&iso_items, idx);
+                    if !p.is_empty() {
+                        chosen_iso = Some(p);
+                    }
                 }
             }
             _ => {
@@ -4146,10 +4204,11 @@ fn harvest_gui_result(
         chosen_iso.clone().unwrap_or_default()
     };
     let mut extra_isos: Vec<String> = Vec::new();
-    for it in iso_items.borrow().iter() {
+    for (idx, it) in iso_items.borrow().iter().enumerate() {
         if let PageCtl::Check(cb, 3) = &it.ctl {
             if cb.check_state() == nwg::CheckBoxState::Checked {
-                let p = cb.text().split("  (").next().unwrap_or("").trim().to_string();
+                // path lives in the row's kind-9 label (checkbox says "extra")
+                let p = iso_row_path(&iso_items, idx);
                 if !p.is_empty()
                     && !p.eq_ignore_ascii_case(&primary_known)
                     && !extra_isos.iter().any(|q: &String| q.eq_ignore_ascii_case(&p))
