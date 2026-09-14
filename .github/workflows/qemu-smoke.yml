@@ -2,8 +2,10 @@ name: qemu-boot-smoke
 
 # Opt-in only: real-hardware-free boot test. Run manually (Actions -> qemu-boot-smoke
 # -> Run workflow) and supply an ISO URL/path. Never triggered automatically so it
-# does not block the main CI. Requires a runner with KVM (Larger runners, or a
-# self-hosted runner with /dev/kvm).
+# does not block the main CI. Requires hardware acceleration: KVM on Linux
+# (/dev/kvm: larger runners or self-hosted), or WHPX on a bare-metal Windows
+# host (assemble in WSL2, boot with Windows QEMU - see tests/qemu-boot-test.sh
+# --phase/--accel). TCG emulation is refused by default (far too slow).
 on:
   workflow_dispatch:
     inputs:
