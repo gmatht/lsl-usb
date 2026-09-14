@@ -107,6 +107,7 @@ pub struct GuiResult {
     pub bios_boot: bool,                       // INSTALL-page "BIOS boot" checkbox (default: supported)
     pub uefi_boot: bool,                       // INSTALL-page "UEFI boot" checkbox (default: supported)
     pub check_usb: bool,                       // INSTALL-page "Check whole USB" checkbox (default: off, slow)
+    pub extra_isos: Vec<String>,               // page-1 "extra boot" checkboxes (loopback-only, no firstboot)
 }
 
 /// Wizard pages: 0 hw, 1 iso, 2 flatpak, 3 system, 4 wifi, 5 install.
@@ -2378,6 +2379,32 @@ pub fn run_gui(
     if found_isos.is_empty() {
         add_plain("(none found)", &mut y);
     }
+    // Extra multiboot entries (loopback-only, no firstboot): same local
+    // ISO list as checkboxes (kind 3). The harvest drops whichever one is
+    // also the selected primary, so ticking everything is harmless.
+    add_label("Extra boot entries (multiboot, loopback-only, no firstboot):", &mut y);
+    if found_isos.is_empty() {
+        add_plain("(none found)", &mut y);
+    }
+    for iso in found_isos.iter().take(10) {
+        let sz = sys::file_size(iso).unwrap_or(0);
+        let mut cb: Box<nwg::CheckBox> = Box::default();
+        let _ = nwg::CheckBox::builder()
+            .text(&format!("{}  ({:.2} GB)", iso, sz as f64 / sys::GB as f64))
+            .position((10, y))
+            .size((780, 20))
+            .parent(&*frame_iso)
+            .build(&mut cb);
+        iso_items.borrow_mut().push(PageItem {
+            ctl: PageCtl::Check(cb, 3),
+            x: 10,
+            y,
+            w: -20,
+            h: 20,
+            idx: 0,
+        });
+        y += 24;
+    }
     add_label("Use an existing Live USB (skips ISO download + Rufus):", &mut y);
     let existing_usbs: Vec<sys::Volume> = {
         let mut v = sys::find_usb_volumes("", &[]);
@@ -2721,13 +2748,61 @@ pub fn run_gui(
         iy += 28;
         let mut help: Box<nwg::Label> = Box::default();
         let _ = nwg::Label::builder()
-            .text("Choose how to write the live image to the USB, then click Install.")
+            .text("Choose the target USB first, then how to write the image.")
             .position((10, iy))
             .size((560, 18))
             .parent(&*frame_install)
             .build(&mut help);
         items.push(PageItem { ctl: PageCtl::Lbl(help, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
         iy += 26;
+        // target USB picker (kind 4): FIRST on the page - the stick is
+        // chosen before the method, so the BIOS/UEFI defaults below can
+        // follow it. Removable volumes, first pre-checked.
+        let mut cap: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text("Target USB (for the non-destructive copy):")
+            .position((10, iy))
+            .size((560, 18))
+            .parent(&*frame_install)
+            .build(&mut cap);
+        cap.set_font(Some(&font_bold));
+        items.push(PageItem { ctl: PageCtl::Lbl(cap, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
+        iy += 22;
+        let mut targets: Vec<sys::Volume> = sys::list_volumes()
+            .into_iter()
+            .filter(|v| v.removable && !v.cdrom && !v.letter.is_empty())
+            .collect();
+        targets.sort_by(|a, b| a.letter.cmp(&b.letter));
+        if targets.is_empty() {
+            let mut none: Box<nwg::Label> = Box::default();
+            let _ = nwg::Label::builder()
+                .text("[No removable USB drives detected]")
+                .position((26, iy))
+                .size((560, 20))
+                .parent(&*frame_install)
+                .build(&mut none);
+            items.push(PageItem { ctl: PageCtl::Lbl(none, 0), x: 26, y: iy, w: -20, h: 20, idx: 0 });
+            iy += 24;
+        }
+        for (n, u) in targets.iter().enumerate() {
+            let mut rb: Box<nwg::RadioButton> = Box::default();
+            let _ = nwg::RadioButton::builder()
+                .flags(if n == 0 {
+                    nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
+                } else {
+                    nwg::RadioButtonFlags::VISIBLE
+                })
+                .text(&format!("{}:  {}  {}  ({:.1} GB)", u.letter, u.label, u.fs, u.size_gb()))
+                .position((10, iy))
+                .size((780, 20))
+                .parent(&*frame_install)
+                .build(&mut rb);
+            if n == 0 {
+                rb.set_check_state(nwg::RadioButtonState::Checked);
+            }
+            items.push(PageItem { ctl: PageCtl::Radio(rb, 4), x: 10, y: iy, w: -20, h: 20, idx: 0 });
+            iy += 24;
+        }
         // write-method radios (kind 3): one group, exactly one checked
         // Rufus (any version, incl. the Win7-compatible 3.22) requires
         // Windows 7 or later. On older Windows the radio is greyed out with
@@ -2851,52 +2926,6 @@ pub fn run_gui(
             .build(&mut note);
         items.push(PageItem { ctl: PageCtl::Lbl(note, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
         iy += 26;
-        // target USB picker (kind 4): removable volumes, first pre-checked
-        let mut cap: Box<nwg::Label> = Box::default();
-        let _ = nwg::Label::builder()
-            .text("Target USB (for the non-destructive copy):")
-            .position((10, iy))
-            .size((560, 18))
-            .parent(&*frame_install)
-            .build(&mut cap);
-        cap.set_font(Some(&font_bold));
-        items.push(PageItem { ctl: PageCtl::Lbl(cap, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
-        iy += 22;
-        let mut targets: Vec<sys::Volume> = sys::list_volumes()
-            .into_iter()
-            .filter(|v| v.removable && !v.cdrom && !v.letter.is_empty())
-            .collect();
-        targets.sort_by(|a, b| a.letter.cmp(&b.letter));
-        if targets.is_empty() {
-            let mut none: Box<nwg::Label> = Box::default();
-            let _ = nwg::Label::builder()
-                .text("[No removable USB drives detected]")
-                .position((26, iy))
-                .size((560, 20))
-                .parent(&*frame_install)
-                .build(&mut none);
-            items.push(PageItem { ctl: PageCtl::Lbl(none, 0), x: 26, y: iy, w: -20, h: 20, idx: 0 });
-            iy += 24;
-        }
-        for (n, u) in targets.iter().enumerate() {
-            let mut rb: Box<nwg::RadioButton> = Box::default();
-            let _ = nwg::RadioButton::builder()
-                .flags(if n == 0 {
-                    nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
-                } else {
-                    nwg::RadioButtonFlags::VISIBLE
-                })
-                .text(&format!("{}:  {}  {}  ({:.1} GB)", u.letter, u.label, u.fs, u.size_gb()))
-                .position((10, iy))
-                .size((780, 20))
-                .parent(&*frame_install)
-                .build(&mut rb);
-            if n == 0 {
-                rb.set_check_state(nwg::RadioButtonState::Checked);
-            }
-            items.push(PageItem { ctl: PageCtl::Radio(rb, 4), x: 10, y: iy, w: -20, h: 20, idx: 0 });
-            iy += 24;
-        }
         // default the BIOS/UEFI checkboxes to the preselected stick
         let first_letter = targets.first().map(|u| u.letter.clone()).unwrap_or_default();
         drop(items); // release the borrow_mut above: apply re-borrows
@@ -3998,6 +4027,29 @@ fn harvest_gui_result(
     chosen_iso = chosen_iso.filter(|s| !s.is_empty() && s != "[None found]");
     reuse_usb = reuse_usb.filter(|s| !s.is_empty());
 
+    // Extra multiboot ISOs (page-1 kind-3 checkboxes): loopback-only
+    // entries, no firstboot. The selected primary is excluded here (the
+    // install-time validation re-checks once downloads resolve to paths).
+    let primary_known = if !iso_arg.is_empty() {
+        iso_arg.to_string()
+    } else {
+        chosen_iso.clone().unwrap_or_default()
+    };
+    let mut extra_isos: Vec<String> = Vec::new();
+    for it in iso_items.borrow().iter() {
+        if let PageCtl::Check(cb, 3) = &it.ctl {
+            if cb.check_state() == nwg::CheckBoxState::Checked {
+                let p = cb.text().split("  (").next().unwrap_or("").trim().to_string();
+                if !p.is_empty()
+                    && !p.eq_ignore_ascii_case(&primary_known)
+                    && !extra_isos.iter().any(|q: &String| q.eq_ignore_ascii_case(&p))
+                {
+                    extra_isos.push(p);
+                }
+            }
+        }
+    }
+
     // Fresh download selected, but an up-to-date, right-sized local copy of
     // the same ISO exists? Reuse it instead of re-downloading (only when the
     // user did not explicitly pick another ISO).
@@ -4109,6 +4161,7 @@ fn harvest_gui_result(
 
     GuiResult {
         iso_path,
+        extra_isos,
         flatpak_ids: [flatpak_ids, extra].concat(),
         wsl_vhdx,
         data_dir: data_text,
