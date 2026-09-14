@@ -2201,14 +2201,24 @@ fn confirm_h2w_delete(letter: &str, ui: Option<&dyn WriteUi>, summary: &str) -> 
     }
 }
 
-/// Delete the confirmed .h2w files, then re-check space. `free_now` is a
-/// parameter (not queried inside) so tests can inject values; production
-/// passes `sys::free_bytes(letter)`.
-fn h2w_delete_and_recheck(letter: &str, found: &[(String, u64)], need: u64, free_now: Option<u64>) -> Result<bool, String> {
+/// Exact-megabyte rendering for space errors. `{:.1} GB` rounding alone
+/// turns "30712 MB free vs 30720 MB needed" into the paradoxical
+/// "30.0 GB free (needs 30.0 GB)" - always pair GB figures with these.
+fn mb_str(bytes: u64) -> String {
+    format!("{} MB", bytes / sys::MB)
+}
+/// Delete the confirmed .h2w files, then re-check space. `free_now` and
+/// `free_before` are parameters (not queried inside) so tests can inject
+/// values; production passes fresh `sys::free_bytes(letter)` for both
+/// (before = at offer time, now = after the delete).
+fn h2w_delete_and_recheck(letter: &str, found: &[(String, u64)], need: u64, free_now: Option<u64>, free_before: u64) -> Result<bool, String> {
     let mut failed = 0;
-    for (path, _) in found {
+    let mut freed: u64 = 0;
+    for (path, size) in found {
         if std::fs::remove_file(path).is_err() {
             failed += 1;
+        } else {
+            freed += size;
         }
     }
     if failed > 0 {
@@ -2222,19 +2232,53 @@ fn h2w_delete_and_recheck(letter: &str, found: &[(String, u64)], need: u64, free
             ));
             Ok(true)
         }
-        Some(now) => Err(format!(
-            "Deleted the h2testw files but {}: still has only {:.1} GB free (needs {:.1} GB) - free more space, then re-run.",
-            letter, now as f64 / sys::GB as f64, need as f64 / sys::GB as f64
-        )),
-        None => Err(format!("Deleted the h2testw files but could not re-check free space on {}: - re-run to continue.", letter)),
+        Some(now) => {
+            // Deleted bytes that never came back as free space point at a
+            // different problem than "disk too small": held copies
+            // elsewhere (Recycle Bin, another volume), the wrong drive
+            // letter after a re-enumeration, or filesystem corruption.
+            // Say so explicitly instead of repeating "still short".
+            const SLACK: u64 = 64 * 1024 * 1024;
+            let appeared = now.saturating_sub(free_before);
+            let missing = if freed >= SLACK && appeared + SLACK < freed {
+                format!(
+                    " Deleting freed {} but only {} came back as free space - the space is held elsewhere (earlier Explorer deletions sitting in $RECYCLE.BIN, the wrong drive letter after the stick re-enumerated, or filesystem corruption: run chkdsk {}: /f) - address that, then re-run.",
+                    mb_str(freed), mb_str(appeared), letter
+                )
+            } else {
+                String::new()
+            };
+            Err(format!(
+                "Deleted {} h2testw file(s) ({}) but {}: still has only {:.1} GB free ({}; needs {:.1} GB, {}) - free more space, then re-run.{}",
+                found.len() - failed, mb_str(freed),
+                letter, now as f64 / sys::GB as f64, mb_str(now), need as f64 / sys::GB as f64, mb_str(need),
+                missing
+            ))
+        }
+        None => Err(format!("Deleted the h2testw files but could not re-check free space on {} - re-run to continue.", letter)),
     }
 }
 
-/// Offer to delete h2testw leftovers when the stick is too full.
-/// Ok(true) = deleted and space now suffices (caller continues);
-/// Ok(false) = nothing to offer (caller emits the plain full-disk error);
-/// Err = declined, still short after delete, or delete-doesn't-cover.
+/// Offer to delete h2testw leftovers when the stick looks too full.
+/// Ok(true) = space suffices after all (caller continues, with or without
+/// deleting); Ok(false) = nothing to offer (caller emits the plain
+/// full-disk error); Err = declined, still short after delete, or
+/// delete-doesn't-cover. `free` is the caller's (possibly stale) snapshot -
+/// free space is re-queried here because the user may have freed space
+/// since the target was probed, and deleting gigabytes on a stale reading
+/// would be pure vandalism.
 fn offer_h2w_cleanup(letter: &str, ui: Option<&dyn WriteUi>, free: u64, need: u64) -> Result<bool, String> {
+    let fresh = sys::free_bytes(letter).unwrap_or(free);
+    if fresh >= need {
+        if fresh != free {
+            out::info(&format!(
+                "Re-scanned {}: {} free now ({} at probe) - continuing without deleting anything.",
+                letter, mb_str(fresh), mb_str(free)
+            ));
+        }
+        return Ok(true);
+    }
+    let free = fresh;
     let root = format!("{}:\\", letter);
     let found = h2w_files_in(&root);
     if found.is_empty() {
@@ -2243,8 +2287,8 @@ fn offer_h2w_cleanup(letter: &str, ui: Option<&dyn WriteUi>, free: u64, need: u6
     let reclaim: u64 = found.iter().map(|(_, s)| s).sum();
     let shortfall = need.saturating_sub(free);
     let summary = format!(
-        "{}: only {:.1} GB free but {:.1} GB needed. Found {} h2testw leftover file(s) (*.h2w, {:.1} GB) in the drive root.",
-        letter, free as f64 / sys::GB as f64, need as f64 / sys::GB as f64,
+        "{}: only {:.1} GB free ({}) but {:.1} GB needed ({}). Found {} h2testw leftover file(s) (*.h2w, {:.1} GB) in the drive root.",
+        letter, free as f64 / sys::GB as f64, mb_str(free), need as f64 / sys::GB as f64, mb_str(need),
         found.len(), reclaim as f64 / sys::GB as f64
     );
     if reclaim < shortfall {
@@ -2256,7 +2300,7 @@ fn offer_h2w_cleanup(letter: &str, ui: Option<&dyn WriteUi>, free: u64, need: u6
     if !confirm_h2w_delete(letter, ui, &summary) {
         return Err(format!("{}\nAborted - the h2testw files were left alone.", summary));
     }
-    h2w_delete_and_recheck(letter, &found, need, sys::free_bytes(letter))
+    h2w_delete_and_recheck(letter, &found, need, sys::free_bytes(letter), free)
 }
 
 fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool, extra_isos: &[String]) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
@@ -2303,11 +2347,11 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         let cleaned = offer_h2w_cleanup(&t.letter, ui, t.free, need_bytes)?;
         if !cleaned {
             return Err(format!(
-                "{:.1} GB free on {}:, the ISO{} needs {:.1} GB - not enough space for the no-reformat method.",
-                t.free as f64 / sys::GB as f64,
+                "{:.1} GB free ({}) on {}:, the ISO{} needs {:.1} GB ({}) - not enough space for the no-reformat method.",
+                t.free as f64 / sys::GB as f64, mb_str(t.free),
                 t.letter,
                 if validated_extra.is_empty() { String::new() } else { format!(" + {} extra(s)", validated_extra.len()) },
-                need_bytes as f64 / sys::GB as f64
+                need_bytes as f64 / sys::GB as f64, mb_str(need_bytes)
             ));
         }
     }
@@ -3199,7 +3243,7 @@ mod tests {
         let found = h2w_files_in(&dir);
         assert_eq!(found.len(), 1);
         // Enough space after delete: Ok(true), .h2w gone, .txt kept.
-        assert!(h2w_delete_and_recheck("T", &found, 50, Some(200)).unwrap());
+        assert!(h2w_delete_and_recheck("T", &found, 50, Some(200), 0).unwrap());
         assert!(h2w_files_in(&dir).is_empty());
         assert!(std::path::Path::new(&format!("{}\\keep.txt", dir)).exists());
         std::fs::remove_file(format!("{}\\keep.txt", dir)).unwrap();
@@ -3213,17 +3257,45 @@ mod tests {
         std::fs::write(format!("{}\\9.h2w", dir), vec![7u8; 10]).unwrap();
         let found = h2w_files_in(&dir);
         // Delete happens (user confirmed), but space still short: loud Err.
-        let err = h2w_delete_and_recheck("T", &found, u64::MAX, Some(1)).unwrap_err();
+        // free_before=0 with a 10-byte delete: nothing "missing", just short.
+        let err = h2w_delete_and_recheck("T", &found, u64::MAX, Some(1), 0).unwrap_err();
         assert!(err.contains("still has only"), "unexpected: {err}");
+        assert!(!err.contains("held elsewhere"), "10 freed bytes must not trip the missing-space hint: {err}");
         assert!(h2w_files_in(&dir).is_empty());
         std::fs::remove_dir(&dir).unwrap();
         // Unqueryable free space: loud Err, not silent success.
         sys::create_dir_all(&dir);
         std::fs::write(format!("{}\\9.h2w", dir), vec![7u8; 10]).unwrap();
         let found = h2w_files_in(&dir);
-        let err = h2w_delete_and_recheck("T", &found, 1, None).unwrap_err();
+        let err = h2w_delete_and_recheck("T", &found, 1, None, 0).unwrap_err();
         assert!(err.contains("could not re-check"), "unexpected: {err}");
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn h2w_delete_names_missing_space_when_freed_never_comes_back() {
+        // 70 MB really deleted, but the re-query shows nothing new: the
+        // error must point at held copies / wrong volume / corruption,
+        // with exact figures - not a bare "still short".
+        let dir = format!("{}lsl-h2w-missing-{}", sys::temp_dir(), std::process::id());
+        sys::create_dir_all(&dir);
+        std::fs::write(format!("{}\\big.h2w", dir), vec![7u8; 70 << 20]).unwrap();
+        let found = h2w_files_in(&dir);
+        assert_eq!(found.len(), 1);
+        let before = 1000u64;
+        let err = h2w_delete_and_recheck("T", &found, u64::MAX, Some(before), before).unwrap_err();
+        assert!(err.contains("70 MB"), "must state what the delete freed: {err}");
+        assert!(err.contains("held elsewhere"), "must name the missing-space cause: {err}");
+        assert!(err.contains("chkdsk T: /f"), "must suggest the repair: {err}");
+        assert!(err.contains("still has only"), "must keep the short-space verdict too: {err}");
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn mb_str_is_exact() {
+        assert_eq!(mb_str(0), "0 MB");
+        assert_eq!(mb_str(sys::GB * 30), "30720 MB");
+        assert_eq!(mb_str(sys::GB * 3 + 512), "3072 MB"); // truncates, never rounds up need
     }
 
     fn valid_mbr() -> [u8; 512] {
