@@ -1,6 +1,6 @@
 #!/bin/bash
 # Shared LSL-USB config and USB vs HDD mode detection.
-# shellcheck disable=SC1091
+# shellcheck disable=SC1090,SC1091
 
 LSL_ENV_FILE="${LSL_ENV_FILE:-/cdrom/lsl-usb.env}"
 
