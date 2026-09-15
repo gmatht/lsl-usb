@@ -51,6 +51,28 @@ diag() {
     fi
 }
 
+# Consecutive no-network boots (own counter: being offline is common and
+# transient, so it must NOT consume the uproot-failure budget, but it must
+# NOT retry silently forever either). The marker + reason drive the desktop
+# error dialog (XDG autostart + immediate notify); no stamp is written so a
+# later boot with working network resumes automatically.
+NET_FAIL_FILE="${LSL_FIRSTBOOT_NET_FAIL:-/cdrom/casper/lsl-firstboot.no-network}"
+FAILED_MARKER=/cdrom/casper/lsl-firstboot.FAILED
+FAILED_REASON=/cdrom/casper/lsl-firstboot.FAILED.reason
+
+# Best-effort: show the failure dialog in the CURRENT desktop session too
+# (the XDG autostart copy only fires at next login). Runs the installed
+# notifier as the console user on :0; silently does nothing headless.
+notify_desktop_now() {
+    command -v zenity >/dev/null 2>&1 || return 0
+    local user xauth
+    user="$(stat -c '%U' /dev/console 2>/dev/null || true)"
+    [ -n "$user" ] && [ "$user" != "root" ] && [ "$user" != "UNKNOWN" ] || return 0
+    xauth="/home/$user/.Xauthority"
+    [ -r "$xauth" ] || return 0
+    su -s /bin/bash "$user" -c "DISPLAY=:0 XAUTHORITY='$xauth' bash /usr/local/bin/lsl-firstboot-failed.sh" 2>/dev/null || true
+}
+
 # Remove any appended layer that fails to list (partial/corrupt from an
 # interrupted mksquashfs) so we never boot a broken layer.
 lsl_firstboot_cleanup_partial_layers() {
@@ -228,11 +250,35 @@ captive_portal_detected() {
 }
 
 if ! wait_for_network; then
-    set_phase 'failed - no network after ~5 minutes, will retry on next boot'
-    log "No network after ~5 minutes; will retry on next boot (Restart=on-failure)."
+    # Bounded-loud, not infinite-silent: count (stick + /run mirror, max, so
+    # a stale stick copy cannot rewind it), leave the FAILED marker + reason
+    # so the desktop shows an Error dialog (this session + next login), then
+    # exit 1 WITHOUT stamping - a later boot with network resumes itself.
+    n_stick="$(cat "$NET_FAIL_FILE" 2>/dev/null || echo 0)"
+    n_run="$(cat /run/lsl-firstboot.no-network 2>/dev/null || echo 0)"
+    net_fail="$n_stick"
+    [ "$n_run" -gt "$net_fail" ] 2>/dev/null && net_fail="$n_run"
+    net_fail=$((net_fail + 1))
+    echo "$net_fail" > "$NET_FAIL_FILE" 2>/dev/null || true
+    echo "$net_fail" > /run/lsl-firstboot.no-network 2>/dev/null || true
+    set_phase "failed - no network (attempt $net_fail), error shown on desktop - will retry on next boot"
+    log "No network after ~5 minutes (attempt $net_fail); leaving the desktop error dialog, will retry on next boot."
     log "TIP: connect via WIRED Ethernet for first boot; some wireless cards need"
     log "firmware not present in the base image (preload it via /cdrom/firmware)."
+    touch "$FAILED_MARKER" 2>/dev/null || true
+    {
+        echo "lsl-usb first boot has no usable network (attempt $net_fail)."
+        echo ""
+        echo "Fix, then reboot - setup resumes automatically:"
+        echo "- plug in wired Ethernet, or"
+        echo "- USB-tether a phone, or"
+        echo "- boot in range of a network listed in /cdrom/wifi.sh"
+        echo ""
+        echo "Details: $LOG and the diagnostics tarball next to it."
+    } > "$FAILED_REASON" 2>/dev/null || true
+    sync 2>/dev/null || true
     diag "firstboot-no-network"
+    notify_desktop_now
     exit 1
 fi
 log "Network up."
@@ -294,6 +340,10 @@ if [ "$rc" -ne 0 ]; then
     exit 1
 fi
 rm -f "$ATTEMPT_FILE" 2>/dev/null || true
+# Success clears the failure state: no stale Error dialog, no stale
+# no-network count (a later offline boot starts its own count).
+rm -f "$FAILED_MARKER" "$FAILED_REASON" "$NET_FAIL_FILE" 2>/dev/null || true
+rm -f /run/lsl-firstboot.no-network 2>/dev/null || true
 
 set_phase 'done - rebooting'
 rm -f "$STATUS"
