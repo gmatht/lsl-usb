@@ -96,17 +96,11 @@ if [ "$ARCH" = "amd64" ] && [ "${LSL_SNAP_SUPPORT:-1}" != "0" ]; then
     apt install -y snapd
 fi
 
-# Install flatpak refs preloaded by the Windows installer (apps the user has
-# on Windows). Runs in the chroot so the installs land in the persisted layer.
-if [ "$ARCH" = "amd64" ] && ls /cdrom/flatpaks/*.flatpakref >/dev/null 2>&1; then
-    echo "Installing preloaded flatpaks..."
-    flatpak remote-list --system 2>/dev/null | grep -q flathub || \
-        flatpak remote-add --system flathub https://flathub.org/repo/flathub.flatpakrepo || true
-    for ref in /cdrom/flatpaks/*.flatpakref; do
-        echo "  flatpak install --from $(basename "$ref")"
-        flatpak install --system --noninteractive --from "$ref" || true
-    done
-fi
+# Flatpaks are NOT installed here. They install host-side (firstboot's
+# install_flatpaks_fat) into the FAT-hosted 'lsl-fat' installation as direct
+# files: baking multi-GB apps into this chroot would pack them into the single
+# squashfs layer file and hit the FAT32 4 GiB ceiling. The *.flatpakref files
+# in /cdrom/flatpaks are only the app LIST for that step.
 # --- web browser: everyone gets one ---
 # 64-bit: Brave (amd64). 32-bit: Pale Moon non-SSE2 from the antiX repo (supports
 # old 32-bit CPUs, incl. pre-SSE2), with fallbacks to firefox-esr / chromium.

@@ -91,6 +91,9 @@ static FIRSTBOOT_TOOLKIT: &[(&str, &str)] = &[
     ("bin\\lsl-diag.sh", include_str!("../../../bin/lsl-diag.sh")),
     ("bin\\lsl-common.sh", include_str!("../../../bin/lsl-common.sh")),
     ("bin\\persist-wifi.sh", include_str!("../../../bin/persist-wifi.sh")),
+    ("bin\\lsl-flatpak-fat.sh", include_str!("../../../bin/lsl-flatpak-fat.sh")),
+    ("fuse\\fat_linux_meta_fs.py", include_str!("../../../fuse/fat_linux_meta_fs.py")),
+    ("fuse\\fusepy\\fuse.py", include_str!("../../../fuse/fusepy/fuse.py")),
     ("onboot.sh", include_str!("../../../onboot.sh")),
 ];
 

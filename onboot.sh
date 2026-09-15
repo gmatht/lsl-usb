@@ -441,10 +441,18 @@ EOF
     } > /run/lsl-usb.state
 fi
 
-# Opt-in: host a flatpak installation on the FAT partition via the
-# fat_linux_meta_fs FUSE layer (apps persist without layer rebuilds).
-if [ "${LSL_FLATPAK_FAT:-0}" = "1" ] && [ -r /cdrom/bin/lsl-flatpak-fat.sh ]; then
-    bash /cdrom/bin/lsl-flatpak-fat.sh mount || true
+# Flatpak-on-FAT, ON by default when the stick holds a FAT installation (or
+# a sideload repo to build one from): mount the FUSE view, publish the
+# 'lsl-fat' installation system-wide, and expose its apps to every desktop
+# session via XDG_DATA_DIRS. Opt OUT with LSL_FLATPAK_FAT=0 in lsl-usb.env.
+# (Installs happen at first boot; this only re-exposes them each boot.)
+if [ "${LSL_FLATPAK_FAT:-1}" != "0" ] && [ -r /cdrom/bin/lsl-flatpak-fat.sh ] && { [ -d /cdrom/flatpak ] || [ -d /cdrom/flatpaks/usb ]; }; then
+    if bash /cdrom/bin/lsl-flatpak-fat.sh mount; then
+        mkdir -p /etc/flatpak/installations.d 2>/dev/null || true
+        { echo '[Installation "lsl-fat"]'; echo "Path=/run/lsl-fat/flatpak"; echo "DisplayName=LSL USB (FAT)"; } > /etc/flatpak/installations.d/lsl-fat.conf 2>/dev/null || true
+        mkdir -p /etc/profile.d 2>/dev/null || true
+        printf '%s\n' 'if [ -d /run/lsl-fat/flatpak/exports/share ]; then' '  export XDG_DATA_DIRS="/run/lsl-fat/flatpak/exports/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"' 'fi' > /etc/profile.d/lsl-flatpak-fat.sh 2>/dev/null || true
+    fi
 fi
 
 lsl_merge_fstab || true

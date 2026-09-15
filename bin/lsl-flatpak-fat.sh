@@ -21,8 +21,17 @@ FUSE_SCRIPT=/cdrom/fuse/fat_linux_meta_fs.py
 mount_fat_view() {
     [ -d "$MOUNT" ] || mkdir -p "$MOUNT"
     mountpoint -q "$MOUNT" && return 0
+    modprobe fuse 2>/dev/null || true
     command -v python3 >/dev/null 2>&1 || { echo "python3 required" >&2; return 1; }
-    python3 -c 'import fuse' 2>/dev/null || { echo "fusepy required (pip install fusepy)" >&2; return 1; }
+    # Prefer the fusepy vendored on the stick (offline-safe); fall back to a
+    # system fusepy, then pip as a last resort (needs network).
+    if [ -f "$BACKING/fuse/fusepy/fuse.py" ]; then
+        export PYTHONPATH="$BACKING/fuse/fusepy${PYTHONPATH:+:$PYTHONPATH}"
+    fi
+    if ! python3 -c 'import fuse' 2>/dev/null; then
+        python3 -m pip install --user fusepy 2>/dev/null || true
+    fi
+    python3 -c 'import fuse' 2>/dev/null || { echo "fusepy required (vendored copy missing at $BACKING/fuse/fusepy and pip unavailable)" >&2; return 1; }
     [ -e /dev/fuse ] || { echo "/dev/fuse not available" >&2; return 1; }
     [ -f "$FUSE_SCRIPT" ] || { echo "missing $FUSE_SCRIPT" >&2; return 1; }
     python3 "$FUSE_SCRIPT" "$BACKING" "$MOUNT" &

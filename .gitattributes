@@ -5,6 +5,8 @@
 # (in .gitattributes the LAST matching line wins).
 bin/** text eol=lf
 misc/** text eol=lf
+fuse/** text eol=lf
+pi-stick/** text eol=lf
 systemd/** text eol=lf
 initramfs/** text eol=lf
 onboot.sh text eol=lf

@@ -61,16 +61,39 @@ FAILED_MARKER=/cdrom/casper/lsl-firstboot.FAILED
 FAILED_REASON=/cdrom/casper/lsl-firstboot.FAILED.reason
 
 # Best-effort: show the failure dialog in the CURRENT desktop session too
-# (the XDG autostart copy only fires at next login). Runs the installed
-# notifier as the console user on :0; silently does nothing headless.
+# (the XDG autostart copy only fires at next login). Session truth comes
+# from loginctl - never a hardcoded DISPLAY=:0 (wrong on :1, multi-seat,
+# and Wayland, which has no XAUTHORITY at all) and never /dev/console
+# ownership (root-owned on systemd, so that test silently never fired).
+# The notifier picks its own dialog backend (zenity or the bundled GTK
+# fallback), so this function gates on nothing but a graphical session.
+# Never fails the service: every fallible step degrades to silent return.
 notify_desktop_now() {
-    command -v zenity >/dev/null 2>&1 || return 0
-    local user xauth
-    user="$(stat -c '%U' /dev/console 2>/dev/null || true)"
-    [ -n "$user" ] && [ "$user" != "root" ] && [ "$user" != "UNKNOWN" ] || return 0
-    xauth="/home/$user/.Xauthority"
-    [ -r "$xauth" ] || return 0
-    su -s /bin/bash "$user" -c "DISPLAY=:0 XAUTHORITY='$xauth' bash /usr/local/bin/lsl-firstboot-failed.sh" 2>/dev/null || true
+    command -v loginctl >/dev/null 2>&1 || return 0
+    local sess dtype user disp rdir home
+    sess=""
+    for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+        dtype="$(loginctl show-session -p Type --value "$s" 2>/dev/null || true)"
+        case "$dtype" in
+            x11|wayland) sess="$s"; break ;;
+        esac
+    done
+    [ -n "$sess" ] || return 0
+    user="$(loginctl show-session -p Name --value "$sess" 2>/dev/null || true)"
+    [ -n "$user" ] && [ "$user" != root ] || return 0
+    dtype="$(loginctl show-session -p Type --value "$sess" 2>/dev/null || true)"
+    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+    rdir="/run/user/$(id -u "$user" 2>/dev/null || echo x)"
+    if [ "$dtype" = wayland ]; then
+        # No XAUTHORITY/DISPLAY on Wayland: socket under the runtime dir
+        # (wayland-0 is the compositor default; the callee still decides).
+        # DISPLAY is emptied so GTK never tries a stale X11 display first.
+        su -s /bin/bash "$user" -c "DISPLAY= XDG_RUNTIME_DIR='$rdir' WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-wayland-0}' bash /usr/local/bin/lsl-firstboot-failed.sh" 2>/dev/null || true
+    else
+        disp="$(loginctl show-session -p Display --value "$sess" 2>/dev/null || true)"
+        su -s /bin/bash "$user" -c "DISPLAY='${disp:-:0}' XDG_RUNTIME_DIR='$rdir' XAUTHORITY='$home/.Xauthority' bash /usr/local/bin/lsl-firstboot-failed.sh" 2>/dev/null || true
+    fi
+    return 0
 }
 
 # Remove any appended layer that fails to list (partial/corrupt from an
@@ -289,12 +312,55 @@ fi
 log "Tooling: btrfs-progs=$(command -v mkfs.btrfs >/dev/null 2>&1 && echo yes || echo MISSING), hivex=$(command -v hivexget >/dev/null 2>&1 && echo yes || echo MISSING)"
 set_phase 'installing packages and packing layer (first boot)...'
 
-if [ ! -x "$UPROOT" ]; then
+# Flatpaks live in a FAT-hosted installation (direct files via the FUSE
+# view), NEVER in the squashfs layer: baking multi-GB apps into one file
+# would hit the FAT32 4 GiB ceiling and bloat every first boot with
+# downloads. Runs host-side (not in the uproot chroot) so the overlay
+# upper stays lean. Skips loud (never bakes) when FUSE won't come up.
+install_flatpaks_fat() {
+    local ids id inst conf
+    command -v flatpak >/dev/null 2>&1 || { log "flatpak CLI missing - skipping flatpak installs."; return 0; }
+    [ -d /cdrom/flatpaks ] || return 0
+    ids="$(for ref in /cdrom/flatpaks/*.flatpakref; do [ -e "$ref" ] || continue; basename "$ref" .flatpakref; done)"
+    [ -n "$ids" ] || { log "No flatpak refs staged in /cdrom/flatpaks - skipping."; return 0; }
+    set_phase 'installing flatpaks onto the stick (files, not the layer)...'
+    log "Installing flatpaks into the FAT-hosted installation: $ids"
+    if [ ! -r /cdrom/bin/lsl-flatpak-fat.sh ] || ! bash /cdrom/bin/lsl-flatpak-fat.sh mount; then
+        log "WARNING: FUSE view unavailable - SKIPPING flatpaks (refusing to bake GBs into the 4 GiB-capped layer). Install later with: bash /cdrom/bin/lsl-flatpak-fat.sh install <app>"
+        return 0
+    fi
+    inst=/run/lsl-fat/flatpak
+    mkdir -p "$inst" 2>/dev/null || true
+    # System-wide named installation pointing at the FUSE mount (this file
+    # lands in the layer via the overlay upper - tiny; the CONTENT is FAT).
+    mkdir -p /etc/flatpak/installations.d 2>/dev/null || true
+    { echo '[Installation "lsl-fat"]'; echo "Path=$inst"; echo "DisplayName=LSL USB (FAT)"; } > /etc/flatpak/installations.d/lsl-fat.conf 2>/dev/null || true
+    if [ -d /cdrom/flatpaks/usb ]; then
+        for id in $ids; do
+            log "  sideload $id (offline, from /cdrom/flatpaks/usb)"
+            flatpak --installation=lsl-fat install --noninteractive --assumeyes --sideload-repo=/cdrom/flatpaks/usb "$id" >>"$LOG" 2>&1 \
+                || log "WARNING: sideload of $id failed (continuing with the rest)"
+        done
+    else
+        log "No /cdrom/flatpaks/usb sideload repo - downloading from flathub (bytes land on FAT, not the layer)."
+        flatpak --installation=lsl-fat remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo >>"$LOG" 2>&1 || true
+        for id in $ids; do
+            log "  download $id from flathub"
+            flatpak --installation=lsl-fat install --noninteractive --assumeyes flathub "$id" >>"$LOG" 2>&1 \
+                || log "WARNING: install of $id failed (continuing with the rest)"
+        done
+    fi
+    log "Flatpak FAT install done (installation 'lsl-fat', backing /cdrom/flatpak)."
+}
+
+if [ ! -r "$UPROOT" ]; then
     log "$UPROOT missing - nothing to install/persist. Stamping anyway."
     touch "$STAMP"
     sync
     exit 0
 fi
+
+install_flatpaks_fat
 
 log "Running $UPROOT --auto-append (log: $(basename "$LOG"))..."
 # Keep the desktop responsive: CPU-low priority, idle I/O class.
