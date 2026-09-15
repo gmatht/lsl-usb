@@ -39,7 +39,10 @@ log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
 
 # Collect diagnostics to a Windows-readable volume on failure so the hardware
 # test can inspect a wedged first boot without the USB.
-diag() { [ -x /cdrom/bin/lsl-diag.sh ] && bash /cdrom/bin/lsl-diag.sh "${1:-firstboot}" 2>/dev/null || true; }
+# Gate on -r, not -x: casper mounts the FAT stick without exec bits, so -x
+# is false (and direct exec fails) even though `bash script` works fine.
+# Without this, no diagnostics tarball is ever written on FAT sticks.
+diag() { [ -r /cdrom/bin/lsl-diag.sh ] && bash /cdrom/bin/lsl-diag.sh "${1:-firstboot}" 2>/dev/null || true; }
 
 # Remove any appended layer that fails to list (partial/corrupt from an
 # interrupted mksquashfs) so we never boot a broken layer.

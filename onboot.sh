@@ -203,15 +203,18 @@ fi
 mount /cdrom/ -o remount,ro 2>/dev/null || true
 
 # Ensure systemd units and PATH tweaks match the tree under /cdrom (not the live ISO alone).
-if [ -x /cdrom/bin/config.sh ]; then
-    /cdrom/bin/config.sh --from-onboot || true
+# NOTE: gate on -r and invoke via bash: casper mounts the FAT stick without
+# exec bits, so -x is false and direct exec fails even though `bash script`
+# works fine. Same for every /cdrom script gate below (incl. wifi.sh).
+if [ -r /cdrom/bin/config.sh ]; then
+    bash /cdrom/bin/config.sh --from-onboot || true
 fi
 
 mount / -o remount
 
 # Remove legacy /etc hooks that append to /cdrom/bash.log (permission denied when /cdrom is ro).
-if [ -x /cdrom/bin/clean-old-system-patches.sh ]; then
-    /cdrom/bin/clean-old-system-patches.sh || true
+if [ -r /cdrom/bin/clean-old-system-patches.sh ]; then
+    bash /cdrom/bin/clean-old-system-patches.sh || true
 fi
 
 touch /run/casper-no-prompt
@@ -235,8 +238,8 @@ modprobe ntfs3 2>/dev/null || true
 mkdir -p /mnt/c /mnt/d
 bash /cdrom/bin/mount_all.sh
 
-if [ -x /cdrom/bin/wsl-boot-setup ]; then
-    /cdrom/bin/wsl-boot-setup
+if [ -r /cdrom/bin/wsl-boot-setup ]; then
+    bash /cdrom/bin/wsl-boot-setup
 fi
 
 # --- LSL data dir / home / cache ---
@@ -250,8 +253,8 @@ lsl_setup_zram
 
 # Opt-in: reclaim Windows pagefile.sys / WSL2 swapfile.vhdx as compressed swap
 # (after verifying a clean Windows shutdown). See bin/lsl-reclaim-win-swap.sh.
-if [ "${LSL_RECLAIM_WIN_SWAP:-0}" = "1" ] && [ -x /cdrom/bin/lsl-reclaim-win-swap.sh ]; then
-    /cdrom/bin/lsl-reclaim-win-swap.sh || true
+if [ "${LSL_RECLAIM_WIN_SWAP:-0}" = "1" ] && [ -r /cdrom/bin/lsl-reclaim-win-swap.sh ]; then
+    bash /cdrom/bin/lsl-reclaim-win-swap.sh || true
 fi
 
 DATA_DIR="$(lsl_resolve_data_dir)"
@@ -440,16 +443,16 @@ fi
 
 # Opt-in: host a flatpak installation on the FAT partition via the
 # fat_linux_meta_fs FUSE layer (apps persist without layer rebuilds).
-if [ "${LSL_FLATPAK_FAT:-0}" = "1" ] && [ -x /cdrom/bin/lsl-flatpak-fat.sh ]; then
-    /cdrom/bin/lsl-flatpak-fat.sh mount || true
+if [ "${LSL_FLATPAK_FAT:-0}" = "1" ] && [ -r /cdrom/bin/lsl-flatpak-fat.sh ]; then
+    bash /cdrom/bin/lsl-flatpak-fat.sh mount || true
 fi
 
 lsl_merge_fstab || true
 lsl_ensure_nix_daemon || true
 
 # After /home is mounted (config.sh --from-onboot runs earlier, before home setup).
-if [ -x /cdrom/bin/config.sh ]; then
-    /cdrom/bin/config.sh --install-autostart-warning-only || true
+if [ -r /cdrom/bin/config.sh ]; then
+    bash /cdrom/bin/config.sh --install-autostart-warning-only || true
 fi
 
 # Optional: overlay-writable view of Windows Steam libraries so Linux Steam can
@@ -469,7 +472,7 @@ mount_steam_overlay "/mnt/c/Program Files (x86)/Steam" /tmp/steam2/upper /tmp/st
 # Wait for wifi (bounded): wifi.sh may be missing (no saved profiles) or the
 # network may be down; don't block boot forever. onboot.service is
 # Type=oneshot + RemainAfterExit, so this script should exit when done.
-if [ -x /cdrom/wifi.sh ]; then
+if [ -r /cdrom/wifi.sh ]; then
     tries=0
     until bash /cdrom/wifi.sh; do
         tries=$((tries + 1))

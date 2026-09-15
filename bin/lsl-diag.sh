@@ -75,8 +75,30 @@ cp -a /cdrom/casper/uproot-logs/.   "$WORK/uproot-logs/"       2>/dev/null || tr
     echo "=== /etc/fstab ==="; cat /etc/fstab 2>/dev/null
 } > "$WORK/hardware.txt" 2>/dev/null || true
 
+# Network snapshot: firstboot usually dies on "no network" with no trace of
+# WHY (missing firmware? no device? out of range? wrong password?). Capture
+# the full L2/L3 picture plus the wifi attempt log every time.
+{
+    echo "=== ip link ==="; ip link 2>/dev/null; echo
+    echo "=== ip addr ==="; ip addr 2>/dev/null; echo
+    echo "=== ip route ==="; ip route 2>/dev/null; echo
+    echo "=== /sys/class/net ==="; ls -l /sys/class/net 2>/dev/null; echo
+    echo "=== /sys/class/ieee80211 (wifi phys) ==="; ls -l /sys/class/ieee80211 2>/dev/null; echo
+    echo "=== rfkill ==="; rfkill list 2>/dev/null; echo
+    echo "=== nmcli dev status ==="; nmcli dev status 2>/dev/null; echo
+    echo "=== nmcli radio ==="; nmcli radio all 2>/dev/null; echo
+    echo "=== nmcli con show ==="; nmcli -t -f NAME,UUID,TYPE,DEVICE con show 2>/dev/null; echo
+    echo "=== nmcli wifi list (cached scan) ==="; nmcli -t -f SSID,SIGNAL,SECURITY dev wifi list --rescan no 2>/dev/null; echo
+    echo "=== /etc/NetworkManager/system-connections ==="; ls -l /etc/NetworkManager/system-connections/ 2>/dev/null
+} > "$WORK/network.txt" 2>/dev/null || true
 if command -v dmesg >/dev/null 2>&1; then
     dmesg > "$WORK/dmesg.txt" 2>/dev/null || true
+    dmesg | grep -iE 'firmware|wlan[0-9]|iwlwifi|brcm|brcmfmac|ath10k|ath11k|rtw_|rtw88|rtw89|mt76|rtl8|rtl9|Direct firmware load' | tail -n 60 > "$WORK/dmesg-net.txt" 2>/dev/null || true
+fi
+# Staged wifi recipe + onboot's attempt trace (proves wifi.sh ran or not).
+cp -a /cdrom/wifi.sh "$WORK/wifi.sh" 2>/dev/null || true
+if command -v journalctl >/dev/null 2>&1; then
+    journalctl -u NetworkManager --no-pager -n 300 > "$WORK/journal-NetworkManager.txt" 2>/dev/null || true
 fi
 # Secure Boot state (relevant if the USB fails to boot on UEFI firmware).
 if command -v mokutil >/dev/null 2>&1; then
@@ -107,6 +129,10 @@ if [ -z "$ARCHIVE" ] || [ ! -f "$ARCHIVE" ]; then
     ARCHIVE="$DEST/lsl-${TAG}-${TS}"
     cp -a "$WORK/." "$ARCHIVE/" 2>/dev/null || true
 fi
+
+# Flush to the stick before anyone reboots: FAT + sudden reboot can lose the
+# tail of the tarball otherwise (firstboot exits 1 and systemd restarts it).
+sync 2>/dev/null || true
 
 if [ "${LSL_DIAG_CDROM_RW:-0}" = "1" ]; then
     mount -o remount,ro /cdrom 2>/dev/null || true
