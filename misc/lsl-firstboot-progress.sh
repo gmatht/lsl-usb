@@ -29,6 +29,14 @@ stamp_present && exit 0
 # and exit instead of vanishing silently (the old `|| exit 0` behavior
 # that hid this exact failure).
 LSL_PROGRESS_GTK="${LSL_PROGRESS_GTK:-/usr/local/bin/lsl-progress-gtk.py}"
+# Dialog errors go here AND to the journal: autostart stdout/stderr may go
+# nowhere visible (/dev/null hid every past failure), and /tmp is writable
+# in every session (unlike /cdrom, which may be the read-only ISO loop).
+DIALOG_LOG="${LSL_DIALOG_LOG:-/tmp/lsl-firstboot-dialog.log}"
+dialog_log() {
+    printf '%s %s\n' "$(date '+%F %T' 2>/dev/null || printf '?')" "$*" >>"$DIALOG_LOG" 2>/dev/null || true
+    logger -t lsl-firstboot-progress "$*" 2>/dev/null || true
+}
 DIALOG_PROG=""
 if command -v zenity >/dev/null 2>&1; then
     DIALOG_PROG=zenity
@@ -36,9 +44,10 @@ elif command -v python3 >/dev/null 2>&1 && [ -f "$LSL_PROGRESS_GTK" ] \
     && python3 -c 'import gi' 2>/dev/null; then
     DIALOG_PROG=gtk
 else
-    logger -t lsl-firstboot-progress "no dialog backend (need zenity or python3-gi + $LSL_PROGRESS_GTK); progress invisible" 2>/dev/null || true
+    dialog_log "no dialog backend (need zenity or python3-gi + $LSL_PROGRESS_GTK); progress invisible"
     exit 0
 fi
+dialog_log "progress dialog starting via $DIALOG_PROG"
 
 current_phase() {
     if [ -r "$STATUS" ]; then
@@ -65,11 +74,14 @@ if [ "$DIALOG_PROG" = zenity ]; then
     feed_phases | zenity --progress --pulsate --auto-close --auto-kill \
         --title="lsl-usb first boot" \
         --text="Preparing your USB system (first boot)..." \
-        --width=480 2>/dev/null
+        --width=480 2>>"$DIALOG_LOG"
+    # PIPESTATUS right away: rc 0 = shown to completion, 1 = dismissed early.
+    dialog_log "progress dialog finished via zenity (consumer rc=${PIPESTATUS[1]:-?})"
 else
     feed_phases | python3 "$LSL_PROGRESS_GTK" \
         --title="lsl-usb first boot" \
         --text="Preparing your USB system (first boot)..." \
-        --width=480
+        --width=480 2>>"$DIALOG_LOG"
+    dialog_log "progress dialog finished via gtk fallback (consumer rc=${PIPESTATUS[1]:-?})"
 fi
 exit 0

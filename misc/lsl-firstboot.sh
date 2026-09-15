@@ -60,39 +60,45 @@ NET_FAIL_FILE="${LSL_FIRSTBOOT_NET_FAIL:-/cdrom/casper/lsl-firstboot.no-network}
 FAILED_MARKER=/cdrom/casper/lsl-firstboot.FAILED
 FAILED_REASON=/cdrom/casper/lsl-firstboot.FAILED.reason
 
-# Best-effort: show the failure dialog in the CURRENT desktop session too
+# Best-effort: show the failure dialog in the CURRENT desktop session(s) too
 # (the XDG autostart copy only fires at next login). Session truth comes
 # from loginctl - never a hardcoded DISPLAY=:0 (wrong on :1, multi-seat,
 # and Wayland, which has no XAUTHORITY at all) and never /dev/console
 # ownership (root-owned on systemd, so that test silently never fired).
-# The notifier picks its own dialog backend (zenity or the bundled GTK
-# fallback), so this function gates on nothing but a graphical session.
+# Every graphical session is notified (deduplicated by user+display, so a
+# twice-logged-in user sees one dialog, not two); single-seat behaves
+# exactly like first-match. The notifier picks its own dialog backend
+# (zenity or the bundled GTK fallback), so this function gates on nothing
+# but the presence of a graphical session.
 # Never fails the service: every fallible step degrades to silent return.
 notify_desktop_now() {
     command -v loginctl >/dev/null 2>&1 || return 0
-    local sess dtype user disp rdir home
-    sess=""
+    local s dtype user disp rdir home key seen
+    seen=" "
     for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
         dtype="$(loginctl show-session -p Type --value "$s" 2>/dev/null || true)"
-        case "$dtype" in
-            x11|wayland) sess="$s"; break ;;
-        esac
+        case "$dtype" in x11|wayland) ;; *) continue ;; esac
+        user="$(loginctl show-session -p Name --value "$s" 2>/dev/null || true)"
+        [ -n "$user" ] && [ "$user" != root ] || continue
+        home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+        rdir="/run/user/$(id -u "$user" 2>/dev/null || echo x)"
+        if [ "$dtype" = wayland ]; then
+            # No XAUTHORITY/DISPLAY on Wayland: socket under the runtime dir
+            # (wayland-0 is the compositor default; the callee still decides).
+            # DISPLAY is emptied so GTK never tries a stale X11 display first.
+            key=" $user|wayland:${WAYLAND_DISPLAY:-wayland-0} "
+            case "$seen" in *"$key"*) continue ;; esac
+            seen="$seen$key"
+            su -s /bin/bash "$user" -c "DISPLAY= XDG_RUNTIME_DIR='$rdir' WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-wayland-0}' bash /usr/local/bin/lsl-firstboot-failed.sh" 2>>"${LOG:-/dev/null}" || { log "notify_desktop_now: su to $user failed (wayland); see above"; true; }
+        else
+            disp="$(loginctl show-session -p Display --value "$s" 2>/dev/null || true)"
+            disp="${disp:-:0}"
+            key=" $user|x11:$disp "
+            case "$seen" in *"$key"*) continue ;; esac
+            seen="$seen$key"
+            su -s /bin/bash "$user" -c "DISPLAY='$disp' XDG_RUNTIME_DIR='$rdir' XAUTHORITY='$home/.Xauthority' bash /usr/local/bin/lsl-firstboot-failed.sh" 2>>"${LOG:-/dev/null}" || { log "notify_desktop_now: su to $user failed (x11 $disp); see above"; true; }
+        fi
     done
-    [ -n "$sess" ] || return 0
-    user="$(loginctl show-session -p Name --value "$sess" 2>/dev/null || true)"
-    [ -n "$user" ] && [ "$user" != root ] || return 0
-    dtype="$(loginctl show-session -p Type --value "$sess" 2>/dev/null || true)"
-    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
-    rdir="/run/user/$(id -u "$user" 2>/dev/null || echo x)"
-    if [ "$dtype" = wayland ]; then
-        # No XAUTHORITY/DISPLAY on Wayland: socket under the runtime dir
-        # (wayland-0 is the compositor default; the callee still decides).
-        # DISPLAY is emptied so GTK never tries a stale X11 display first.
-        su -s /bin/bash "$user" -c "DISPLAY= XDG_RUNTIME_DIR='$rdir' WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-wayland-0}' bash /usr/local/bin/lsl-firstboot-failed.sh" 2>/dev/null || true
-    else
-        disp="$(loginctl show-session -p Display --value "$sess" 2>/dev/null || true)"
-        su -s /bin/bash "$user" -c "DISPLAY='${disp:-:0}' XDG_RUNTIME_DIR='$rdir' XAUTHORITY='$home/.Xauthority' bash /usr/local/bin/lsl-firstboot-failed.sh" 2>/dev/null || true
-    fi
     return 0
 }
 
@@ -318,7 +324,7 @@ set_phase 'installing packages and packing layer (first boot)...'
 # downloads. Runs host-side (not in the uproot chroot) so the overlay
 # upper stays lean. Skips loud (never bakes) when FUSE won't come up.
 install_flatpaks_fat() {
-    local ids id inst conf
+    local ids id inst
     command -v flatpak >/dev/null 2>&1 || { log "flatpak CLI missing - skipping flatpak installs."; return 0; }
     [ -d /cdrom/flatpaks ] || return 0
     ids="$(for ref in /cdrom/flatpaks/*.flatpakref; do [ -e "$ref" ] || continue; basename "$ref" .flatpakref; done)"

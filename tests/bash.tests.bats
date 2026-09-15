@@ -321,9 +321,27 @@ EOF
     chmod +x "$TMPDIR_TEST/bin/zenity"
     export PATH="$TMPDIR_TEST/bin:$PATH"
     export ZENITY_INPUT="$TMPDIR_TEST/zenity-input"
+    export LSL_DIALOG_LOG="$TMPDIR_TEST/dialog.log"
     run bash misc/lsl-firstboot-progress.sh
     [ "$status" -eq 0 ]
     grep -q 'installing packages' "$ZENITY_INPUT"
+    # The finished line pins dialog-error logging (the feature that ends
+    # silent failures): backend + consumer status hit the log every run.
+    grep -q 'finished via zenity' "$TMPDIR_TEST/dialog.log"
+}
+
+@test "lsl-firstboot-progress: no backend logs loudly instead of vanishing" {
+    export LSL_FIRSTBOOT_STAMP="$TMPDIR_TEST/stamp"
+    export LSL_FIRSTBOOT_STATUS="$TMPDIR_TEST/status"
+    export LSL_DIALOG_LOG="$TMPDIR_TEST/dialog.log"
+    echo 'phase=working...' > "$LSL_FIRSTBOOT_STATUS"
+    mkdir -p "$TMPDIR_TEST/emptybin"
+    export LSL_PROGRESS_GTK="$TMPDIR_TEST/no-such-gtk.py"
+    # No zenity, no python3-gi path here: only the empty bin dir + system
+    # paths (which lack zenity in CI) are visible.
+    run env PATH="$TMPDIR_TEST/emptybin:/usr/bin:/bin" bash misc/lsl-firstboot-progress.sh
+    [ "$status" -eq 0 ]
+    grep -q 'no dialog backend' "$TMPDIR_TEST/dialog.log"
 }
 
 # --- uproot: --auto-append accepted (config-failure path needs a live system) ---

@@ -21,6 +21,13 @@ fi
 msg="$msg"$'\n\n'"Collect diagnostics:  bash /cdrom/bin/lsl-diag.sh"$'\n'"Retry manually:      sudo bash /cdrom/bin/uproot --auto-append"
 
 LSL_PROGRESS_GTK="${LSL_PROGRESS_GTK:-/usr/local/bin/lsl-progress-gtk.py}"
+# Same dialog-error log as the progress script (autostart output may go
+# nowhere; /tmp is writable in every session).
+DIALOG_LOG="${LSL_DIALOG_LOG:-/tmp/lsl-firstboot-dialog.log}"
+dialog_log() {
+    printf '%s %s\n' "$(date '+%F %T' 2>/dev/null || printf '?')" "$*" >>"$DIALOG_LOG" 2>/dev/null || true
+    logger -t lsl-firstboot-failed "$*" 2>/dev/null || true
+}
 DIALOG_PROG=""
 if command -v zenity >/dev/null 2>&1; then
     DIALOG_PROG=zenity
@@ -30,10 +37,14 @@ elif command -v python3 >/dev/null 2>&1 && [ -f "$LSL_PROGRESS_GTK" ] \
 fi
 
 if [ "$DIALOG_PROG" = zenity ]; then
-    zenity --warning --no-wrap --title "lsl-usb: first boot incomplete" --text "$msg" 2>/dev/null || true
+    zenity --warning --no-wrap --title "lsl-usb: first boot incomplete" --text "$msg" 2>>"$DIALOG_LOG"
+    # rc 0 = shown and acknowledged, 1 = dismissed/failed: log either way so
+    # the next "no dialog appeared" report starts from evidence, not guesses.
+    dialog_log "warning dialog via zenity finished (rc=${PIPESTATUS[0]:-?}); $msg"
 elif [ "$DIALOG_PROG" = gtk ]; then
-    python3 "$LSL_PROGRESS_GTK" --warn --title "lsl-usb: first boot incomplete" --text "$msg" || true
+    python3 "$LSL_PROGRESS_GTK" --warn --title "lsl-usb: first boot incomplete" --text "$msg" 2>>"$DIALOG_LOG"
+    dialog_log "warning dialog via gtk fallback finished (rc=$?); $msg"
 else
-    logger -t lsl-firstboot-failed "no dialog backend; $msg" 2>/dev/null || true
+    dialog_log "no dialog backend; $msg"
 fi
 exit 0
