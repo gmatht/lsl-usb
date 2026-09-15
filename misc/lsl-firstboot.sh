@@ -329,6 +329,15 @@ install_flatpaks_fat() {
     [ -d /cdrom/flatpaks ] || return 0
     ids="$(for ref in /cdrom/flatpaks/*.flatpakref; do [ -e "$ref" ] || continue; basename "$ref" .flatpakref; done)"
     [ -n "$ids" ] || { log "No flatpak refs staged in /cdrom/flatpaks - skipping."; return 0; }
+    # Builder pre-installed the apps straight into /cdrom/flatpak (fast
+    # builder network, direct files): nothing to install, just publish the
+    # installation definition so this boot (and onboot, every boot) sees it.
+    if [ -d /cdrom/flatpak/repo ]; then
+        log "Flatpaks preinstalled by the builder in /cdrom/flatpak - mount-only, no install."
+        mkdir -p /etc/flatpak/installations.d 2>/dev/null || true
+        { echo '[Installation "lsl-fat"]'; echo "Path=/run/lsl-fat/flatpak"; echo "DisplayName=LSL USB (FAT)"; } > /etc/flatpak/installations.d/lsl-fat.conf 2>/dev/null || true
+        return 0
+    fi
     set_phase 'installing flatpaks onto the stick (files, not the layer)...'
     log "Installing flatpaks into the FAT-hosted installation: $ids"
     if [ ! -r /cdrom/bin/lsl-flatpak-fat.sh ] || ! bash /cdrom/bin/lsl-flatpak-fat.sh mount; then
@@ -377,6 +386,15 @@ else
     nice -n 10 bash "$UPROOT" --auto-append >>"$LOG" 2>&1 || rc=$?
 fi
 if [ "$rc" -ne 0 ]; then
+    giveup_why=""
+    if [ "$rc" -eq 2 ]; then
+        # Deterministic refusal (uproot exit 2: over the FAT32 4 GiB limit or
+        # out of space). Retrying cannot help, so skip the transient budget
+        # and go straight to FAILED + stop.
+        giveup_why="refused deterministically (over the FAT32 4 GiB limit or out of space)"
+        log "uproot $giveup_why - not retrying (see $LOG)."
+        attempts=$MAX_ATTEMPTS
+    else
     # The counter must stay bounded even when the stick is unreachable:
     # if its write fails, every retry reads back a stale value and the
     # loop runs forever (observed: endless "attempt 1/5" on read-only
@@ -390,13 +408,18 @@ if [ "$rc" -ne 0 ]; then
     attempts=$((attempts + 1))
     echo "$attempts" > "$ATTEMPT_FILE" 2>/dev/null || true
     echo "$attempts" > /run/lsl-firstboot.attempts 2>/dev/null || true
+    fi
     if [ "$attempts" -ge "$MAX_ATTEMPTS" ]; then
-        set_phase "setup failed after $attempts attempts - see $LOG"
-        log "uproot --auto-append FAILED $attempts times; giving up (see $LOG)."
+        set_phase "setup failed ${giveup_why:-after $attempts attempts} - see $LOG"
+        log "uproot --auto-append ${giveup_why:-FAILED $attempts times}; giving up (see $LOG)."
         # Leave a visible marker so the failure isn't silent after reboot.
         touch /cdrom/casper/lsl-firstboot.FAILED 2>/dev/null || true
         {
-            echo "lsl-firstboot gave up after $attempts attempts ($(date))."
+            if [ -n "$giveup_why" ]; then
+                echo "lsl-firstboot gave up: $giveup_why ($(date))."
+            else
+                echo "lsl-firstboot gave up after $attempts attempts ($(date))."
+            fi
             echo "See $LOG and the diagnostics tarball (bash /cdrom/bin/lsl-diag.sh)."
             echo "To retry: boot, open a terminal, run: sudo bash /cdrom/bin/uproot --auto-append"
         } > /cdrom/casper/lsl-firstboot.FAILED.reason 2>/dev/null || true

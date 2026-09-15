@@ -183,17 +183,25 @@ write_append_layer() {
     fi
     # FAT32 file-size ceiling: a squashfs written to a vfat /cdrom may not exceed
     # ~4 GiB. Refuse up front (with a clear message) instead of failing mid-write.
+    # Exit 2 (deterministic, never retry) vs 1 (transient): firstboot stops
+    # immediately on 2 instead of burning its retry budget on a size that
+    # cannot change between attempts.
     if lsl_cdrom_is_vfat; then
         local fatcap; fatcap="$(lsl_fat32_max_bytes)"
         if [ "${upper_bytes:-0}" -gt "$fatcap" ] 2>/dev/null; then
             echo "ERROR: the layer (~${upper_bytes} bytes of changes) would exceed the FAT32 4 GiB file limit on /cdrom." >&2
             echo "       Use smaller, more frequent appends, or move the data dir to an HDD (LSL_DATA_DIR)." >&2
-            log "Refusing to write layer: ${upper_bytes} bytes exceeds FAT32 limit ${fatcap}."
-            return 1
+            log "Refusing to write layer: ${upper_bytes} bytes exceeds FAT32 limit ${fatcap} (deterministic)."
+            return 2
         fi
     fi
     echo "Writing new layer squashfs: $layer"
-    mksquashfs /tmp/squashfs/upper "$layer" -comp zstd -Xcompression-level 22
+    # Mirror the merge path's exclusions, plus flatpak: /var/lib/flatpak holds
+    # a content-addressed object store (multi-GB) that must NEVER be baked into
+    # a FAT32-capped layer file - flatpaks live in the FAT-hosted 'lsl-fat'
+    # installation as direct files instead (see install_flatpaks_fat).
+    mksquashfs /tmp/squashfs/upper "$layer" -comp zstd -Xcompression-level 22 \
+        -wildcards -e "var/lib/flatpak/*" "var/cache/apt/archives/*" "var/lib/apt/lists/*"
     if [ -n "${squashfs_config_used_host:-}" ] && [ -f "$squashfs_config_used_host" ]; then
         cp -a "$squashfs_config_used_host" "$meta"
         echo "Saved config script snapshot: $meta"
@@ -225,6 +233,16 @@ cleanup_mounts() {
     umount /tmp/squashfs/root/ 2>/dev/null || true
 }
 trap cleanup_mounts EXIT
+
+# Tear down a poisoned overlay so the NEXT attempt starts empty: unmount our
+# own binds (never -R, see above), then delete the upper/work contents. A
+# failed run otherwise leaves gigabytes in upper/ on the live /cow, and every
+# retry silently reuses them (observed: 7.2 GiB over-limit upper re-failing
+# identically 27 times). Only call when nothing will be persisted.
+reset_overlay() {
+    cleanup_mounts
+    rm -rf /tmp/squashfs/upper/* /tmp/squashfs/work/* 2>/dev/null || true
+}
 
 clear_mount_tree() {
     local target="$1"
@@ -411,6 +429,7 @@ if [ -n "$config_in_chroot" ]; then
         log "Non-interactive run failed."
         if [ "$auto_append" -eq 1 ]; then
             echo "Auto-append mode: no interactive fallback; aborting (retry on next boot)."
+            reset_overlay
             exit 1
         fi
         echo "Falling back to interactive chroot."
@@ -473,9 +492,12 @@ case "$choice" in
     append)
         # Append a new layer from the overlay upperdir only.
         log "User selected: append"
-        if ! write_append_layer; then
+        write_append_layer
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
             echo "Append failed (see log). Not persisting." >&2
-            exit 1
+            reset_overlay
+            exit "$rc"
         fi
         ;;
     merge)
@@ -497,8 +519,8 @@ case "$choice" in
             if [ "$est" -gt "$fatcap" ] 2>/dev/null; then
                 echo "ERROR: the merged image (~${est} bytes) would exceed the FAT32 4 GiB file limit on /cdrom." >&2
                 echo "       Use append instead (smaller, incremental layers)." >&2
-                log "Merge skipped: ${est} bytes exceeds FAT32 limit ${fatcap}."
-                exit 1
+                log "Merge skipped: ${est} bytes exceeds FAT32 limit ${fatcap} (deterministic)."
+                exit 2
             fi
         fi
         # Drop apt caches/lists from the layer so it stays small (and under the

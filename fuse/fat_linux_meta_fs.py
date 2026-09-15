@@ -557,7 +557,7 @@ class FatLinuxMetaFS(fuse.Operations):
             d["st_rdev"] = int(ent["rdev"])
         if ent.get("symlink"):
             target = str(ent["symlink"])
-            d["st_mode"] = (d.get("st_mode", 0) & ~stat.S_IFMT) | stat.S_IFLNK
+            d["st_mode"] = (d.get("st_mode", 0) & ~stat.S_IFMT(d.get("st_mode", 0))) | stat.S_IFLNK
             d["st_size"] = len(target.encode("utf-8"))
         if ent.get("special") == "socket":
             d["st_size"] = 0
@@ -884,10 +884,12 @@ class FatLinuxMetaFS(fuse.Operations):
         return 0
 
     def lock(self, path: str, fh: int, cmd: int, lock) -> int:
-        try:
-            return fcntl.fcntl(fh, cmd, lock)
-        except OSError as e:
-            raise fuse.FuseOSError(e.errno)
+        # Advisory locks are a no-op here: `fh` is a FUSE handle, not a real
+        # fd, so it cannot be passed to fcntl (doing so surfaced as EFAULT on
+        # F_OFD_SETLKW and broke ostree/flatpak installs). Correct for our
+        # single-writer flows (builder fetch, firstboot install): never run
+        # two writers against the same backing tree concurrently.
+        return 0
 
     def copy_file_range(
         self,
@@ -1013,7 +1015,9 @@ class FatLinuxMetaFS(fuse.Operations):
             cur_mode = os.lstat(full).st_mode
         else:
             cur_mode = cur_mode or stat.S_IFREG | 0o644
-        new_mode = (int(cur_mode) & stat.S_IFMT) | (mode & 0o777)
+        # stat.S_IFMT is a function (not a mask): keep the old file-type bits
+        # explicitly and take all permission bits (incl. setuid/sticky) from mode.
+        new_mode = (int(cur_mode) & 0o170000) | (mode & 0o7777)
         self._set_entry(path, {"mode": new_mode})
         try:
             os.chmod(full, mode & 0o777, follow_symlinks=False)
@@ -1252,5 +1256,5 @@ def main() -> None:
     )
 
 
-if __main__ == "__main__":
+if __name__ == "__main__":
     main()

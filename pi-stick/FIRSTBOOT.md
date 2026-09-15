@@ -24,11 +24,17 @@ Turn a plain Mint ISO stick into a self-installing portable workstation:
   `_ISO/linuxmint-22.3-cinnamon-64bit/`, base squashfs + z0 in `casper/`,
   signed UEFI chain in `EFI/BOOT/`, BIOS `grldr` + `menu.lst`, toolkit in
   `bin/`, 6 wifi networks staged in `wifi.sh`.
-- **Blocker: no network in the live session.** Intel wifi card is alive
-  (`wlp0s20f3`, `iwlmvm` driver loaded) but no usable link: firstboot waits
-  ~5 min, exits 1, systemd retries. Machine is likely out of range of the
-  staged networks. Fixes that change everything: plug wired Ethernet, or
-  USB-tether a phone (appears as wired), then reboot — setup resumes itself.
+- **Network now works** (wifi `eero` connected; the old "no network" loop was
+  an out-of-range machine — cable/tether still the fastest fix if it drops).
+- **Blocker: the appended layer hit the FAT32 4 GiB file cap.** The overlay
+  upper reached ~7.2 GiB (5.2 G baked-in flatpaks + Brave + apt), so uproot
+  refused and the service crash-looped on a poisoned overlay. Fix deployed:
+  flatpaks install into the FAT-hosted `lsl-fat` installation as direct
+  files (builder pre-installs them; firstboot only mounts, sideloads, or
+  downloads into FAT as fallback) and never enter the layer; the append
+  path excludes `var/lib/flatpak`, failures tear down the overlay, and
+  deterministic refusals stop immediately with FAILED + dialog instead of
+  retrying. Non-flatpak changes are only ~2 GiB — comfortably under the cap.
 - Fixes already deployed on this stick: wifi/onboot/diag scripts run via
   `bash` with `-r` gates (FAT has no exec bit — the old `-x` gates silently
   skipped everything); failure tarballs go to `/cdrom/lsl-diag/` (survive
