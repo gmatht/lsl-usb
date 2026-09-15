@@ -19,7 +19,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 M="$REPO_ROOT/misc"
 OUT="${1:-$REPO_ROOT/rust9x/lslsetup/assets/filesystem.z0.squashfs}"
 
-for f in lsl-firstboot.sh lsl-firstboot-progress.sh lsl-firstboot.service \
+for f in lsl-firstboot.sh lsl-firstboot-progress.sh lsl-progress-gtk.py lsl-firstboot.service \
          lsl-firstboot-progress.desktop lsl-boot-time.desktop \
          lsl-firstboot-failed.sh lsl-firstboot-failed.desktop \
          lsl-merge-suggest.sh lsl-merge-suggest.desktop; do
@@ -32,6 +32,7 @@ mkdir -p /tmp/z0build/usr/local/sbin /tmp/z0build/usr/local/bin \
          /tmp/z0build/etc/xdg/autostart
 install -m 755 "$M/lsl-firstboot.sh" /tmp/z0build/usr/local/sbin/lsl-firstboot.sh
 install -m 755 "$M/lsl-firstboot-progress.sh" /tmp/z0build/usr/local/bin/lsl-firstboot-progress.sh
+install -m 755 "$M/lsl-progress-gtk.py" /tmp/z0build/usr/local/bin/lsl-progress-gtk.py
 install -m 644 "$M/lsl-firstboot.service" /tmp/z0build/etc/systemd/system/lsl-firstboot.service
 install -m 644 "$M/lsl-firstboot-progress.desktop" /tmp/z0build/etc/xdg/autostart/lsl-firstboot-progress.desktop
 install -m 644 "$M/lsl-boot-time.desktop" /tmp/z0build/etc/xdg/autostart/lsl-boot-time.desktop

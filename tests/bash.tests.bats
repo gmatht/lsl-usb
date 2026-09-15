@@ -234,6 +234,67 @@ setup_firstboot() {
     [ -e "$LSL_FIRSTBOOT_STAMP" ]
 }
 
+# --- notify_desktop_now: session display for the failure dialog ----------
+# The dialog must target the REAL graphical session (loginctl), never a
+# hardcoded DISPLAY=:0 and never /dev/console ownership (root-owned on
+# systemd, so that test silently never fired). Stub loginctl + su and
+# assert what the notifier would execute.
+notify_loginctl_stub() {
+    # $1 = session type (x11|wayland|none), $2 = user, $3 = display
+    local type="$1" user="$2" disp="$3"
+    cat > "$MOCKS/loginctl" <<EOF
+#!/bin/bash
+if [ "\$1" = "list-sessions" ]; then
+    [ "$type" = none ] || echo "3 $user tty7"
+elif [ "\$3" = "Type" ]; then echo "$type";
+elif [ "\$3" = "Name" ]; then echo "$user";
+elif [ "\$3" = "Display" ]; then echo "$disp"; fi
+EOF
+    chmod +x "$MOCKS/loginctl"
+}
+
+@test "notify_desktop_now: uses the session display, not hardcoded :0" {
+    MOCKS="$TMPDIR_TEST/bin"
+    mkdir -p "$MOCKS"
+    notify_loginctl_stub x11 mint ":1"
+    printf '#!/bin/bash\necho "$@" >> "%s/su.log"\n' "$TMPDIR_TEST" > "$MOCKS/su"
+    printf '#!/bin/bash\necho "mint:x:1000:1000::/home/mint:/bin/bash"\n' > "$MOCKS/getent"
+    chmod +x "$MOCKS"/*
+    run env PATH="$MOCKS:$PATH" bash -c 'eval "$(sed -n "/^notify_desktop_now()/",/^}/p misc/lsl-firstboot.sh)"; notify_desktop_now'
+    [ "$status" -eq 0 ]
+    grep -q "DISPLAY=':1'" "$TMPDIR_TEST/su.log"
+    grep -q "XAUTHORITY='/home/mint/.Xauthority'" "$TMPDIR_TEST/su.log"
+    grep -q "lsl-firstboot-failed.sh" "$TMPDIR_TEST/su.log"
+}
+
+@test "notify_desktop_now: wayland gets socket vars and an emptied DISPLAY" {
+    MOCKS="$TMPDIR_TEST/bin"
+    mkdir -p "$MOCKS"
+    notify_loginctl_stub wayland mint ""
+    printf '#!/bin/bash\necho "$@" >> "%s/su.log"\n' "$TMPDIR_TEST" > "$MOCKS/su"
+    printf '#!/bin/bash\necho "mint:x:1000:1000::/home/mint:/bin/bash"\n' > "$MOCKS/getent"
+    chmod +x "$MOCKS"/*
+    run env PATH="$MOCKS:$PATH" bash -c 'eval "$(sed -n "/^notify_desktop_now()/",/^}/p misc/lsl-firstboot.sh)"; notify_desktop_now'
+    [ "$status" -eq 0 ]
+    grep -q "WAYLAND_DISPLAY='wayland-0'" "$TMPDIR_TEST/su.log"
+    grep -q "DISPLAY= XDG" "$TMPDIR_TEST/su.log"
+    if grep -q "DISPLAY=':0'" "$TMPDIR_TEST/su.log"; then
+        echo "must not fall back to hardcoded :0 on wayland" >&2
+        return 1
+    fi
+}
+
+@test "notify_desktop_now: silent no-op with no graphical session" {
+    MOCKS="$TMPDIR_TEST/bin"
+    mkdir -p "$MOCKS"
+    notify_loginctl_stub none "" ""
+    printf '#!/bin/bash\necho CALLED >> "%s/su.log"\n' "$TMPDIR_TEST" > "$MOCKS/su"
+    chmod +x "$MOCKS"/*
+    run env PATH="$MOCKS:$PATH" bash -c 'eval "$(sed -n "/^notify_desktop_now()/",/^}/p misc/lsl-firstboot.sh)"; notify_desktop_now'
+    [ "$status" -eq 0 ]
+    [ ! -e "$TMPDIR_TEST/su.log" ]
+}
+
 # --- lsl-firstboot-progress: zenity dialog logic ---
 @test "lsl-firstboot-progress: exits when already stamped" {
     export LSL_FIRSTBOOT_STAMP="$TMPDIR_TEST/stamp"
