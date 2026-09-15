@@ -10,12 +10,14 @@ set -u
 TAG="${1:-diag}"
 TS="$(date +%Y%m%d%H%M%S)"
 
-# Destination: first writable, reboot-surviving location we can find. /tmp is RAM
-# and is lost on reboot, so it is the last resort; /cdrom (the USB itself) is
-# preferred when no Windows volume is mounted (e.g. first boot, hivex missing).
+# Destination: first writable, reboot-surviving location we can find.
+# /cdrom (the USB stick itself) goes FIRST: on a live boot the /persist and
+# /tmp candidates are RAM-backed tmpfs, so a tarball there is lost on reboot
+# (we once lost 22 consecutive failure tarballs that way). /tmp stays the
+# last resort; anything there must be copied off before rebooting.
 DEST=""
 LSL_DIAG_CDROM_RW=0
-for cand in /mnt/c/lsl-diag /mnt/c/Users/lsl-usb/lsl-diag /persist/casper/lsl-diag /cdrom/lsl-diag /tmp/lsl-diag; do
+for cand in /cdrom/lsl-diag /mnt/c/lsl-diag /mnt/c/Users/lsl-usb/lsl-diag /persist/casper/lsl-diag /tmp/lsl-diag; do
     mkdir -p "$cand" 2>/dev/null || continue
     if [ -w "$cand" ]; then
         DEST="$cand"

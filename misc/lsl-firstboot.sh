@@ -42,7 +42,14 @@ log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
 # Gate on -r, not -x: casper mounts the FAT stick without exec bits, so -x
 # is false (and direct exec fails) even though `bash script` works fine.
 # Without this, no diagnostics tarball is ever written on FAT sticks.
-diag() { [ -r /cdrom/bin/lsl-diag.sh ] && bash /cdrom/bin/lsl-diag.sh "${1:-firstboot}" 2>/dev/null || true; }
+diag() {
+    # Tee the "wrote <path>" line into our own log: with stderr silenced a
+    # lost tarball (RAM fallback, failed remount) is otherwise invisible and
+    # undebuggable from Windows after a reboot.
+    if [ -r /cdrom/bin/lsl-diag.sh ]; then
+        bash /cdrom/bin/lsl-diag.sh "${1:-firstboot}" 2>/dev/null | tee -a "$LOG" 2>/dev/null || true
+    fi
+}
 
 # Remove any appended layer that fails to list (partial/corrupt from an
 # interrupted mksquashfs) so we never boot a broken layer.
