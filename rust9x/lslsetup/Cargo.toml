@@ -20,6 +20,7 @@ sha2 = "0.10"
 flate2 = "1"
 tar = "0.4"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+serde_json = "1"
 
 [build-dependencies]
 # Host-side only: build.rs re-inflates assets/grldr.gz (gzip -9 + advdef -z -4)

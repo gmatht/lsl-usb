@@ -1,0 +1,8 @@
+name = "lsl-usb-reports-api"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "lsl-usb-reports"
+database_id = "f716a611-fa2d-4366-8606-03d5645a6fb5"

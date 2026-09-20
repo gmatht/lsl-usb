@@ -1,6 +1,7 @@
 [Unit]
 Description=On Boot
-After=network-online.target
+After=NetworkManager.service
+Before=network-online.target
 
 [Service]
 Type=oneshot

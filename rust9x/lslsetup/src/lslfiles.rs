@@ -88,10 +88,19 @@ pub fn env_file_set(path: &str, key: &str, value: &str) {
 static FIRSTBOOT_TOOLKIT: &[(&str, &str)] = &[
     ("bin\\uproot", include_str!("../../../bin/uproot")),
     ("bin\\squashfs_config.sh", include_str!("../../../bin/squashfs_config.sh")),
+    ("bin\\config.sh", include_str!("../../../bin/config.sh")),
     ("bin\\lsl-diag.sh", include_str!("../../../bin/lsl-diag.sh")),
     ("bin\\lsl-common.sh", include_str!("../../../bin/lsl-common.sh")),
     ("bin\\persist-wifi.sh", include_str!("../../../bin/persist-wifi.sh")),
     ("bin\\lsl-flatpak-fat.sh", include_str!("../../../bin/lsl-flatpak-fat.sh")),
+    ("systemd\\onboot.service", include_str!("../../../systemd/onboot.service")),
+    ("systemd\\lsl-boot-stamp.service", include_str!("../../../systemd/lsl-boot-stamp.service")),
+    ("systemd\\lsl-btrfs-growd.service", include_str!("../../../systemd/lsl-btrfs-growd.service")),
+    ("systemd\\lsl-home-flushd.service", include_str!("../../../systemd/lsl-home-flushd.service")),
+    ("systemd\\lsl-precache.service", include_str!("../../../systemd/lsl-precache.service")),
+    ("systemd\\lsl-reclaim-win-swap.service", include_str!("../../../systemd/lsl-reclaim-win-swap.service")),
+    ("systemd\\lsl-win-backup.service", include_str!("../../../systemd/lsl-win-backup.service")),
+    ("systemd\\lsl-win-backup.timer", include_str!("../../../systemd/lsl-win-backup.timer")),
     ("fuse\\fat_linux_meta_fs.py", include_str!("../../../fuse/fat_linux_meta_fs.py")),
     ("fuse\\fusepy\\fuse.py", include_str!("../../../fuse/fusepy/fuse.py")),
     ("onboot.sh", include_str!("../../../onboot.sh")),
@@ -159,8 +168,15 @@ pub fn install_lsl_files(vol_letter: &str, bundle_dir: &str) -> Result<(), Strin
 
     let mut copied: Vec<String> = Vec::new();
 
-    // 1) the (minimal) root layer - casper stacks it over the base image
+    // 1) the (minimal) root layer - casper stacks it over the base image.
+    // Legacy bundle path (install.ps1 parity): a build.sh bundle ships
+    // filesystem_z0_firstboot.squashfs next to the exe. The nofmt path
+    // already wrote the embedded equivalent (casper/filesystem.z0.squashfs)
+    // before we get here, so don't warn then - and never leave the stick
+    // without a z0 layer: fall back to the embedded blob when the bundle
+    // file is absent.
     let layer = format!("{}\\filesystem_z0_firstboot.squashfs", bundle_dir);
+    let dotted = format!("{}\\filesystem.z0.squashfs", casper);
     if path_exists(&layer) {
         sys::copy_file(&layer, &format!("{}\\filesystem_z0_firstboot.squashfs", casper))
             .map_err(|e| format!("copy layer: {}", e))?;
@@ -168,11 +184,16 @@ pub fn install_lsl_files(vol_letter: &str, bundle_dir: &str) -> Result<(), Strin
         // Dotted twin for casper's multi-layer dotted-chain walk (the
         // `layerfs-path=` on direct entries needs exactly this name; 8 KB,
         // and every existing `_firstboot` reader keeps working untouched).
-        sys::copy_file(&layer, &format!("{}\\filesystem.z0.squashfs", casper))
+        sys::copy_file(&layer, &dotted)
             .map_err(|e| format!("copy dotted layer: {}", e))?;
         copied.push("filesystem.z0.squashfs".into());
+    } else if path_exists(&dotted) {
+        out::info("z0 firstboot layer already present on the stick (embedded install); skipping bundle layer copy.");
     } else {
-        out::warn("filesystem_z0_firstboot.squashfs not found in bundle; layer not copied.");
+        match install_z0_layer(&root) {
+            Ok(_) => copied.push("filesystem.z0.squashfs (embedded)".into()),
+            Err(e) => out::warn(&format!("filesystem_z0_firstboot.squashfs not found in bundle and embedded z0 install failed ({}); layer not copied.", e)),
+        }
     }
 
     // 2) the FAT-side lsl scripts (same set as bin/config.sh --sync-only)
@@ -334,6 +355,17 @@ fn find_label_live(txt: &str) -> Option<String> {
 // Copy-SfsToHdd
 // ---------------------------------------------------------------------------
 pub fn copy_sfs_to_hdd(vol_letter: &str, data_dir: &str) {
+    copy_sfs_to_hdd_with_progress(vol_letter, data_dir, &mut |_, _, _| {});
+}
+
+/// Copy squashfs layers to the HDD with live progress. Skips files that are
+/// already present with the same size (idempotent re-runs). `progress` is
+/// called before each file with `(name, 0, total)`, during the copy with
+/// `(name, done, total)`, and after with `(name, total, total)`.
+pub fn copy_sfs_to_hdd_with_progress<F>(vol_letter: &str, data_dir: &str, progress: &mut F)
+where
+    F: FnMut(&str, u64, u64),
+{
     if data_dir.is_empty() {
         return;
     }
@@ -369,6 +401,7 @@ pub fn copy_sfs_to_hdd(vol_letter: &str, data_dir: &str) {
     bases.dedup();
 
     let mut copied = 0;
+    let mut skipped = 0;
     let mut manifest = vec![
         "# LSL squashfs layers copied to HDD for faster boot".to_string(),
         format!("SourceUSB={}:", vol_letter),
@@ -391,9 +424,31 @@ pub fn copy_sfs_to_hdd(vol_letter: &str, data_dir: &str) {
             base.clone()
         };
         let d = format!("{}\\{}", dest, dname);
-        if sys::copy_file(&s, &d).is_ok() {
+        let sz = file_size(&s).unwrap_or(0);
+        // Idempotency: skip if already on HDD with matching size.
+        if path_exists(&d) && file_size(&d).unwrap_or(0) == sz && sz > 0 {
+            skipped += 1;
+            progress(&dname, sz, sz);
+            // Still include in manifest so a partial run leaves a valid file.
+            match sha256_file(&s) {
+                Some(hash) => manifest.push(format!("{}={} sha256:{}", dname, sz, hash)),
+                None => manifest.push(format!("{}={}", dname, sz)),
+            }
+            out::info(&format!("  skipped {} (already on HDD, {} bytes)", dname, sz));
+            continue;
+        }
+        progress(&dname, 0, sz);
+        let copy_ok = if sz > 256 * sys::MB {
+            // Large files: use the progress-aware copy so the GUI bar stays live.
+            sys::copy_file_with_progress(&s, &d, |done, total| {
+                progress(&dname, done, total);
+            })
+        } else {
+            sys::copy_file(&s, &d)
+        };
+        if copy_ok.is_ok() {
             copied += 1;
-            let sz = file_size(&s).unwrap_or(0);
+            progress(&dname, sz, sz);
             match sha256_file(&s) {
                 Some(hash) => manifest.push(format!("{}={} sha256:{}", dname, sz, hash)),
                 None => manifest.push(format!("{}={}", dname, sz)),
@@ -409,10 +464,20 @@ pub fn copy_sfs_to_hdd(vol_letter: &str, data_dir: &str) {
         env_file_set(&env_file, "LSL_SFS_HDD_CACHE", "1");
         out::info("Set LSL_SFS_HDD_CACHE=1 in lsl-usb.env");
     }
-    if copied > 0 {
+    if copied > 0 && skipped > 0 {
+        out::info(&format!(
+            "Copied {} + skipped {} layer file(s) to {} (used for faster page-cache warm).",
+            copied, skipped, dest
+        ));
+    } else if copied > 0 {
         out::info(&format!(
             "Copied {} layer file(s) to {} (used for faster page-cache warm).",
             copied, dest
+        ));
+    } else if skipped > 0 {
+        out::info(&format!(
+            "All {} layer file(s) already on {} (nothing to copy).",
+            skipped, dest
         ));
     } else {
         out::warn("No squashfs layers found on the USB to copy.");

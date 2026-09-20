@@ -2,6 +2,7 @@
 
 set -eo pipefail
 
+echo "LSL_STEP 1/9 update package lists"
 apt update
 # Resume cleanly if a previous first-boot attempt left dpkg/apt half-configured
 # (interrupted apt install, etc.) before we add more packages.
@@ -11,6 +12,7 @@ apt-get install -f -y || true
 # packages into /cdrom/firmware/ for hardware whose WiFi/ethernet needs
 # out-of-tree firmware not in the base image. Install them first so the first-boot
 # apt can then fetch over that interface even with no preloaded drivers.
+echo "LSL_STEP 2/9 offline firmware"
 if ls /cdrom/firmware/*.deb >/dev/null 2>&1; then
     echo "Installing offline firmware from /cdrom/firmware ..."
     dpkg -i /cdrom/firmware/*.deb >/dev/null 2>&1 || true
@@ -22,6 +24,7 @@ fi
 # BCM43xx). Two forms:
 #   *.deb     - Ubuntu-packaged DKMS drivers (apt installs + builds them)
 #   *.tar.gz  - DKMS source tarballs from GitHub (built via dkms below)
+echo "LSL_STEP 3/9 staged drivers"
 if ls /cdrom/drivers/*.deb /cdrom/drivers/*.tar.gz >/dev/null 2>&1; then
     echo "Installing staged network drivers from /cdrom/drivers ..."
     # DKMS needs the exact running kernel's headers + build tools. The live ISO
@@ -74,6 +77,7 @@ fi
 # x86_64-only, and a 32-bit kernel cannot execute 64-bit binaries at all, so on
 # i386 we install a native 32-bit apt set and SKIP the blocks below.
 ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+echo "LSL_STEP 4/9 base packages ($ARCH)"
 case "$ARCH" in
     i386|i686)
         # Native 32-bit set. Avoid amd64-only packages: nix-bin, steam-installer,
@@ -90,6 +94,7 @@ esac
 # snapd. lsl's Windows installer can preload .snap files onto the USB
 # (/cdrom/snaps/), so remove the pin and install snapd to allow offline installs.
 # Set LSL_SNAP_SUPPORT=0 to keep Mint's default (no snaps).
+echo "LSL_STEP 5/9 snap support"
 if [ "$ARCH" = "amd64" ] && [ "${LSL_SNAP_SUPPORT:-1}" != "0" ]; then
     echo "Enabling snap support (removing Mint's nosnap pin)..."
     rm -f /etc/apt/preferences.d/nosnap.pref
@@ -104,6 +109,7 @@ fi
 # --- web browser: everyone gets one ---
 # 64-bit: Brave (amd64). 32-bit: Pale Moon non-SSE2 from the antiX repo (supports
 # old 32-bit CPUs, incl. pre-SSE2), with fallbacks to firefox-esr / chromium.
+echo "LSL_STEP 6/9 web browser"
 if [ "$ARCH" = "amd64" ]; then
     curl -fsS https://dl.brave.com/install.sh | sh
 else
@@ -123,6 +129,7 @@ fi
 # bind-mounted to the stick, so it stays writable even on iso-scan boots
 # where /cdrom itself is the read-only ISO loop. It persists, and updates
 # are just a file swap. A wrapper prefers it over the distro deb.
+echo "LSL_STEP 7/9 nvim AppImage"
 APPIMG_DIR=/cdrom/casper/appimages
 if [ "$ARCH" = "amd64" ] && command -v curl >/dev/null 2>&1; then
     if mkdir -p "$APPIMG_DIR"; then
@@ -156,6 +163,7 @@ fi
 
 # Optional curated AppImages (e.g. LSL_APPIMAGES="rustdesk keepassxc").
 # Downloads land on /cdrom/casper/appimages (stick, writable) and persist across boots.
+echo "LSL_STEP 8/9 extra AppImages"
 if [ "$ARCH" = "amd64" ] && [ -n "${LSL_APPIMAGES:-}" ]; then
     echo "Downloading requested AppImages: $LSL_APPIMAGES"
     bash /cdrom/bin/lsl-appimages.sh $LSL_APPIMAGES || true
@@ -163,7 +171,17 @@ fi
 
 # Optional statically-linked CLI tools (e.g. LSL_RUSTTOOLS="rg fd bat").
 # Installed to /cdrom/bin (on PATH) and persist on the FAT partition.
+echo "LSL_STEP 9/9 CLI tools"
 if [ "$ARCH" = "amd64" ] && [ -n "${LSL_RUSTTOOLS:-}" ]; then
     echo "Installing requested CLI tools: $LSL_RUSTTOOLS"
     bash /cdrom/bin/lsl-rusttools.sh $LSL_RUSTTOOLS || true
+fi
+
+# --- runtime integration ---
+# Install systemd units (onboot.service, etc.), desktop shortcuts, and
+# autostart entries so the next boot is actually usable (WiFi, persistent
+# home, desktop icons, PATH tweaks, etc.).
+if [ -x /cdrom/bin/config.sh ]; then
+    echo "Installing LSL runtime configuration..."
+    LSL_CONFIG_ROOT=/ LSL_CDROM=/cdrom bash /cdrom/bin/config.sh || true
 fi

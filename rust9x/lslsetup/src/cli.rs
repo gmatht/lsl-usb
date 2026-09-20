@@ -8,7 +8,7 @@ pub struct Opts {
     pub bundle_dir: String,
     pub rufus_path: String,
     pub volume_label: String,
-    pub write_mode: String,     // "rufus" (default) | "nofmt" (non-destructive grub4dos)
+    pub write_mode: String,     // "nofmt" (default, non-destructive grub4dos) | "rufus"
     pub write_mode_set: bool,   // --write-mode was passed explicitly
     pub usb_letter: String,     // --usb-letter <X>: pick the nofmt target
     pub allow_fixed: bool,      // --allow-fixed: override removable+USB checks
@@ -32,6 +32,7 @@ pub struct Opts {
     pub gui_test_boot_dialog: bool,
     pub gui_test_modal_clicks: bool,
     pub gui_test_boot_page: bool,
+    pub auto_upload: bool,
     // settings the GUI also collects, exposed as flags so a FINISHED-page
     // command line can reproduce the exact wizard choices headlessly
     pub data_dir: String,
@@ -63,7 +64,7 @@ impl Default for Opts {
             bundle_dir,
             rufus_path: String::new(),
             volume_label: String::new(),
-            write_mode: "rufus".into(),
+            write_mode: "nofmt".into(),
             write_mode_set: false,
             usb_letter: String::new(),
             allow_fixed: false,
@@ -87,6 +88,7 @@ impl Default for Opts {
             gui_test_boot_dialog: false,
             gui_test_modal_clicks: false,
             gui_test_boot_page: false,
+            auto_upload: false,
             data_dir: String::new(),
             wifi: true,
             wifi_networks: Vec::new(),
@@ -107,7 +109,7 @@ Options:
   --download-dir <dir>       Folder for the downloaded ISO (default Downloads)
   --bundle-dir <dir>         lsl files to drop onto the USB (default: exe dir)
   --rufus-path <path>        Path to rufus.exe (auto-downloaded if missing)
-  --write-mode <mode>        rufus (default, DD-style write) or nofmt
+  --write-mode <mode>        nofmt (default, non-destructive) or rufus
                              (non-destructive: grub4dos MBR-code write +
                              kernel/base extracts (no ISO file) + direct-kernel
                              menu.lst + BOOTX64.EFI/grub.cfg for UEFI (BIOS + UEFI);
@@ -146,6 +148,7 @@ Options:
   --gui-test-boot-dialog     (test) show only the boot-choice dialog, print the choice, exit
   --gui-test-modal-clicks    (test) headless modal-loop click probe, print CLICK-OK/CLICK-DEAD
   --gui-test-boot-page       (test) real wizard boot page (no install), print the clicked choice, exit
+  --auto-upload              Check for pending boot telemetry and prompt to upload; then exit
   --preload-rust-tools       Download fd/bat/zoxide onto <USB>:\\bin
   --data-dir <path>           LSL_DATA_DIR to write into lsl-usb.env
   --no-wifi                   Do not copy wifi profiles
@@ -210,6 +213,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--gui-test-boot-dialog" => o.gui_test_boot_dialog = true,
             "--gui-test-modal-clicks" => o.gui_test_modal_clicks = true,
             "--gui-test-boot-page" => o.gui_test_boot_page = true,
+            "--auto-upload" => o.auto_upload = true,
             "--data-dir" => o.data_dir = next()?,
             "--no-wifi" => o.wifi = false,
             "--wifi-network" => o.wifi_networks.push(next()?),

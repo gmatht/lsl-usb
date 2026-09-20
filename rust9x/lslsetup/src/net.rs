@@ -224,6 +224,103 @@ fn get_with(
     }
 }
 
+/// POST a JSON payload to a URL. Returns the HTTP status and response body.
+/// Used for submitting telemetry to the Cloudflare Worker backend.
+pub fn post(url: &str, user_agent: &str, body: &[u8], extra_headers: &str) -> Result<HttpResult, HttpErr> {
+    let wh = winhttp().ok_or(HttpErr::NoTransport)?;
+    let (secure, host, port, path) = split_url(url);
+    unsafe {
+        let ua = crate::sys::wide(user_agent);
+        let session = (wh.open)(ua.as_ptr(), 0, std::ptr::null(), std::ptr::null(), 0);
+        if session.is_null() {
+            return Err(HttpErr::Failed("WinHttpOpen failed".into()));
+        }
+        let whost = crate::sys::wide(&host);
+        let conn = (wh.connect)(session, whost.as_ptr(), port as u16, 0);
+        if conn.is_null() {
+            (wh.close_handle)(session);
+            return Err(HttpErr::Failed("WinHttpConnect failed (DNS/offline?)".into()));
+        }
+        let wpath = crate::sys::wide(&path);
+        let req = (wh.open_request)(
+            conn,
+            cstr16("POST").as_ptr(),
+            wpath.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            if secure { WINHTTP_FLAG_SECURE } else { 0 },
+        );
+        if req.is_null() {
+            (wh.close_handle)(conn);
+            (wh.close_handle)(session);
+            return Err(HttpErr::Failed("WinHttpOpenRequest failed".into()));
+        }
+        let protos: u32 = SP_PROT_TLS1_2_CLIENT;
+        (wh.set_option)(req, WINHTTP_OPTION_SECURE_PROTOCOLS, &protos as *const u32 as *mut c_void, 4);
+        let policy: u32 = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+        (wh.set_option)(req, WINHTTP_OPTION_REDIRECT_POLICY, &policy as *const u32 as *mut c_void, 4);
+
+        let mut headers = crate::sys::wide(&format!(
+            "User-Agent: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n",
+            user_agent,
+            body.len(),
+            extra_headers
+        ));
+        let _ = (wh.add_headers)(req, headers.as_mut_ptr(), (headers.len() as u32) - 1, 0x20000000);
+
+        let mut ok = (wh.send_request)(
+            req,
+            std::ptr::null(),
+            0,
+            body.as_ptr() as *mut c_void,
+            body.len() as u32,
+            std::ptr::null_mut(),
+            0,
+        ) != 0;
+        if ok {
+            ok = (wh.receive_response)(req, std::ptr::null_mut()) != 0;
+        }
+        if !ok {
+            (wh.close_handle)(req);
+            (wh.close_handle)(conn);
+            (wh.close_handle)(session);
+            let e = winapi::um::errhandlingapi::GetLastError();
+            if e == 12175 {
+                return Err(HttpErr::OldTls);
+            }
+            return Err(HttpErr::Failed(format!("POST failed (error {})", e)));
+        }
+        let mut status: u32 = 0;
+        let mut sz: u32 = 4;
+        (wh.query_headers)(
+            req,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            std::ptr::null_mut(),
+            &mut status as *mut u32 as *mut c_void,
+            &mut sz,
+            std::ptr::null_mut(),
+        );
+        let mut resp_body: Vec<u8> = Vec::new();
+        loop {
+            let mut avail: u32 = 0;
+            if (wh.query_data_available)(req, &mut avail) == 0 || avail == 0 {
+                break;
+            }
+            let mut buf = vec![0u8; avail as usize];
+            let mut got: u32 = 0;
+            if (wh.read_data)(req, buf.as_mut_ptr() as *mut c_void, avail, &mut got) == 0 || got == 0 {
+                break;
+            }
+            resp_body.extend_from_slice(&buf[..got as usize]);
+        }
+        (wh.close_handle)(req);
+        (wh.close_handle)(conn);
+        (wh.close_handle)(session);
+        Ok(HttpResult { status, body: resp_body })
+    }
+}
+
 fn cstr16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }

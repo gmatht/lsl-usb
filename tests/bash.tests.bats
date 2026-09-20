@@ -174,12 +174,20 @@ setup_firstboot() {
     export LSL_FIRSTBOOT_ATTEMPT="$TMPDIR_TEST/attempts"
     export LSL_FIRSTBOOT_NET_TRIES=1
     export LSL_FIRSTBOOT_REBOOT=0
+    # Instant reboot path by default (LSL_FIRSTBOOT_REBOOT_TIMEOUT=0 skips
+    # the 10-minute countdown); timer tests override per-case below.
+    export LSL_FIRSTBOOT_REBOOT_TIMEOUT=0
+    export LSL_FIRSTBOOT_FLAG_DIR="$TMPDIR_TEST/reboot-flags"
     # Stick location seam (misc/lsl-firstboot.sh): the partition scan and
     # the /cdrom fallback both need root; CI runners are non-root.
     mkdir -p "$TMPDIR_TEST/stick/casper" "$TMPDIR_TEST/bin"
     export LSL_FIRSTBOOT_STICK="$TMPDIR_TEST/stick"
     printf '#!/bin/bash\necho full\n' > "$TMPDIR_TEST/bin/nmcli"
     chmod +x "$TMPDIR_TEST/bin/nmcli"
+    # No graphical sessions by default: the reboot-timer dialog launcher
+    # becomes a silent no-op (notify tests install their own stub after).
+    printf '#!/bin/bash\nexit 0\n' > "$TMPDIR_TEST/bin/loginctl"
+    chmod +x "$TMPDIR_TEST/bin/loginctl"
     export PATH="$TMPDIR_TEST/bin:$PATH"
 }
 
@@ -219,6 +227,81 @@ setup_firstboot() {
     grep -q "reboot" "$TMPDIR_TEST/reboot.log"
 }
 
+@test "lsl-firstboot: success flushes home via the stick uphome" {
+    setup_firstboot
+    printf '#!/bin/bash\nexit 0\n' > "$LSL_FIRSTBOOT_UPROOT"
+    chmod +x "$LSL_FIRSTBOOT_UPROOT"
+    mkdir -p "$LSL_FIRSTBOOT_STICK/bin"
+    printf '#!/bin/bash\necho flushed > "$TMPDIR_TEST/home-flushed"\n' > "$LSL_FIRSTBOOT_STICK/bin/uphome"
+    chmod +x "$LSL_FIRSTBOOT_STICK/bin/uphome"
+    printf '#!/bin/bash\necho "systemctl $*" >> "$TMPDIR_TEST/reboot.log"\n' > "$TMPDIR_TEST/bin/systemctl"
+    chmod +x "$TMPDIR_TEST/bin/systemctl"
+    export LSL_FIRSTBOOT_REBOOT=1
+    run bash misc/lsl-firstboot.sh
+    [ "$status" -eq 0 ]
+    [ -e "$LSL_FIRSTBOOT_STAMP" ]
+    [ -e "$TMPDIR_TEST/home-flushed" ]
+    grep -q "reboot" "$TMPDIR_TEST/reboot.log"
+}
+
+@test "lsl-firstboot: reboot timer honors cancel written mid-countdown" {
+    setup_firstboot
+    printf '#!/bin/bash\nexit 0\n' > "$LSL_FIRSTBOOT_UPROOT"
+    chmod +x "$LSL_FIRSTBOOT_UPROOT"
+    printf '#!/bin/bash\necho "systemctl $*" >> "$TMPDIR_TEST/reboot.log"\n' > "$TMPDIR_TEST/bin/systemctl"
+    chmod +x "$TMPDIR_TEST/bin/systemctl"
+    export LSL_FIRSTBOOT_REBOOT=1 LSL_FIRSTBOOT_REBOOT_TIMEOUT=60
+    mkdir -p "$LSL_FIRSTBOOT_FLAG_DIR"
+    # Signal after the loop starts (it clears stale flags first, and logs
+    # "Automatic reboot in" once listening) - no race either way.
+    bash misc/lsl-firstboot.sh >"$TMPDIR_TEST/out.log" 2>&1 &
+    srv=$!
+    for _ in $(seq 1 200); do
+        grep -q "Automatic reboot in" "$TMPDIR_TEST/logs"/*.log 2>/dev/null && break
+        sleep 0.1
+    done
+    touch "$LSL_FIRSTBOOT_FLAG_DIR/reboot-cancel"
+    wait "$srv"
+    [ "$?" -eq 0 ]
+    [ -e "$LSL_FIRSTBOOT_STAMP" ]
+    [ ! -e "$TMPDIR_TEST/reboot.log" ]
+}
+
+@test "lsl-firstboot: reboot timer honors reboot-now written mid-countdown" {
+    setup_firstboot
+    printf '#!/bin/bash\nexit 0\n' > "$LSL_FIRSTBOOT_UPROOT"
+    chmod +x "$LSL_FIRSTBOOT_UPROOT"
+    printf '#!/bin/bash\necho "systemctl $*" >> "$TMPDIR_TEST/reboot.log"\n' > "$TMPDIR_TEST/bin/systemctl"
+    chmod +x "$TMPDIR_TEST/bin/systemctl"
+    export LSL_FIRSTBOOT_REBOOT=1 LSL_FIRSTBOOT_REBOOT_TIMEOUT=60
+    mkdir -p "$LSL_FIRSTBOOT_FLAG_DIR"
+    bash misc/lsl-firstboot.sh >"$TMPDIR_TEST/out.log" 2>&1 &
+    srv=$!
+    for _ in $(seq 1 200); do
+        grep -q "Automatic reboot in" "$TMPDIR_TEST/logs"/*.log 2>/dev/null && break
+        sleep 0.1
+    done
+    touch "$LSL_FIRSTBOOT_FLAG_DIR/reboot-now"
+    wait "$srv"
+    [ "$?" -eq 0 ]
+    [ -e "$LSL_FIRSTBOOT_STAMP" ]
+    grep -q "reboot" "$TMPDIR_TEST/reboot.log"
+}
+
+@test "lsl-firstboot: reboot timer fires on expiry" {
+    setup_firstboot
+    printf '#!/bin/bash\nexit 0\n' > "$LSL_FIRSTBOOT_UPROOT"
+    chmod +x "$LSL_FIRSTBOOT_UPROOT"
+    printf '#!/bin/bash\necho "systemctl $*" >> "$TMPDIR_TEST/reboot.log"\n' > "$TMPDIR_TEST/bin/systemctl"
+    chmod +x "$TMPDIR_TEST/bin/systemctl"
+    export LSL_FIRSTBOOT_REBOOT=1 LSL_FIRSTBOOT_REBOOT_TIMEOUT=4
+    mkdir -p "$LSL_FIRSTBOOT_FLAG_DIR"
+    run bash misc/lsl-firstboot.sh
+    [ "$status" -eq 0 ]
+    [ -e "$LSL_FIRSTBOOT_STAMP" ]
+    grep -q "reboot" "$TMPDIR_TEST/reboot.log"
+}
+
 @test "lsl-firstboot: uproot failure retries, then gives up after max attempts" {
     setup_firstboot
     printf '#!/bin/bash\nexit 1\n' > "$LSL_FIRSTBOOT_UPROOT"
@@ -232,6 +315,93 @@ setup_firstboot() {
     run bash misc/lsl-firstboot.sh
     [ "$status" -eq 0 ]   # gave up after 3 attempts
     [ -e "$LSL_FIRSTBOOT_STAMP" ]
+}
+
+@test "lsl-firstboot-reboot: no backend exits 0 without flags" {
+    mkdir -p "$TMPDIR_TEST/empty" "$TMPDIR_TEST/flags"
+    # PATH with nothing in it: no python3, no zenity, no date/logger
+    # (all guarded). LSL_PROGRESS_GTK points at a missing file.
+    run env PATH="$TMPDIR_TEST/empty" LSL_PROGRESS_GTK="$TMPDIR_TEST/missing.py" \
+        LSL_DIALOG_LOG="$TMPDIR_TEST/dialog.log" \
+        /bin/bash misc/lsl-firstboot-reboot.sh --timeout 600 --flag-dir "$TMPDIR_TEST/flags"
+    [ "$status" -eq 0 ]
+    [ ! -e "$TMPDIR_TEST/flags/reboot-now" ]
+    [ ! -e "$TMPDIR_TEST/flags/reboot-cancel" ]
+}
+
+@test "lsl-firstboot-reboot: gtk backend receives countdown + flag dir" {
+    mkdir -p "$TMPDIR_TEST/bin" "$TMPDIR_TEST/flags"
+    printf '#!/bin/bash\nif [ "$1" = "-c" ]; then exit 0; fi\necho "$@" > "$TMPDIR_TEST/gtk-args"\n' > "$TMPDIR_TEST/bin/python3"
+    chmod +x "$TMPDIR_TEST/bin/python3"
+    touch "$TMPDIR_TEST/fake-gtk.py"
+    run env PATH="$TMPDIR_TEST/bin:/usr/bin:/bin" LSL_PROGRESS_GTK="$TMPDIR_TEST/fake-gtk.py" \
+        LSL_DIALOG_LOG="$TMPDIR_TEST/dialog.log" \
+        bash misc/lsl-firstboot-reboot.sh --timeout 321 --flag-dir "$TMPDIR_TEST/flags"
+    [ "$status" -eq 0 ]
+    grep -q -- "--reboot-countdown 321" "$TMPDIR_TEST/gtk-args"
+    grep -q -- "--flag-dir $TMPDIR_TEST/flags" "$TMPDIR_TEST/gtk-args"
+}
+
+@test "lsl-firstboot-reboot: zenity ok writes reboot-now, cancel writes reboot-cancel" {
+    mkdir -p "$TMPDIR_TEST/bin" "$TMPDIR_TEST/flags"
+    printf '#!/bin/bash\nexit 1\n' > "$TMPDIR_TEST/bin/python3"
+    chmod +x "$TMPDIR_TEST/bin/python3"
+    printf '#!/bin/bash\necho "$@" > "$TMPDIR_TEST/zenity-args"\nexit 0\n' > "$TMPDIR_TEST/bin/zenity"
+    chmod +x "$TMPDIR_TEST/bin/zenity"
+    run env PATH="$TMPDIR_TEST/bin:/usr/bin:/bin" LSL_PROGRESS_GTK="$TMPDIR_TEST/missing.py" \
+        LSL_DIALOG_LOG="$TMPDIR_TEST/dialog.log" \
+        bash misc/lsl-firstboot-reboot.sh --timeout 600 --flag-dir "$TMPDIR_TEST/flags"
+    [ "$status" -eq 0 ]
+    grep -q -- "--timeout=600" "$TMPDIR_TEST/zenity-args"
+    grep -q -- "Reboot now" "$TMPDIR_TEST/zenity-args"
+    [ -e "$TMPDIR_TEST/flags/reboot-now" ]
+    [ ! -e "$TMPDIR_TEST/flags/reboot-cancel" ]
+    rm -f "$TMPDIR_TEST/flags/reboot-now"
+    printf '#!/bin/bash\nexit 1\n' > "$TMPDIR_TEST/bin/zenity"
+    chmod +x "$TMPDIR_TEST/bin/zenity"
+    run env PATH="$TMPDIR_TEST/bin:/usr/bin:/bin" LSL_PROGRESS_GTK="$TMPDIR_TEST/missing.py" \
+        LSL_DIALOG_LOG="$TMPDIR_TEST/dialog.log" \
+        bash misc/lsl-firstboot-reboot.sh --timeout 600 --flag-dir "$TMPDIR_TEST/flags"
+    [ "$status" -eq 0 ]
+    [ -e "$TMPDIR_TEST/flags/reboot-cancel" ]
+    [ ! -e "$TMPDIR_TEST/flags/reboot-now" ]
+}
+
+@test "lsl-firstboot-reboot: zenity timeout/dismissal writes no flag (reboot proceeds)" {
+    mkdir -p "$TMPDIR_TEST/bin" "$TMPDIR_TEST/flags"
+    printf '#!/bin/bash\nexit 1\n' > "$TMPDIR_TEST/bin/python3"
+    printf '#!/bin/bash\nexit 5\n' > "$TMPDIR_TEST/bin/zenity"
+    chmod +x "$TMPDIR_TEST/bin"/*
+    run env PATH="$TMPDIR_TEST/bin:/usr/bin:/bin" LSL_PROGRESS_GTK="$TMPDIR_TEST/missing.py" \
+        LSL_DIALOG_LOG="$TMPDIR_TEST/dialog.log" \
+        bash misc/lsl-firstboot-reboot.sh --timeout 600 --flag-dir "$TMPDIR_TEST/flags"
+    [ "$status" -eq 0 ]
+    [ ! -e "$TMPDIR_TEST/flags/reboot-now" ]
+    [ ! -e "$TMPDIR_TEST/flags/reboot-cancel" ]
+}
+
+@test "lsl-progress-gtk: reboot-countdown mode compiles and parses args" {
+    command -v python3 >/dev/null 2>&1 || skip "python3 not available"
+    python3 -m py_compile misc/lsl-progress-gtk.py
+    run python3 -c "import importlib.util; s=importlib.util.spec_from_file_location('lpg','misc/lsl-progress-gtk.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.parse_args(['--reboot-countdown','321','--flag-dir','/tmp/x']))"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"'reboot'"* ]]
+    [[ "$output" == *"321"* ]]
+    [[ "$output" == *"/tmp/x"* ]]
+}
+
+@test "lsl-progress-gtk: task order includes the home backup step" {
+    command -v python3 >/dev/null 2>&1 || skip "python3 not available"
+    run python3 -c "import importlib.util; s=importlib.util.spec_from_file_location('lpg','misc/lsl-progress-gtk.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print([t for t,_ in m.TASK_ORDER])"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"'home'"* ]]
+}
+
+@test "z0 layer ships the reboot dialog + gtk fallback" {
+    grep -q "lsl-firstboot-reboot.sh" build.sh
+    grep -q "lsl-firstboot-reboot.sh" misc/build-z0.sh
+    grep -q "usr/local/bin/lsl-firstboot-reboot.sh" build.sh
+    grep -q "lsl-progress-gtk.py" build.sh
 }
 
 # --- notify_desktop_now: session display for the failure dialog ----------

@@ -70,7 +70,7 @@ pub fn wifi_lines(profiles: &[String]) -> Vec<String> {
     for n in &profiles {
         if let Some(psk) = psk_for_profile(n) {
             lines.push(format!(
-                "nmcli device wifi connect '{}' password '{}'",
+                "nmcli device wifi connect '{}' password '{}' && exit 0",
                 shell_quote(n),
                 shell_quote(&psk)
             ));
@@ -103,5 +103,6 @@ pub fn generate_wifi_sh(profiles: &[String]) -> Option<(String, usize)> {
         body.push_str(&l);
         body.push('\n');
     }
+    body.push_str("exit 1\n");
     Some((body, n))
 }

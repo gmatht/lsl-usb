@@ -83,20 +83,70 @@ pub fn secure_boot_status() -> sys::SecBoot {
     sys::firmware().1
 }
 
-/// Set-NextBootUsb: UEFI + bcdedit (Vista+). Returns the matched entry
-/// description on success, or '' if it can't be done.
-pub fn set_next_boot_usb() -> String {
-    if !is_uefi() || sys::os_ver() < sys::OsVer::Vista {
-        return String::new();
+fn bcdedit_path() -> String {
+    if sys::is_64bit_os() {
+        r"C:\Windows\Sysnative\bcdedit.exe".to_string()
+    } else {
+        r"C:\Windows\System32\bcdedit.exe".to_string()
     }
-    let Some((code, txt)) = sys::capture("bcdedit.exe", &["/enum".into(), "firmware".into()]) else {
-        return String::new();
+}
+
+fn is_likely_usb_entry(desc: &str) -> bool {
+    let d = desc.to_lowercase();
+    let positive = d.contains("usb")
+        || d.contains("removable")
+        || d.contains("external")
+        || d.contains("flash")
+        || d.contains("mass storage")
+        || d.contains("sd card")
+        || d.contains("thumb")
+        || d.contains("pen drive");
+    // Strong negatives are things that are almost certainly not USB.
+    let strong_negative = d.contains("windows")
+        || d.contains("network")
+        || d.contains("cd/dvd")
+        || d.contains("sata")
+        || d.contains("nvme")
+        || d.contains("cdrom")
+        || d.contains("dvd");
+    if strong_negative && !positive {
+        return false;
+    }
+    positive
+}
+
+fn is_likely_internal_drive(desc: &str) -> bool {
+    let d = desc.to_lowercase();
+    d.contains("sata") || d.contains("nvme") || d.contains("cd/dvd")
+        || d.contains("cdrom") || d.contains("dvd") || d.contains("windows")
+        || d.contains("network")
+}
+
+/// Set-NextBootUsb: UEFI + bcdedit (Vista+). Returns the matched entry
+/// description on success, or a detailed error message on failure so the
+/// caller can explain the problem instead of silently falling back.
+pub fn set_next_boot_usb() -> Result<String, String> {
+    if !is_uefi() {
+        return Err("One-time USB boot requires UEFI firmware. This PC appears to use Legacy BIOS.\
+\nPlease reboot and press the boot-menu key (".to_string() + &boot_menu_key() + ") during POST to select the USB stick manually.");
+    }
+    if sys::os_ver() < sys::OsVer::Vista {
+        return Err("One-time USB boot requires Windows Vista or later.".into());
+    }
+    let bcdedit = bcdedit_path();
+    if !sys::path_exists(&bcdedit) {
+        return Err(format!(
+            "bcdedit.exe not found at {}.\n\nThis usually means:\n- You are running 32-bit Windows on a 64-bit PC and WOW64 redirection blocked the tool, OR\n- bcdedit is not installed on this edition of Windows.",
+            bcdedit
+        ));
+    }
+    let Some((code, txt)) = sys::capture(&bcdedit, &["/enum".into(), "firmware".into()]) else {
+        return Err("Failed to run bcdedit. Access may be denied (need Administrator).".into());
     };
     if code != 0 {
-        return String::new();
+        return Err(format!("bcdedit exited with code {}.\nOutput:\n{}", code, txt.trim()));
     }
-    // Parse identifier/description pairs (localized output variants tolerated:
-    // match the {....} identifier and the 'description' line by heuristic).
+    // Parse identifier/description pairs (localized output variants tolerated).
     let mut entries: Vec<(String, String)> = Vec::new();
     let mut cur_id = String::new();
     let mut cur_desc = String::new();
@@ -122,26 +172,161 @@ pub fn set_next_boot_usb() -> String {
     if cur_id.contains('{') {
         entries.push((cur_id, cur_desc));
     }
-    let Some((id, desc)) = entries.into_iter().find(|(_, d)| d.to_lowercase().contains("usb"))
-    else {
-        return String::new();
+    // Exclude Windows Boot Manager and discard ghost entries created from
+    // displayorder / bootsequence lines (they have empty descriptions).
+    let candidates: Vec<_> = entries
+        .iter()
+        .filter(|(_, d)| {
+            !d.to_lowercase().contains("windows boot manager") && !d.is_empty()
+        })
+        .cloned()
+        .collect();
+    // Prefer an entry that looks like a USB/removable device.
+    let hit = candidates
+        .iter()
+        .find(|(_, d)| is_likely_usb_entry(d))
+        .or_else(|| {
+            // Fallback 1: after removing clearly-internal entries (SATA/NVMe/DVD),
+            // if exactly one remains, treat it as the USB stick. This catches
+            // manufacturer-named sticks like "SanDisk Cruzer" when listed
+            // alongside "Windows Boot Manager" and "Internal SATA HDD".
+            let non_internal: Vec<_> = candidates
+                .iter()
+                .filter(|(_, d)| !is_likely_internal_drive(d))
+                .collect();
+            if non_internal.len() == 1 {
+                non_internal.first().cloned()
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            // Fallback 2: if there is exactly one non-Windows entry total, use it
+            // (common on clean systems with only one extra boot device).
+            if candidates.len() == 1 {
+                candidates.first()
+            } else {
+                None
+            }
+        });
+    let Some((id, desc)) = hit.cloned() else {
+        let mut err = "No USB firmware boot entry found in bcdedit.\n\nAvailable firmware entries:\n".to_string();
+        for (_, d) in &candidates {
+            err.push_str(&format!("  - {}\n", d));
+        }
+        if candidates.is_empty() {
+            err.push_str("  (none besides Windows Boot Manager)\n");
+        }
+        err.push_str("\nCommon causes:\n");
+        err.push_str("- The USB stick is not plugged in (firmware only lists it when present).\n");
+        err.push_str("- The firmware lists it under a name without 'USB' (e.g. the manufacturer name).\n");
+        err.push_str("- This PC uses Legacy BIOS instead of UEFI.\n\n");
+        err.push_str("Tip: even when a USB entry IS found, many HP, Dell, and Lenovo firmwares ignore the Windows override and boot back into Windows anyway.\n");
+        err.push_str("The reliable option is 'Firmware boot menu' — it works on every PC.");
+        return Err(err);
     };
-    let _ = sys::capture(
-        "bcdedit.exe",
-        &[
-            "/set".into(),
-            "{fwbootmgr}".into(),
-            "bootsequence".into(),
-            id.clone(),
-        ],
-    );
+    if let Some((c, _)) = sys::capture(&bcdedit, &[
+        "/set".into(),
+        "{fwbootmgr}".into(),
+        "bootsequence".into(),
+        id.clone(),
+    ]) {
+        if c != 0 {
+            return Err(format!("bcdedit /set bootsequence failed (exit code {}).", c));
+        }
+    } else {
+        return Err("Failed to run bcdedit /set.".into());
+    }
     // Verify
-    if let Some((code, check)) = sys::capture("bcdedit.exe", &["/enum".into(), "{fwbootmgr}".into()]) {
+    if let Some((code, check)) = sys::capture(&bcdedit, &["/enum".into(), "{fwbootmgr}".into()]) {
         if code == 0 && check.contains(&id) {
-            return desc;
+            return Ok(desc);
         }
     }
-    String::new()
+    Err(format!("Set one-time boot to '{}' but verification failed.", desc))
+}
+
+/// Pre-flight diagnosis: can we expect set_next_boot_usb() to succeed?
+/// Runs bcdedit /enum firmware and checks for a plausible USB entry,
+/// returning a human-readable warning when things look unlikely.
+/// This is best-effort: some firmwares hide USB entries until POST.
+pub fn usb_boot_readiness() -> Option<String> {
+    if !is_uefi() {
+        return Some(format!(
+            "This PC appears to use Legacy BIOS, not UEFI.\nOne-time USB boot will not work.\nPlease use the Firmware Boot Menu or press {} during POST.",
+            boot_menu_key()
+        ));
+    }
+    if sys::os_ver() < sys::OsVer::Vista {
+        return Some("One-time USB boot requires Windows Vista or later.".into());
+    }
+    let bcdedit = bcdedit_path();
+    if !sys::path_exists(&bcdedit) {
+        return Some(format!(
+            "bcdedit.exe not found ({}).\nThis usually happens on 32-bit Windows running on 64-bit hardware.",
+            bcdedit
+        ));
+    }
+    let (code, txt) = sys::capture(&bcdedit, &["/enum".into(), "firmware".into()])?;
+    if code != 0 {
+        return Some(format!("bcdedit failed (exit code {}).", code));
+    }
+    // Parse entries (same logic as set_next_boot_usb).
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut cur_id = String::new();
+    let mut cur_desc = String::new();
+    for line in txt.lines() {
+        let l = line.trim();
+        if let Some(open) = l.find('{') {
+            if let Some(close) = l[open..].find('}') {
+                if cur_id.contains('{') {
+                    entries.push((cur_id.clone(), cur_desc.clone()));
+                }
+                cur_id = l[open..=open + close].to_string();
+                cur_desc.clear();
+                continue;
+            }
+        }
+        let lower = l.to_lowercase();
+        if lower.starts_with("description") || lower.starts_with("beschreibung") {
+            if let Some(i) = l.find(' ') {
+                cur_desc = l[i..].trim().to_string();
+            }
+        }
+    }
+    if cur_id.contains('{') {
+        entries.push((cur_id, cur_desc));
+    }
+    let candidates: Vec<_> = entries
+        .iter()
+        .filter(|(_, d)| !d.to_lowercase().contains("windows boot manager"))
+        .cloned()
+        .collect();
+    let usb_like = candidates.iter().any(|(_, d)| is_likely_usb_entry(d));
+    if usb_like {
+        // A USB-like entry exists, but many HP/Dell/Lenovo firmwares ignore
+        // the BCD override anyway. Warn so the user knows the fallback.
+        return Some(
+            "A USB boot entry was found, but many HP, Dell, and Lenovo firmwares ignore the Windows override and boot back into Windows.\n\
+             If that happens, use 'Firmware Boot Menu' instead — it works on every PC.".into()
+        );
+    }
+    if candidates.is_empty() {
+        return Some(
+            "No USB boot entry detected in firmware.\n\
+             The stick may not be plugged in, or this firmware does not expose USB devices to Windows.\n\
+             Many HP, Dell, and Lenovo laptops behave this way.\n\
+             Use the 'Firmware Boot Menu' option instead — it works on every PC.".into()
+        );
+    }
+    // Non-USB entries exist but none look like USB
+    let mut msg = "Firmware entries found, but none look like a USB device:\n".to_string();
+    for (_, d) in &candidates {
+        msg.push_str(&format!("  - {}\n", d));
+    }
+    msg.push_str("\nIf your USB stick is plugged in, the firmware may be hiding it from Windows.\n");
+    msg.push_str("Use the 'Firmware Boot Menu' option instead — it is reliable on every PC.");
+    Some(msg)
 }
 
 /// shutdown.exe arguments for "reboot into firmware boot menu" (Win8+).
@@ -292,9 +477,9 @@ pub enum BootChoice {
 pub fn boot_key_hint() -> String {
     let key = boot_menu_key();
     if key.is_empty() {
-        "Manual boot-menu key unknown - watch for the prompt during POST (often F12, F9, F8, or Esc).".into()
+        crate::locale::tr("Manual boot-menu key unknown - watch for the prompt during POST (often F12, F9, F8, or Esc).")
     } else {
-        format!("Manual boot menu: press {} during POST.", key)
+        crate::locale::tr("Manual boot menu: press {K} during POST.").replace("{K}", &key)
     }
 }
 
@@ -313,21 +498,30 @@ pub fn show_boot_choice_dialog() -> BootChoice {
 
     let uefi = can_set_next_boot();
     let key_hint = boot_key_hint();
+    let readiness = usb_boot_readiness();
+    let show_warning = readiness.is_some();
+    let warning_text = readiness.unwrap_or_default();
 
     let choice: Rc<RefCell<BootChoice>> = Rc::new(RefCell::new(BootChoice::None));
     let choice2 = choice.clone();
 
     let mut window: nwg::Window = Default::default();
     let mut key_lbl: nwg::Label = Default::default();
+    let mut warn_lbl: nwg::Label = Default::default();
+    let mut usb_warn_lbl: nwg::Label = Default::default();
     let mut usb_btn: nwg::Button = Default::default();
     let mut adv_btn: nwg::Button = Default::default();
     let mut fw_btn: nwg::Button = Default::default();
     let mut none_btn: nwg::Button = Default::default();
 
+    // Always show a caution about one-time USB boot on HP/Dell/Lenovo.
+    let usb_warn_text = crate::locale::tr("Caution: many HP, Dell, and Lenovo firmwares ignore the Windows boot override.\nIf the PC boots back into Windows, use 'Firmware boot menu' instead.");
+    let usb_warn_h = if uefi { 32 } else { 0 };
+    let win_h = if show_warning { 360 + usb_warn_h } else { 280 + usb_warn_h };
     let _ = nwg::Window::builder()
-        .size((560, 280))
+        .size((560, win_h))
         .center(true)
-        .title("lsl-usb - Boot from USB")
+        .title(&crate::locale::tr("lsl-usb - Boot from USB"))
         .build(&mut window);
     let _ = nwg::Label::builder()
         .text(&key_hint)
@@ -335,27 +529,46 @@ pub fn show_boot_choice_dialog() -> BootChoice {
         .size((524, 24))
         .parent(&window)
         .build(&mut key_lbl);
+    let warn_y = 38;
+    let usb_warn_y = if show_warning { 100 } else { 42 };
+    let btn_y = usb_warn_y + usb_warn_h + 4;
+    if show_warning {
+        let _ = nwg::Label::builder()
+            .text(&warning_text)
+            .position((12, warn_y))
+            .size((524, 56))
+            .parent(&window)
+            .build(&mut warn_lbl);
+    }
+    if uefi {
+        let _ = nwg::Label::builder()
+            .text(&usb_warn_text)
+            .position((12, usb_warn_y))
+            .size((524, usb_warn_h))
+            .parent(&window)
+            .build(&mut usb_warn_lbl);
+    }
     let _ = nwg::Button::builder()
-        .text("Boot USB now (set one-time boot entry)")
-        .position((12, 42))
+        .text(&crate::locale::tr("Boot USB now (set one-time boot entry)"))
+        .position((12, btn_y))
         .size((524, 30))
         .parent(&window)
         .build(&mut usb_btn);
     let _ = nwg::Button::builder()
-        .text("Advanced boot menu (shutdown /r /o)")
-        .position((12, 78))
+        .text(&crate::locale::tr("Advanced boot menu (shutdown /r /o)"))
+        .position((12, btn_y + 36))
         .size((524, 30))
         .parent(&window)
         .build(&mut adv_btn);
     let _ = nwg::Button::builder()
-        .text("Firmware boot menu (shutdown /r /fw)")
-        .position((12, 114))
+        .text(&crate::locale::tr("Firmware boot menu (shutdown /r /fw)"))
+        .position((12, btn_y + 72))
         .size((524, 30))
         .parent(&window)
         .build(&mut fw_btn);
     let _ = nwg::Button::builder()
-        .text("Don't reboot")
-        .position((12, 150))
+        .text(&crate::locale::tr("Don't reboot"))
+        .position((12, btn_y + 108))
         .size((524, 30))
         .parent(&window)
         .build(&mut none_btn);

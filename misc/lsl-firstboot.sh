@@ -10,7 +10,10 @@
 #      in /cdrom/bin/squashfs_config.sh inside an overlay chroot and appends a
 #      new squashfs layer capturing ONLY the changes - so the installed packages
 #      are persisted while nothing in the shipped layer is distro-specific
-#   3) stamps /cdrom/casper/lsl-firstboot.done and reboots
+#   3) backs up /home to its permanent location (USB: /cdrom/home.sfs via
+#      uphome; HDD: btrfs sync), stamps /cdrom/casper/lsl-firstboot.done,
+#      and offers a 10-minute cancellable reboot (desktop dialog with
+#      Cancel / Reboot now; the timer firing reboots)
 #
 # The recipe on the FAT partition (/cdrom/bin/squashfs_config.sh) is editable
 # from Windows before first boot to change what gets installed.
@@ -25,10 +28,87 @@ UPROOT="${LSL_FIRSTBOOT_UPROOT:-/cdrom/bin/uproot}"
 MAX_ATTEMPTS="${LSL_FIRSTBOOT_MAX_ATTEMPTS:-5}"
 ATTEMPT_FILE="${LSL_FIRSTBOOT_ATTEMPT:-/cdrom/casper/lsl-firstboot.attempts}"
 NET_TRIES="${LSL_FIRSTBOOT_NET_TRIES:-60}"
+case "$NET_TRIES" in ''|*[!0-9]*|0) NET_TRIES=60 ;; esac
 TS="$(date +%Y%m%d%H%M%S)"
 
+# --- structured progress -------------------------------------------------
+# The desktop progress dialog shows: the full task list, which tasks are
+# done, and how far through the current task we are. Single source of truth
+# is $STATUS (a small key=value file in /run, world-readable so the user
+# session can poll it). KEEP IN SYNC with misc/lsl-progress-gtk.py TASK_ORDER.
+LSL_TASKS="stick:Find USB stick|wifi:Stage Wi-Fi|network:Wait for network|flatpak:Install Flatpaks|packages:Install packages|layer:Pack USB layer|home:Back up home|done:Finish & reboot"
+LSL_PHASE="starting"
+LSL_TASK="stick"
+LSL_DONE=""
+LSL_PCT=0
+LSL_DETAIL=""
+
+# Atomic rewrite of the whole status file (tmp + mv avoids torn reads).
+status_write() {
+    local tmp="${STATUS}.tmp.$$"
+    {
+        echo "phase=$LSL_PHASE"
+        echo "tasks=$LSL_TASKS"
+        echo "task=$LSL_TASK"
+        echo "done=$LSL_DONE"
+        echo "pct=$LSL_PCT"
+        echo "detail=$LSL_DETAIL"
+    } > "$tmp" 2>/dev/null && mv -f "$tmp" "$STATUS" 2>/dev/null
+    chmod 644 "$STATUS" 2>/dev/null || true
+    rm -f "$tmp" 2>/dev/null || true
+}
+
+# Read one key from the status file (used by the background uproot monitor
+# and after it stops, to re-sync in-memory state).
+status_get() {
+    sed -n "s/^$1=//p" "$STATUS" 2>/dev/null | tail -n 1
+}
+status_load() {
+    LSL_PHASE="$(status_get phase)"; [ -n "$LSL_PHASE" ] || LSL_PHASE="starting"
+    LSL_TASK="$(status_get task)"; [ -n "$LSL_TASK" ] || LSL_TASK="stick"
+    LSL_DONE="$(status_get done)"
+    LSL_PCT="$(status_get pct)"; [ -n "$LSL_PCT" ] || LSL_PCT=0
+    LSL_DETAIL="$(status_get detail)"
+}
+
+task_begin() {
+    LSL_TASK="$1"
+    LSL_PCT=0
+    [ $# -ge 2 ] && LSL_DETAIL="$2"
+    status_write
+}
+task_progress() {
+    # task_progress PCT [DETAIL] — clamp 0..100, keep current task.
+    local p="$1"
+    case "$p" in ''|*[!0-9]*) p=0 ;; esac
+    [ "$p" -gt 100 ] 2>/dev/null && p=100
+    [ "$p" -lt 0 ] 2>/dev/null && p=0
+    LSL_PCT="$p"
+    [ $# -ge 2 ] && LSL_DETAIL="$2"
+    status_write
+}
+task_done() {
+    # Mark a task id done (idempotent) and snap its bar to 100 if current.
+    local id="$1"
+    case ",$LSL_DONE," in
+        *",$id,"*) ;;
+        *) LSL_DONE="${LSL_DONE:+$LSL_DONE,}$id" ;;
+    esac
+    [ "$LSL_TASK" = "$id" ] && LSL_PCT=100
+    status_write
+}
+tasks_init() {
+    LSL_PHASE="starting"
+    LSL_TASK="stick"
+    LSL_DONE=""
+    LSL_PCT=0
+    LSL_DETAIL="Locating USB stick…"
+    status_write
+}
+
 set_phase() {
-    echo "phase=$*" > "$STATUS"
+    LSL_PHASE="$*"
+    status_write
     # Surface progress to the console (if one is attached) and the journal so a
     # long, unattended first boot can be seen alive without the GUI dialog.
     echo "lsl-firstboot: phase=$*" > /dev/tty1 2>/dev/null || true
@@ -72,6 +152,18 @@ FAILED_REASON=/cdrom/casper/lsl-firstboot.FAILED.reason
 # but the presence of a graphical session.
 # Never fails the service: every fallible step degrades to silent return.
 notify_desktop_now() {
+    # Optional: notify_desktop_now SCRIPT [ARGS...] runs SCRIPT (default: the
+    # firstboot-failed notifier) instead. The reboot timer reuses this to
+    # show its countdown dialog; the default keeps every existing caller.
+    local script="${1:-/usr/local/bin/lsl-firstboot-failed.sh}"
+    if [ $# -gt 0 ]; then shift; fi
+    # Re-quote for the nested su -c shell: interpolating "$@" inside the
+    # outer "..." would join it into ONE word when su re-parses the -c
+    # string, so escape every word up front (MUST stay correct for paths
+    # with spaces).
+    local inner arg
+    printf -v inner 'bash %q' "$script"
+    for arg in "$@"; do printf -v inner '%s %q' "$inner" "$arg"; done
     command -v loginctl >/dev/null 2>&1 || return 0
     local s dtype user disp rdir home key seen
     seen=" "
@@ -89,17 +181,127 @@ notify_desktop_now() {
             key=" $user|wayland:${WAYLAND_DISPLAY:-wayland-0} "
             case "$seen" in *"$key"*) continue ;; esac
             seen="$seen$key"
-            su -s /bin/bash "$user" -c "DISPLAY= XDG_RUNTIME_DIR='$rdir' WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-wayland-0}' bash /usr/local/bin/lsl-firstboot-failed.sh" 2>>"${LOG:-/dev/null}" || { log "notify_desktop_now: su to $user failed (wayland); see above"; true; }
+            su -s /bin/bash "$user" -c "DISPLAY= XDG_RUNTIME_DIR='$rdir' WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-wayland-0}' $inner" 2>>"${LOG:-/dev/null}" || { log "notify_desktop_now: su to $user failed (wayland); see above"; true; }
         else
             disp="$(loginctl show-session -p Display --value "$s" 2>/dev/null || true)"
             disp="${disp:-:0}"
             key=" $user|x11:$disp "
             case "$seen" in *"$key"*) continue ;; esac
             seen="$seen$key"
-            su -s /bin/bash "$user" -c "DISPLAY='$disp' XDG_RUNTIME_DIR='$rdir' XAUTHORITY='$home/.Xauthority' bash /usr/local/bin/lsl-firstboot-failed.sh" 2>>"${LOG:-/dev/null}" || { log "notify_desktop_now: su to $user failed (x11 $disp); see above"; true; }
+            # Live ISO: Xorg runs as root with the cookie under /var/run/lightdm/root/
+            xauth="/var/run/lightdm/root/$disp"
+            [ -r "$xauth" ] || xauth="$home/.Xauthority"
+            log "notify_desktop_now: trying $user on $disp (XAUTHORITY=$xauth)"
+            if su -s /bin/bash "$user" -c "DISPLAY='$disp' XDG_RUNTIME_DIR='$rdir' XAUTHORITY='$xauth' $inner" 2>>"${LOG:-/dev/null}"; then
+                log "notify_desktop_now: $user on $disp OK"
+            else
+                log "notify_desktop_now: su to $user failed (x11 $disp); see above"
+            fi
         fi
     done
     return 0
+}
+
+# Final home backup: persist the merged /home to its permanent location
+# before the reboot (USB: bake into /cdrom/home.sfs via the stick's uphome;
+# HDD: btrfs sync via the same tool). Best-effort: the new layer is already
+# built, so a flush failure only logs loudly (the idle flush daemon retries
+# later) instead of failing firstboot. Never fails the service.
+flush_home_final() {
+    task_begin home "Backing up /home to its permanent location…"
+    local uphome="" cand
+    for cand in "${STICK_DIR:-/cdrom}/bin/uphome" /cdrom/bin/uphome; do
+        # Gate on -r, not -x: casper mounts FAT without exec bits (same as
+        # everywhere else in this script); uphome is always run via bash.
+        if [ -r "$cand" ]; then uphome="$cand"; break; fi
+    done
+    if [ -z "$uphome" ]; then
+        log "No uphome on the stick - skipping final home flush."
+        task_done home
+        return 0
+    fi
+    log "Flushing /home to its permanent location ($uphome)..."
+    if bash "$uphome" >>"$LOG" 2>&1; then
+        log "Final home flush OK."
+    else
+        log "WARNING: final home flush failed (continuing - the idle flush daemon retries; see $LOG)."
+    fi
+    task_done home
+    return 0
+}
+
+# End-of-firstboot reboot with a user-visible countdown (default 10
+# minutes): a dialog in each graphical session offers "Reboot now" /
+# "Cancel automatic reboot", and the reboot fires when the timer expires.
+# Cancel is safe - the stamp already exists, so the new layer is picked up
+# on the next boot anyway.
+# Env: LSL_FIRSTBOOT_REBOOT (1/0, default 1), LSL_FIRSTBOOT_REBOOT_TIMEOUT
+# (seconds, default 600; 0 = reboot immediately), LSL_FIRSTBOOT_FLAG_DIR
+# (default /run/lsl-firstboot - tmpfs, so flags vanish on reboot).
+schedule_reboot_with_timer() {
+    if [ "${LSL_FIRSTBOOT_REBOOT:-1}" != "1" ]; then
+        log "LSL_FIRSTBOOT_REBOOT=0: reboot manually when ready."
+        return 0
+    fi
+    local timeout="${LSL_FIRSTBOOT_REBOOT_TIMEOUT:-600}"
+    case "$timeout" in ''|*[!0-9]*) timeout=600 ;; esac
+    local flagdir="${LSL_FIRSTBOOT_FLAG_DIR:-/run/lsl-firstboot}"
+    if [ "$timeout" -le 0 ] 2>/dev/null; then
+        sync
+        systemctl reboot
+        return $?
+    fi
+    # World-writable so the unprivileged desktop dialog can record the
+    # user's choice; sticky bit so users cannot remove each other's flags.
+    mkdir -p "$flagdir" 2>/dev/null || true
+    chmod 1777 "$flagdir" 2>/dev/null || true
+    rm -f "$flagdir/reboot-cancel" "$flagdir/reboot-now" 2>/dev/null || true
+    log "Setup complete. Automatic reboot in $((timeout / 60)) minutes - Cancel or Reboot now in the desktop dialog…"
+    # Dialogs run per-session in the background; this loop is the reboot
+    # authority (the user session cannot reboot the machine itself).
+    notify_desktop_now /usr/local/bin/lsl-firstboot-reboot.sh --timeout "$timeout" --flag-dir "$flagdir" </dev/null >/dev/null 2>&1 &
+    local left="$timeout" mm ss
+    while [ "$left" -gt 0 ]; do
+        if [ -e "$flagdir/reboot-cancel" ]; then
+            log "Automatic reboot cancelled by the user; the new layer activates on the next boot."
+            set_phase 'done - automatic reboot cancelled by user'
+            return 0
+        fi
+        if [ -e "$flagdir/reboot-now" ]; then
+            log "Reboot requested now by the user."
+            break
+        fi
+        sleep 2
+        left=$((left - 2))
+        [ "$left" -lt 0 ] && left=0
+        mm=$((left / 60)); ss=$((left % 60))
+        task_progress 100 "$(printf 'Rebooting in %d:%02d — Cancel or Reboot now in the dialog…' "$mm" "$ss")"
+    done
+    set_phase 'done - rebooting'
+    sync
+    systemctl reboot
+}
+
+# Drop COMPLETE appended layers from previous attempts so the next retry
+# boots clean (base+z0 only) and uproot regenerates one self-contained
+# layer instead of stacking. Only runs while the stamp is missing, i.e. no
+# successful firstboot has ever completed, so there is no working setup
+# whose layers we could destroy - the content is regenerated
+# deterministically from squashfs_config.sh on the next attempt. Base z0,
+# home.sfs and .sh companions of kept files are never touched. (Unlinking
+# mid-session is safe: the running overlay already holds the loop mounts
+# open; only the next boot's casper glob is affected.)
+lsl_firstboot_drop_prior_appended_layers() {
+    local stick="${STICK_DIR:-/cdrom}" l n=0
+    for l in "$stick"/casper/filesystem.z0.[0-9]*.squashfs "$stick"/casper/filesystem_z[0-9][0-9][0-9][0-9]*.squashfs; do
+        [ -e "$l" ] || continue
+        case "$(basename "$l")" in
+            filesystem.z0.squashfs|filesystem_z0_firstboot.squashfs) continue ;;
+        esac
+        rm -f "$l" "${l%.squashfs}.sh" 2>/dev/null || true
+        n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && log "Dropped $n prior-attempt appended layer(s); next boot regenerates a fresh one."
 }
 
 # Remove any appended layer that fails to list (partial/corrupt from an
@@ -114,9 +316,33 @@ lsl_firstboot_cleanup_partial_layers() {
     done
 }
 
+# --- unconditional: ensure onboot.service is installed ---
+# The live ISO's z0 layer may predate onboot.service. Install it from the
+# FAT partition so /cdrom/onboot.sh (including wifi.sh) runs every boot.
+# Idempotent: harmless if already present.
+if [ -r /cdrom/systemd/onboot.service ] && [ ! -f /etc/systemd/system/onboot.service ]; then
+    cp /cdrom/systemd/onboot.service /etc/systemd/system/onboot.service 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable onboot.service 2>/dev/null || true
+fi
+
+# --- unconditional: stage wifi profiles ---
+# If the user re-ran lslsetup.exe to update wifi.sh, we must stage the
+# new profiles even when the stamp exists. onboot.service also runs
+# wifi.sh, but firstboot may start before onboot finishes on old z0 layers.
+if [ -r /cdrom/wifi.sh ]; then
+    bash /cdrom/wifi.sh >/dev/null 2>&1 || true
+fi
+
 if [ -e "$STAMP" ]; then
     exit 0
 fi
+
+# Start clean: a previous run may have left FAILED / .no-network markers.
+# Remove them now so a successful run this boot doesn't pop a phantom
+# error dialog from stale state.
+rm -f "$FAILED_MARKER" "$FAILED_REASON" "$NET_FAIL_FILE" 2>/dev/null || true
+rm -f /run/lsl-firstboot.no-network 2>/dev/null || true
 
 # --- locate the install stick -------------------------------------------
 # In iso-scan boots /cdrom is the ISO loop (read-only); the FAT partition
@@ -203,6 +429,8 @@ if [ -z "$STICK_DIR" ]; then
     exit 1
 fi
 rm -f /run/lsl-firstboot.strikes 2>/dev/null || true
+task_done stick
+task_begin wifi "Locating USB stick… done"
 # Bring the stick's toolkit into the /cdrom view every script expects:
 # bind the stick's casper/ and bin/ over the ISO loop's (the ISO has no
 # bin/, and its casper/ holds the same base squashfs we extracted). Writes
@@ -239,12 +467,14 @@ fi
 rm -f "$LOG_DIR/.write-test" 2>/dev/null || true
 LOG="$LOG_DIR/firstboot-${TS}.log"
 
-set_phase starting
+tasks_init
 log "lsl-firstboot starting."
 
 wait_for_network() {
     local tries=0
+    task_begin network "Waiting for network (attempt 1/$NET_TRIES)…"
     while [ "$tries" -lt "$NET_TRIES" ]; do
+        task_progress $((tries * 100 / NET_TRIES)) "Waiting for network (attempt $((tries + 1))/$NET_TRIES)…"
         local state
         state="$(nmcli -t -f connectivity g 2>/dev/null || true)"
         case "$state" in
@@ -278,11 +508,26 @@ captive_portal_detected() {
     [ "$code" != "204" ]
 }
 
+# Fallback wifi staging: onboot.service runs wifi.sh every boot, but on
+# old z0 layers (or if onboot hasn't started yet) we stage here too so
+# NM has profiles before we poll for network.
+task_begin wifi "Staging Wi-Fi profiles…"
+if [ -r /cdrom/wifi.sh ]; then
+    log "Staging wifi profiles from /cdrom/wifi.sh ..."
+    bash /cdrom/wifi.sh >>"$LOG" 2>&1 || log "wifi.sh exited non-zero (continuing)"
+    task_progress 100 "Wi-Fi profiles staged"
+else
+    task_progress 100 "No wifi.sh on stick — skipping"
+    log "No /cdrom/wifi.sh; skipping wifi staging." 
+fi
+task_done wifi
+task_begin network "Waiting for network…"
+
 if ! wait_for_network; then
     # Bounded-loud, not infinite-silent: count (stick + /run mirror, max, so
-    # a stale stick copy cannot rewind it), leave the FAILED marker + reason
-    # so the desktop shows an Error dialog (this session + next login), then
-    # exit 1 WITHOUT stamping - a later boot with network resumes itself.
+    # a stale stick copy cannot rewind it).  No-network is transient, so it
+    # is NOT an actionable failure: no FAILED marker, no error dialog, just
+    # retry on the next boot.
     n_stick="$(cat "$NET_FAIL_FILE" 2>/dev/null || echo 0)"
     n_run="$(cat /run/lsl-firstboot.no-network 2>/dev/null || echo 0)"
     net_fail="$n_stick"
@@ -290,26 +535,16 @@ if ! wait_for_network; then
     net_fail=$((net_fail + 1))
     echo "$net_fail" > "$NET_FAIL_FILE" 2>/dev/null || true
     echo "$net_fail" > /run/lsl-firstboot.no-network 2>/dev/null || true
-    set_phase "failed - no network (attempt $net_fail), error shown on desktop - will retry on next boot"
-    log "No network after ~5 minutes (attempt $net_fail); leaving the desktop error dialog, will retry on next boot."
+    set_phase "failed - no network (attempt $net_fail), will retry on next boot"
+    log "No network after ~5 minutes (attempt $net_fail); will retry on next boot."
     log "TIP: connect via WIRED Ethernet for first boot; some wireless cards need"
     log "firmware not present in the base image (preload it via /cdrom/firmware)."
-    touch "$FAILED_MARKER" 2>/dev/null || true
-    {
-        echo "lsl-usb first boot has no usable network (attempt $net_fail)."
-        echo ""
-        echo "Fix, then reboot - setup resumes automatically:"
-        echo "- plug in wired Ethernet, or"
-        echo "- USB-tether a phone, or"
-        echo "- boot in range of a network listed in /cdrom/wifi.sh"
-        echo ""
-        echo "Details: $LOG and the diagnostics tarball next to it."
-    } > "$FAILED_REASON" 2>/dev/null || true
     sync 2>/dev/null || true
-    diag "firstboot-no-network"
-    notify_desktop_now
     exit 1
 fi
+task_progress 100 "Network up"
+task_done network
+task_begin flatpak "Installing Flatpaks…"
 log "Network up."
 mem_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
 if [ "${mem_kb:-0}" -lt 3145728 ] 2>/dev/null; then
@@ -324,7 +559,7 @@ set_phase 'installing packages and packing layer (first boot)...'
 # downloads. Runs host-side (not in the uproot chroot) so the overlay
 # upper stays lean. Skips loud (never bakes) when FUSE won't come up.
 install_flatpaks_fat() {
-    local ids id inst
+    local ids id inst _flat_total _flat_i
     command -v flatpak >/dev/null 2>&1 || { log "flatpak CLI missing - skipping flatpak installs."; return 0; }
     [ -d /cdrom/flatpaks ] || return 0
     ids="$(for ref in /cdrom/flatpaks/*.flatpakref; do [ -e "$ref" ] || continue; basename "$ref" .flatpakref; done)"
@@ -345,13 +580,19 @@ install_flatpaks_fat() {
         return 0
     fi
     inst=/run/lsl-fat/flatpak
+    task_progress 10 "Flatpak view mounted"
     mkdir -p "$inst" 2>/dev/null || true
     # System-wide named installation pointing at the FUSE mount (this file
     # lands in the layer via the overlay upper - tiny; the CONTENT is FAT).
     mkdir -p /etc/flatpak/installations.d 2>/dev/null || true
     { echo '[Installation "lsl-fat"]'; echo "Path=$inst"; echo "DisplayName=LSL USB (FAT)"; } > /etc/flatpak/installations.d/lsl-fat.conf 2>/dev/null || true
+    # Per-app progress so the dialog can show how far through this task we are.
+    _flat_total=0; for id in $ids; do _flat_total=$((_flat_total + 1)); done
+    _flat_i=0
     if [ -d /cdrom/flatpaks/usb ]; then
         for id in $ids; do
+            _flat_i=$((_flat_i + 1))
+            task_progress $((10 + _flat_i * 80 / (_flat_total + 1))) "Flatpak $_flat_i/$_flat_total: $id"
             log "  sideload $id (offline, from /cdrom/flatpaks/usb)"
             flatpak --installation=lsl-fat install --noninteractive --assumeyes --sideload-repo=/cdrom/flatpaks/usb "$id" >>"$LOG" 2>&1 \
                 || log "WARNING: sideload of $id failed (continuing with the rest)"
@@ -360,31 +601,102 @@ install_flatpaks_fat() {
         log "No /cdrom/flatpaks/usb sideload repo - downloading from flathub (bytes land on FAT, not the layer)."
         flatpak --installation=lsl-fat remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo >>"$LOG" 2>&1 || true
         for id in $ids; do
+            _flat_i=$((_flat_i + 1))
+            task_progress $((10 + _flat_i * 80 / (_flat_total + 1))) "Flatpak $_flat_i/$_flat_total: $id"
             log "  download $id from flathub"
             flatpak --installation=lsl-fat install --noninteractive --assumeyes flathub "$id" >>"$LOG" 2>&1 \
                 || log "WARNING: install of $id failed (continuing with the rest)"
         done
     fi
+    task_progress 100 "Flatpaks done"
     log "Flatpak FAT install done (installation 'lsl-fat', backing /cdrom/flatpak)."
+}
+
+# Background progress monitor: while uproot runs, the main script is blocked
+# waiting, so this is the sole STATUS writer. It tails the firstboot log for
+# LSL_STEP n/m + LSL_TASK markers (emitted by uproot / squashfs_config.sh)
+# and mksquashfs percentages. Never fails the service.
+# $1 is uproot's pid: tail --pid exits by itself when uproot finishes, so
+# this monitor (pipe included) can never outlive the install it follows -
+# no kill needed, and no orphaned tail can wedge a test runner's capture.
+monitor_uproot_progress() {
+    tail --pid="$1" -n 0 -F "$LOG" 2>/dev/null | while IFS= read -r line; do
+        case "$line" in
+            *"LSL_TASK layer"*)
+                task_done packages 2>/dev/null || true
+                task_begin layer "Packing USB layer…" 2>/dev/null || true
+                ;;
+            *"LSL_STEP "*)
+                _rest="${line##*LSL_STEP }"
+                _frac="${_rest%% *}"
+                _label="${_rest#* }"
+                [ -n "$_label" ] || _label="Installing packages…"
+                _n="${_frac%%/*}"; _m="${_frac##*/}"
+                case "$_n$_m" in ''|*[!0-9]*) continue ;; esac
+                [ "$_m" -gt 0 ] 2>/dev/null || continue
+                [ "$LSL_TASK" = "packages" ] || task_begin packages "$_label" 2>/dev/null || true
+                task_progress $((_n * 100 / _m)) "$_label" 2>/dev/null || true
+                ;;
+            *%*)
+                case "$line" in
+                    *mksquashfs*|*squashfs*|*"Writing new layer"*) ;;
+                    *) [ "$LSL_TASK" = "layer" ] || continue ;;
+                esac
+                _pct="$(printf '%s' "$line" | grep -o '[0-9][0-9]*%' | tail -n 1 | tr -d '%')"
+                case "$_pct" in ''|*[!0-9]*) continue ;; esac
+                task_progress "$_pct" "Compressing layer (${_pct}%)…" 2>/dev/null || true
+                ;;
+        esac
+    done 2>/dev/null || true
 }
 
 if [ ! -r "$UPROOT" ]; then
     log "$UPROOT missing - nothing to install/persist. Stamping anyway."
+    task_done flatpak 2>/dev/null || true
+    task_done packages 2>/dev/null || true
+    task_done layer 2>/dev/null || true
+    task_begin done "Nothing to install — finishing…" 2>/dev/null || true
+    task_progress 100 "Done" 2>/dev/null || true
     touch "$STAMP"
     sync
     exit 0
 fi
 
 install_flatpaks_fat
+task_done flatpak
+task_begin packages "Starting package install…"
+
+# Every attempt starts with a sane chain: drop corrupt/partial layers from
+# an interrupted mksquashfs BEFORE uproot runs, so casper never stacks a
+# broken layer on this boot. (The give-up path also calls this; healthy
+# layers are never touched - retries must stack, not replace, because the
+# retry boot already sees prior layers' packages as installed and a fresh
+# layer is incremental against that view.)
+lsl_firstboot_cleanup_partial_layers
 
 log "Running $UPROOT --auto-append (log: $(basename "$LOG"))..."
 # Keep the desktop responsive: CPU-low priority, idle I/O class.
+# The monitor feeds the dialog while uproot runs; re-sync state after.
+# Detached stdio: under test runners that capture via $() (bats < 1.5),
+# any background child inheriting stdout would hold the capture pipe open
+# forever - and a lingering tail would do exactly that. The monitor only
+# ever writes the status file, never the terminal.
 rc=0
 if command -v ionice >/dev/null 2>&1; then
-    nice -n 10 ionice -c 3 bash "$UPROOT" --auto-append >>"$LOG" 2>&1 || rc=$?
+    nice -n 10 ionice -c 3 bash "$UPROOT" --auto-append >>"$LOG" 2>&1 &
 else
-    nice -n 10 bash "$UPROOT" --auto-append >>"$LOG" 2>&1 || rc=$?
+    nice -n 10 bash "$UPROOT" --auto-append >>"$LOG" 2>&1 &
 fi
+uproot_pid=$!
+# Detached stdio: under test runners that capture via $() (bats < 1.5),
+# any background child inheriting stdout would hold the capture pipe open
+# forever - and the monitor only ever writes the status file, never the
+# terminal.
+monitor_uproot_progress "$uproot_pid" </dev/null >/dev/null 2>&1 &
+monitor_pid=$!
+wait "$uproot_pid" || rc=$?
+wait "$monitor_pid" 2>/dev/null || true
+status_load
 if [ "$rc" -ne 0 ]; then
     giveup_why=""
     if [ "$rc" -eq 2 ]; then
@@ -410,6 +722,7 @@ if [ "$rc" -ne 0 ]; then
     echo "$attempts" > /run/lsl-firstboot.attempts 2>/dev/null || true
     fi
     if [ "$attempts" -ge "$MAX_ATTEMPTS" ]; then
+        task_progress "$LSL_PCT" "Setup failed - see $LOG" 2>/dev/null || true
         set_phase "setup failed ${giveup_why:-after $attempts attempts} - see $LOG"
         log "uproot --auto-append ${giveup_why:-FAILED $attempts times}; giving up (see $LOG)."
         # Leave a visible marker so the failure isn't silent after reboot.
@@ -431,6 +744,10 @@ if [ "$rc" -ne 0 ]; then
     fi
     set_phase "setup failed (attempt $attempts/$MAX_ATTEMPTS) - will retry on next boot"
     log "uproot --auto-append FAILED (see $LOG); will retry on next boot (attempt $attempts/$MAX_ATTEMPTS)."
+    # Retry boots clean: uproot writes a layer only on success, so anything
+    # stacked now is a leftover - drop it so the next attempt regenerates
+    # one complete layer instead of stacking an incremental one on top.
+    lsl_firstboot_drop_prior_appended_layers
     diag "firstboot-retry"
     exit 1
 fi
@@ -439,7 +756,11 @@ rm -f "$ATTEMPT_FILE" 2>/dev/null || true
 # no-network count (a later offline boot starts its own count).
 rm -f "$FAILED_MARKER" "$FAILED_REASON" "$NET_FAIL_FILE" 2>/dev/null || true
 rm -f /run/lsl-firstboot.no-network 2>/dev/null || true
-
+task_done packages
+task_done layer
+flush_home_final
+task_begin done "Setup complete — rebooting…"
+task_progress 100 "Done — rebooting…"
 set_phase 'done - rebooting'
 rm -f "$STATUS"
 touch "$STAMP"
@@ -447,11 +768,5 @@ sync
 log "First-boot setup complete; new layer persisted. Rebooting to use it."
 diag "firstboot-ok"   # baseline diagnostics for every successful first boot
 
-if [ "${LSL_FIRSTBOOT_REBOOT:-1}" = "1" ]; then
-    sleep 5
-    sync
-    systemctl reboot
-else
-    log "LSL_FIRSTBOOT_REBOOT=0: reboot manually when ready."
-fi
+schedule_reboot_with_timer
 exit 0

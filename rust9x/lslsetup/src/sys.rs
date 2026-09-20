@@ -10,6 +10,7 @@
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 use std::ffi::OsString;
+use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::ffi::OsStringExt;
 use std::sync::OnceLock;
@@ -36,10 +37,10 @@ use winapi::um::winbase::{
 };
 use winapi::shared::minwindef::HKEY;
 use winapi::um::winreg::{
-    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
-    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+    RegCloseKey, RegCreateKeyExW, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
+    RegSetValueExW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
 };
-use winapi::um::winnt::{FILE_ATTRIBUTE_DIRECTORY, HANDLE, REG_SZ};
+use winapi::um::winnt::{FILE_ATTRIBUTE_DIRECTORY, HANDLE, KEY_WRITE, REG_SZ};
 
 pub const GB: u64 = 1024 * 1024 * 1024;
 pub const MB: u64 = 1024 * 1024;
@@ -240,6 +241,25 @@ fn os_ver_ansi() -> OsVer {
 
 pub fn is_9x() -> bool {
     os_ver() == OsVer::Win9x
+}
+
+pub fn is_64bit_os() -> bool {
+    if is_9x() {
+        return false;
+    }
+    type IsWow64Fn = unsafe extern "system" fn(HANDLE, *mut i32) -> i32;
+    match proc_from_module::<IsWow64Fn>("kernel32.dll", "IsWow64Process") {
+        Some(f) => unsafe {
+            let mut wow64: i32 = 0;
+            let proc_handle = winapi::um::processthreadsapi::GetCurrentProcess();
+            if f(proc_handle, &mut wow64) != 0 {
+                wow64 != 0
+            } else {
+                false
+            }
+        },
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,6 +1079,33 @@ pub fn copy_file(src: &str, dst: &str) -> SysResult<()> {
     Ok(())
 }
 
+/// Copy a file with per-chunk progress callback. Slower than `copy_file`
+/// (user-mode buffer) but works on every Windows version and reports live
+/// progress for multi-GB copies. `progress` is called after every chunk
+/// with `(done_bytes, total_bytes)`.
+pub fn copy_file_with_progress<F>(src: &str, dst: &str, mut progress: F) -> SysResult<()>
+where
+    F: FnMut(u64, u64),
+{
+    let mut src_f = std::fs::File::open(src).map_err(|e| SysErr::Msg(e.to_string()))?;
+    let mut dst_f = std::fs::File::create(dst).map_err(|e| SysErr::Msg(e.to_string()))?;
+    let total = src_f.metadata().map(|m| m.len()).unwrap_or(0);
+    const CHUNK: usize = 1 << 20; // 1 MiB
+    let mut buf = vec![0u8; CHUNK];
+    let mut done = 0u64;
+    progress(done, total);
+    loop {
+        let n = src_f.read(&mut buf).map_err(|e| SysErr::Msg(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        dst_f.write_all(&buf[..n]).map_err(|e| SysErr::Msg(e.to_string()))?;
+        done += n as u64;
+        progress(done, total);
+    }
+    Ok(())
+}
+
 /// Copy a whole directory tree (files only; skips junction loops).
 pub fn copy_tree(src: &str, dst: &str) -> SysResult<()> {
     create_dir_all(dst);
@@ -1706,6 +1753,44 @@ impl RegKey {
                 Some(v)
             }
         }
+    }
+    /// Create or open a key with write access (HKCU only; HKLM would need
+    /// elevation). Returns None on error.
+    pub fn create(root: HKEY, path: &str) -> Option<RegKey> {
+        let mut h: HKEY = std::ptr::null_mut();
+        let w = wide(path);
+        unsafe {
+            if RegCreateKeyExW(root, w.as_ptr(), 0, std::ptr::null_mut(), 0,
+                KEY_WRITE, std::ptr::null_mut(), &mut h,
+                std::ptr::null_mut()) == 0
+            {
+                Some(RegKey(h))
+            } else {
+                None
+            }
+        }
+    }
+    /// Write a REG_SZ value. Returns true on success.
+    pub fn set_value_string(&self, name: &str, value: &str) -> bool {
+        let wname = wide(name);
+        let wval = wide(value);
+        unsafe {
+            RegSetValueExW(
+                self.0,
+                wname.as_ptr(),
+                0,
+                REG_SZ,
+                wval.as_ptr() as *const u8,
+                (wval.len() * 2) as u32,
+            ) == 0
+        }
+    }
+    /// Delete a value by name. Returns true on success (also true if the
+    /// value did not exist).
+    pub fn delete_value(&self, name: &str) -> bool {
+        use winapi::um::winreg::RegDeleteValueW;
+        let w = wide(name);
+        unsafe { RegDeleteValueW(self.0, w.as_ptr()) == 0 || winapi::um::errhandlingapi::GetLastError() == 2 }
     }
 }
 impl Drop for RegKey {

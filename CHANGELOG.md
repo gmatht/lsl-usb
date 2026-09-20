@@ -31,6 +31,12 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   `fat_linux_meta_fs` FUSE layer.
 - First-boot recipe: apt tools, snap unpin (`LSL_SNAP_SUPPORT`), flatpak refs,
   nvim AppImage (ELF-verified), rust tools, AppImages.
+- First-boot finale: backs up `/home` to its permanent location (`uphome` -
+  USB bakes `home.sfs`, HDD syncs btrfs) as a visible `Back up home` step,
+  then offers a 10-minute cancellable reboot instead of rebooting at once -
+  a per-session dialog (bundled GTK fallback, else zenity) with a live
+  countdown plus Reboot now / Cancel automatic reboot (`LSL_FIRSTBOOT_REBOOT`,
+  `LSL_FIRSTBOOT_REBOOT_TIMEOUT`, `LSL_FIRSTBOOT_FLAG_DIR` to tune/skip).
 - Test harness (PowerShell, ~55 assertions) + bats (~77 tests) + CI + release workflow.
 - `VALIDATION.md` (real-hardware checklist), `VERSION`, `CHANGELOG.md`.
 

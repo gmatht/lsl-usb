@@ -24,7 +24,7 @@ Everything the PS script does is implemented:
 - Rufus: locate / auto-download from GitHub releases / Authenticode
   verification ("Akeo Consulting") / elevated launch / wait-for-USB with the
   stable-squashfs-size heuristic and prefer-fresh-volume logic
-- Non-destructive write (`--write-mode nofmt`, keep Rufus as the default):
+- Non-destructive write (`--write-mode nofmt`, the default):
   turns an already-formatted FAT32/NTFS stick into a live USB WITHOUT
   reformatting. Writes grub4dos boot code into the MBR boot-code area ONLY
   (bytes 0..440; disk signature, partition table and every file untouched),

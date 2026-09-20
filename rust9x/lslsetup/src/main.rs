@@ -18,11 +18,13 @@ mod float_shim;
 mod gui;
 mod hardware;
 mod iso;
+mod locale;
 mod lslfiles;
 mod net;
 mod nofmt;
 mod rufus;
 mod sys;
+mod telemetry;
 mod usbcheck;
 mod wifi;
 
@@ -243,6 +245,50 @@ fn run() {
         std::process::exit(0);
     }
 
+    // --auto-upload: scheduled by a previous run to check for telemetry on
+    // the next Windows boot. Do the check, clean up the Run key, and exit
+    // without showing the main GUI.
+    if opts.auto_upload {
+        for report in telemetry::check_results() {
+            if telemetry::prompt_upload(&report) {
+                let url = telemetry::upload_url(&report);
+                let _ = sys::spawn("explorer", &[url]);
+            }
+        }
+        for probe in telemetry::check_failures() {
+            let report = telemetry::failure_report(&probe);
+            if telemetry::prompt_upload(&report) {
+                let url = telemetry::upload_url(&report);
+                let _ = sys::spawn("explorer", &[url]);
+            }
+        }
+        telemetry::cancel_auto_upload();
+        std::process::exit(0);
+    }
+
+    // Check for boot-result telemetry from a previous run (no admin needed).
+    // Upload both successes (result file present) and failures (orphaned probe).
+    // Also cancels any stale auto-upload schedule so it does not pop again.
+    let mut had_telemetry = false;
+    for report in telemetry::check_results() {
+        if telemetry::prompt_upload(&report) {
+            let url = telemetry::upload_url(&report);
+            let _ = sys::spawn("explorer", &[url]);
+        }
+        had_telemetry = true;
+    }
+    for probe in telemetry::check_failures() {
+        let report = telemetry::failure_report(&probe);
+        if telemetry::prompt_upload(&report) {
+            let url = telemetry::upload_url(&report);
+            let _ = sys::spawn("explorer", &[url]);
+        }
+        had_telemetry = true;
+    }
+    if had_telemetry || telemetry::is_auto_upload_scheduled() {
+        telemetry::cancel_auto_upload();
+    }
+
     // Pre-flight: this installer writes to the USB and launches Rufus, both of
     // which require Administrator rights, and the DD-mode live USB interacts
     // with Secure Boot - confirm with the user before any destructive step.
@@ -311,6 +357,7 @@ fn run() {
                 nofmt_pending: None,
                 boot_choice: None,
                 back: false,
+                sfs_hdd_done: false,
             };
         }
         // a fresh download picked on page 1 may still be running: join it
@@ -367,7 +414,7 @@ fn run() {
         // the wizard's write-method radio is explicit by construction; on
         // pre-Win7 the Rufus radio is greyed out, so a "rufus" value here can
         // only come from the CLI (--write-mode rufus) - refuse it loudly.
-        let mut mode = g.write_mode.clone().unwrap_or_else(|| "rufus".into());
+        let mut mode = g.write_mode.clone().unwrap_or_else(|| "nofmt".into());
         if mode == "rufus"
             && matches!(
                 sys::os_ver(),
@@ -457,6 +504,32 @@ fn run() {
                             }
                             check_done = true;
                         }
+                        // Write the telemetry probe NOW so it survives even if the user
+                        // closes the wizard without picking a boot option (they may reboot
+                        // manually via the Start Menu). The boot_method is updated later
+                        // when they actually choose.
+                        crate::telemetry::write_probe(&t.letter, "pending");
+                        // Copy squashfs to HDD while the window is still open so the user
+                        // sees live progress instead of a frozen final page.
+                        if g.sfs_hdd && !g.data_dir.is_empty() {
+                            ui.set_status("Copying squashfs layers to HDD...");
+                            ui.pump();
+                            crate::lslfiles::copy_sfs_to_hdd_with_progress(
+                                &t.letter,
+                                &g.data_dir,
+                                &mut |name, done, total| {
+                                    if done == 0 && total > 0 {
+                                        ui.set_status(&format!(
+                                            "Copying {} ({:.1} GB)...",
+                                            name,
+                                            total as f64 / crate::sys::GB as f64
+                                        ));
+                                    }
+                                    ui.set_progress(done, total);
+                                    ui.pump();
+                                },
+                            );
+                        }
                         // finished: show the summary page (window stays open)
                         ui.show_final(
                             "lslsetup - finished",
@@ -465,12 +538,17 @@ fn run() {
                         );
                         // Boot choice as the next page of the SAME window
                         // (no close-and-reopen dialog): manual key hint included.
-                        let mut boot_body = String::from("The USB stick is ready. Reboot into it now, or later by hand.\n");
+                        let mut boot_body = crate::locale::tr("The USB stick is ready. Reboot into it now, or later by hand.\n");
                         boot_body.push_str(&crate::boot::boot_key_hint());
-                        if !crate::boot::can_set_next_boot() {
-                            boot_body.push_str("\nOne-time-boot needs UEFI + bcdedit-capable Windows (absent here) - pick the firmware menu or reboot by hand.");
+                        if let Some(warn) = crate::boot::usb_boot_readiness() {
+                            boot_body.push_str("\n\nWARNING: ");
+                            boot_body.push_str(&warn);
                         }
-                        let boot_choice = ui.ask_boot_choice(&boot_body, crate::boot::can_set_next_boot());
+                        let can_usb = crate::boot::can_set_next_boot();
+                        if !can_usb {
+                            boot_body.push_str(&format!("\n\n{}", crate::locale::tr("One-time USB boot is not available on this PC. The Firmware Boot Menu option is reliable.")));
+                        }
+                        let boot_choice = ui.ask_boot_choice(&boot_body, can_usb);
                         gui::GuiWork {
                             iso,
                             mode,
@@ -480,6 +558,7 @@ fn run() {
                             nofmt_pending: pending,
                             boot_choice: Some(boot_choice),
                             back: false,
+                            sfs_hdd_done: g.sfs_hdd && !g.data_dir.is_empty(),
                         }
                     }
                     Err(e) => {
@@ -504,6 +583,7 @@ fn run() {
                     nofmt_pending: None,
                     boot_choice: None,
                     back: false,
+                    sfs_hdd_done: false,
                 }
             }
             _ => {
@@ -555,6 +635,7 @@ fn run() {
                     nofmt_pending: None,
                     boot_choice: None,
                     back: false,
+                    sfs_hdd_done: false,
                 }
             }
         }
@@ -579,10 +660,10 @@ fn run() {
             // preselect the write-method radio from explicit CLI choices
             if opts.skip_rufus {
                 "skip"
-            } else if opts.write_mode_set && opts.write_mode == "nofmt" {
-                "nofmt"
-            } else {
+            } else if opts.write_mode_set && opts.write_mode == "rufus" {
                 "rufus"
+            } else {
+                "nofmt"
             },
             &mut on_confirm,
         ) else {
@@ -649,7 +730,7 @@ fn run() {
     }
 
     // GUI nofmt flow already asked in-window (same window, next page).
-    let gui_boot_choice = work.as_ref().and_then(|w| w.boot_choice.clone());
+    let mut gui_boot_choice = work.as_ref().and_then(|w| w.boot_choice.clone());
 
     if vol.is_none() {
         if let Some(w) = work.take() {
@@ -730,19 +811,19 @@ fn run() {
             iso_used = iso;
         } else {
             // No explicit write method (no --write-mode, no GUI checkbox):
-            // present the choice - Rufus first (well supported), then the
-            // built-in non-destructive install (less tested).
+            // present the choice - built-in non-destructive first (default,
+            // keeps existing files), then Rufus (rewrites the stick).
             if !write_mode_explicit {
                 out::step("USB write method:");
-                out::info("  1. Rufus (recommended - well tested, UEFI + BIOS; rewrites the stick)");
-                out::info("  2. Built-in non-destructive (less tested - no reformat, keeps existing files;");
+                out::info("  1. Built-in non-destructive (recommended - no reformat, keeps existing files;");
                 out::info("     BIOS + UEFI boot (FAT32 + loader for UEFI), stick must be FAT32/NTFS)");
+                out::info("  2. Rufus (well tested, UEFI + BIOS; rewrites the stick)");
                 out::info("  3. Skip - I will write the USB myself (like --skip-rufus)");
-                let ans = out::prompt("Choose [1-3], or press Enter for 1 (Rufus): ");
+                let ans = out::prompt("Choose [1-3], or press Enter for 1 (non-destructive): ");
                 match ans.as_str() {
-                    "2" => write_mode = "nofmt".into(),
+                    "2" => write_mode = "rufus".into(),
                     "3" => skip_write = true,
-                    _ => write_mode = "rufus".into(),
+                    _ => write_mode = "nofmt".into(),
                 }
             }
             if skip_write {
@@ -918,11 +999,14 @@ fn run() {
         out::info("Leaving LSL_RECLAIM_WIN_SWAP off (unchecked in installer).");
     }
 
-    if copy_sfs_hdd {
+    // Skip the SFS copy when the GUI nofmt path already performed it
+    // inside the working phase (live progress bar).
+    let sfs_already_done = work.as_ref().map(|w| w.sfs_hdd_done).unwrap_or(false);
+    if copy_sfs_hdd && !sfs_already_done {
         out::step("Copying Linux squashfs layers to the NTFS HDD for faster boot...");
         lslfiles::copy_sfs_to_hdd(&vol.letter, &data_dir);
     } else {
-        out::info("Skipping squashfs-to-HDD copy (unchecked).");
+        out::info("Skipping squashfs-to-HDD copy (unchecked or already done).");
     }
 
     out::step("Locating WSL VHDX files...");
@@ -968,6 +1052,19 @@ fn run() {
                 let wifi_sh = format!("{}:\\wifi.sh", vol.letter);
                 if std::fs::write(&wifi_sh, &body).is_ok() {
                     out::info(&format!("wifi.sh written ({} network(s)).", n));
+                    // If the user re-ran the installer to update wifi profiles,
+                    // delete the first-boot stamp so the live system re-runs
+                    // wifi staging (and anything else that may have been gated).
+                    let stamps = [
+                        format!("{}:\\casper\\lsl-firstboot.done", vol.letter),
+                        format!("{}:\\casper\\lsl-firstboot.FAILED", vol.letter),
+                        format!("{}:\\casper\\lsl-firstboot.FAILED.reason", vol.letter),
+                        format!("{}:\\casper\\lsl-firstboot.attempts", vol.letter),
+                        format!("{}:\\casper\\lsl-firstboot.no-network", vol.letter),
+                    ];
+                    for s in &stamps {
+                        let _ = std::fs::remove_file(s);
+                    }
                 } else {
                     out::warn("wifi.sh could not be written.");
                 }
@@ -998,30 +1095,53 @@ fn run() {
         out::info(&format!("Created 'LSL - Reboot to Select USB' shortcut(s): {}", shortcuts.join(", ")));
     }
     // GUI nofmt flow already asked in-window; every other flow gets the dialog.
-    let choice = match gui_boot_choice {
-        Some(c) => c,
-        None => boot::show_boot_choice_dialog(),
-    };
-    match choice {
-        boot::BootChoice::Usb => {
-            let set = boot::set_next_boot_usb();
-            if !set.is_empty() {
-                out::info(&format!("Set one-time boot to the USB ({}). Rebooting...", set));
-                boot::reboot("/r /t 0");
-            } else {
-                out::warn("Could not set the one-time boot entry - rebooting into the boot menu instead.");
+    // Loop so a failed USB-boot setup lets the user pick a different option
+    // instead of auto-rebooting back into Windows.
+    loop {
+        let choice = match gui_boot_choice {
+            Some(c) => c,
+            None => boot::show_boot_choice_dialog(),
+        };
+        match choice {
+            boot::BootChoice::Usb => {
+                match boot::set_next_boot_usb() {
+                    Ok(desc) => {
+                        out::info(&format!("Set one-time boot to the USB ({}). Rebooting...", desc));
+                        if !telemetry::update_latest_probe(&vol.letter, "usb-one-time") {
+                            telemetry::write_probe(&vol.letter, "usb-one-time");
+                        }
+                        boot::reboot("/r /t 0");
+                        break;
+                    }
+                    Err(e) => {
+                        out::warn(&format!("Could not set one-time USB boot:\n{}", e));
+                        out::info("Please select a different boot option.");
+                        gui_boot_choice = None;
+                        continue;
+                    }
+                }
+            }
+            boot::BootChoice::Adv => {
+                out::info("Rebooting into the advanced boot menu (shutdown /r /o)...");
+                if !telemetry::update_latest_probe(&vol.letter, "advanced-menu") {
+                    telemetry::write_probe(&vol.letter, "advanced-menu");
+                }
+                boot::reboot("/r /o /f /t 0");
+                break;
+            }
+            boot::BootChoice::Fw => {
+                out::info("Rebooting into the firmware boot menu...");
+                if !telemetry::update_latest_probe(&vol.letter, "firmware-menu") {
+                    telemetry::write_probe(&vol.letter, "firmware-menu");
+                }
                 boot::reboot(boot::reboot_args());
+                break;
+            }
+            boot::BootChoice::None => {
+                out::info("Not rebooting.");
+                break;
             }
         }
-        boot::BootChoice::Adv => {
-            out::info("Rebooting into the advanced boot menu (shutdown /r /o)...");
-            boot::reboot("/r /o /f /t 0");
-        }
-        boot::BootChoice::Fw => {
-            out::info("Rebooting into the firmware boot menu...");
-            boot::reboot(boot::reboot_args());
-        }
-        boot::BootChoice::None => out::info("Not rebooting."),
     }
 }
 

@@ -23,6 +23,7 @@ command -v mksquashfs >/dev/null 2>&1 || { echo "ERROR: mksquashfs (squashfs-too
 command -v zip       >/dev/null 2>&1 || { echo "ERROR: zip not found" >&2; exit 1; }
 for f in "$REPO_ROOT"/misc/lsl-firstboot.sh "$REPO_ROOT"/misc/lsl-firstboot.service \
          "$REPO_ROOT"/misc/lsl-firstboot-progress.sh "$REPO_ROOT"/misc/lsl-firstboot-progress.desktop \
+         "$REPO_ROOT"/misc/lsl-firstboot-reboot.sh "$REPO_ROOT"/misc/lsl-progress-gtk.py \
          "$REPO_ROOT"/misc/lsl-firstboot-failed.sh "$REPO_ROOT"/misc/lsl-firstboot-failed.desktop \
          "$REPO_ROOT"/misc/lsl-merge-suggest.sh "$REPO_ROOT"/misc/lsl-merge-suggest.desktop; do
     [ -f "$f" ] || { echo "ERROR: missing $f" >&2; exit 1; }
@@ -91,6 +92,8 @@ mkdir -p "$LAYER/usr/local/sbin" "$LAYER/usr/local/bin" \
 
 install -m 755 "$REPO_ROOT/misc/lsl-firstboot.sh" "$LAYER/usr/local/sbin/lsl-firstboot.sh"
 install -m 755 "$REPO_ROOT/misc/lsl-firstboot-progress.sh" "$LAYER/usr/local/bin/lsl-firstboot-progress.sh"
+install -m 755 "$REPO_ROOT/misc/lsl-firstboot-reboot.sh" "$LAYER/usr/local/bin/lsl-firstboot-reboot.sh"
+install -m 755 "$REPO_ROOT/misc/lsl-progress-gtk.py" "$LAYER/usr/local/bin/lsl-progress-gtk.py"
 install -m 644 "$REPO_ROOT/misc/lsl-firstboot.service" "$LAYER/etc/systemd/system/lsl-firstboot.service"
 install -m 644 "$REPO_ROOT/misc/lsl-firstboot-progress.desktop" "$LAYER/etc/xdg/autostart/lsl-firstboot-progress.desktop"
 install -m 644 "$REPO_ROOT/misc/lsl-boot-time.desktop" "$LAYER/etc/xdg/autostart/lsl-boot-time.desktop"
@@ -227,6 +230,8 @@ if command -v unsquashfs >/dev/null 2>&1; then
     for want in \
         usr/local/sbin/lsl-firstboot.sh \
         usr/local/bin/lsl-firstboot-progress.sh \
+        usr/local/bin/lsl-firstboot-reboot.sh \
+        usr/local/bin/lsl-progress-gtk.py \
         etc/systemd/system/lsl-firstboot.service \
         etc/systemd/system/multi-user.target.wants/lsl-firstboot.service \
         etc/xdg/autostart/lsl-firstboot-progress.desktop \

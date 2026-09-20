@@ -77,10 +77,11 @@ install_desktop_shortcuts() {
     if [[ "$SYNC" -eq 0 ]]; then
         return 0
     fi
-    if [[ ! -d /home/$LSL_DESKTOP_USER/Desktop ]]; then
+    if ! mkdir -p /home/$LSL_DESKTOP_USER/Desktop 2>/dev/null; then
+        # No writable home (e.g. --sync-only against a scratch dir): the
+        # desktop shortcuts cannot be installed - skip them, not the sync.
         return 0
     fi
-    mkdir -p /home/$LSL_DESKTOP_USER/Desktop
     chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop 2>/dev/null || true
 
     cat <<'EOF' >/home/$LSL_DESKTOP_USER/Desktop/lsl-gui.desktop
@@ -110,6 +111,22 @@ Categories=System;Utility;
 EOF
     chmod +x /home/$LSL_DESKTOP_USER/Desktop/lsl-shutdown.desktop
     chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/lsl-shutdown.desktop
+
+    if command -v brave-browser >/dev/null 2>&1 || command -v brave-browser-stable >/dev/null 2>&1; then
+        cat <<'EOF' >/home/$LSL_DESKTOP_USER/Desktop/brave-browser.desktop
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Brave Web Browser
+Comment=Access the Internet
+Exec=/usr/bin/brave-browser-stable %U
+Icon=brave-browser
+Terminal=false
+Categories=Network;WebBrowser;
+EOF
+        chmod +x /home/$LSL_DESKTOP_USER/Desktop/brave-browser.desktop
+        chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/brave-browser.desktop
+    fi
 }
 
 # Runs even when SYNC=0 (--from-onboot) so login warning is installed after /home exists.
@@ -256,14 +273,22 @@ install_systemd_units() {
 
     ensure_cdrom_path_in_bashrc
 
+    local systemctl_cmd
     if [[ -n "$CFG_ROOT" ]]; then
-        chroot "$CFG_ROOT" systemctl daemon-reload
-        chroot "$CFG_ROOT" systemctl enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service lsl-reclaim-win-swap.service
+        systemctl_cmd="chroot $CFG_ROOT systemctl"
     elif [[ "$(id -u)" -eq 0 ]]; then
-        systemctl daemon-reload
-        systemctl enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service lsl-win-backup.timer lsl-reclaim-win-swap.service
+        systemctl_cmd="systemctl"
     else
         echo "config.sh: systemd install skipped (need root or LSL_CONFIG_ROOT + chroot)" >&2
+        return 0
+    fi
+
+    # daemon-reload may fail in a chroot without a running systemd;
+    # the enable symlinks are still created, so do not fail the script.
+    $systemctl_cmd daemon-reload 2>/dev/null || true
+    $systemctl_cmd enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service lsl-reclaim-win-swap.service 2>/dev/null || true
+    if [[ -z "$CFG_ROOT" ]]; then
+        $systemctl_cmd enable lsl-win-backup.timer 2>/dev/null || true
     fi
 }
 

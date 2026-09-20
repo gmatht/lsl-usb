@@ -162,9 +162,15 @@ pub(crate) fn apply_boot_caps(items: &PageItems, letter: &str, uefi_flag: &str, 
         match &it.ctl {
             PageCtl::Check(cb, 5) => {
                 if caps.bios_ok {
+                    // Check by default when the box becomes available: a box
+                    // that was greyed out (or never touched) means the user
+                    // never made a choice, so default to on. An enabled box
+                    // the user deliberately unchecked keeps their choice.
+                    let was_off = cb.text().contains("unavailable")
+                        || cb.text().contains("built-in installer only");
                     cb.set_enabled(true);
                     cb.set_text("BIOS/CSM boot (grub4dos MBR, no reformat)");
-                    if first {
+                    if first || was_off {
                         cb.set_check_state(nwg::CheckBoxState::Checked);
                     }
                 } else {
@@ -175,9 +181,11 @@ pub(crate) fn apply_boot_caps(items: &PageItems, letter: &str, uefi_flag: &str, 
             }
             PageCtl::Check(cb, 6) => {
                 if caps.uefi_ok {
+                    let was_off = cb.text().contains("unavailable")
+                        || cb.text().contains("built-in installer only");
                     cb.set_enabled(true);
                     cb.set_text("UEFI boot (BOOTX64.EFI, Secure Boot off)");
-                    if first {
+                    if first || was_off {
                         cb.set_check_state(nwg::CheckBoxState::Checked);
                     }
                 } else {
@@ -238,7 +246,7 @@ fn checked_method(items: &PageItems) -> &'static str {
             }
         }
     }
-    "rufus"
+    "nofmt"
 }
 
 /// Gate the BIOS/UEFI checkboxes (kinds 5/6) on the write method: only
@@ -293,8 +301,10 @@ pub(crate) fn write_mode_from_label(t: &str) -> &'static str {
         "nofmt"
     } else if tl.starts_with("skip") {
         "skip"
-    } else {
+    } else if tl.contains("rufus") {
         "rufus"
+    } else {
+        "nofmt"
     }
 }
 
@@ -345,7 +355,7 @@ pub fn recommended_distro() -> usize {
 /// Machine 64-bit capability: 64-bit Windows proves it, otherwise ask the
 /// CPU directly (IsWow64Process is blind on 32-bit Windows).
 pub fn is_64bit_capable() -> bool {
-    is_64bit_os() || sys::cpu_has_long_mode()
+    sys::is_64bit_os() || sys::cpu_has_long_mode()
 }
 
 /// Guess an ISO's x86 arch from its filename: Some(true) = 64-bit,
@@ -369,26 +379,6 @@ pub fn iso_arch_64(name: &str) -> Option<bool> {
     }
 }
 
-fn is_64bit_os() -> bool {
-    // IsWow64Process, dynamically loaded; on 9x always false.
-    if sys::is_9x() {
-        return false;
-    }
-    type IsWow64Fn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut i32) -> i32;
-    match sys::proc_from_module::<IsWow64Fn>("kernel32.dll", "IsWow64Process") {
-        Some(f) => unsafe {
-            let mut wow64: i32 = 0;
-            let proc_handle = winapi::um::processthreadsapi::GetCurrentProcess();
-            if f(proc_handle, &mut wow64) != 0 {
-                wow64 != 0 // 32-bit process on 64-bit Windows => OS is 64-bit
-            } else {
-                false
-            }
-        },
-        None => false, // pre-XP x86 => 32-bit OS
-    }
-}
-
 pub fn recommendation_text() -> (String, String) {
     let ram_bytes = sys::total_ram();
     if ram_bytes > 0 && ram_bytes <= 256 * sys::MB {
@@ -401,7 +391,7 @@ pub fn recommendation_text() -> (String, String) {
         );
     }
     // Pure decision matrix (unit-tested below); probes stay at the edges.
-    recommendation_for(is_64bit_capable(), is_64bit_os(), ram_bytes as f64 / sys::GB as f64)
+    recommendation_for(is_64bit_capable(), sys::is_64bit_os(), ram_bytes as f64 / sys::GB as f64)
 }
 
 /// Recommendation text from probed facts. `cpu64` = hardware long mode,
@@ -1283,7 +1273,7 @@ struct LayoutCtx<'a> {
     install_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
     fp_content: &'a Cell<i32>,
     guard: &'a Cell<bool>,
-    iso_content: i32,
+    iso_content: &'a Cell<i32>,
     sys_content: i32,
     wifi_content: i32,
     install_content: i32,
@@ -1368,13 +1358,31 @@ fn relayout(c: &LayoutCtx, cw: i32, ch: i32) {
     c.btn_everything.set_position(10, fh - 34);
     c.btn_everything.set_size(400, 26);
 
+    // Recalculate ISO path label heights so narrowed windows don't clip
+    // multiline labels; update iso_content to match.
+    {
+        let mut max_y = 0;
+        let mut b = c.iso.borrow_mut();
+        for it in b.iter_mut() {
+            let new_h = if let PageCtl::Lbl(ref lbl, 9) = it.ctl {
+                let w = if it.w > 0 { it.w } else { (fw - 10 + it.w - it.x).max(60) };
+                let text = lbl.text();
+                text_h(&text, w).max(20)
+            } else {
+                it.h
+            };
+            it.h = new_h;
+            max_y = max_y.max(it.y + it.h);
+        }
+        c.iso_content.set(max_y + 10);
+    }
 
     // scrollable pages 1-5: geometry, scrollbar, items
     // (top = fixed strip above the scroll area, bot = fixed strip below)
     let iso_top = (22 + rec_h + 10).max(72);
     let iso_shift = (iso_top - 72).max(0); // push items below a taller help text
     let pages = [
-        (c.sb_iso, c.iso, c.iso_off, c.iso_geom, c.iso_content, iso_top, iso_bot, iso_shift),
+        (c.sb_iso, c.iso, c.iso_off, c.iso_geom, c.iso_content.get(), iso_top, iso_bot, iso_shift),
         (c.sb_fp, c.fp, c.fp_off, c.fp_geom, c.fp_content.get(), 30, 32, 0),
         (c.sb_sys, c.sys, c.sys_off, c.sys_geom, c.sys_content, 4, 32, 0),
         (c.sb_wifi, c.wifi_items, c.wifi_off, c.wifi_geom, c.wifi_content, 4, 32, 0),
@@ -1580,6 +1588,9 @@ pub struct GuiWork {
     pub boot_choice: Option<crate::boot::BootChoice>,
     /// FAILED page "Back to install options": resume the wizard.
     pub back: bool,
+    /// Set when the SFS->HDD copy was already performed inside the GUI
+    /// working phase so main() does not repeat it.
+    pub sfs_hdd_done: bool,
 }
 
 impl GuiWork {
@@ -1595,6 +1606,7 @@ impl GuiWork {
             nofmt_pending: None,
             boot_choice: None,
             back: true,
+            sfs_hdd_done: false,
         }
     }
 }
@@ -1839,31 +1851,31 @@ impl WorkingUi {
         let top = 78;
         self.raw_show(self.sum_frame, true);
         set_ctl_rect(self.sum_frame, MARGIN, top, fw, (ch - top - NAV_H).max(80));
-        set_wnd_text(self.sum_heading, "lslsetup - boot the USB");
+        set_wnd_text(self.sum_heading, &crate::locale::tr("lslsetup - boot the USB"));
         set_ctl_rect(self.sum_heading, MARGIN + 10, top + 6, bw, 22);
         self.raw_show(self.sum_heading, true);
-        set_wnd_text(self.sum_body, &format!("{}\n\nKeys 1-4 choose directly (Enter = first button, Esc = Don't reboot).", body));
+        set_wnd_text(self.sum_body, &format!("{}\n\n{}", body, crate::locale::tr("Keys 1-4 choose directly (Enter = first button, Esc = Don't reboot).")));
         set_ctl_rect(self.sum_body, MARGIN + 10, top + 34, bw, 60);
         self.raw_show(self.sum_body, true);
         // stacked actions, same order as the standalone dialog
         let mut y = top + 100;
         if can_usb {
-            set_wnd_text(self.sum_btn, "Reboot to USB now");
+            set_wnd_text(self.sum_btn, &crate::locale::tr("Reboot to USB now"));
             set_ctl_rect(self.sum_btn, MARGIN + 10, y, bw, 28);
             self.raw_show(self.sum_btn, true);
         } else {
             self.raw_show(self.sum_btn, false);
         }
         y += 36;
-        set_wnd_text(self.sum_copy, "Advanced startup menu");
+        set_wnd_text(self.sum_copy, &crate::locale::tr("Advanced startup menu"));
         set_ctl_rect(self.sum_copy, MARGIN + 10, y, bw, 28);
         self.raw_show(self.sum_copy, true);
         y += 36;
-        set_wnd_text(self.sum_open, "Firmware boot menu");
+        set_wnd_text(self.sum_open, &crate::locale::tr("Firmware boot menu"));
         set_ctl_rect(self.sum_open, MARGIN + 10, y, bw, 28);
         self.raw_show(self.sum_open, true);
         y += 36;
-        set_wnd_text(self.sum_back, "Don't reboot");
+        set_wnd_text(self.sum_back, &crate::locale::tr("Don't reboot"));
         set_ctl_rect(self.sum_back, MARGIN + 10, y, bw, 28);
         self.raw_show(self.sum_back, true);
         // hide everything else that could paint over it
@@ -2586,17 +2598,32 @@ pub fn run_gui(
             idx: 0,
         });
         // path label (kind 9): the harvest reads the ISO path from here
-        let mut path_label = format!("{}  ({:.2} GB)", iso, sz as f64 / sys::GB as f64);
-        if too_new {
-            path_label.push_str("  <- 64-bit: will NOT boot this 32-bit machine");
+        // (iso_row_path splits on "  (" before any suffix, so an explicit
+        // line break before the suffix never corrupts the harvested path).
+        // SS_LEFT word-wraps a long first line visually, so reserve wrapped
+        // height up front - a fixed 20px row lets the second visual line
+        // paint over the following row.
+        let path_head = format!("{}  ({:.2} GB)", iso, sz as f64 / sys::GB as f64);
+        let suffix = if too_new {
+            "<- 64-bit: will NOT boot this 32-bit machine"
         } else if is_the_mint {
-            path_label.push_str("  <- recommended (up-to-date, reuse instead of downloading)");
-        }
+            "<- recommended (up-to-date, reuse instead of downloading)"
+        } else {
+            ""
+        };
+        let path_label = if suffix.is_empty() {
+            path_head
+        } else {
+            format!("{}\r\n{}", path_head, suffix)
+        };
+        // Relayout sizes this label at ~fw-330 px wide (~520 px at the
+        // default 880 px window); height here must cover the wrapped lines.
+        let pl_h = text_h(&path_label, 520).max(20);
         let mut pl: Box<nwg::Label> = Box::default();
         let _ = nwg::Label::builder()
             .text(&path_label)
             .position((150, y))
-            .size((630, 20))
+            .size((630, pl_h))
             .parent(&*frame_iso)
             .build(&mut pl);
         iso_items.borrow_mut().push(PageItem {
@@ -2604,10 +2631,10 @@ pub fn run_gui(
             x: 150,
             y,
             w: -170,
-            h: 20,
+            h: pl_h,
             idx: 0,
         });
-        y += 24;
+        y += pl_h + 4;
     }
     add_label("Use an existing Live USB (skips ISO download + Rufus):", &mut y);
     let existing_usbs: Vec<sys::Volume> = {
@@ -2621,7 +2648,7 @@ pub fn run_gui(
     if existing_usbs.is_empty() {
         add_plain("(none found)", &mut y);
     }
-    let iso_content = y + 10;
+    let iso_content = Cell::new(y + 10);
 
     // NOTE: the USB write-method radios used to live here; they moved to
     // page 5 (INSTALL NOW) so the choice is made at install time, like
@@ -3049,8 +3076,8 @@ pub fn run_gui(
         };
         let mut rufus_tt: Option<&'static mut nwg::Tooltip> = None;
         let methods = [
-            ("Rufus (recommended - well tested, UEFI + BIOS; rewrites the stick)", "rufus"),
-            ("Built-in non-destructive (less tested - no reformat, keeps existing files; BIOS + UEFI)", "nofmt"),
+            ("Built-in non-destructive (recommended - no reformat, keeps existing files; BIOS + UEFI)", "nofmt"),
+            ("Rufus (well tested, UEFI + BIOS; rewrites the stick)", "rufus"),
             ("Skip - I will write the USB myself (like --skip-rufus)", "skip"),
         ];
         for (n, (text, mode)) in methods.iter().enumerate() {
@@ -3349,7 +3376,7 @@ pub fn run_gui(
             install_geom: &install_geom,
             fp_content: &fp_content,
             guard: &in_relayout,
-            iso_content: iso_content,
+            iso_content: &iso_content,
             sys_content: sys_content,
             wifi_content: wifi_content,
             install_content: install_content,
@@ -3683,7 +3710,7 @@ pub fn run_gui(
                         install_geom: &install_geom,
                         fp_content: &fp_content,
                         guard: &in_relayout,
-                        iso_content: iso_content,
+                        iso_content: &iso_content,
                         sys_content: sys_content,
                         wifi_content: wifi_content,
                         install_content: install_content,
@@ -3904,12 +3931,24 @@ pub fn run_gui(
                     glog("click reboot");
                     match crate::boot::show_boot_choice_dialog() {
                         crate::boot::BootChoice::Usb => {
-                            if !crate::boot::set_next_boot_usb().is_empty() {
-                                crate::boot::reboot("/r /t 0");
-                            } else {
-                                crate::boot::reboot(crate::boot::reboot_args());
+                            match crate::boot::set_next_boot_usb() {
+                                Ok(_) => {
+                                    crate::boot::reboot("/r /t 0");
+                                    std::process::exit(0);
+                                }
+                                Err(e) => {
+                                    let text = crate::sys::wide(&crate::locale::tr("Could not set one-time USB boot:\n\n{E}\n\nPlease try the Firmware Boot Menu option instead.").replace("{E}", &e));
+                                    let caption = crate::sys::wide(&crate::locale::tr("USB Boot Failed"));
+                                    unsafe {
+                                        winapi::um::winuser::MessageBoxW(
+                                            std::ptr::null_mut(),
+                                            text.as_ptr(),
+                                            caption.as_ptr(),
+                                            winapi::um::winuser::MB_OK | winapi::um::winuser::MB_ICONWARNING,
+                                        );
+                                    }
+                                }
                             }
-                            std::process::exit(0);
                         }
                         crate::boot::BootChoice::Adv => {
                             crate::boot::reboot("/r /o /f /t 0");
@@ -4818,11 +4857,11 @@ mod tests {
     #[test]
     fn write_mode_labels_map() {
         assert_eq!(
-            write_mode_from_label("Rufus (recommended - well tested, UEFI + BIOS; rewrites the stick)"),
+            write_mode_from_label("Rufus (well tested, UEFI + BIOS; rewrites the stick)"),
             "rufus"
         );
         assert_eq!(
-            write_mode_from_label("Built-in non-destructive (less tested - no reformat, keeps existing files; BIOS + UEFI)"),
+            write_mode_from_label("Built-in non-destructive (recommended - no reformat, keeps existing files; BIOS + UEFI)"),
             "nofmt"
         );
         assert_eq!(
@@ -4832,8 +4871,9 @@ mod tests {
         // case-insensitive, like the harvest path
         assert_eq!(write_mode_from_label("SKIP everything"), "skip");
         assert_eq!(write_mode_from_label("NON-DESTRUCTIVE copy"), "nofmt");
-        // unknown labels fall back to Rufus, never to an empty/invalid mode
-        assert_eq!(write_mode_from_label("???"), "rufus");
+        assert_eq!(write_mode_from_label("RUFUS portable"), "rufus");
+        // unknown labels fall back to nofmt (the default), never to an empty/invalid mode
+        assert_eq!(write_mode_from_label("???"), "nofmt");
     }
 
     #[test]

@@ -1,8 +1,8 @@
 [Unit]
 Description=lsl-usb first-boot setup (one-shot, per-install)
-# onboot.service connects wifi and mounts drives; the script waits for the
-# network itself as a safety net.
-After=network-online.target onboot.service
+# Runs after onboot.service (which connects wifi) and waits for the network
+# before installing packages. Wi-fi staging is also kept as a fallback.
+After=network-online.target NetworkManager.service onboot.service
 Wants=network-online.target
 # Cap any rapid crash loop (the script already rate-limits its own retries via
 # RestartSec + MAX_ATTEMPTS, this is a belt-and-braces backstop).

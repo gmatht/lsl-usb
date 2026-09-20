@@ -195,6 +195,7 @@ write_append_layer() {
             return 2
         fi
     fi
+    echo "LSL_TASK layer"
     echo "Writing new layer squashfs: $layer"
     # Mirror the merge path's exclusions, plus flatpak: /var/lib/flatpak holds
     # a content-addressed object store (multi-GB) that must NEVER be baked into
@@ -413,6 +414,7 @@ if [ -n "$config_host" ]; then
 fi
 
 if [ -n "$config_in_chroot" ]; then
+    echo "LSL_TASK packages"
     log "Running ${config_in_chroot} non-interactively (log: $(basename "$auto_log"))."
     echo ""
     echo "=== squashfs_config.sh (live output; also: $auto_log) ==="

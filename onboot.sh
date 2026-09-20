@@ -80,6 +80,23 @@ lsl_ensure_nix_daemon() {
 # Replace the # BEGIN lsl-usb fstab ... # END lsl-usb fstab block in /etc/fstab so
 # installers, disk tools, and "mount -a" see stable UUID/path lines for /cdrom,
 # Windows drive letters, persist, and (HDD mode) loop-backed /home and cache.
+# Refresh every loop device currently attached to $1 so the kernel sees the
+# grown file size. No-op when unattached. Never fails the caller.
+# Background: the kernel caches loop capacity at attach time; extending the
+# backing file leaves attached loops stale, and a later `btrfs resize max`
+# then silently no-ops (exit 0, no growth). Tested: partprobe does NOT fix
+# this (it only re-reads partition tables); `losetup -c` does.
+lsl_refresh_image_loops() {
+    local img="$1" devs dev
+    command -v losetup >/dev/null 2>&1 || return 0
+    devs="$(losetup -j "$(readlink -f "$img" 2>/dev/null || printf '%s' "$img")" 2>/dev/null | cut -d: -f1)"
+    [ -n "$devs" ] || return 0
+    for dev in $devs; do
+        [ -b "$dev" ] || continue
+        losetup -c "$dev" 2>/dev/null || true
+    done
+}
+
 lsl_grow_btrfs_image() {
     # Grow a btrfs image file to $2 MiB if it is currently smaller. Done while the
     # image is unmounted (e.g. at boot), so it always succeeds; online growth of a
@@ -92,6 +109,10 @@ lsl_grow_btrfs_image() {
     want="$(( want_mib * 1024 * 1024 ))"
     if [ "$cur" -lt "$want" ] 2>/dev/null; then
         truncate -s "${want_mib}M" "$img" 2>/dev/null || true
+        # Usually unattached here, but a stale loop from a crashed boot (or a
+        # retry path) would keep the old size cached and make the caller's
+        # `btrfs resize max` a silent no-op - refresh any attachments now.
+        lsl_refresh_image_loops "$img"
     fi
 }
 
@@ -476,6 +497,79 @@ mount_steam_overlay() {
 mkdir -p /tmp/steam /tmp/steam2
 mount_steam_overlay "/mnt/d/SteamLibrary" /tmp/steam/upper /tmp/steam/work /tmp/steam/root
 mount_steam_overlay "/mnt/c/Program Files (x86)/Steam" /tmp/steam2/upper /tmp/steam2/work /tmp/steam2/root
+
+# ---------------------------------------------------------------------------
+# Telemetry: write boot result back to the USB stick so Windows can detect
+# whether the USB boot succeeded on the next run.
+# ---------------------------------------------------------------------------
+lsl_report_boot_result() {
+    local probe_dir="/cdrom/lsl-boot-probe"
+    [ -d "$probe_dir" ] || return 0
+    [ -w "$probe_dir" ] || return 0
+
+    local distro kernel firstboot_ok network_ok
+    distro="$(cat /etc/os-release 2>/dev/null | sed -n 's/^PRETTY_NAME=//p' | tr -d '"')"
+    [ -z "$distro" ] && distro="Unknown"
+    kernel="$(uname -r 2>/dev/null || echo unknown)"
+    firstboot_ok="false"
+    [ -f /cdrom/casper/lsl-firstboot.done ] && firstboot_ok="true"
+    network_ok="false"
+    if command -v nmcli >/dev/null 2>&1; then
+        state="$(nmcli -t -f connectivity g 2>/dev/null || true)"
+        [ "$state" = "full" ] && network_ok="true"
+    fi
+
+    # Per-hardware Linux status (best-effort automated detection)
+    local wifi_worked ethernet_worked audio_worked gpu_worked
+    wifi_worked="false"
+    ethernet_worked="false"
+    if command -v nmcli >/dev/null 2>&1; then
+        # A WiFi device that is "connected" means it worked
+        nmcli -t -f DEVICE,TYPE,STATE device 2>/dev/null | grep -q '^[^:]*:wifi:connected$' && wifi_worked="true"
+        # An ethernet device that is "connected"
+        nmcli -t -f DEVICE,TYPE,STATE device 2>/dev/null | grep -q '^[^:]*:ethernet:connected$' && ethernet_worked="true"
+    fi
+    audio_worked="false"
+    # PulseAudio or PipeWire running and at least one sink available
+    if command -v pactl >/dev/null 2>&1 && pactl list sinks 2>/dev/null | grep -q 'Name:'; then
+        audio_worked="true"
+    elif command -v wpctl >/dev/null 2>&1 && wpctl status 2>/dev/null | grep -q 'Audio'; then
+        audio_worked="true"
+    fi
+    gpu_worked="false"
+    # glxinfo or lspci indicates a working GPU
+    if command -v glxinfo >/dev/null 2>&1 && glxinfo 2>/dev/null | grep -q 'direct rendering: Yes'; then
+        gpu_worked="true"
+    elif lspci 2>/dev/null | grep -qi 'vga\|3d\|display'; then
+        # Fallback: GPU is detected by PCI bus (does not guarantee acceleration)
+        gpu_worked="true"
+    fi
+
+    for probe in "$probe_dir"/*-*.probe.txt; do
+        [ -f "$probe" ] || continue
+        local probe_id
+        probe_id="$(sed -n 's/^probe_id: *//p' "$probe" 2>/dev/null | head -n1)"
+        [ -n "$probe_id" ] || continue
+        local result_file="$probe_dir/${probe_id}.result.txt"
+        [ -f "$result_file" ] && continue  # already reported
+
+        {
+            echo "probe_id: $probe_id"
+            echo "boot_success: true"
+            echo "boot_timestamp: $(date '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || date)"
+            echo "linux_distro: $distro"
+            echo "kernel: $kernel"
+            echo "firstboot_ok: $firstboot_ok"
+            echo "network_ok: $network_ok"
+            echo "wifi_worked: $wifi_worked"
+            echo "ethernet_worked: $ethernet_worked"
+            echo "audio_worked: $audio_worked"
+            echo "gpu_worked: $gpu_worked"
+            echo "shutdown_clean: true"
+        } > "$result_file"
+    done
+}
+lsl_report_boot_result
 
 # Wait for wifi (bounded): wifi.sh may be missing (no saved profiles) or the
 # network may be down; don't block boot forever. onboot.service is
