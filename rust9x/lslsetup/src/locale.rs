@@ -16,7 +16,18 @@ use crate::sys;
 
 /// ISO-639 primary language of the Windows UI ("de", "th", "en", ...).
 /// English default (also on Win9x / when the API is missing).
+/// LSL_LANG=th|de|en overrides the detection (for trying translations
+/// without reinstalling the Windows display language); anything else
+/// falls through to the system language.
 pub fn ui_lang() -> &'static str {
+    if let Ok(ov) = std::env::var("LSL_LANG") {
+        match ov.to_ascii_lowercase().as_str() {
+            "th" => return "th",
+            "de" => return "de",
+            "en" => return "en",
+            _ => {}
+        }
+    }
     if sys::is_9x() {
         return "en";
     }
@@ -228,6 +239,35 @@ mod tests {
             tr_for("de", "SanDisk Cruzer"),
             "SanDisk Cruzer"
         );
+    }
+
+    #[test]
+    fn lsl_lang_override_selects_language() {
+        // Isolated: no other test reads LSL_LANG, and the override path
+        // returns before any Win32 call. (env mutation is process-global;
+        // safe here precisely because nothing else observes this variable.)
+        unsafe {
+            std::env::set_var("LSL_LANG", "th");
+        }
+        assert_eq!(ui_lang(), "th");
+        unsafe {
+            std::env::set_var("LSL_LANG", "DE");
+        }
+        assert_eq!(ui_lang(), "de");
+        unsafe {
+            std::env::set_var("LSL_LANG", "en");
+        }
+        assert_eq!(ui_lang(), "en");
+        unsafe {
+            std::env::set_var("LSL_LANG", "xx");
+        }
+        assert_ne!(ui_lang(), "xx");
+        unsafe {
+            std::env::remove_var("LSL_LANG");
+        }
+        // Without the override the system language decides (English here
+        // unless the test box runs a Thai/German display language).
+        assert!(["th", "de", "en"].contains(&ui_lang()));
     }
 
     #[test]
