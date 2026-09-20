@@ -517,10 +517,14 @@ fn run() {
                             crate::lslfiles::copy_sfs_to_hdd_with_progress(
                                 &t.letter,
                                 &g.data_dir,
-                                &mut |name, done, total| {
+                                &mut |name, done, total, phase| {
                                     if done == 0 && total > 0 {
                                         ui.set_status(&format!(
-                                            "Copying {} ({:.1} GB)...",
+                                            "{} {} ({:.1} GB)...",
+                                            match phase {
+                                                crate::lslfiles::SfsPhase::Copying => "Copying",
+                                                crate::lslfiles::SfsPhase::Hashing => "Hashing for manifest",
+                                            },
                                             name,
                                             total as f64 / crate::sys::GB as f64
                                         ));

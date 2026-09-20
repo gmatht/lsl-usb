@@ -25,10 +25,10 @@ pub enum HashResult {
 /// caller's closure already pumps the GUI on each call.
 fn hash_for_manifest<F>(s: &str, dname: &str, progress: &mut F) -> Option<String>
 where
-    F: FnMut(&str, u64, u64),
+    F: FnMut(&str, u64, u64, SfsPhase),
 {
     match sha256_file_progress(s, &mut |done, total| {
-        progress(dname, done, total);
+        progress(dname, done, total, SfsPhase::Hashing);
         true
     }) {
         Ok(HashResult::Hash(h)) => Some(h),
@@ -372,16 +372,26 @@ fn find_label_live(txt: &str) -> Option<String> {
 // Copy-SfsToHdd
 // ---------------------------------------------------------------------------
 pub fn copy_sfs_to_hdd(vol_letter: &str, data_dir: &str) {
-    copy_sfs_to_hdd_with_progress(vol_letter, data_dir, &mut |_, _, _| {});
+    copy_sfs_to_hdd_with_progress(vol_letter, data_dir, &mut |_, _, _, _| {});
+}
+
+/// Which sub-step of the squashfs-to-HDD copy is reporting progress, so
+/// status text can name the actual operation: after each file's 0→100% copy
+/// sweep, the manifest hash makes a second 0→100% sweep over the same file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SfsPhase {
+    Copying,
+    Hashing,
 }
 
 /// Copy squashfs layers to the HDD with live progress. Skips files that are
 /// already present with the same size (idempotent re-runs). `progress` is
-/// called before each file with `(name, 0, total)`, during the copy with
-/// `(name, done, total)`, and after with `(name, total, total)`.
+/// called before each file with `(name, 0, total, phase)`, during the copy
+/// and the manifest hash with `(name, done, total, phase)`, and after with
+/// `(name, total, total, phase)`.
 pub fn copy_sfs_to_hdd_with_progress<F>(vol_letter: &str, data_dir: &str, progress: &mut F)
 where
-    F: FnMut(&str, u64, u64),
+    F: FnMut(&str, u64, u64, SfsPhase),
 {
     if data_dir.is_empty() {
         return;
@@ -445,7 +455,7 @@ where
         // Idempotency: skip if already on HDD with matching size.
         if path_exists(&d) && file_size(&d).unwrap_or(0) == sz && sz > 0 {
             skipped += 1;
-            progress(&dname, sz, sz);
+            progress(&dname, sz, sz, SfsPhase::Hashing);
             // Still include in manifest so a partial run leaves a valid file.
             // The hash re-reads the whole source file: on multi-GB layers
             // over USB that is minutes of I/O, so announce it and keep the
@@ -461,18 +471,18 @@ where
             out::info(&format!("  skipped {} (already on HDD, {} bytes)", dname, sz));
             continue;
         }
-        progress(&dname, 0, sz);
+        progress(&dname, 0, sz, SfsPhase::Copying);
         let copy_ok = if sz > 256 * sys::MB {
             // Large files: use the progress-aware copy so the GUI bar stays live.
             sys::copy_file_with_progress(&s, &d, |done, total| {
-                progress(&dname, done, total);
+                progress(&dname, done, total, SfsPhase::Copying);
             })
         } else {
             sys::copy_file(&s, &d)
         };
         if copy_ok.is_ok() {
             copied += 1;
-            progress(&dname, sz, sz);
+            progress(&dname, sz, sz, SfsPhase::Copying);
             if sz > 256 * sys::MB {
                 out::info(&format!("  hashing {} for manifest...", dname));
             }
@@ -912,16 +922,20 @@ mod manifest_hash_progress_tests {
         }
         drop(f);
         let ps = path.to_string_lossy().into_owned();
-        let mut calls: Vec<(u64, u64)> = Vec::new();
-        let got = hash_for_manifest(&ps, "layer.bin", &mut |_name: &str, done: u64, total: u64| {
-            calls.push((done, total));
+        let mut calls: Vec<(u64, u64, SfsPhase)> = Vec::new();
+        let got = hash_for_manifest(&ps, "layer.bin", &mut |_name: &str, done: u64, total: u64, phase| {
+            calls.push((done, total, phase));
         });
         assert_eq!(got, sha256_file(&ps));
         assert!(got.is_some());
         assert!(!calls.is_empty(), "hash reported no progress");
-        assert_eq!(calls.last().unwrap(), &(3 << 20, 3 << 20));
+        assert!(
+            calls.iter().all(|(_, _, p)| *p == SfsPhase::Hashing),
+            "manifest hash must report the Hashing phase so status text names the real operation"
+        );
+        assert_eq!(calls.last().unwrap(), &(3 << 20, 3 << 20, SfsPhase::Hashing));
         let mut prev = 0u64;
-        for (done, total) in &calls {
+        for (done, total, _) in &calls {
             assert_eq!(*total, 3 << 20);
             assert!(*done >= prev, "progress went backwards");
             prev = *done;
