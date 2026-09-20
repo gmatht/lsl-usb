@@ -74,5 +74,68 @@ mkcasper "$CASPER" 1 1M
 lsl_merge_should_suggest; eq "$?" 1 "S6 fresh streak (2 layers) -> no suggest yet"
 [ -e "$STATE/merge-streak" ] && ok "S6 streak started" || bad "S6 streak should start"
 
+# --- remember-choice: Always / Yes / No / Never on the same dialog -------
+# The dialog offers all four; the sticky answers persist in merge-choice.
+STATE="$ROOT/choice"; mkdir -p "$STATE"
+eq "$(lsl_merge_choice)" "" "C0 no file -> undecided"
+lsl_merge_record_choice never
+eq "$(lsl_merge_choice)" "never" "C1 record never"
+lsl_merge_record_choice always
+eq "$(lsl_merge_choice)" "always" "C2 record always"
+printf 'bogus\n' > "$STATE/merge-choice"
+eq "$(lsl_merge_choice)" "" "C3 corrupt content -> undecided"
+rm -f "$STATE/merge-choice"
+
+# Each selection dispatches correctly (mock the merge launcher).
+MERGED=0
+lsl_merge_do() { MERGED=$((MERGED + 1)); }
+lsl_merge_handle_choice "Merge now"; eq "$MERGED" 1 "C4 Merge now merges once"
+[ ! -e "$STATE/merge-choice" ] && ok "C4 Merge now records nothing" || bad "C4 Merge now must not persist"
+lsl_merge_handle_choice "Always merge when suggested"; eq "$MERGED" 2 "C5 Always merges now"
+eq "$(lsl_merge_choice)" "always" "C5 Always persists"
+lsl_merge_handle_choice "Later"; eq "$MERGED" 2 "C6 Later merges nothing"
+eq "$(lsl_merge_choice)" "always" "C6 Later keeps the stored choice"
+lsl_merge_handle_choice "Never ask again"; eq "$MERGED" 2 "C7 Never merges nothing"
+eq "$(lsl_merge_choice)" "never" "C7 Never persists"
+lsl_merge_handle_choice ""; eq "$MERGED" 2 "C8 dismiss merges nothing"
+
+# A remembered choice skips the dialog: run main() in a subshell (it calls
+# exit) with a zenity mock that fails the test if ever invoked.
+MOCKBIN="$ROOT/mockbin"; mkdir -p "$MOCKBIN"
+printf '#!/bin/bash\necho CALLED >> "%s/zen.log"\nexit 1\n' "$ROOT" > "$MOCKBIN/zenity"
+chmod +x "$MOCKBIN/zenity"
+STATE="$ROOT/c9"; mkdir -p "$STATE"
+printf 'never\n' > "$STATE/merge-choice"
+( DISPLAY=:0 PATH="$MOCKBIN:/usr/bin:/bin" main ); eq "$?" 0 "C9 never-choice exits 0"
+[ ! -e "$ROOT/zen.log" ] && ok "C9 never-choice shows no dialog" || bad "C9 dialog must not appear for never-choice"
+STATE="$ROOT/c10"; mkdir -p "$STATE"
+printf 'always\n' > "$STATE/merge-choice"
+CASPER="$ROOT/c10casper"; mkcasper "$CASPER" 3 1M
+lsl_cdrom_is_vfat() { return 1; }
+rm -f "$ROOT/merged"
+( export DISPLAY=:0 PATH="$MOCKBIN:/usr/bin:/bin"; lsl_merge_do() { touch "$ROOT/merged"; }; main ); eq "$?" 0 "C10 always-choice exits 0"
+[ -e "$ROOT/merged" ] && ok "C10 always-choice merges without dialog" || bad "C10 always-choice must merge"
+[ ! -e "$ROOT/zen.log" ] && ok "C10 always-choice shows no dialog" || bad "C10 dialog must not appear for always-choice"
+
+# GTK choice backend is preferred when available (stock Mint ships no
+# zenity, so zenity-only would silently never ask there).
+GTK_BIN="$ROOT/gtkbin"; mkdir -p "$GTK_BIN"
+printf '#!/bin/bash\nif [ "$1" = "-c" ]; then exit 0; fi\necho "GTK-CALLED $*" >> "%s/gtk.log"\ncat "%s/gtk-out"\n' "$ROOT" "$ROOT" > "$GTK_BIN/python3"
+chmod +x "$GTK_BIN/python3"
+touch "$ROOT/fake-gtk.py"
+rm -f "$ROOT/zen.log" "$ROOT/merged2"
+STATE="$ROOT/c11"; mkdir -p "$STATE"
+CASPER="$ROOT/c11casper"; mkcasper "$CASPER" 3 1M
+lsl_cdrom_is_vfat() { return 1; }
+printf 'Merge now\n' > "$ROOT/gtk-out"
+( export DISPLAY=:0 PATH="$GTK_BIN:/usr/bin:/bin" LSL_PROGRESS_GTK="$ROOT/fake-gtk.py"; lsl_merge_do() { touch "$ROOT/merged2"; }; main ); eq "$?" 0 "C11 gtk choice exits 0"
+[ -e "$ROOT/merged2" ] && ok "C11 gtk Merge now merges" || bad "C11 gtk Merge now must merge"
+[ ! -e "$ROOT/zen.log" ] && ok "C11 gtk preferred over zenity" || bad "C11 zenity must not run when gtk available"
+grep -q -- "--choice" "$ROOT/gtk.log" && ok "C11 gtk gets --choice" || bad "C11 gtk missing --choice"
+printf 'Later\n' > "$ROOT/gtk-out"
+rm -f "$ROOT/merged2"
+( export DISPLAY=:0 PATH="$GTK_BIN:/usr/bin:/bin" LSL_PROGRESS_GTK="$ROOT/fake-gtk.py"; lsl_merge_do() { touch "$ROOT/merged2"; }; main ); eq "$?" 0 "C12 gtk choice exits 0"
+[ ! -e "$ROOT/merged2" ] && ok "C12 gtk Later merges nothing" || bad "C12 gtk Later must not merge"
+
 echo "RESULT: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] && exit 0 || exit 1

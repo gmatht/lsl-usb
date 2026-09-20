@@ -8,6 +8,10 @@
 #   * we have been able to reduce the layer count for at least a week (a
 #     persistent "worth merging" streak tracked in $STATE/merge-streak).
 #
+# The dialog offers all four choices at once - Merge now (yes, this time),
+# Always merge when suggested, Later (no, ask again), Never ask again -
+# with the sticky answers persisted in $STATE/merge-choice.
+#
 # The actual merge is delegated to bin/uproot (the tested live-overlay merge),
 # which is launched in a terminal so the user keeps control and sees progress.
 #
@@ -110,10 +114,69 @@ lsl_merge_do() {
     fi
 }
 
+# Persistent remember-choice for the suggestion dialog ("Always" / "Never"):
+# $STATE/merge-choice holds one word. Derived from $STATE on every call so
+# tests (and XDG overrides) can point STATE at scratch dirs.
+lsl_merge_choice_file() {
+    printf '%s/merge-choice' "${STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/lsl}"
+}
+lsl_merge_choice() {
+    # Prints: always | never | "" (undecided or corrupt content).
+    local f choice
+    f="$(lsl_merge_choice_file)"
+    choice="$(cat "$f" 2>/dev/null || true)"
+    case "$choice" in
+        always|never) printf '%s' "$choice" ;;
+        *) printf '' ;;
+    esac
+}
+lsl_merge_record_choice() {
+    # lsl_merge_record_choice always|never
+    local f
+    f="$(lsl_merge_choice_file)"
+    mkdir -p "$(dirname "$f")" 2>/dev/null || return 1
+    printf '%s\n' "$1" > "$f" 2>/dev/null || return 1
+}
+lsl_merge_handle_choice() {
+    # Act on one dialog selection. Always returns 0 (a declined merge is
+    # not an error); unknown, empty, or dismissed selections mean "Later".
+    case "${1:-}" in
+        "Merge now")
+            lsl_merge_do ;;
+        "Always merge when suggested")
+            lsl_merge_record_choice always || true
+            lsl_merge_do ;;
+        "Never ask again")
+            lsl_merge_record_choice never || true ;;
+        *) : ;;  # "Later", dismiss, empty
+    esac
+    return 0
+}
+
 main() {
-    # Only meaningful in a graphical session with zenity available.
+    # Only meaningful in a graphical session with some dialog backend.
+    # Stock Mint ships no zenity (it arrives via firstboot apt, if online),
+    # so prefer the bundled GTK fallback and keep zenity as the fallback.
     [ -n "${DISPLAY:-}" ] || exit 0
-    command -v zenity >/dev/null 2>&1 || exit 0
+    local have_gtk=0 have_zenity=0
+    if command -v python3 >/dev/null 2>&1 && [ -f "${LSL_PROGRESS_GTK:-/usr/local/bin/lsl-progress-gtk.py}" ] \
+        && python3 -c 'import gi' 2>/dev/null; then
+        have_gtk=1
+    fi
+    if command -v zenity >/dev/null 2>&1; then
+        have_zenity=1
+    fi
+    [ "$have_gtk" = 1 ] || [ "$have_zenity" = 1 ] || exit 0
+
+    # A remembered choice short-circuits the dialog entirely.
+    case "$(lsl_merge_choice)" in
+        never) exit 0 ;;
+        always)
+            if lsl_merge_should_suggest; then
+                lsl_merge_do
+            fi
+            exit 0 ;;
+    esac
 
     lsl_merge_should_suggest || exit 0
 
@@ -121,10 +184,25 @@ main() {
     msg="You have $LSL_MERGE_N squashfs layers on this live USB."$'\n'
     msg="$msg Merging them into a single layer would reduce the count by $LSL_MERGE_REDUCTION and keep dpkg's package database consistent."$'\n\n'
     msg="$msg$LSL_MERGE_REASON"
-    if zenity --question --no-wrap --title "lsl-usb: consider merging filesystem layers" \
-              --text "$msg" --ok-label "Merge now" --cancel-label "Later" 2>/dev/null; then
-        lsl_merge_do
+    local choice=""
+    if [ "$have_gtk" = 1 ]; then
+        choice="$(python3 "${LSL_PROGRESS_GTK:-/usr/local/bin/lsl-progress-gtk.py}" \
+            --choice --title "lsl-usb: consider merging filesystem layers" \
+            --text "$msg" \
+            --options "Merge now|Always merge when suggested|Later|Never ask again" \
+            --preselect 1 2>/dev/null || true)"
+    else
+        choice="$(zenity --list --radiolist \
+            --title "lsl-usb: consider merging filesystem layers" \
+            --text "$msg" \
+            --column "" --column "What should happen?" \
+            TRUE "Merge now" \
+            FALSE "Always merge when suggested" \
+            FALSE "Later" \
+            FALSE "Never ask again" \
+            --width=620 --height=400 2>/dev/null || true)"
     fi
+    lsl_merge_handle_choice "$choice"
     exit 0
 }
 

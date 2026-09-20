@@ -5,6 +5,12 @@ tools/rusttools-build/
 tmp/
 .pir/
 *.swp
+# Python bytecode (regenerated on import; never commit)
+__pycache__/
+*.pyc
+*.pyo
+# Wrangler local state (may contain account credentials)
+.wrangler/
 # Release-attached source bundle (regenerate via rust9x/lslsetup/scripts/bundle-vendored-source.sh)
 lslsetup-vendored-src-*.tar.gz
 

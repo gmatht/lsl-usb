@@ -252,24 +252,26 @@ pub fn set_next_boot_usb() -> Result<String, String> {
 /// This is best-effort: some firmwares hide USB entries until POST.
 pub fn usb_boot_readiness() -> Option<String> {
     if !is_uefi() {
-        return Some(format!(
-            "This PC appears to use Legacy BIOS, not UEFI.\nOne-time USB boot will not work.\nPlease use the Firmware Boot Menu or press {} during POST.",
-            boot_menu_key()
-        ));
+        return Some(
+            crate::locale::tr("This PC appears to use Legacy BIOS, not UEFI.\nOne-time USB boot will not work.\nPlease use the Firmware Boot Menu or press {K} during POST.")
+                .replace("{K}", &boot_menu_key()),
+        );
     }
     if sys::os_ver() < sys::OsVer::Vista {
-        return Some("One-time USB boot requires Windows Vista or later.".into());
+        return Some(crate::locale::tr("One-time USB boot requires Windows Vista or later."));
     }
     let bcdedit = bcdedit_path();
     if !sys::path_exists(&bcdedit) {
-        return Some(format!(
-            "bcdedit.exe not found ({}).\nThis usually happens on 32-bit Windows running on 64-bit hardware.",
-            bcdedit
-        ));
+        return Some(
+            crate::locale::tr("bcdedit.exe not found ({P}).\nThis usually happens on 32-bit Windows running on 64-bit hardware.")
+                .replace("{P}", &bcdedit),
+        );
     }
     let (code, txt) = sys::capture(&bcdedit, &["/enum".into(), "firmware".into()])?;
     if code != 0 {
-        return Some(format!("bcdedit failed (exit code {}).", code));
+        return Some(
+            crate::locale::tr("bcdedit failed (exit code {C}).").replace("{C}", &code.to_string()),
+        );
     }
     // Parse entries (same logic as set_next_boot_usb).
     let mut entries: Vec<(String, String)> = Vec::new();
@@ -306,26 +308,26 @@ pub fn usb_boot_readiness() -> Option<String> {
     if usb_like {
         // A USB-like entry exists, but many HP/Dell/Lenovo firmwares ignore
         // the BCD override anyway. Warn so the user knows the fallback.
-        return Some(
+        return Some(crate::locale::tr(
             "A USB boot entry was found, but many HP, Dell, and Lenovo firmwares ignore the Windows override and boot back into Windows.\n\
-             If that happens, use 'Firmware Boot Menu' instead — it works on every PC.".into()
-        );
+             If that happens, use 'Firmware Boot Menu' instead — it works on every PC.",
+        ));
     }
     if candidates.is_empty() {
-        return Some(
+        return Some(crate::locale::tr(
             "No USB boot entry detected in firmware.\n\
              The stick may not be plugged in, or this firmware does not expose USB devices to Windows.\n\
              Many HP, Dell, and Lenovo laptops behave this way.\n\
-             Use the 'Firmware Boot Menu' option instead — it works on every PC.".into()
-        );
+             Use the 'Firmware Boot Menu' option instead — it works on every PC.",
+        ));
     }
     // Non-USB entries exist but none look like USB
-    let mut msg = "Firmware entries found, but none look like a USB device:\n".to_string();
+    let mut msg =
+        crate::locale::tr("Firmware entries found, but none look like a USB device:\n");
     for (_, d) in &candidates {
         msg.push_str(&format!("  - {}\n", d));
     }
-    msg.push_str("\nIf your USB stick is plugged in, the firmware may be hiding it from Windows.\n");
-    msg.push_str("Use the 'Firmware Boot Menu' option instead — it is reliable on every PC.");
+    msg.push_str(&crate::locale::tr("\nIf your USB stick is plugged in, the firmware may be hiding it from Windows.\nUse the 'Firmware Boot Menu' option instead — it is reliable on every PC."));
     Some(msg)
 }
 

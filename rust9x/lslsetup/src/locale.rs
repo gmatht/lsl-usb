@@ -76,6 +76,30 @@ pub fn tr_for(lang: &str, msgid: &str) -> String {
         "Could not set one-time USB boot:\n\n{E}\n\nPlease try the Firmware Boot Menu option instead." => {
             "Einmaliger USB-Boot konnte nicht eingerichtet werden:\n\n{E}\n\nBitte stattdessen die Option „Firmware-Bootmenü“ wählen.".into()
         }
+        "This PC appears to use Legacy BIOS, not UEFI.\nOne-time USB boot will not work.\nPlease use the Firmware Boot Menu or press {K} during POST." => {
+            "Dieser PC scheint Legacy-BIOS statt UEFI zu verwenden.\nEinmaliger USB-Boot funktioniert nicht.\nBitte das Firmware-Bootmenü verwenden oder {K} während des POST drücken.".into()
+        }
+        "One-time USB boot requires Windows Vista or later." => {
+            "Einmaliger USB-Boot erfordert Windows Vista oder neuer.".into()
+        }
+        "bcdedit.exe not found ({P}).\nThis usually happens on 32-bit Windows running on 64-bit hardware." => {
+            "bcdedit.exe nicht gefunden ({P}).\nDas passiert meist bei 32-Bit-Windows auf 64-Bit-Hardware.".into()
+        }
+        "bcdedit failed (exit code {C})." => {
+            "bcdedit ist fehlgeschlagen (Exit-Code {C}).".into()
+        }
+        "A USB boot entry was found, but many HP, Dell, and Lenovo firmwares ignore the Windows override and boot back into Windows.\nIf that happens, use 'Firmware Boot Menu' instead — it works on every PC." => {
+            "Ein USB-Boot-Eintrag wurde gefunden, aber viele HP-, Dell- und Lenovo-Firmwares ignorieren die Windows-Vorgabe und starten wieder Windows.\nFalls das passiert, „Firmware-Bootmenü“ verwenden — das funktioniert auf jedem PC.".into()
+        }
+        "No USB boot entry detected in firmware.\nThe stick may not be plugged in, or this firmware does not expose USB devices to Windows.\nMany HP, Dell, and Lenovo laptops behave this way.\nUse the 'Firmware Boot Menu' option instead — it works on every PC." => {
+            "Kein USB-Boot-Eintrag in der Firmware gefunden.\nDer Stick ist möglicherweise nicht eingesteckt, oder diese Firmware zeigt Windows keine USB-Geräte.\nViele HP-, Dell- und Lenovo-Laptops verhalten sich so.\nStattdessen die Option „Firmware-Bootmenü“ verwenden — sie funktioniert auf jedem PC.".into()
+        }
+        "Firmware entries found, but none look like a USB device:\n" => {
+            "Firmware-Einträge gefunden, aber keiner sieht nach einem USB-Gerät aus:\n".into()
+        }
+        "\nIf your USB stick is plugged in, the firmware may be hiding it from Windows.\nUse the 'Firmware Boot Menu' option instead — it is reliable on every PC." => {
+            "\nFalls der USB-Stick eingesteckt ist, verbirgt die Firmware ihn möglicherweise vor Windows.\nDie Option „Firmware-Bootmenü“ verwenden — sie ist auf jedem PC zuverlässig.".into()
+        }
         _ => msgid.to_string(),
     }
 }
@@ -99,6 +123,36 @@ mod tests {
     #[test]
     fn unknown_key_passes_through() {
         assert_eq!(tr_for("de", "no such string"), "no such string");
+    }
+
+    #[test]
+    fn german_readiness_strings() {
+        // Placeholder substitution survives translation ({K}/{P}/{C}).
+        assert_eq!(
+            tr_for(
+                "de",
+                "This PC appears to use Legacy BIOS, not UEFI.\nOne-time USB boot will not work.\nPlease use the Firmware Boot Menu or press {K} during POST."
+            )
+            .replace("{K}", "F12"),
+            "Dieser PC scheint Legacy-BIOS statt UEFI zu verwenden.\nEinmaliger USB-Boot funktioniert nicht.\nBitte das Firmware-Bootmenü verwenden oder F12 während des POST drücken."
+        );
+        assert_eq!(
+            tr_for("de", "bcdedit failed (exit code {C}).").replace("{C}", "1"),
+            "bcdedit ist fehlgeschlagen (Exit-Code 1)."
+        );
+        assert_eq!(
+            tr_for("de", "One-time USB boot requires Windows Vista or later."),
+            "Einmaliger USB-Boot erfordert Windows Vista oder neuer."
+        );
+        assert_eq!(
+            tr_for("de", "Firmware entries found, but none look like a USB device:\n"),
+            "Firmware-Einträge gefunden, aber keiner sieht nach einem USB-Gerät aus:\n"
+        );
+        // Firmware entry names themselves are never translated.
+        assert_eq!(
+            tr_for("de", "SanDisk Cruzer"),
+            "SanDisk Cruzer"
+        );
     }
 
     #[test]

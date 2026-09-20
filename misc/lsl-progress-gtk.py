@@ -24,6 +24,11 @@ Two progress modes:
       firstboot service owns the actual reboot and fires on timeout; closing
       the window counts as Cancel).
 
+  choice mode (--choice --options "A|B|C" [--preselect N]): single-choice
+      radiolist dialog (used where zenity --list --radiolist would be, but
+      Mint ships no zenity out of the box); prints the chosen label, exit 0.
+      Dismissal prints nothing and exits 1.
+
 Status file format (written atomically by lsl-firstboot.sh):
   phase=  human-readable phase (legacy)
   tasks=  id:label|id:label|... (full ordered task list)
@@ -59,6 +64,8 @@ STAMP_FALLBACKS = (
 
 def parse_args(argv):
     mode = "progress"
+    choice_options = []
+    choice_preselect = 1
     title = "lsl-usb first boot"
     text = "Preparing your USB system (first boot)..."
     body = ""
@@ -91,6 +98,19 @@ def parse_args(argv):
             flag_dir = argv[i] or flag_dir
         elif a.startswith("--flag-dir="):
             flag_dir = a.split("=", 1)[1] or flag_dir
+        elif a == "--choice":
+            mode = "choice"
+        elif a == "--options" and i + 1 < len(argv):
+            i += 1
+            choice_options = [o for o in argv[i].split("|")]
+        elif a.startswith("--options="):
+            choice_options = [o for o in a.split("=", 1)[1].split("|")]
+        elif a == "--preselect" and i + 1 < len(argv):
+            i += 1
+            try:
+                choice_preselect = max(1, int(argv[i]))
+            except ValueError:
+                pass
         elif a == "--title" and i + 1 < len(argv):
             i += 1
             title = argv[i]
@@ -115,7 +135,19 @@ def parse_args(argv):
             except ValueError:
                 pass
         i += 1
-    return mode, title, text, body, status_file, stamp, poll, countdown, flag_dir
+    return (
+        mode,
+        title,
+        text,
+        body,
+        status_file,
+        stamp,
+        poll,
+        countdown,
+        flag_dir,
+        choice_options,
+        choice_preselect,
+    )
 
 
 def read_status(path):
@@ -173,9 +205,19 @@ def stamp_present(stamp):
 
 
 def main():
-    mode, title, text, body, status_file, stamp, poll, countdown, flag_dir = parse_args(
-        sys.argv[1:]
-    )
+    (
+        mode,
+        title,
+        text,
+        body,
+        status_file,
+        stamp,
+        poll,
+        countdown,
+        flag_dir,
+        choice_options,
+        choice_preselect,
+    ) = parse_args(sys.argv[1:])
     try:
         import gi
         gi.require_version("Gtk", "3.0")
@@ -186,6 +228,9 @@ def main():
 
     if mode == "reboot":
         return run_reboot_countdown(Gtk, GLib, title, text, countdown, flag_dir)
+
+    if mode == "choice":
+        return run_choice(Gtk, GLib, title, text, choice_options, choice_preselect)
 
     if mode == "warn":
         dlg = Gtk.MessageDialog(
@@ -341,6 +386,77 @@ def main():
     GLib.timeout_add(int(poll * 1000), refresh)
     refresh()
     Gtk.main()
+    return 0
+
+
+def run_choice(Gtk, GLib, title, text, options, preselect):
+    """Single-choice radiolist dialog: the GTK replacement for
+    `zenity --list --radiolist` (Mint ships no zenity out of the box).
+    Prints the chosen label to stdout, exit 0. Dismissal (Cancel, Escape,
+    window close) prints nothing and exits 1. Empty options exits 1."""
+    if not options:
+        return 1
+    if preselect < 1 or preselect > len(options):
+        preselect = 1
+
+    win = Gtk.Window(title=title)
+    win.set_default_size(560, -1)
+    win.set_border_width(12)
+    win.set_position(Gtk.WindowPosition.CENTER)
+    win.set_wmclass("lsl-choice", "lsl-choice")
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    win.add(box)
+
+    header = Gtk.Label(label=text)
+    header.set_line_wrap(True)
+    header.set_xalign(0.0)
+    box.pack_start(header, False, False, 0)
+
+    radios = []
+    group = None
+    for label in options:
+        if group is None:
+            rb = Gtk.RadioButton.new_with_label_from_widget(None, label)
+            group = rb
+        else:
+            rb = Gtk.RadioButton.new_with_label_from_widget(group, label)
+        box.pack_start(rb, False, False, 0)
+        radios.append(rb)
+    radios[preselect - 1].set_active(True)
+
+    buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    box.pack_start(buttons, False, False, 0)
+    ok_btn = Gtk.Button(label="Choose")
+    cancel_btn = Gtk.Button(label="Cancel")
+    buttons.pack_start(ok_btn, True, True, 0)
+    buttons.pack_start(cancel_btn, True, True, 0)
+
+    state = {"choice": None}
+
+    def finish_ok(_btn=None):
+        for rb in radios:
+            if rb.get_active():
+                state["choice"] = rb.get_label()
+                break
+        Gtk.main_quit()
+
+    def finish_cancel(_btn=None):
+        Gtk.main_quit()
+
+    ok_btn.connect("clicked", finish_ok)
+    cancel_btn.connect("clicked", finish_cancel)
+    win.connect("destroy", finish_cancel)
+
+    win.show_all()
+    win.present()
+    Gtk.main()
+    if state["choice"] is None:
+        return 1
+    try:
+        sys.stdout.write(state["choice"] + "\n")
+        sys.stdout.flush()
+    except OSError:
+        return 1
     return 0
 
 

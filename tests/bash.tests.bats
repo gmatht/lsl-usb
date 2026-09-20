@@ -875,6 +875,11 @@ EOF
     btrfs() { echo "btrfs $*" >> "$TMPDIR_TEST/btrfs.log"; }
     # Function mocks do not cross into `bash bin/uphome` unless exported.
     export -f btrfs
+    # persist-wifi.sh re-execs via sudo when not root; a real sudo would
+    # hang waiting for a password in this sandbox (same pattern as the
+    # config.sh test below).
+    sudo() { true; }
+    export -f sudo
     run env LSL_DATA_DIR=/mnt/c/Users/lsl-usb bash bin/uphome
     [ "$status" -eq 0 ]
     grep -q "sync /home" "$TMPDIR_TEST/btrfs.log"
@@ -1068,6 +1073,59 @@ EOF
     sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/progress.sh"
     run bash "$TMPDIR_TEST/progress.sh"
     [ "$status" -eq 0 ]
+}
+
+@test "lsl-firstboot-progress: fresh login during countdown shows the timer" {
+    CD="$TMPDIR_TEST/cdrom"
+    mkdir -p "$CD/casper" "$TMPDIR_TEST/flags"
+    touch "$CD/casper/lsl-firstboot.done"
+    echo $(( $(date +%s) + 300 )) > "$TMPDIR_TEST/flags/deadline"
+    printf '#!/bin/bash\necho "$@" > "$TMPDIR_TEST/reboot-args"\n' > "$TMPDIR_TEST/reboot-mock.sh"
+    chmod +x "$TMPDIR_TEST/reboot-mock.sh"
+    cp misc/lsl-firstboot-progress.sh "$TMPDIR_TEST/progress.sh"
+    sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/progress.sh"
+    run env LSL_FIRSTBOOT_FLAG_DIR="$TMPDIR_TEST/flags" LSL_FIRSTBOOT_REBOOT_SH="$TMPDIR_TEST/reboot-mock.sh" \
+        bash "$TMPDIR_TEST/progress.sh"
+    [ "$status" -eq 0 ]
+    grep -q -- "--flag-dir $TMPDIR_TEST/flags" "$TMPDIR_TEST/reboot-args"
+    t="$(grep -oE -- '--timeout [0-9]+' "$TMPDIR_TEST/reboot-args" | awk '{print $2}')"
+    [ "$t" -gt 0 ] 2>/dev/null
+    [ "$t" -le 300 ] 2>/dev/null
+}
+
+@test "lsl-firstboot-progress: stays silent when reboot was cancelled" {
+    CD="$TMPDIR_TEST/cdrom"
+    mkdir -p "$CD/casper" "$TMPDIR_TEST/flags"
+    touch "$CD/casper/lsl-firstboot.done" "$TMPDIR_TEST/flags/reboot-cancel"
+    echo $(( $(date +%s) + 300 )) > "$TMPDIR_TEST/flags/deadline"
+    printf '#!/bin/bash\necho CALLED > "$TMPDIR_TEST/reboot-args"\n' > "$TMPDIR_TEST/reboot-mock.sh"
+    chmod +x "$TMPDIR_TEST/reboot-mock.sh"
+    cp misc/lsl-firstboot-progress.sh "$TMPDIR_TEST/progress.sh"
+    sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/progress.sh"
+    run env LSL_FIRSTBOOT_FLAG_DIR="$TMPDIR_TEST/flags" LSL_FIRSTBOOT_REBOOT_SH="$TMPDIR_TEST/reboot-mock.sh" \
+        bash "$TMPDIR_TEST/progress.sh"
+    [ "$status" -eq 0 ]
+    [ ! -e "$TMPDIR_TEST/reboot-args" ]
+}
+
+@test "lsl-firstboot-progress: stays silent with past deadline or none" {
+    CD="$TMPDIR_TEST/cdrom"
+    mkdir -p "$CD/casper" "$TMPDIR_TEST/flags"
+    touch "$CD/casper/lsl-firstboot.done"
+    printf '#!/bin/bash\necho CALLED > "$TMPDIR_TEST/reboot-args"\n' > "$TMPDIR_TEST/reboot-mock.sh"
+    chmod +x "$TMPDIR_TEST/reboot-mock.sh"
+    cp misc/lsl-firstboot-progress.sh "$TMPDIR_TEST/progress.sh"
+    sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/progress.sh"
+    echo $(( $(date +%s) - 60 )) > "$TMPDIR_TEST/flags/deadline"
+    run env LSL_FIRSTBOOT_FLAG_DIR="$TMPDIR_TEST/flags" LSL_FIRSTBOOT_REBOOT_SH="$TMPDIR_TEST/reboot-mock.sh" \
+        bash "$TMPDIR_TEST/progress.sh"
+    [ "$status" -eq 0 ]
+    [ ! -e "$TMPDIR_TEST/reboot-args" ]
+    rm -f "$TMPDIR_TEST/flags/deadline"
+    run env LSL_FIRSTBOOT_FLAG_DIR="$TMPDIR_TEST/flags" LSL_FIRSTBOOT_REBOOT_SH="$TMPDIR_TEST/reboot-mock.sh" \
+        bash "$TMPDIR_TEST/progress.sh"
+    [ "$status" -eq 0 ]
+    [ ! -e "$TMPDIR_TEST/reboot-args" ]
 }
 
 @test "lsl-firstboot-progress: exits without zenity" {

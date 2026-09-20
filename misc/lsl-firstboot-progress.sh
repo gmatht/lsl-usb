@@ -29,7 +29,32 @@ stamp_present() {
     [ -e /cdrom/casper/lsl-firstboot.done ] && return 0
     return 1
 }
-stamp_present && exit 0
+# A reboot may still be pending (the finale stamps first, then counts
+# down): a fresh login inside that window should see the timer instead of
+# nothing. Prints remaining seconds, or nothing (return 1) when no dialog
+# is due: no flag dir, a decision already recorded, no/unparseable
+# deadline, or a deadline already reached (reboot imminent - stay out of
+# the way).
+reboot_pending_deadline() {
+    local dir="${LSL_FIRSTBOOT_FLAG_DIR:-/run/lsl-firstboot}" dl now
+    [ -d "$dir" ] || return 1
+    [ -e "$dir/reboot-cancel" ] && return 1
+    [ -e "$dir/reboot-now" ] && return 1
+    [ -f "$dir/deadline" ] || return 1
+    dl="$(cat "$dir/deadline" 2>/dev/null || true)"
+    case "$dl" in ''|*[!0-9]*) return 1 ;; esac
+    now="$(date +%s 2>/dev/null || echo 0)"
+    [ "$now" -ge "$dl" ] 2>/dev/null && return 1
+    echo $((dl - now))
+    return 0
+}
+if stamp_present; then
+    if remaining="$(reboot_pending_deadline)"; then
+        exec bash "${LSL_FIRSTBOOT_REBOOT_SH:-/usr/local/bin/lsl-firstboot-reboot.sh}" \
+            --timeout "$remaining" --flag-dir "${LSL_FIRSTBOOT_FLAG_DIR:-/run/lsl-firstboot}"
+    fi
+    exit 0
+fi
 
 # Dialog backend: zenity when present (unchanged behavior), else the
 # bundled GTK fallback (misc/lsl-progress-gtk.py). python3-gi ships with

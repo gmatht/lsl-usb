@@ -256,6 +256,10 @@ schedule_reboot_with_timer() {
     mkdir -p "$flagdir" 2>/dev/null || true
     chmod 1777 "$flagdir" 2>/dev/null || true
     rm -f "$flagdir/reboot-cancel" "$flagdir/reboot-now" 2>/dev/null || true
+    # Absolute deadline (epoch) so a *fresh login* inside the window can
+    # show the same timer with the remaining time (see the reboot-pending
+    # branch in lsl-firstboot-progress.sh).
+    echo $(( $(date +%s 2>/dev/null || echo 0) + timeout )) > "$flagdir/deadline" 2>/dev/null || true
     log "Setup complete. Automatic reboot in $((timeout / 60)) minutes - Cancel or Reboot now in the desktop dialog…"
     # Dialogs run per-session in the background; this loop is the reboot
     # authority (the user session cannot reboot the machine itself).
