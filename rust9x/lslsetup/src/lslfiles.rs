@@ -19,6 +19,23 @@ pub enum HashResult {
     Aborted,
 }
 
+/// Hash a layer file for the manifest with live progress: a silent multi-GB
+/// SHA-256 over USB looks exactly like a freeze (no bar movement, no pump,
+/// no console output), so every 1 MB chunk reports through `progress` - the
+/// caller's closure already pumps the GUI on each call.
+fn hash_for_manifest<F>(s: &str, dname: &str, progress: &mut F) -> Option<String>
+where
+    F: FnMut(&str, u64, u64),
+{
+    match sha256_file_progress(s, &mut |done, total| {
+        progress(dname, done, total);
+        true
+    }) {
+        Ok(HashResult::Hash(h)) => Some(h),
+        _ => None,
+    }
+}
+
 /// SHA-256 of a file with live (done, total) progress. `progress` returns
 /// false to abort early (mid-flight skip). Same hash as `sha256_file` on
 /// completion; use it for multi-GB files so callers can drive a progress
@@ -430,7 +447,14 @@ where
             skipped += 1;
             progress(&dname, sz, sz);
             // Still include in manifest so a partial run leaves a valid file.
-            match sha256_file(&s) {
+            // The hash re-reads the whole source file: on multi-GB layers
+            // over USB that is minutes of I/O, so announce it and keep the
+            // bar live through the progress callback (a silent hash here
+            // used to look exactly like a freeze).
+            if sz > 256 * sys::MB {
+                out::info(&format!("  hashing {} for manifest...", dname));
+            }
+            match hash_for_manifest(&s, &dname, progress) {
                 Some(hash) => manifest.push(format!("{}={} sha256:{}", dname, sz, hash)),
                 None => manifest.push(format!("{}={}", dname, sz)),
             }
@@ -449,7 +473,10 @@ where
         if copy_ok.is_ok() {
             copied += 1;
             progress(&dname, sz, sz);
-            match sha256_file(&s) {
+            if sz > 256 * sys::MB {
+                out::info(&format!("  hashing {} for manifest...", dname));
+            }
+            match hash_for_manifest(&s, &dname, progress) {
                 Some(hash) => manifest.push(format!("{}={} sha256:{}", dname, sz, hash)),
                 None => manifest.push(format!("{}={}", dname, sz)),
             }
@@ -863,6 +890,44 @@ pub fn find_local_isos() -> Vec<String> {
     // the simple name ordering and cap at 20 like the PS version.
     hits.sort_by(|a, b| a.0.cmp(&b.0));
     hits.into_iter().map(|(p, _)| p).take(20).collect()
+}
+
+#[cfg(test)]
+mod manifest_hash_progress_tests {
+    use super::*;
+
+    #[test]
+    fn hash_for_manifest_reports_progress() {
+        // Regression: the manifest hash used to be a silent multi-GB
+        // re-read (no bar movement, no pump, no console output) that
+        // looked exactly like a freeze. It must report per-chunk progress.
+        let dir = std::env::temp_dir().join("lsl-hash-progress-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("layer.bin");
+        let chunk = vec![0xABu8; 1 << 20];
+        let mut f = std::fs::File::create(&path).unwrap();
+        for _ in 0..3 {
+            use std::io::Write;
+            f.write_all(&chunk).unwrap();
+        }
+        drop(f);
+        let ps = path.to_string_lossy().into_owned();
+        let mut calls: Vec<(u64, u64)> = Vec::new();
+        let got = hash_for_manifest(&ps, "layer.bin", &mut |_name: &str, done: u64, total: u64| {
+            calls.push((done, total));
+        });
+        assert_eq!(got, sha256_file(&ps));
+        assert!(got.is_some());
+        assert!(!calls.is_empty(), "hash reported no progress");
+        assert_eq!(calls.last().unwrap(), &(3 << 20, 3 << 20));
+        let mut prev = 0u64;
+        for (done, total) in &calls {
+            assert_eq!(*total, 3 << 20);
+            assert!(*done >= prev, "progress went backwards");
+            prev = *done;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
