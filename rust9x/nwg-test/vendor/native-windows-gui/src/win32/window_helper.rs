@@ -1,4 +1,4 @@
-use super::base_helper::{to_ansi, from_ansi};
+use super::base_helper::{from_ansi, to_utf16, from_utf16};
 use super::high_dpi;
 use winapi::shared::windef::{HFONT, HWND, HMENU};
 use winapi::shared::minwindef::{UINT, WPARAM, LPARAM, LRESULT};
@@ -255,27 +255,25 @@ pub unsafe fn get_focus(handle: HWND) -> bool {
 }
 
 pub unsafe fn get_window_text(handle: HWND) -> String {
-    // Win95 patch: ANSI text APIs
-    use winapi::um::winuser::{GetWindowTextA, GetWindowTextLengthA};
+    use winapi::um::winuser::{GetWindowTextW, GetWindowTextLengthW};
 
-    let buffer_size = GetWindowTextLengthA(handle) as usize + 1;
+    let buffer_size = GetWindowTextLengthW(handle) as usize + 1;
     if buffer_size == 0 { return String::new(); }
 
-    let mut buffer: Vec<u8> = vec![0; buffer_size];
+    let mut buffer: Vec<u16> = vec![0; buffer_size];
 
-    if GetWindowTextA(handle, buffer.as_mut_ptr() as *mut i8, buffer_size as c_int) == 0 {
+    if GetWindowTextW(handle, buffer.as_mut_ptr(), buffer_size as c_int) == 0 {
         String::new()
     } else {
-        from_ansi(&buffer[..])
+        from_utf16(&buffer[..])
     }
 }
 
 pub unsafe fn set_window_text<'a>(handle: HWND, text: &'a str) {
-    // Win95 patch: ANSI text APIs
-    use winapi::um::winuser::SetWindowTextA;
+    use winapi::um::winuser::SetWindowTextW;
 
-    let text = to_ansi(text);
-    SetWindowTextA(handle, text.as_ptr() as *const i8);
+    let text = to_utf16(text);
+    SetWindowTextW(handle, text.as_ptr());
 }
 
 pub unsafe fn set_window_position(handle: HWND, x: i32, y: i32) {

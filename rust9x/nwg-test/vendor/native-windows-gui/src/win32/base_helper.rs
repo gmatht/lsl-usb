@@ -30,18 +30,76 @@ pub fn to_utf16<'a>(s: &'a str) -> Vec<u16> {
       .collect()
 }
 
-/// Win95-compatible ANSI encoding (Win95 has no working Unicode APIs, so text
-/// passed to the *A variants is encoded as ANSI bytes).
+/// Win95-compatible ANSI encoding using the system ANSI codepage.
+/// Characters that fit the current locale survive; others become '?'.
 #[allow(unused)]
 pub fn to_ansi(s: &str) -> Vec<u8> {
-    s.chars().map(|c| if (c as u32) < 0x80 { c as u8 } else { b'?' }).chain(Some(0u8).into_iter()).collect()
+    use winapi::um::stringapiset::WideCharToMultiByte;
+    use winapi::um::winnls::{CP_ACP, WC_NO_BEST_FIT_CHARS};
+
+    let wide: Vec<u16> = s.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let len = WideCharToMultiByte(
+            CP_ACP,
+            WC_NO_BEST_FIT_CHARS,
+            wide.as_ptr(),
+            wide.len() as i32,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        if len <= 1 {
+            return vec![0];
+        }
+        let mut out = vec![0u8; len as usize];
+        WideCharToMultiByte(
+            CP_ACP,
+            WC_NO_BEST_FIT_CHARS,
+            wide.as_ptr(),
+            wide.len() as i32,
+            out.as_mut_ptr() as *mut i8,
+            len,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        out
+    }
 }
 
-/// Decode an ANSI (CP1252) buffer. Should be null terminated.
+/// Decode an ANSI buffer using the system ANSI codepage. Should be null terminated.
 #[allow(unused)]
 pub fn from_ansi(s: &[u8]) -> String {
-    let null_index = s.iter().position(|&i| i==0).unwrap_or(s.len());
-    s[0..null_index].iter().map(|&b| b as char).collect()
+    use winapi::um::stringapiset::MultiByteToWideChar;
+    use winapi::um::winnls::CP_ACP;
+
+    let null_index = s.iter().position(|&i| i == 0).unwrap_or(s.len());
+    if null_index == 0 {
+        return String::new();
+    }
+    unsafe {
+        let len = MultiByteToWideChar(
+            CP_ACP,
+            0,
+            s.as_ptr() as *const i8,
+            null_index as i32,
+            ptr::null_mut(),
+            0,
+        );
+        if len <= 0 {
+            return String::new();
+        }
+        let mut wide = vec![0u16; len as usize];
+        MultiByteToWideChar(
+            CP_ACP,
+            0,
+            s.as_ptr() as *const i8,
+            null_index as i32,
+            wide.as_mut_ptr(),
+            len,
+        );
+        from_utf16(&wide)
+    }
 }
 
 /**

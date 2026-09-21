@@ -8,7 +8,7 @@ use winapi::shared::windef::{HWND, HMENU, HBRUSH};
 use winapi::shared::basetsd::{DWORD_PTR, UINT_PTR};
 use winapi::um::winuser::{WNDPROC, NMHDR, IDCANCEL, IDOK};
 use winapi::um::commctrl::{NMTTDISPINFOW, SUBCLASSPROC};
-use super::base_helper::{CUSTOM_ID_BEGIN, to_ansi, from_ansi};
+use super::base_helper::{CUSTOM_ID_BEGIN, to_ansi, from_ansi, to_utf16};
 use super::window_helper::{NOTICE_MESSAGE, NWG_INIT, NWG_TRAY, NWG_TIMER_TICK, NWG_TIMER_STOP};
 use super::high_dpi;
 use crate::controls::ControlHandle;
@@ -368,16 +368,15 @@ pub(crate) unsafe fn build_hwnd_control<'a>(
 ) -> Result<ControlHandle, NwgError> 
 {
     use winapi::um::winuser::{WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_CLIPCHILDREN, /*WS_EX_LAYERED*/};
-    use winapi::um::winuser::{CreateWindowExA, AdjustWindowRectEx};
+    use winapi::um::winuser::{CreateWindowExW, AdjustWindowRectEx};
     use winapi::shared::windef::RECT;
-    use winapi::um::libloaderapi::GetModuleHandleA;
+    use winapi::um::libloaderapi::GetModuleHandleW;
 
-    let hmod = GetModuleHandleA(ptr::null_mut());
-    if hmod.is_null() { return Err(NwgError::initialization("GetModuleHandleA failed")); }
+    let hmod = GetModuleHandleW(ptr::null_mut());
+    if hmod.is_null() { return Err(NwgError::initialization("GetModuleHandleW failed")); }
 
-    // Win95 patch: ANSI window creation (Unicode APIs are stubs on Win95)
-    let class_name = to_ansi(class_name);
-    let window_title = to_ansi(window_title.unwrap_or("New Window"));
+    let class_name = to_utf16(class_name);
+    let window_title = to_utf16(window_title.unwrap_or("New Window"));
     let ex_flags = ex_flags.unwrap_or(0);
     let flags = flags.unwrap_or(WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE) | forced_flags;
 
@@ -397,9 +396,9 @@ pub(crate) unsafe fn build_hwnd_control<'a>(
         sy = rect.bottom  - rect.top;
     }
 
-    let handle = CreateWindowExA (
+    let handle = CreateWindowExW (
         ex_flags,
-        class_name.as_ptr() as *const i8, window_title.as_ptr() as *const i8,
+        class_name.as_ptr(), window_title.as_ptr(),
         flags,
         px, py,
         sx, sy,
@@ -425,33 +424,32 @@ pub(crate) unsafe fn build_sysclass<'a>(
     style: Option<UINT>
 ) -> Result<(), NwgError> 
 {
-    use winapi::um::winuser::{LoadCursorA, RegisterClassExA};
-    use winapi::um::winuser::{CS_HREDRAW, CS_VREDRAW, COLOR_WINDOW, WNDCLASSEXA};
+    use winapi::um::winuser::{LoadCursorW, RegisterClassExW};
+    use winapi::um::winuser::{CS_HREDRAW, CS_VREDRAW, COLOR_WINDOW, WNDCLASSEXW};
     use winapi::um::errhandlingapi::GetLastError;
     use winapi::shared::winerror::ERROR_CLASS_ALREADY_EXISTS;
 
-    // Win95 patch: ANSI class registration (RegisterClassExW is a stub on Win95)
-    let class_name = to_ansi(class_name);
+    let class_name = to_utf16(class_name);
     let background: HBRUSH = background.unwrap_or(COLOR_WINDOW as usize as HBRUSH);
     let style: UINT = style.unwrap_or(CS_HREDRAW | CS_VREDRAW);
 
     let class =
-    WNDCLASSEXA {
-        cbSize: mem::size_of::<WNDCLASSEXA>() as UINT,
+    WNDCLASSEXW {
+        cbSize: mem::size_of::<WNDCLASSEXW>() as UINT,
         style,
         lpfnWndProc: clsproc, 
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: hmod,
         hIcon: ptr::null_mut(),
-        hCursor: LoadCursorA(ptr::null_mut(), 32512usize as *const i8), // IDC_ARROW (A variant)
+        hCursor: LoadCursorW(ptr::null_mut(), 32512usize as *const u16), // IDC_ARROW
         hbrBackground: background,
         lpszMenuName: ptr::null(),
-        lpszClassName: class_name.as_ptr() as *const i8,
+        lpszClassName: class_name.as_ptr(),
         hIconSm: ptr::null_mut()
     };
 
-    let class_token = RegisterClassExA(&class);
+    let class_token = RegisterClassExW(&class);
     if class_token == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS { 
         Err(NwgError::initialization("System class creation failed"))
     } else {
@@ -461,11 +459,11 @@ pub(crate) unsafe fn build_sysclass<'a>(
 
 /// Create the window class for the base nwg window
 pub(crate) fn init_window_class() -> Result<(), NwgError> {
-    use winapi::um::libloaderapi::GetModuleHandleA;
+    use winapi::um::libloaderapi::GetModuleHandleW;
     
     unsafe {
-        let hmod = GetModuleHandleA(ptr::null_mut());
-        if hmod.is_null() { return Err(NwgError::initialization("GetModuleHandleA failed")); }
+        let hmod = GetModuleHandleW(ptr::null_mut());
+        if hmod.is_null() { return Err(NwgError::initialization("GetModuleHandleW failed")); }
 
         build_sysclass(hmod, "NativeWindowsGuiWindow", Some(blank_window_proc), None, None)?;
     }
@@ -477,10 +475,10 @@ pub(crate) fn init_window_class() -> Result<(), NwgError> {
 #[cfg(feature = "frame")]
 /// Create the window class for the frame control
 pub(crate) fn create_frame_classes() -> Result<(), NwgError> {
-    use winapi::um::libloaderapi::GetModuleHandleA;
+    use winapi::um::libloaderapi::GetModuleHandleW;
     
     unsafe {
-        let hmod = GetModuleHandleA(ptr::null_mut());
+        let hmod = GetModuleHandleW(ptr::null_mut());
         if hmod.is_null() { return Err(NwgError::initialization("GetModuleHandleA failed")); }
 
         build_sysclass(hmod, "NWG_FRAME", Some(blank_window_proc), None, None)?;
@@ -493,22 +491,20 @@ pub(crate) fn create_frame_classes() -> Result<(), NwgError> {
 /// Create a message only window. Used with the `MessageWindow` control
 pub(crate) fn create_message_window() -> Result<ControlHandle, NwgError> {
     use winapi::um::winuser::HWND_MESSAGE;
-    use winapi::um::winuser::CreateWindowExA;
-    use winapi::um::libloaderapi::GetModuleHandleA;
+    use winapi::um::winuser::CreateWindowExW;
+    use winapi::um::libloaderapi::GetModuleHandleW;
 
-
-    // Win95 patch: ANSI window creation
-    let class_name = to_ansi("NativeWindowsGuiWindow");
-    let window_title = vec![0u8];
+    let class_name = to_utf16("NativeWindowsGuiWindow");
+    let window_title = vec![0u16];
 
     unsafe {
-        let hmod = GetModuleHandleA(ptr::null_mut());
-        if hmod.is_null() { return Err(NwgError::initialization("GetModuleHandleA failed")); }
+        let hmod = GetModuleHandleW(ptr::null_mut());
+        if hmod.is_null() { return Err(NwgError::initialization("GetModuleHandleW failed")); }
         
-        let handle = CreateWindowExA (
+        let handle = CreateWindowExW (
             0,
-            class_name.as_ptr() as *const i8,
-            window_title.as_ptr() as *const i8,
+            class_name.as_ptr(),
+            window_title.as_ptr(),
             0,
             0, 0,
             0, 0,
@@ -532,11 +528,11 @@ pub(crate) fn create_message_window() -> Result<ControlHandle, NwgError> {
 */
 unsafe extern "system" fn blank_window_proc(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) -> LRESULT {
     use winapi::um::winuser::{WM_CREATE, WM_CLOSE, SW_HIDE};
-    use winapi::um::winuser::{DefWindowProcA, PostMessageA, ShowWindow};
+    use winapi::um::winuser::{DefWindowProcW, PostMessageW, ShowWindow};
 
     let handled = match msg {
         WM_CREATE => {
-            PostMessageA(hwnd, NWG_INIT, 0, 0);
+            PostMessageW(hwnd, NWG_INIT, 0, 0);
             true
         },
         WM_CLOSE => {
@@ -549,7 +545,7 @@ unsafe extern "system" fn blank_window_proc(hwnd: HWND, msg: UINT, w: WPARAM, l:
     if handled {
         0
     } else {
-        DefWindowProcA(hwnd, msg, w, l)
+        DefWindowProcW(hwnd, msg, w, l)
     }
 }
 

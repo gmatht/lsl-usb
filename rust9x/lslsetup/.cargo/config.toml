@@ -41,6 +41,7 @@ rustflags = [
   # the VC6 path (the SDK ships no CRT libs). Lowercase symlinks were added
   # because lld looks up e.g. "kernel32.lib" verbatim on a case-sensitive fs.
   '-Clink-arg=/LIBPATH:/opt/msvc-toolchains/sdk71a/Lib',
+  '-Clink-arg=unicows.lib',
 
   # VC6 (MSVC 6.0) static CRT (libcmt.lib): Win95+/NT3.5+, no unwinding
   # (panic = "abort" is set in Cargo.toml), no SAFESEH -> see /SAFESEH:NO.

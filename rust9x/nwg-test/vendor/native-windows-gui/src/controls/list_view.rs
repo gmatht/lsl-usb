@@ -8,7 +8,7 @@ use winapi::um::commctrl::{
 };
 use super::{ControlBase, ControlHandle};
 use crate::win32::window_helper as wh;
-use crate::win32::base_helper::{to_utf16, from_utf16, to_ansi, check_hwnd};
+use crate::win32::base_helper::{to_utf16, from_utf16, check_hwnd};
 use crate::{NwgError, RawEventHandler, unbind_raw_event_handler};
 use std::{mem, ptr, rc::Rc, cell::RefCell};
 
@@ -670,8 +670,7 @@ impl ListView {
 
     /// Inserts a new item into the list view
     pub fn insert_item<I: Into<InsertListViewItem>>(&self, insert: I) {
-        // (Patch-Win95) ANSI messages: Win95 comctl32 has no W-message support
-        use winapi::um::commctrl::{LVM_INSERTITEMA, LVM_SETITEMA, LVITEMA};
+        use winapi::um::commctrl::{LVM_INSERTITEMW, LVM_SETITEMW, LVITEMW};
 
         let handle = check_hwnd(&self.handle, NOT_BOUND, BAD_HANDLE);
         let insert = insert.into();
@@ -692,20 +691,20 @@ impl ListView {
         let mask = LVIF_TEXT | check_image_mask(&insert);
         let image = check_image(&insert);
         let text = insert.text.unwrap_or("".to_string());
-        let mut text = to_ansi(&text);
+        let mut text = to_utf16(&text);
 
-        let mut item: LVITEMA = unsafe { mem::zeroed() };
+        let mut item: LVITEMW = unsafe { mem::zeroed() };
         item.mask = mask;
         item.iItem = row_insert;
         item.iImage = image;
         item.iSubItem = column_insert;
-        item.pszText = text.as_mut_ptr() as *mut i8;
+        item.pszText = text.as_mut_ptr();
         item.cchTextMax = text.len() as i32;
 
         if column_insert == 0 {
-            wh::send_message(handle, LVM_INSERTITEMA , 0, &mut item as *mut LVITEMA as _);
+            wh::send_message(handle, LVM_INSERTITEMW , 0, &mut item as *mut LVITEMW as _);
         } else {
-            wh::send_message(handle, LVM_SETITEMA , 0, &mut item as *mut LVITEMA as _);
+            wh::send_message(handle, LVM_SETITEMW , 0, &mut item as *mut LVITEMW as _);
         }
     }
 
@@ -719,16 +718,15 @@ impl ListView {
 
     /// Returns `true` if an item exists at the selected index or `false` otherwise.
     pub fn has_item(&self, row_index: usize, column_index: usize) -> bool {
-        // (Patch-Win95) ANSI messages: Win95 comctl32 has no W-message support
-        use winapi::um::commctrl::{LVM_GETITEMA, LVITEMA};
+        use winapi::um::commctrl::{LVM_GETITEMW, LVITEMW};
 
         let handle = check_hwnd(&self.handle, NOT_BOUND, BAD_HANDLE);
 
-        let mut item: LVITEMA = unsafe { mem::zeroed() };
+        let mut item: LVITEMW = unsafe { mem::zeroed() };
         item.iItem = row_index as _;
         item.iSubItem = column_index as _;
 
-        wh::send_message(handle, LVM_GETITEMA , 0, &mut item as *mut LVITEMA as _) == 1
+        wh::send_message(handle, LVM_GETITEMW , 0, &mut item as *mut LVITEMW as _) == 1
     }
 
     /// Returns data of an item in the list view. Returns `None` if there is no data at the selected index
