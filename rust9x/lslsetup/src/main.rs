@@ -340,7 +340,7 @@ fn run() {
         // ISO resolution here is what stops the installer from downloading
         // Mint (or any distro) when the user already has a rufus'ed stick.
         if g.use_existing_usb.is_some() {
-            ui.set_status("Using the existing live USB - no download, no Rufus write...");
+            ui.set_status(&crate::locale::tr("Using the existing live USB - no download, no Rufus write..."));
             ui.pump();
             // finish: show the summary the user can automate
             ui.show_final(
@@ -367,7 +367,7 @@ fn run() {
         // a fresh download picked on page 1 may still be running: join it
         // with the window open (progress bar keeps updating)
         ui.set_active_stage(gui::WorkStage::Iso as usize);
-        ui.set_stage_status(gui::WorkStage::Iso as usize, "resolving...");
+        ui.set_stage_status(gui::WorkStage::Iso as usize, &crate::locale::tr("resolving..."));
         ui.wait_downloads();
         let iso = match resolve_iso(
             &g.iso_path,
@@ -493,7 +493,7 @@ fn run() {
                 // targets keep the typed gate (raw-sector writes must never
                 // hinge on a stale flag).
                 ui.set_active_stage(gui::WorkStage::UsbWrite as usize);
-                ui.set_stage_status(gui::WorkStage::UsbWrite as usize, "writing...");
+                ui.set_stage_status(gui::WorkStage::UsbWrite as usize, &crate::locale::tr("writing..."));
                 match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some(), opts.skip_verify, &extra_isos) {
                     Ok((t, metrics, pending)) => {
                         use gui::WorkStage as ST;
@@ -502,8 +502,8 @@ fn run() {
                         let mut check_rep = None;
                         if g.check_usb || opts.check_usb {
                             ui.set_active_stage(ST::UsbCheck as usize);
-                            ui.set_stage_status(ST::UsbCheck as usize, "checking surface...");
-                            ui.set_status("Write done - checking the whole USB surface (slow, cache bypassed)...");
+                            ui.set_stage_status(ST::UsbCheck as usize, &crate::locale::tr("checking surface..."));
+                            ui.set_status(&crate::locale::tr("Write done - checking the whole USB surface (slow, cache bypassed)..."));
                             ui.pump();
                             match usbcheck::check_whole_usb(&t.letter, Some(ui)) {
                                 Ok(r) => {
@@ -519,7 +519,7 @@ fn run() {
                             }
                             check_done = true;
                         } else {
-                            ui.set_stage_status(ST::UsbCheck as usize, "skipped");
+                            ui.set_stage_status(ST::UsbCheck as usize, &crate::locale::tr("skipped"));
                             ui.set_stage_progress(ST::UsbCheck as usize, 1, 1);
                             ui.pump();
                         }
@@ -560,8 +560,8 @@ fn run() {
                             ui.set_active_stage(ST::BootSetup as usize);
                             match choice {
                                 crate::boot::BootChoice::Usb => {
-                                    ui.set_stage_status(ST::BootSetup as usize, "setting one-time boot...");
-                                    ui.set_status("Setting one-time USB boot...");
+                                    ui.set_stage_status(ST::BootSetup as usize, &crate::locale::tr("setting one-time boot..."));
+                                    ui.set_status(&crate::locale::tr("Setting one-time USB boot..."));
                                     ui.set_stage_progress(ST::BootSetup as usize, 0, 1);
                                     ui.pump();
                                     match crate::boot::set_next_boot_usb() {
@@ -575,7 +575,7 @@ fn run() {
                                         }
                                         Err(e) => {
                                             out::warn(&format!("Could not set one-time USB boot:\n{}", e));
-                                            ui.set_stage_status(ST::BootSetup as usize, "one-time boot failed - pick again");
+                                            ui.set_stage_status(ST::BootSetup as usize, &crate::locale::tr("one-time boot failed - pick again"));
                                             ui.pump();
                                             boot_error = Some(e);
                                             continue;
@@ -583,7 +583,7 @@ fn run() {
                                     }
                                 }
                                 crate::boot::BootChoice::Adv => {
-                                    ui.set_stage_status(ST::BootSetup as usize, "advanced menu...");
+                                    ui.set_stage_status(ST::BootSetup as usize, &crate::locale::tr("advanced menu..."));
                                     ui.set_stage_done(ST::BootSetup as usize);
                                     if !crate::telemetry::update_latest_probe(&t.letter, "advanced-menu") {
                                         crate::telemetry::write_probe(&t.letter, "advanced-menu");
@@ -591,7 +591,7 @@ fn run() {
                                     break (choice, "/r /o /f /t 0".to_string(), "advanced-menu".to_string());
                                 }
                                 crate::boot::BootChoice::Fw => {
-                                    ui.set_stage_status(ST::BootSetup as usize, "firmware menu...");
+                                    ui.set_stage_status(ST::BootSetup as usize, &crate::locale::tr("firmware menu..."));
                                     ui.set_stage_done(ST::BootSetup as usize);
                                     let args = crate::boot::reboot_args().to_string();
                                     if !crate::telemetry::update_latest_probe(&t.letter, "firmware-menu") {
@@ -600,7 +600,7 @@ fn run() {
                                     break (choice, args, "firmware-menu".to_string());
                                 }
                                 crate::boot::BootChoice::None => {
-                                    ui.set_stage_status(ST::BootSetup as usize, "no reboot");
+                                    ui.set_stage_status(ST::BootSetup as usize, &crate::locale::tr("no reboot"));
                                     ui.set_stage_progress(ST::BootSetup as usize, 1, 1);
                                     ui.pump();
                                     break (choice, String::new(), String::new());
@@ -655,7 +655,7 @@ fn run() {
                 }
             }
             _ => {
-                ui.set_status("Launching Rufus with the ISO pre-selected...");
+                ui.set_status(&crate::locale::tr("Launching Rufus with the ISO pre-selected..."));
                 ui.pump();
                 out::step("Launching Rufus with the ISO pre-selected.");
                 out::info("In Rufus: pick the target USB stick, then click START (this is the one destructive confirmation).");
@@ -1573,8 +1573,8 @@ fn gui_tail_in_dialog(
     assert_usb_capacity(&vol, "");
 
     ui.set_active_stage(ST::LslFiles as usize);
-    ui.set_stage_status(ST::LslFiles as usize, "copying...");
-    ui.set_status("Dropping lsl-usb files onto the USB...");
+    ui.set_stage_status(ST::LslFiles as usize, &crate::locale::tr("copying..."));
+    ui.set_status(&crate::locale::tr("Dropping lsl-usb files onto the USB..."));
     out::step("Dropping lsl-usb files onto the USB...");
     ui.set_stage_progress(ST::LslFiles as usize, 0, 1);
     ui.pump();
@@ -1586,7 +1586,7 @@ fn gui_tail_in_dialog(
     ui.set_active_stage(ST::RustTools as usize);
     let want_rust = opts.preload_rust_tools || g.rust_tools;
     if want_rust {
-        ui.set_stage_status(ST::RustTools as usize, "installing...");
+        ui.set_stage_status(ST::RustTools as usize, &crate::locale::tr("installing..."));
         let hay = format!("{} {}", download_iso_name.unwrap_or_default(), iso_path_for_arch).to_lowercase();
         let arch = distro_arch
             .map(|x| x.to_string())
@@ -1605,22 +1605,22 @@ fn gui_tail_in_dialog(
                 if pae.contains("64") || pa.contains("64") { "x86_64".to_string() } else { "i686".to_string() }
             });
         out::step(&format!("Preloading Rust CLI tools (fd/bat/zoxide, {}) onto the USB...", arch));
-        ui.set_status(&format!("Preloading Rust CLI tools ({})...", arch));
+        ui.set_status(&crate::locale::tr("Preloading Rust CLI tools ({A})...").replace("{A}", &arch));
         ui.set_stage_progress(ST::RustTools as usize, 0, 1);
         ui.pump();
         lslfiles::install_rust_tools(vol_letter, &arch);
         ui.set_stage_done(ST::RustTools as usize);
     } else {
         out::info("Skipping Rust tools (unchecked).");
-        ui.set_stage_status(ST::RustTools as usize, "skipped");
+        ui.set_stage_status(ST::RustTools as usize, &crate::locale::tr("skipped"));
         ui.set_stage_progress(ST::RustTools as usize, 1, 1);
         ui.pump();
     }
 
     ui.set_active_stage(ST::Drivers as usize);
     if g.drivers || opts.drivers {
-        ui.set_stage_status(ST::Drivers as usize, "preloading...");
-        ui.set_status("Preloading network drivers...");
+        ui.set_stage_status(ST::Drivers as usize, &crate::locale::tr("preloading..."));
+        ui.set_status(&crate::locale::tr("Preloading network drivers..."));
         out::step("Preloading network drivers for this machine...");
         ui.set_stage_progress(ST::Drivers as usize, 0, 1);
         ui.pump();
@@ -1628,7 +1628,7 @@ fn gui_tail_in_dialog(
         for l in &report {
             out::info(&format!("  {}", l));
         }
-        ui.set_stage_status(ST::Drivers as usize, "rating...");
+        ui.set_stage_status(ST::Drivers as usize, &crate::locale::tr("rating..."));
         ui.pump();
         out::info("Rating network devices against linux-hardware.org (LKDDb)...");
         let net_hw = hardware::network_hardware();
@@ -1646,15 +1646,15 @@ fn gui_tail_in_dialog(
         ui.set_stage_done(ST::Drivers as usize);
     } else {
         out::info("Skipping network driver preload (unchecked).");
-        ui.set_stage_status(ST::Drivers as usize, "skipped");
+        ui.set_stage_status(ST::Drivers as usize, &crate::locale::tr("skipped"));
         ui.set_stage_progress(ST::Drivers as usize, 1, 1);
         ui.pump();
     }
 
     ui.set_active_stage(ST::HddCopy as usize);
     if g.sfs_hdd && !g.data_dir.is_empty() {
-        ui.set_stage_status(ST::HddCopy as usize, "copying...");
-        ui.set_status("Copying squashfs layers to HDD...");
+        ui.set_stage_status(ST::HddCopy as usize, &crate::locale::tr("copying..."));
+        ui.set_status(&crate::locale::tr("Copying squashfs layers to HDD..."));
         out::step("Copying Linux squashfs layers to the NTFS HDD for faster boot...");
         ui.pump();
         crate::lslfiles::copy_sfs_to_hdd_with_progress(
@@ -1663,8 +1663,8 @@ fn gui_tail_in_dialog(
             &mut |name, done, total, phase| {
                 if done == 0 && total > 0 {
                     let op = match phase {
-                        crate::lslfiles::SfsPhase::Copying => "Copying",
-                        crate::lslfiles::SfsPhase::Hashing => "Hashing for manifest",
+                        crate::lslfiles::SfsPhase::Copying => crate::locale::tr("Copying"),
+                        crate::lslfiles::SfsPhase::Hashing => crate::locale::tr("Hashing for manifest"),
                     };
                     ui.set_stage_status(ST::HddCopy as usize, &format!("{} {}", op, name));
                     ui.set_status(&format!("{} {} ({:.1} GB)...", op, name, total as f64 / crate::sys::GB as f64));
@@ -1677,7 +1677,7 @@ fn gui_tail_in_dialog(
         ui.set_stage_done(ST::HddCopy as usize);
     } else {
         out::info("Skipping squashfs-to-HDD copy (unchecked).");
-        ui.set_stage_status(ST::HddCopy as usize, "skipped");
+        ui.set_stage_status(ST::HddCopy as usize, &crate::locale::tr("skipped"));
         ui.set_stage_progress(ST::HddCopy as usize, 1, 1);
         ui.pump();
     }
@@ -1779,8 +1779,8 @@ fn gui_tail_in_dialog(
     ui.set_stage_done(ST::Finalize as usize);
 
     ui.set_active_stage(ST::BootSectors as usize);
-    ui.set_stage_status(ST::BootSectors as usize, "committing...");
-    ui.set_status("Finalizing boot sectors...");
+    ui.set_stage_status(ST::BootSectors as usize, &crate::locale::tr("committing..."));
+    ui.set_status(&crate::locale::tr("Finalizing boot sectors..."));
     ui.pump();
     if let Some(p) = pending {
         out::step("Committing boot sectors...");
@@ -2036,7 +2036,9 @@ fn resolve_extra_download(
             out::info(&format!("  {} MB...", mb));
         }
         if let Some(u) = ui {
-            u.set_status(&format!("Downloading extra {} - {} MB...", real_name, mb));
+            u.set_status(&crate::locale::tr("Downloading extra {N} - {M} MB...")
+                .replace("{N}", &real_name)
+                .replace("{M}", &mb.to_string()));
             u.pump();
         }
     }) {
@@ -2172,7 +2174,9 @@ fn resolve_iso(
             if let Some(ui) = ui {
                 if mb >= last_ui + 50 {
                     last_ui = mb;
-                    ui.set_status(&format!("Downloading {} - {} MB of ~3 GB...", iso_name, mb));
+                    ui.set_status(&crate::locale::tr("Downloading {N} - {M} MB of ~3 GB...")
+                        .replace("{N}", &iso_name)
+                        .replace("{M}", &mb.to_string()));
                     ui.pump();
                 }
             }

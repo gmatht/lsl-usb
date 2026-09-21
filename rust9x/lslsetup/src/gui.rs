@@ -1776,8 +1776,10 @@ impl WorkingUi {
     /// "STAGE - detail". Empty detail restores the bare stage name.
     pub fn set_stage_status(&self, idx: usize, detail: &str) {
         if let (Some(&h), Some(&name)) = (self.stage_labels.get(idx), WORK_STAGES.get(idx)) {
+            // WORK_STAGES entries are English IDs; translate for display.
+            let name = crate::locale::tr(name);
             let text = if detail.is_empty() {
-                name.to_string()
+                name
             } else {
                 format!("{} - {}", name, detail)
             };
@@ -1793,7 +1795,10 @@ impl WorkingUi {
             self.set_bar_units(b, 1, 1);
             repaint(b);
             if let Some(&h) = self.stage_labels.get(idx) {
-                set_wnd_text(h, &format!("{} - done", name));
+                set_wnd_text(
+                    h,
+                    &crate::locale::tr("{N} - done").replace("{N}", &crate::locale::tr(name)),
+                );
                 repaint(h);
             }
         }
@@ -1914,7 +1919,12 @@ impl WorkingUi {
         // one button, bottom-right where "Next"/"Install" lived
         let btn_x = (cw - MARGIN - 96).max(MARGIN);
         let btn_y = (ch - MARGIN - 28).max(top);
-        set_wnd_text(self.sum_btn, if ok { "Finish" } else { "Close" });
+        let caption = if ok {
+            crate::locale::tr("Finish")
+        } else {
+            crate::locale::tr("Close")
+        };
+        set_wnd_text(self.sum_btn, &caption);
         set_ctl_rect(self.sum_btn, btn_x, btn_y, 96, 28);
         self.raw_show(self.sum_btn, true);
         // "Copy" sits left of Finish. On failure "Back to install options"
@@ -1985,7 +1995,12 @@ impl WorkingUi {
             if self.copy_clicked.get() {
                 self.copy_clicked.set(false);
                 copy_to_clipboard(body);
-                set_wnd_text(self.sum_btn, if ok { "Finish" } else { "Close" });
+                let caption = if ok {
+            crate::locale::tr("Finish")
+        } else {
+            crate::locale::tr("Close")
+        };
+        set_wnd_text(self.sum_btn, &caption);
             }
             if self.open_clicked.get() {
                 self.open_clicked.set(false);
@@ -2171,10 +2186,9 @@ impl WorkingUi {
                 .map(|i| bg.remove(i))
         } {
             let name = b.dest.rsplit('\\').next().unwrap_or("").to_string();
-            self.set_status(&format!(
-                "Downloading {} - the progress bar below stays live; the installer continues once it finishes.",
-                name
-            ));
+            self.set_status(&crate::locale::tr(
+                "Downloading {N} - the progress bar below stays live; the installer continues once it finishes.",
+            ).replace("{N}", &name));
             loop {
                 match b.rx.try_recv() {
                     Ok(Ok(())) => {
@@ -2227,7 +2241,12 @@ impl crate::nofmt::WriteUi for WorkingUi {
         // enable took effect - a silently-stuck grey button is exactly how
         // a broken skip path would hide.
         if is_window(self.nav_cancel) {
-            set_wnd_text(self.nav_cancel, if armed { "Skip verify" } else { "Cancel" });
+            let caption = if armed {
+                crate::locale::tr("Skip verify")
+            } else {
+                crate::locale::tr("Cancel")
+            };
+            set_wnd_text(self.nav_cancel, &caption);
             use winapi::um::winuser::{EnableWindow, IsWindowEnabled};
             unsafe {
                 EnableWindow(self.nav_cancel as winapi::shared::windef::HWND, if armed { 1 } else { 0 });
@@ -2695,7 +2714,7 @@ pub fn run_gui(
         });
         let mut cb: Box<nwg::CheckBox> = Box::default();
         let _ = nwg::CheckBox::builder()
-            .text("extra")
+            .text(&crate::locale::tr("extra"))
             .position((660, y))
             .size((110, 20))
             .parent(&*frame_iso)
@@ -2743,7 +2762,7 @@ pub fn run_gui(
             } else {
                 nwg::RadioButtonFlags::VISIBLE
             })
-            .text("main")
+            .text(&crate::locale::tr("main"))
             .position((10, y))
             .size((64, 20))
             .parent(&*frame_iso)
@@ -2763,7 +2782,7 @@ pub fn run_gui(
         // extra checkbox: same row
         let mut cb: Box<nwg::CheckBox> = Box::default();
         let _ = nwg::CheckBox::builder()
-            .text("extra")
+            .text(&crate::locale::tr("extra"))
             .position((80, y))
             .size((64, 20))
             .parent(&*frame_iso)
@@ -3445,7 +3464,7 @@ pub fn run_gui(
     for name in WORK_STAGES.iter() {
         let mut lb: nwg::Label = Default::default();
         let _ = nwg::Label::builder()
-            .text(*name)
+            .text(&crate::locale::tr(name))
             .position((22, 130))
             .size((800, 16))
             .parent(&window)
@@ -5289,6 +5308,85 @@ mod tests {
 
         unsafe {
             std::env::remove_var("LSL_LANG");
+        }
+    }
+
+    #[test]
+    fn nav_button_is_thai_under_lsl_lang_th() {
+        // The visual-check regression: with LSL_LANG=th the LIVE nav
+        // captions must be Thai, not just the tr() plumbing.
+        let _guard = crate::locale::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("LSL_LANG", "th");
+        }
+        assert_eq!(nav_label(0), "ถัดไป >");
+        assert_eq!(nav_label(INSTALL_PAGE), "ติดตั้ง");
+        unsafe {
+            std::env::remove_var("LSL_LANG");
+        }
+    }
+
+    #[test]
+    fn caption_literals_route_through_tr() {
+        // Regression: the summary relabels ("Finish"/"Close", "Skip
+        // verify") and merged-ISO row controls ("main"/"extra") shipped
+        // raw English although every Thai round-trip test passed - those
+        // cover the Win32 plumbing, THIS audits the wiring: any control
+        // caption set from a string literal must be empty, a probe
+        // placeholder, or wrapped in locale::tr.
+        const ALLOW: [&str; 5] = ["Probe", "usb", "adv", "fw", "none"];
+        for (file, full) in [
+            ("gui.rs", include_str!("gui.rs")),
+            ("main.rs", include_str!("main.rs")),
+        ] {
+            // Audit app code only: the tests module (including this
+            // test's own pattern strings) is not user-visible.
+            let src = match full.find("mod tests") {
+                Some(i) => &full[..i],
+                None => full,
+            };
+            for (i, line) in src.lines().enumerate() {
+                let l = line.trim();
+                let caption_literal = l.contains(".text(\"")
+                    || l.contains(".set_text(\"")
+                    || (l.contains("set_wnd_text(") && l.contains('"'))
+                    || (l.contains(".set_status(") && l.contains('"'))
+                    || (l.contains(".set_stage_status(") && l.contains('"'));
+                if !caption_literal || l.contains("tr(") {
+                    continue;
+                }
+                let mut cur = String::new();
+                let mut in_str = false;
+                let mut literals: Vec<String> = Vec::new();
+                for c in l.chars() {
+                    if c == '"' {
+                        if in_str {
+                            literals.push(cur.clone());
+                            cur.clear();
+                        }
+                        in_str = !in_str;
+                    } else if in_str {
+                        cur.push(c);
+                    }
+                }
+                for lit in literals {
+                    // no lowercase ASCII -> format placeholders / units (GB),
+                    // not translatable prose
+                    let prose = lit.chars().any(|c| c.is_ascii_lowercase());
+                    if !prose || lit.is_empty() || ALLOW.contains(&lit.as_str()) {
+                        continue;
+                    }
+                    panic!(
+                        "{}:{}: caption literal {:?} not routed through locale::tr: {}",
+                        file,
+                        i + 1,
+                        lit,
+                        l
+                    );
+                }
+            }
         }
     }
 

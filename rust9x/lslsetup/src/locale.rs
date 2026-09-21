@@ -71,6 +71,60 @@ pub fn tr_for(lang: &str, msgid: &str) -> String {
             "Firmware-Bootmenü (shutdown /r /fw)".into()
         }
         "Don't reboot" => "Nicht neu starten".into(),
+        "Finish" => "Fertig".into(),
+        "Close" => "Schließen".into(),
+        "Cancel" => "Abbrechen".into(),
+        "Skip verify" => "Prüfung überspringen".into(),
+        "main" => "Standard".into(),
+        "extra" => "Extra".into(),
+        "{N} - done" => "{N} - fertig".into(),
+        "ISO download" => "ISO-Download".into(),
+        "USB write" => "USB schreiben".into(),
+        "USB check" => "USB prüfen".into(),
+        "LSL files" => "LSL-Dateien".into(),
+        "Rust tools" => "Rust-Werkzeuge".into(),
+        "Drivers" => "Treiber".into(),
+        "HDD copy" => "HDD-Kopie".into(),
+        "Finalize" => "Finalisieren".into(),
+        "Boot sectors" => "Bootsektoren".into(),
+        "Boot setup" => "Boot-Einrichtung".into(),
+        "resolving..." => "wird ermittelt...".into(),
+        "writing..." => "wird geschrieben...".into(),
+        "checking surface..." => "Gesamtfläche wird geprüft...".into(),
+        "skipped" => "übersprungen".into(),
+        "setting one-time boot..." => "Einmal-Boot wird gesetzt...".into(),
+        "one-time boot failed - pick again" => "Einmal-Boot fehlgeschlagen - neu wählen".into(),
+        "advanced menu..." => "erweitertes Menü...".into(),
+        "firmware menu..." => "Firmware-Menü...".into(),
+        "no reboot" => "kein Neustart".into(),
+        "copying..." => "wird kopiert...".into(),
+        "installing..." => "wird installiert...".into(),
+        "preloading..." => "wird vorab geladen...".into(),
+        "rating..." => "Bewertung läuft...".into(),
+        "Copying" => "Kopieren".into(),
+        "Hashing for manifest" => "Hash für Manifest".into(),
+        "Using the existing live USB - no download, no Rufus write..." => {
+            "Verwende den bestehenden Live-USB - kein Download, kein Rufus-Schreibvorgang...".into()
+        }
+        "Write done - checking the whole USB surface (slow, cache bypassed)..." => {
+            "Schreiben fertig - gesamte USB-Fläche wird geprüft (langsam, ohne Cache)...".into()
+        }
+        "Setting one-time USB boot..." => "Einmal-USB-Boot wird eingestellt...".into(),
+        "Launching Rufus with the ISO pre-selected..." => {
+            "Rufus wird mit vorausgewähltem ISO gestartet...".into()
+        }
+        "Dropping lsl-usb files onto the USB..." => {
+            "lsl-usb-Dateien werden auf den USB-Stick kopiert...".into()
+        }
+        "Preloading network drivers..." => "Netzwerktreiber werden vorab geladen...".into(),
+        "Copying squashfs layers to HDD..." => "Squashfs-Ebenen werden auf die HDD kopiert...".into(),
+        "Finalizing boot sectors..." => "Bootsektoren werden finalisiert...".into(),
+        "Preloading Rust CLI tools ({A})..." => "Rust-CLI-Werkzeuge werden vorab geladen ({A})...".into(),
+        "Downloading extra {N} - {M} MB..." => "Zusätzlich wird {N} geladen - {M} MB...".into(),
+        "Downloading {N} - {M} MB of ~3 GB..." => "{N} wird geladen - {M} MB von ~3 GB...".into(),
+        "Downloading {N} - the progress bar below stays live; the installer continues once it finishes." => {
+            "{N} wird geladen - die Fortschrittsleiste unten bleibt aktiv; das Setup macht weiter, sobald der Download fertig ist.".into()
+        }
         "Manual boot menu: press {K} during POST." => {
             "Manuelles Bootmenü: {K} während des POST drücken.".into()
         }
@@ -198,6 +252,56 @@ fn tr_th(msgid: &str) -> String {
         "< Back to install options" => "< กลับไปตัวเลือกการติดตั้ง".into(),
         "Cancel" => "ยกเลิก".into(),
         "Finish" => "เสร็จสิ้น".into(),
+        "Close" => "ปิด".into(),
+        "Skip verify" => "ข้ามการตรวจสอบ".into(),
+        "main" => "หลัก".into(),
+        "extra" => "เพิ่มเติม".into(),
+        "{N} - done" => "{N} - เสร็จแล้ว".into(),
+        "ISO download" => "ดาวน์โหลด ISO".into(),
+        "USB write" => "เขียน USB".into(),
+        "USB check" => "ตรวจสอบ USB".into(),
+        "LSL files" => "ไฟล์ LSL".into(),
+        "Rust tools" => "เครื่องมือ Rust".into(),
+        "Drivers" => "ไดรเวอร์".into(),
+        "HDD copy" => "คัดลอกไป HDD".into(),
+        "Finalize" => "ขั้นสุดท้าย".into(),
+        "Boot sectors" => "เซกเตอร์บูต".into(),
+        "Boot setup" => "ตั้งค่าการบูต".into(),
+        "resolving..." => "กำลังตรวจหา...".into(),
+        "writing..." => "กำลังเขียน...".into(),
+        "checking surface..." => "กำลังตรวจสอบพื้นที่ทั้งหมด...".into(),
+        "skipped" => "ข้ามแล้ว".into(),
+        "setting one-time boot..." => "กำลังตั้งบูตครั้งเดียว...".into(),
+        "one-time boot failed - pick again" => "ตั้งบูตครั้งเดียวไม่สำเร็จ - เลือกใหม่".into(),
+        "advanced menu..." => "เมนูขั้นสูง...".into(),
+        "firmware menu..." => "เมนูเฟิร์มแวร์...".into(),
+        "no reboot" => "ไม่รีบูต".into(),
+        "copying..." => "กำลังคัดลอก...".into(),
+        "installing..." => "กำลังติดตั้ง...".into(),
+        "preloading..." => "กำลังโหลดล่วงหน้า...".into(),
+        "rating..." => "กำลังประเมิน...".into(),
+        "Copying" => "กำลังคัดลอก".into(),
+        "Hashing for manifest" => "กำลังคำนวณแฮชสำหรับ manifest".into(),
+        "Using the existing live USB - no download, no Rufus write..." => {
+            "ใช้ live USB ที่มีอยู่แล้ว - ไม่ต้องดาวน์โหลดหรือเขียนด้วย Rufus...".into()
+        }
+        "Write done - checking the whole USB surface (slow, cache bypassed)..." => {
+            "เขียนเสร็จ - กำลังตรวจสอบพื้นที่ USB ทั้งหมด (ช้า, ไม่ใช้แคช)...".into()
+        }
+        "Setting one-time USB boot..." => "กำลังตั้งบูต USB ครั้งเดียว...".into(),
+        "Launching Rufus with the ISO pre-selected..." => {
+            "กำลังเปิด Rufus โดยเลือก ISO ไว้แล้ว...".into()
+        }
+        "Dropping lsl-usb files onto the USB..." => "กำลังคัดลอกไฟล์ lsl-usb ไปยัง USB...".into(),
+        "Preloading network drivers..." => "กำลังโหลดไดรเวอร์เครือข่ายล่วงหน้า...".into(),
+        "Copying squashfs layers to HDD..." => "กำลังคัดลอกเลเยอร์ squashfs ไป HDD...".into(),
+        "Finalizing boot sectors..." => "กำลังเขียนเซกเตอร์บูตขั้นสุดท้าย...".into(),
+        "Preloading Rust CLI tools ({A})..." => "กำลังโหลดเครื่องมือ Rust ({A})...".into(),
+        "Downloading extra {N} - {M} MB..." => "กำลังดาวน์โหลด {N} เพิ่มเติม - {M} MB...".into(),
+        "Downloading {N} - {M} MB of ~3 GB..." => "กำลังดาวน์โหลด {N} - {M} MB จาก ~3 GB...".into(),
+        "Downloading {N} - the progress bar below stays live; the installer continues once it finishes." => {
+            "กำลังดาวน์โหลด {N} - แถบความคืบหน้าด้านล่างยังทำงานอยู่ ตัวติดตั้งจะไปต่อเมื่อเสร็จ".into()
+        }
         "Copy" => "คัดลอก".into(),
         "Browse..." => "เรียกดู...".into(),
         "Reboot" => "รีบูต".into(),
