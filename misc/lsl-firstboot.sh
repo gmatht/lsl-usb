@@ -12,8 +12,8 @@
 #      are persisted while nothing in the shipped layer is distro-specific
 #   3) backs up /home to its permanent location (USB: /cdrom/home.sfs via
 #      uphome; HDD: btrfs sync), stamps /cdrom/casper/lsl-firstboot.done,
-#      and offers a 10-minute cancellable reboot (desktop dialog with
-#      Cancel / Reboot now; the timer firing reboots)
+#      and waits for the user to approve the reboot (desktop dialog with
+#      Reboot now / Reboot later - no timer, never reboots on its own)
 #
 # The recipe on the FAT partition (/cdrom/bin/squashfs_config.sh) is editable
 # from Windows before first boot to change what gets installed.
@@ -153,8 +153,8 @@ FAILED_REASON=/cdrom/casper/lsl-firstboot.FAILED.reason
 # Never fails the service: every fallible step degrades to silent return.
 notify_desktop_now() {
     # Optional: notify_desktop_now SCRIPT [ARGS...] runs SCRIPT (default: the
-    # firstboot-failed notifier) instead. The reboot timer reuses this to
-    # show its countdown dialog; the default keeps every existing caller.
+    # firstboot-failed notifier) instead. The reboot approval reuses this to
+    # show its approval dialog; the default keeps every existing caller.
     local script="${1:-/usr/local/bin/lsl-firstboot-failed.sh}"
     if [ $# -gt 0 ]; then shift; fi
     # Re-quote for the nested su -c shell: interpolating "$@" inside the
@@ -230,23 +230,24 @@ flush_home_final() {
     return 0
 }
 
-# End-of-firstboot reboot with a user-visible countdown (default 10
-# minutes): a dialog in each graphical session offers "Reboot now" /
-# "Cancel automatic reboot", and the reboot fires when the timer expires.
-# Cancel is safe - the stamp already exists, so the new layer is picked up
-# on the next boot anyway.
-# Env: LSL_FIRSTBOOT_REBOOT (1/0, default 1), LSL_FIRSTBOOT_REBOOT_TIMEOUT
-# (seconds, default 600; 0 = reboot immediately), LSL_FIRSTBOOT_FLAG_DIR
-# (default /run/lsl-firstboot - tmpfs, so flags vanish on reboot).
-schedule_reboot_with_timer() {
+# End-of-firstboot reboot approval: the service NEVER reboots on its own.
+# A dialog in each graphical session offers "Reboot now" / "Reboot later"
+# and this function waits indefinitely until the user chooses. Reboot later
+# is safe - the stamp already exists, so the new layer is picked up on the
+# next manual boot anyway.
+# Env: LSL_FIRSTBOOT_REBOOT (1/0, default 1),
+# LSL_FIRSTBOOT_REBOOT_TIMEOUT (compat only: 0 = reboot immediately without
+# asking; any other value waits for approval - there is no timer),
+# LSL_FIRSTBOOT_FLAG_DIR (default /run/lsl-firstboot - tmpfs, so flags
+# vanish on reboot).
+schedule_reboot_on_approval() {
     if [ "${LSL_FIRSTBOOT_REBOOT:-1}" != "1" ]; then
         log "LSL_FIRSTBOOT_REBOOT=0: reboot manually when ready."
         return 0
     fi
-    local timeout="${LSL_FIRSTBOOT_REBOOT_TIMEOUT:-600}"
-    case "$timeout" in ''|*[!0-9]*) timeout=600 ;; esac
+    local timeout="${LSL_FIRSTBOOT_REBOOT_TIMEOUT:-x}"
     local flagdir="${LSL_FIRSTBOOT_FLAG_DIR:-/run/lsl-firstboot}"
-    if [ "$timeout" -le 0 ] 2>/dev/null; then
+    if [ "$timeout" = "0" ]; then
         sync
         systemctl reboot
         return $?
@@ -255,35 +256,46 @@ schedule_reboot_with_timer() {
     # user's choice; sticky bit so users cannot remove each other's flags.
     mkdir -p "$flagdir" 2>/dev/null || true
     chmod 1777 "$flagdir" 2>/dev/null || true
-    rm -f "$flagdir/reboot-cancel" "$flagdir/reboot-now" 2>/dev/null || true
-    # Absolute deadline (epoch) so a *fresh login* inside the window can
-    # show the same timer with the remaining time (see the reboot-pending
-    # branch in lsl-firstboot-progress.sh).
-    echo $(( $(date +%s 2>/dev/null || echo 0) + timeout )) > "$flagdir/deadline" 2>/dev/null || true
-    log "Setup complete. Automatic reboot in $((timeout / 60)) minutes - Cancel or Reboot now in the desktop dialog…"
+    rm -f "$flagdir/reboot-cancel" "$flagdir/reboot-now" "$flagdir/deadline" 2>/dev/null || true
+    log "Setup complete. Waiting for you to approve the reboot - Reboot now or Reboot later in the desktop dialog…"
     # Dialogs run per-session in the background; this loop is the reboot
     # authority (the user session cannot reboot the machine itself).
-    notify_desktop_now /usr/local/bin/lsl-firstboot-reboot.sh --timeout "$timeout" --flag-dir "$flagdir" </dev/null >/dev/null 2>&1 &
-    local left="$timeout" mm ss
-    while [ "$left" -gt 0 ]; do
+    # No deadline and no timeout: a fresh login re-shows the same approval
+    # dialog (see the reboot-approval branch in lsl-firstboot-progress.sh).
+    notify_desktop_now /usr/local/bin/lsl-firstboot-reboot.sh --flag-dir "$flagdir" </dev/null >/dev/null 2>&1 &
+    while true; do
         if [ -e "$flagdir/reboot-cancel" ]; then
-            log "Automatic reboot cancelled by the user; the new layer activates on the next boot."
-            set_phase 'done - automatic reboot cancelled by user'
+            log "Reboot deferred by the user; the new layer activates on the next boot."
+            set_phase 'done - reboot deferred by user'
             return 0
         fi
         if [ -e "$flagdir/reboot-now" ]; then
-            log "Reboot requested now by the user."
+            log "Reboot approved by the user."
             break
         fi
         sleep 2
-        left=$((left - 2))
-        [ "$left" -lt 0 ] && left=0
-        mm=$((left / 60)); ss=$((left % 60))
-        task_progress 100 "$(printf 'Rebooting in %d:%02d — Cancel or Reboot now in the dialog…' "$mm" "$ss")"
+        task_progress 100 "Waiting for reboot approval — Reboot now or Reboot later in the dialog…"
     done
     set_phase 'done - rebooting'
     sync
     systemctl reboot
+}
+
+# Flush the RAM-side dialog/boot telemetry to the stick. /tmp, the journal
+# and /run die at reboot; the dialog trace is the only persistent record of
+# whether/when the desktop dialog ran (lost on 2026-09-15/16 AND
+# 2026-09-21 - nobody could answer "why no progress dialog" because every
+# log lived in RAM). Appends, never truncates: boots accumulate.
+flush_dialog_telemetry() {
+    local stick="${STICK_DIR:-/cdrom}" fd="${LSL_FIRSTBOOT_FLAG_DIR:-/run/lsl-firstboot}" f
+    mount "$stick" -o remount,rw 2>/dev/null || true
+    for f in dialog-trace.log boot-times.log; do
+        if [ -s "$fd/$f" ]; then
+            cat "$fd/$f" >>"$stick/casper/$f" 2>/dev/null || true
+        fi
+    done
+    sync 2>/dev/null || true
+    return 0
 }
 
 # Drop COMPLETE appended layers from previous attempts so the next retry
@@ -347,6 +359,21 @@ fi
 # error dialog from stale state.
 rm -f "$FAILED_MARKER" "$FAILED_REASON" "$NET_FAIL_FILE" 2>/dev/null || true
 rm -f /run/lsl-firstboot.no-network 2>/dev/null || true
+
+# World-writable flag dir + telemetry files, BEFORE the desktop dialog can
+# start: the unprivileged XDG-autostart dialog (and lsl-boot-time.sh
+# --desktop) record their trace in /run because vfat /cdrom is root-owned
+# (fmask applies to every file, pre-created or not). /tmp and the journal
+# are RAM-only and already cost two post-mortems. Flushed to the stick at
+# the finale by flush_dialog_telemetry; lsl-diag.sh captures them in every
+# tarball. onboot.sh does the same on every boot; both are idempotent.
+flagdir="${LSL_FIRSTBOOT_FLAG_DIR:-/run/lsl-firstboot}"
+mkdir -p "$flagdir" 2>/dev/null || true
+chmod 1777 "$flagdir" 2>/dev/null || true
+for _tf in dialog-trace.log boot-times.log; do
+    : >>"$flagdir/$_tf" 2>/dev/null || true
+    chmod 666 "$flagdir/$_tf" 2>/dev/null || true
+done
 
 # --- locate the install stick -------------------------------------------
 # In iso-scan boots /cdrom is the ISO loop (read-only); the FAT partition
@@ -663,6 +690,7 @@ if [ ! -r "$UPROOT" ]; then
     task_progress 100 "Done" 2>/dev/null || true
     touch "$STAMP"
     sync
+    flush_dialog_telemetry
     exit 0
 fi
 
@@ -742,6 +770,7 @@ if [ "$rc" -ne 0 ]; then
         } > /cdrom/casper/lsl-firstboot.FAILED.reason 2>/dev/null || true
         lsl_firstboot_cleanup_partial_layers
         diag "firstboot-failed"
+        flush_dialog_telemetry
         touch "$STAMP"   # stop the retry loop; the failure is visible in the log
         sync
         exit 0
@@ -763,14 +792,15 @@ rm -f /run/lsl-firstboot.no-network 2>/dev/null || true
 task_done packages
 task_done layer
 flush_home_final
-task_begin done "Setup complete — rebooting…"
-task_progress 100 "Done — rebooting…"
-set_phase 'done - rebooting'
+task_begin done "Setup complete — waiting for reboot approval…"
+task_progress 100 "Done — waiting for reboot approval…"
+set_phase 'done - waiting for reboot approval'
 rm -f "$STATUS"
 touch "$STAMP"
 sync
-log "First-boot setup complete; new layer persisted. Rebooting to use it."
+log "First-boot setup complete; new layer persisted. Waiting for reboot approval to use it."
+flush_dialog_telemetry   # before diag so the flushed files are also in the tarball
 diag "firstboot-ok"   # baseline diagnostics for every successful first boot
 
-schedule_reboot_with_timer
+schedule_reboot_on_approval
 exit 0

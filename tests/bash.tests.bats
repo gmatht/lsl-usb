@@ -174,8 +174,9 @@ setup_firstboot() {
     export LSL_FIRSTBOOT_ATTEMPT="$TMPDIR_TEST/attempts"
     export LSL_FIRSTBOOT_NET_TRIES=1
     export LSL_FIRSTBOOT_REBOOT=0
-    # Instant reboot path by default (LSL_FIRSTBOOT_REBOOT_TIMEOUT=0 skips
-    # the 10-minute countdown); timer tests override per-case below.
+    # Instant reboot path by default (LSL_FIRSTBOOT_REBOOT_TIMEOUT=0 reboots
+    # immediately without asking); approval-wait tests override per-case
+    # below. Any other timeout value waits indefinitely for user approval.
     export LSL_FIRSTBOOT_REBOOT_TIMEOUT=0
     export LSL_FIRSTBOOT_FLAG_DIR="$TMPDIR_TEST/reboot-flags"
     # Stick location seam (misc/lsl-firstboot.sh): the partition scan and
@@ -244,7 +245,7 @@ setup_firstboot() {
     grep -q "reboot" "$TMPDIR_TEST/reboot.log"
 }
 
-@test "lsl-firstboot: reboot timer honors cancel written mid-countdown" {
+@test "lsl-firstboot: reboot approval honors cancel written while waiting" {
     setup_firstboot
     printf '#!/bin/bash\nexit 0\n' > "$LSL_FIRSTBOOT_UPROOT"
     chmod +x "$LSL_FIRSTBOOT_UPROOT"
@@ -253,11 +254,11 @@ setup_firstboot() {
     export LSL_FIRSTBOOT_REBOOT=1 LSL_FIRSTBOOT_REBOOT_TIMEOUT=60
     mkdir -p "$LSL_FIRSTBOOT_FLAG_DIR"
     # Signal after the loop starts (it clears stale flags first, and logs
-    # "Automatic reboot in" once listening) - no race either way.
+    # "Waiting for you to approve" once listening) - no race either way.
     bash misc/lsl-firstboot.sh >"$TMPDIR_TEST/out.log" 2>&1 &
     srv=$!
     for _ in $(seq 1 200); do
-        grep -q "Automatic reboot in" "$TMPDIR_TEST/logs"/*.log 2>/dev/null && break
+        grep -q "Waiting for you to approve" "$TMPDIR_TEST/logs"/*.log 2>/dev/null && break
         sleep 0.1
     done
     touch "$LSL_FIRSTBOOT_FLAG_DIR/reboot-cancel"
@@ -267,7 +268,7 @@ setup_firstboot() {
     [ ! -e "$TMPDIR_TEST/reboot.log" ]
 }
 
-@test "lsl-firstboot: reboot timer honors reboot-now written mid-countdown" {
+@test "lsl-firstboot: reboot approval honors reboot-now written while waiting" {
     setup_firstboot
     printf '#!/bin/bash\nexit 0\n' > "$LSL_FIRSTBOOT_UPROOT"
     chmod +x "$LSL_FIRSTBOOT_UPROOT"
@@ -278,7 +279,7 @@ setup_firstboot() {
     bash misc/lsl-firstboot.sh >"$TMPDIR_TEST/out.log" 2>&1 &
     srv=$!
     for _ in $(seq 1 200); do
-        grep -q "Automatic reboot in" "$TMPDIR_TEST/logs"/*.log 2>/dev/null && break
+        grep -q "Waiting for you to approve" "$TMPDIR_TEST/logs"/*.log 2>/dev/null && break
         sleep 0.1
     done
     touch "$LSL_FIRSTBOOT_FLAG_DIR/reboot-now"
@@ -288,18 +289,28 @@ setup_firstboot() {
     grep -q "reboot" "$TMPDIR_TEST/reboot.log"
 }
 
-@test "lsl-firstboot: reboot timer fires on expiry" {
+@test "lsl-firstboot: reboot approval never fires on its own (no timer)" {
     setup_firstboot
     printf '#!/bin/bash\nexit 0\n' > "$LSL_FIRSTBOOT_UPROOT"
     chmod +x "$LSL_FIRSTBOOT_UPROOT"
     printf '#!/bin/bash\necho "systemctl $*" >> "$TMPDIR_TEST/reboot.log"\n' > "$TMPDIR_TEST/bin/systemctl"
     chmod +x "$TMPDIR_TEST/bin/systemctl"
-    export LSL_FIRSTBOOT_REBOOT=1 LSL_FIRSTBOOT_REBOOT_TIMEOUT=4
+    export LSL_FIRSTBOOT_REBOOT=1 LSL_FIRSTBOOT_REBOOT_TIMEOUT=600
     mkdir -p "$LSL_FIRSTBOOT_FLAG_DIR"
-    run bash misc/lsl-firstboot.sh
-    [ "$status" -eq 0 ]
+    bash misc/lsl-firstboot.sh >"$TMPDIR_TEST/out.log" 2>&1 &
+    srv=$!
+    for _ in $(seq 1 100); do
+        grep -q "Waiting for you to approve" "$TMPDIR_TEST/logs"/*.log 2>/dev/null && break
+        sleep 0.1
+    done
+    grep -q "Waiting for you to approve" "$TMPDIR_TEST/logs"/*.log
+    # Past the old 10-minute-timer behavior: no decision yet, so no reboot.
+    sleep 5
+    [ ! -e "$TMPDIR_TEST/reboot.log" ]
+    kill "$srv" 2>/dev/null || true
+    wait "$srv" 2>/dev/null || true
     [ -e "$LSL_FIRSTBOOT_STAMP" ]
-    grep -q "reboot" "$TMPDIR_TEST/reboot.log"
+    [ ! -e "$TMPDIR_TEST/reboot.log" ]
 }
 
 @test "lsl-firstboot: uproot failure retries, then gives up after max attempts" {
@@ -329,17 +340,24 @@ setup_firstboot() {
     [ ! -e "$TMPDIR_TEST/flags/reboot-cancel" ]
 }
 
-@test "lsl-firstboot-reboot: gtk backend receives countdown + flag dir" {
+@test "lsl-firstboot-reboot: gtk backend waits for approval (no timer)" {
     mkdir -p "$TMPDIR_TEST/bin" "$TMPDIR_TEST/flags"
     printf '#!/bin/bash\nif [ "$1" = "-c" ]; then exit 0; fi\necho "$@" > "$TMPDIR_TEST/gtk-args"\n' > "$TMPDIR_TEST/bin/python3"
     chmod +x "$TMPDIR_TEST/bin/python3"
     touch "$TMPDIR_TEST/fake-gtk.py"
     run env PATH="$TMPDIR_TEST/bin:/usr/bin:/bin" LSL_PROGRESS_GTK="$TMPDIR_TEST/fake-gtk.py" \
         LSL_DIALOG_LOG="$TMPDIR_TEST/dialog.log" \
+        bash misc/lsl-firstboot-reboot.sh --flag-dir "$TMPDIR_TEST/flags"
+    [ "$status" -eq 0 ]
+    grep -q -- "--reboot-countdown 0" "$TMPDIR_TEST/gtk-args"
+    grep -q -- "--flag-dir $TMPDIR_TEST/flags" "$TMPDIR_TEST/gtk-args"
+    grep -q -- "NOT reboot" "$TMPDIR_TEST/gtk-args"
+    # Legacy --timeout is accepted but ignored (no timer).
+    run env PATH="$TMPDIR_TEST/bin:/usr/bin:/bin" LSL_PROGRESS_GTK="$TMPDIR_TEST/fake-gtk.py" \
+        LSL_DIALOG_LOG="$TMPDIR_TEST/dialog.log" \
         bash misc/lsl-firstboot-reboot.sh --timeout 321 --flag-dir "$TMPDIR_TEST/flags"
     [ "$status" -eq 0 ]
-    grep -q -- "--reboot-countdown 321" "$TMPDIR_TEST/gtk-args"
-    grep -q -- "--flag-dir $TMPDIR_TEST/flags" "$TMPDIR_TEST/gtk-args"
+    grep -q -- "--reboot-countdown 0" "$TMPDIR_TEST/gtk-args"
 }
 
 @test "lsl-firstboot-reboot: zenity ok writes reboot-now, cancel writes reboot-cancel" {
@@ -350,10 +368,11 @@ setup_firstboot() {
     chmod +x "$TMPDIR_TEST/bin/zenity"
     run env PATH="$TMPDIR_TEST/bin:/usr/bin:/bin" LSL_PROGRESS_GTK="$TMPDIR_TEST/missing.py" \
         LSL_DIALOG_LOG="$TMPDIR_TEST/dialog.log" \
-        bash misc/lsl-firstboot-reboot.sh --timeout 600 --flag-dir "$TMPDIR_TEST/flags"
+        bash misc/lsl-firstboot-reboot.sh --flag-dir "$TMPDIR_TEST/flags"
     [ "$status" -eq 0 ]
-    grep -q -- "--timeout=600" "$TMPDIR_TEST/zenity-args"
     grep -q -- "Reboot now" "$TMPDIR_TEST/zenity-args"
+    grep -q -- "Reboot later" "$TMPDIR_TEST/zenity-args"
+    if grep -q -- "--timeout" "$TMPDIR_TEST/zenity-args"; then false; fi
     [ -e "$TMPDIR_TEST/flags/reboot-now" ]
     [ ! -e "$TMPDIR_TEST/flags/reboot-cancel" ]
     rm -f "$TMPDIR_TEST/flags/reboot-now"
@@ -361,23 +380,23 @@ setup_firstboot() {
     chmod +x "$TMPDIR_TEST/bin/zenity"
     run env PATH="$TMPDIR_TEST/bin:/usr/bin:/bin" LSL_PROGRESS_GTK="$TMPDIR_TEST/missing.py" \
         LSL_DIALOG_LOG="$TMPDIR_TEST/dialog.log" \
-        bash misc/lsl-firstboot-reboot.sh --timeout 600 --flag-dir "$TMPDIR_TEST/flags"
+        bash misc/lsl-firstboot-reboot.sh --flag-dir "$TMPDIR_TEST/flags"
     [ "$status" -eq 0 ]
     [ -e "$TMPDIR_TEST/flags/reboot-cancel" ]
     [ ! -e "$TMPDIR_TEST/flags/reboot-now" ]
 }
 
-@test "lsl-firstboot-reboot: zenity timeout/dismissal writes no flag (reboot proceeds)" {
+@test "lsl-firstboot-reboot: zenity dismissal defers reboot (no timer, never auto-reboots)" {
     mkdir -p "$TMPDIR_TEST/bin" "$TMPDIR_TEST/flags"
     printf '#!/bin/bash\nexit 1\n' > "$TMPDIR_TEST/bin/python3"
     printf '#!/bin/bash\nexit 5\n' > "$TMPDIR_TEST/bin/zenity"
     chmod +x "$TMPDIR_TEST/bin"/*
     run env PATH="$TMPDIR_TEST/bin:/usr/bin:/bin" LSL_PROGRESS_GTK="$TMPDIR_TEST/missing.py" \
         LSL_DIALOG_LOG="$TMPDIR_TEST/dialog.log" \
-        bash misc/lsl-firstboot-reboot.sh --timeout 600 --flag-dir "$TMPDIR_TEST/flags"
+        bash misc/lsl-firstboot-reboot.sh --flag-dir "$TMPDIR_TEST/flags"
     [ "$status" -eq 0 ]
     [ ! -e "$TMPDIR_TEST/flags/reboot-now" ]
-    [ ! -e "$TMPDIR_TEST/flags/reboot-cancel" ]
+    [ -e "$TMPDIR_TEST/flags/reboot-cancel" ]
 }
 
 @test "lsl-progress-gtk: reboot-countdown mode compiles and parses args" {
@@ -647,10 +666,13 @@ EOF
     INPUT='"\\DosDevices\\C:"=hex(3):44,4d,49,4f,3a,49,44,3a,11,12,13,14,15,16,17,18,19,1a,1b,1c,1d,1e,1f,20,01,02,03,04,05,06,07,08,09,0a,0b,0c,0d,0e,0f,10'
     lsblk() { echo "nvme0n1p3 04030201-0605-0807-090a-0b0c0d0e0f10"; }
     mount() { echo "mount $*" > "$TMPDIR_TEST/mount.log"; }
-    run parse_drive "C" "/mnt/c"
+    # Mount at a path that does not exist yet: parse_drive skips already-
+    # mounted targets, and /mnt/c IS mounted under WSL (host C: drive).
+    MNT="$TMPDIR_TEST/mnt-c"
+    run parse_drive "C" "$MNT"
     [ "$status" -eq 0 ]
-    # The disk GUID resolved to /dev/nvme0n1p3 and was mounted at /mnt/c.
-    grep -q "mount /dev/nvme0n1p3 -t ntfs3 /mnt/c" "$TMPDIR_TEST/mount.log"
+    # The disk GUID resolved to /dev/nvme0n1p3 and was mounted at $MNT.
+    grep -q "mount /dev/nvme0n1p3 -t ntfs3 $MNT" "$TMPDIR_TEST/mount.log"
 }
 
 @test "mount_all: parse_drive skips unknown drive letters" {
@@ -875,11 +897,14 @@ EOF
     btrfs() { echo "btrfs $*" >> "$TMPDIR_TEST/btrfs.log"; }
     # Function mocks do not cross into `bash bin/uphome` unless exported.
     export -f btrfs
-    # persist-wifi.sh re-execs via sudo when not root; a real sudo would
-    # hang waiting for a password in this sandbox (same pattern as the
-    # config.sh test below).
-    sudo() { true; }
-    export -f sudo
+    # persist-wifi.sh re-execs via `exec sudo`, which bypasses function
+    # mocks; a real sudo would hang waiting for a password in sandboxes
+    # without passwordless sudo (WSL). Intercept it with a fake binary on
+    # PATH (the test runs in a subshell, so the export is test-scoped).
+    mkdir -p "$TMPDIR_TEST/bin"
+    printf '#!/bin/bash\nexit 0\n' > "$TMPDIR_TEST/bin/sudo"
+    chmod +x "$TMPDIR_TEST/bin/sudo"
+    export PATH="$TMPDIR_TEST/bin:$PATH"
     run env LSL_DATA_DIR=/mnt/c/Users/lsl-usb bash bin/uphome
     [ "$status" -eq 0 ]
     grep -q "sync /home" "$TMPDIR_TEST/btrfs.log"
@@ -1075,11 +1100,10 @@ EOF
     [ "$status" -eq 0 ]
 }
 
-@test "lsl-firstboot-progress: fresh login during countdown shows the timer" {
+@test "lsl-firstboot-progress: fresh login while approval pending shows the dialog" {
     CD="$TMPDIR_TEST/cdrom"
     mkdir -p "$CD/casper" "$TMPDIR_TEST/flags"
     touch "$CD/casper/lsl-firstboot.done"
-    echo $(( $(date +%s) + 300 )) > "$TMPDIR_TEST/flags/deadline"
     printf '#!/bin/bash\necho "$@" > "$TMPDIR_TEST/reboot-args"\n' > "$TMPDIR_TEST/reboot-mock.sh"
     chmod +x "$TMPDIR_TEST/reboot-mock.sh"
     cp misc/lsl-firstboot-progress.sh "$TMPDIR_TEST/progress.sh"
@@ -1088,9 +1112,7 @@ EOF
         bash "$TMPDIR_TEST/progress.sh"
     [ "$status" -eq 0 ]
     grep -q -- "--flag-dir $TMPDIR_TEST/flags" "$TMPDIR_TEST/reboot-args"
-    t="$(grep -oE -- '--timeout [0-9]+' "$TMPDIR_TEST/reboot-args" | awk '{print $2}')"
-    [ "$t" -gt 0 ] 2>/dev/null
-    [ "$t" -le 300 ] 2>/dev/null
+    if grep -q -- "\-\-timeout" "$TMPDIR_TEST/reboot-args"; then false; fi
 }
 
 @test "lsl-firstboot-progress: stays silent when reboot was cancelled" {
@@ -1108,7 +1130,7 @@ EOF
     [ ! -e "$TMPDIR_TEST/reboot-args" ]
 }
 
-@test "lsl-firstboot-progress: stays silent with past deadline or none" {
+@test "lsl-firstboot-progress: stays silent once decided, shows dialog while pending" {
     CD="$TMPDIR_TEST/cdrom"
     mkdir -p "$CD/casper" "$TMPDIR_TEST/flags"
     touch "$CD/casper/lsl-firstboot.done"
@@ -1116,12 +1138,21 @@ EOF
     chmod +x "$TMPDIR_TEST/reboot-mock.sh"
     cp misc/lsl-firstboot-progress.sh "$TMPDIR_TEST/progress.sh"
     sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/progress.sh"
+    # No decision yet (even with a stale deadline file from an older layer):
+    # the approval dialog is due - there is no timer to expire.
     echo $(( $(date +%s) - 60 )) > "$TMPDIR_TEST/flags/deadline"
     run env LSL_FIRSTBOOT_FLAG_DIR="$TMPDIR_TEST/flags" LSL_FIRSTBOOT_REBOOT_SH="$TMPDIR_TEST/reboot-mock.sh" \
         bash "$TMPDIR_TEST/progress.sh"
     [ "$status" -eq 0 ]
-    [ ! -e "$TMPDIR_TEST/reboot-args" ]
-    rm -f "$TMPDIR_TEST/flags/deadline"
+    [ -e "$TMPDIR_TEST/reboot-args" ]
+    rm -f "$TMPDIR_TEST/reboot-args" "$TMPDIR_TEST/flags/deadline"
+    run env LSL_FIRSTBOOT_FLAG_DIR="$TMPDIR_TEST/flags" LSL_FIRSTBOOT_REBOOT_SH="$TMPDIR_TEST/reboot-mock.sh" \
+        bash "$TMPDIR_TEST/progress.sh"
+    [ "$status" -eq 0 ]
+    [ -e "$TMPDIR_TEST/reboot-args" ]
+    # Once the user decides, fresh logins stay silent.
+    rm -f "$TMPDIR_TEST/reboot-args"
+    touch "$TMPDIR_TEST/flags/reboot-cancel"
     run env LSL_FIRSTBOOT_FLAG_DIR="$TMPDIR_TEST/flags" LSL_FIRSTBOOT_REBOOT_SH="$TMPDIR_TEST/reboot-mock.sh" \
         bash "$TMPDIR_TEST/progress.sh"
     [ "$status" -eq 0 ]

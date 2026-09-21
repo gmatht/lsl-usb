@@ -33,10 +33,19 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   nvim AppImage (ELF-verified), rust tools, AppImages.
 - First-boot finale: backs up `/home` to its permanent location (`uphome` -
   USB bakes `home.sfs`, HDD syncs btrfs) as a visible `Back up home` step,
-  then offers a 10-minute cancellable reboot instead of rebooting at once -
-  a per-session dialog (bundled GTK fallback, else zenity) with a live
-  countdown plus Reboot now / Cancel automatic reboot (`LSL_FIRSTBOOT_REBOOT`,
-  `LSL_FIRSTBOOT_REBOOT_TIMEOUT`, `LSL_FIRSTBOOT_FLAG_DIR` to tune/skip).
+  then waits for the user to approve the reboot instead of rebooting at once -
+  a per-session dialog (bundled GTK fallback, else zenity) with Reboot now /
+  Reboot later and no timer: it never reboots on its own (`LSL_FIRSTBOOT_REBOOT`,
+  `LSL_FIRSTBOOT_FLAG_DIR` to tune/skip; `LSL_FIRSTBOOT_REBOOT_TIMEOUT=0`
+  keeps the explicit reboot-immediately escape hatch).
+- Boot + dialog telemetry that survives reboot: the progress/reboot dialogs
+  trace every launch (including the previously silent "already complete"
+  exit) to `/run/lsl-firstboot/dialog-trace.log`, flushed to the stick by
+  the firstboot finale; `lsl-diag.sh` captures the dialog journal tags,
+  `loginctl` sessions with `Since=`, live dialog processes, and the
+  dialog/boot-time logs; `lsl-boot-time.sh` now ships on the stick (the
+  autostart entry referenced it, but it was never installed) and records
+  `user@display` with a `/proc/uptime` fallback when no boot stamp exists.
 - Test harness (PowerShell, ~55 assertions) + bats (~77 tests) + CI + release workflow.
 - `VALIDATION.md` (real-hardware checklist), `VERSION`, `CHANGELOG.md`.
 

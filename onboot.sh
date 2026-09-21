@@ -34,6 +34,20 @@ if ! lsl_ensure_nix_users_group_membership; then
     ) &
 fi
 
+# World-writable flag dir + telemetry files, every boot (we run as root,
+# before the desktop): the unprivileged XDG autostarts
+# (lsl-firstboot-progress.sh, lsl-boot-time.sh --desktop) record their
+# trace in /run because vfat /cdrom is root-owned. /tmp and the journal
+# are RAM-only and already cost two post-mortems. lsl-firstboot.sh does
+# the same (it can start before we finish); lsl-diag.sh captures these in
+# every tarball and the firstboot finale flushes them to the stick.
+mkdir -p /run/lsl-firstboot 2>/dev/null || true
+chmod 1777 /run/lsl-firstboot 2>/dev/null || true
+for _tf in dialog-trace.log boot-times.log; do
+    : >>"/run/lsl-firstboot/$_tf" 2>/dev/null || true
+    chmod 666 "/run/lsl-firstboot/$_tf" 2>/dev/null || true
+done
+
 # Compressed swap in RAM (zram). Uses LSL_ZRAM_MIB from lsl-usb.env (see lsl_load_config).
 # 0 = off; unset = 80% of MemTotal (minimum 128 MiB).
 lsl_setup_zram() {

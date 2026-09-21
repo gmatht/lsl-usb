@@ -110,6 +110,11 @@ static FIRSTBOOT_TOOLKIT: &[(&str, &str)] = &[
     ("bin\\lsl-common.sh", include_str!("../../../bin/lsl-common.sh")),
     ("bin\\persist-wifi.sh", include_str!("../../../bin/persist-wifi.sh")),
     ("bin\\lsl-flatpak-fat.sh", include_str!("../../../bin/lsl-flatpak-fat.sh")),
+    // Boot telemetry: /etc/xdg/autostart/lsl-boot-time.desktop (z0 layer)
+    // execs /cdrom/bin/lsl-boot-time.sh --desktop; shipping it was the
+    // missing half of the "boot telemetry" work - without it the autostart
+    // silently fails and boot-times.log never exists (2026-09-21 post-mortem).
+    ("bin\\lsl-boot-time.sh", include_str!("../../../bin/lsl-boot-time.sh")),
     ("systemd\\onboot.service", include_str!("../../../systemd/onboot.service")),
     ("systemd\\lsl-boot-stamp.service", include_str!("../../../systemd/lsl-boot-stamp.service")),
     ("systemd\\lsl-btrfs-growd.service", include_str!("../../../systemd/lsl-btrfs-growd.service")),

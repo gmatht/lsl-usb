@@ -55,6 +55,16 @@ cp -a /cdrom/casper/lsl-firstboot-logs/. "$WORK/firstboot-logs/" 2>/dev/null || 
 mkdir -p "$WORK/uproot-logs"
 cp -a /cdrom/casper/uproot-logs/.   "$WORK/uproot-logs/"       2>/dev/null || true
 
+# Dialog/boot telemetry: the progress + reboot dialogs log to /tmp and the
+# journal only, and both are RAM - two post-mortems (2026-09-15/16 and
+# 2026-09-21) lost the only record of whether the desktop dialog ran.
+# Capture every trace whenever a tarball is taken (the tarball is usually
+# written minutes before the RAM goes away).
+cp -a /tmp/lsl-firstboot-dialog.log      "$WORK/lsl-firstboot-dialog.log" 2>/dev/null || true
+cp -a /run/lsl-firstboot/dialog-trace.log "$WORK/dialog-trace.log"        2>/dev/null || true
+cp -a /run/lsl-firstboot/boot-times.log   "$WORK/boot-times.run.log"      2>/dev/null || true
+cp -a /run/lsl-boot.state                 "$WORK/lsl-boot.state"          2>/dev/null || true
+
 # Live system state (best-effort; these tools may not all be present).
 {
     echo "=== mount ==="; mount 2>/dev/null
@@ -64,6 +74,13 @@ cp -a /cdrom/casper/uproot-logs/.   "$WORK/uproot-logs/"       2>/dev/null || tr
     echo "=== lsl-data-dir ==="; ls -ld /mnt/c/Users/lsl-usb 2>/dev/null
     echo "=== lsl-build ==="; cat /cdrom/lsl-build.txt 2>/dev/null; echo; cat /cdrom/VERSION 2>/dev/null
     echo "=== systemctl lsl-* ==="; systemctl list-units 'lsl-*' 2>/dev/null
+    echo "=== loginctl sessions ==="; loginctl list-sessions --no-pager 2>/dev/null
+    loginctl list-sessions --no-legend 2>/dev/null | while read -r sid _rest; do
+        [ -n "$sid" ] || continue
+        loginctl show-session "$sid" -p Id -p Name -p State -p Type -p Class -p Display -p Since 2>/dev/null
+    done
+    echo "=== dialog processes ==="
+    ps auxww 2>/dev/null | grep -E 'zenity|lsl-firstboot-progress|lsl-progress-gtk|lsl-firstboot-reboot|lsl-boot-time' | grep -v grep
 } > "$WORK/system-state.txt" 2>/dev/null || true
 
 # Hardware / boot-context for a remote post-mortem (distinguishes DD-mode vs
@@ -109,6 +126,12 @@ fi
 if command -v journalctl >/dev/null 2>&1; then
     journalctl -u lsl-firstboot.service -u onboot.service --no-pager -n 500 \
         > "$WORK/journal-lsl.txt" 2>/dev/null || true
+    # The dialogs syslog-tag their lines (logger -t lsl-firstboot-progress /
+    # -t lsl-firstboot-reboot); a -u unit filter EXCLUDES them - which is
+    # exactly how the 2026-09-21 tarball lost the dialog evidence while the
+    # dialog was still running. Capture the tags explicitly.
+    journalctl -t lsl-firstboot-progress -t lsl-firstboot-reboot --no-pager -n 200 \
+        > "$WORK/journal-dialog.txt" 2>/dev/null || true
 fi
 
 # Optional setup-health probes (Nix / Steam overlays). Best-effort: the scripts

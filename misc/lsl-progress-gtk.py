@@ -19,10 +19,11 @@ Two progress modes:
   warn mode (--warn): show a one-shot warning dialog, exit on close.
 
   reboot mode (--reboot-countdown SECONDS [--flag-dir DIR]): end-of-firstboot
-      reboot timer with a live MM:SS countdown and Reboot now / Cancel
-      buttons; writes reboot-now or reboot-cancel into the flag dir (the root
-      firstboot service owns the actual reboot and fires on timeout; closing
-      the window counts as Cancel).
+      reboot approval dialog with Reboot now / Reboot later buttons; writes
+      reboot-now or reboot-cancel into the flag dir (the root firstboot
+      service only reboots after reboot-now - there is no timer and no
+      automatic reboot; closing the window counts as Reboot later). The
+      SECONDS value is accepted for compatibility and ignored.
 
   choice mode (--choice --options "A|B|C" [--preselect N]): single-choice
       radiolist dialog (used where zenity --list --radiolist would be, but
@@ -72,7 +73,7 @@ def parse_args(argv):
     status_file = ""
     stamp = ""
     poll = 0.5
-    countdown = 600
+    countdown = 0
     flag_dir = "/run/lsl-firstboot"
     i = 0
     while i < len(argv):
@@ -84,13 +85,13 @@ def parse_args(argv):
             if i + 1 < len(argv):
                 i += 1
                 try:
-                    countdown = max(1, int(argv[i]))
+                    countdown = max(0, int(argv[i]))
                 except ValueError:
                     pass
         elif a.startswith("--reboot-countdown="):
             mode = "reboot"
             try:
-                countdown = max(1, int(a.split("=", 1)[1]))
+                countdown = max(0, int(a.split("=", 1)[1]))
             except ValueError:
                 pass
         elif a == "--flag-dir" and i + 1 < len(argv):
@@ -303,7 +304,7 @@ def main():
             Gtk.main_quit()
             return False
         if stamp_present(stamp):
-            finish_ui("Done - rebooting")
+            finish_ui("Done - waiting for reboot approval")
             if not state["done_quit"]:
                 state["done_quit"] = True
                 GLib.timeout_add(1500, Gtk.main_quit)
@@ -461,12 +462,14 @@ def run_choice(Gtk, GLib, title, text, options, preselect):
 
 
 def run_reboot_countdown(Gtk, GLib, title, text, seconds, flag_dir):
-    """End-of-firstboot reboot timer: live MM:SS countdown with Reboot now /
-    Cancel buttons. Writes flag_dir/reboot-now or reboot-cancel; the root
-    firstboot service owns the actual reboot and fires on timeout, so every
-    exit path here is safe (proceed, cancel, or crash-and-reboot-on-time).
-    Closing the window counts as Cancel - a surprise reboot is worse than a
-    deferred one (the stamped layer activates on the next boot anyway)."""
+    """End-of-firstboot reboot approval: wait indefinitely for the user to
+    choose Reboot now / Reboot later. Writes flag_dir/reboot-now or
+    reboot-cancel; the root firstboot service only reboots after reboot-now,
+    so every exit path here is safe (reboot, defer, or crash-and-keep-
+    waiting for a fresh login to re-show this dialog). Closing the window
+    counts as Reboot later - a surprise reboot is worse than a deferred one
+    (the stamped layer activates on the next boot anyway). The countdown
+    value is ignored: there is no timer and no automatic reboot."""
     try:
         os.makedirs(flag_dir, exist_ok=True)
     except OSError:
@@ -492,30 +495,22 @@ def run_reboot_countdown(Gtk, GLib, title, text, seconds, flag_dir):
     header.set_xalign(0.0)
     box.pack_start(header, False, False, 0)
 
-    countdown = Gtk.Label()
-    countdown.set_xalign(0.5)
-    box.pack_start(countdown, False, False, 0)
-
-    bar = Gtk.ProgressBar()
-    bar.set_show_text(False)
-    box.pack_start(bar, False, False, 0)
+    waiting = Gtk.Label()
+    waiting.set_xalign(0.5)
+    waiting.set_markup(
+        "<big><b>Waiting for your approval</b></big>\n"
+        "<span fgcolor=\"#555555\">No timer - the system will not reboot until you choose.</span>"
+    )
+    box.pack_start(waiting, False, False, 0)
 
     buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     box.pack_start(buttons, False, False, 0)
     reboot_btn = Gtk.Button(label="Reboot now")
-    cancel_btn = Gtk.Button(label="Cancel automatic reboot")
+    cancel_btn = Gtk.Button(label="Reboot later")
     buttons.pack_start(reboot_btn, True, True, 0)
     buttons.pack_start(cancel_btn, True, True, 0)
 
     state = {"over": False}
-    deadline = time.monotonic() + seconds
-
-    def render(left):
-        mm, ss = divmod(max(0, left), 60)
-        countdown.set_markup(
-            "<big><b>%d:%02d</b> until automatic reboot</big>" % (mm, ss)
-        )
-        bar.set_fraction(max(0.0, min(1.0, 1.0 - left / float(seconds))))
 
     def finish_reboot(_btn=None):
         if state["over"]:
@@ -535,23 +530,8 @@ def run_reboot_countdown(Gtk, GLib, title, text, seconds, flag_dir):
     cancel_btn.connect("clicked", finish_cancel)
     win.connect("destroy", finish_cancel)
 
-    def tick():
-        if state["over"]:
-            return False
-        left = int(deadline - time.monotonic())
-        if left <= 0:
-            countdown.set_markup("<big><b>Rebooting now…</b></big>")
-            bar.set_fraction(1.0)
-            state["over"] = True
-            GLib.timeout_add(1200, Gtk.main_quit)
-            return False
-        render(left)
-        return True
-
-    render(seconds)
     win.show_all()
     win.present()
-    GLib.timeout_add(250, tick)
     Gtk.main()
     return 0
 

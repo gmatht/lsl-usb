@@ -20,6 +20,24 @@ set -u
 STAMP="${LSL_FIRSTBOOT_STAMP:-/cdrom/casper/lsl-firstboot.done}"
 STATUS="${LSL_FIRSTBOOT_STATUS:-/run/lsl-firstboot-status}"
 
+# Dialog errors go to THREE places: /tmp (writable in every session), the
+# journal, and the persistent trace file. /tmp and the journal are RAM-only
+# and already cost two post-mortems ("was the progress dialog even shown?"
+# - 2026-09-15/16 and 2026-09-21): the root firstboot service pre-creates
+# the trace world-writable in /run/lsl-firstboot and flushes it to
+# /cdrom/casper/dialog-trace.log at the finale; lsl-diag.sh captures it in
+# every tarball. vfat /cdrom is root-owned, so the session user cannot
+# write the stick directly - the flush is root's job.
+DIALOG_LOG="${LSL_DIALOG_LOG:-/tmp/lsl-firstboot-dialog.log}"
+TRACE="${LSL_DIALOG_TRACE:-/run/lsl-firstboot/dialog-trace.log}"
+dialog_log() {
+    local ts
+    ts="$(date '+%F %T' 2>/dev/null || printf '?')"
+    printf '%s %s\n' "$ts" "$*" >>"$DIALOG_LOG" 2>/dev/null || true
+    printf '%s %s\n' "$ts" "$*" >>"$TRACE" 2>/dev/null || true
+    logger -t lsl-firstboot-progress "$*" 2>/dev/null || true
+}
+
 # Nothing to do if the stamp exists (setup already completed).
 # The service mounts the stick at /isodevice when /cdrom is the ISO loop;
 # accept the stamp at either place (or an explicit override).
@@ -29,30 +47,29 @@ stamp_present() {
     [ -e /cdrom/casper/lsl-firstboot.done ] && return 0
     return 1
 }
-# A reboot may still be pending (the finale stamps first, then counts
-# down): a fresh login inside that window should see the timer instead of
-# nothing. Prints remaining seconds, or nothing (return 1) when no dialog
-# is due: no flag dir, a decision already recorded, no/unparseable
-# deadline, or a deadline already reached (reboot imminent - stay out of
-# the way).
-reboot_pending_deadline() {
-    local dir="${LSL_FIRSTBOOT_FLAG_DIR:-/run/lsl-firstboot}" dl now
+# Reboot approval may still be pending (the finale stamps first, then waits
+# indefinitely for the user to approve the reboot): a fresh login with no
+# decision recorded yet should see the approval dialog instead of nothing.
+# Returns 0 when a dialog is due: the flag dir exists and neither
+# reboot-now nor reboot-cancel is recorded. There is no deadline and no
+# timer - a stale deadline file from an older layer is ignored.
+reboot_approval_pending() {
+    local dir="${LSL_FIRSTBOOT_FLAG_DIR:-/run/lsl-firstboot}"
     [ -d "$dir" ] || return 1
     [ -e "$dir/reboot-cancel" ] && return 1
     [ -e "$dir/reboot-now" ] && return 1
-    [ -f "$dir/deadline" ] || return 1
-    dl="$(cat "$dir/deadline" 2>/dev/null || true)"
-    case "$dl" in ''|*[!0-9]*) return 1 ;; esac
-    now="$(date +%s 2>/dev/null || echo 0)"
-    [ "$now" -ge "$dl" ] 2>/dev/null && return 1
-    echo $((dl - now))
     return 0
 }
 if stamp_present; then
-    if remaining="$(reboot_pending_deadline)"; then
+    if reboot_approval_pending; then
+        dialog_log "stamp present, reboot approval still pending - showing the reboot dialog"
         exec bash "${LSL_FIRSTBOOT_REBOOT_SH:-/usr/local/bin/lsl-firstboot-reboot.sh}" \
-            --timeout "$remaining" --flag-dir "${LSL_FIRSTBOOT_FLAG_DIR:-/run/lsl-firstboot}"
+            --flag-dir "${LSL_FIRSTBOOT_FLAG_DIR:-/run/lsl-firstboot}"
     fi
+    # The one exit that used to be completely silent: if the desktop came
+    # up after setup finished, this is exactly what happened - and no log
+    # anywhere recorded it.
+    dialog_log "stamp present at dialog start - nothing to show (setup already complete)"
     exit 0
 fi
 
@@ -63,14 +80,6 @@ fi
 # and exit instead of vanishing silently (the old `|| exit 0` behavior
 # that hid this exact failure).
 LSL_PROGRESS_GTK="${LSL_PROGRESS_GTK:-/usr/local/bin/lsl-progress-gtk.py}"
-# Dialog errors go here AND to the journal: autostart stdout/stderr may go
-# nowhere visible (/dev/null hid every past failure), and /tmp is writable
-# in every session (unlike /cdrom, which may be the read-only ISO loop).
-DIALOG_LOG="${LSL_DIALOG_LOG:-/tmp/lsl-firstboot-dialog.log}"
-dialog_log() {
-    printf '%s %s\n' "$(date '+%F %T' 2>/dev/null || printf '?')" "$*" >>"$DIALOG_LOG" 2>/dev/null || true
-    logger -t lsl-firstboot-progress "$*" 2>/dev/null || true
-}
 DIALOG_PROG=""
 if command -v zenity >/dev/null 2>&1; then
     DIALOG_PROG=zenity
@@ -81,7 +90,7 @@ else
     dialog_log "no dialog backend (need zenity or python3-gi + $LSL_PROGRESS_GTK); progress invisible"
     exit 0
 fi
-dialog_log "progress dialog starting via $DIALOG_PROG"
+dialog_log "progress dialog starting via $DIALOG_PROG (user=$(id -un 2>/dev/null || echo '?') display=${DISPLAY:-none}${WAYLAND_DISPLAY:+ wayland=$WAYLAND_DISPLAY})"
 
 status_get() {
     # status_get KEY [DEFAULT] — single-line value, newline-stripped.
@@ -193,7 +202,7 @@ feed_zenity() {
         sleep 1
         if ! kill -0 "$PPID" 2>/dev/null; then break; fi
     done
-    echo "100 # Done - rebooting"
+    echo "100 # Done - waiting for reboot approval"
     sleep 1
 }
 
