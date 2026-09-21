@@ -1373,14 +1373,12 @@ pub fn board_note_short(want_bios: bool, want_uefi: bool, caps: &sys::BoardCaps)
         sys::FwCap::No => "no",
         sys::FwCap::Unknown => "?",
     };
-    let mut s = format!(
-        "This PC boots {} (board: UEFI {}, legacy/CSM {})",
-        boot,
-        cap(caps.uefi_capable),
-        cap(caps.bios_capable)
-    );
+    let mut s = crate::locale::tr("This PC boots {B} (board: UEFI {U}, legacy/CSM {L})")
+        .replace("{B}", boot)
+        .replace("{U}", &cap(caps.uefi_capable))
+        .replace("{L}", &cap(caps.bios_capable));
     if board_warnings(want_bios, want_uefi, caps).iter().any(|(hard, _)| *hard) {
-        s.push_str(" - WARNING: this selection will NOT boot this PC");
+        s.push_str(&crate::locale::tr(" - WARNING: this selection will NOT boot this PC"));
     }
     s
 }
@@ -3724,9 +3722,19 @@ mod tests {
     #[test]
     fn board_note_short_flags_hard_conflicts() {
         use sys::FwCap::*;
+        // Pinned to English: board_note_short translates (see locale.rs).
+        let _guard = crate::locale::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("LSL_LANG", "en");
+        }
         let c = caps(false, No, Yes);
         assert!(board_note_short(true, true, &c).contains("WARNING"));
         assert!(!board_note_short(true, false, &c).contains("WARNING"));
+        unsafe {
+            std::env::remove_var("LSL_LANG");
+        }
     }
 
     #[test]

@@ -122,11 +122,11 @@ pub(crate) const INSTALL_LABEL: &str = "Install";
 /// Nav-button caption for `page`: "Install" only on the INSTALL page.
 /// Pure helper so the caption rule is unit-testable (the live button is
 /// covered by the win-install-page GUI test).
-pub(crate) fn nav_label(page: usize) -> &'static str {
+pub(crate) fn nav_label(page: usize) -> String {
     if page == INSTALL_PAGE {
-        INSTALL_LABEL
+        crate::locale::tr(INSTALL_LABEL)
     } else {
-        NEXT_LABEL
+        crate::locale::tr(NEXT_LABEL)
     }
 }
 
@@ -162,36 +162,41 @@ pub(crate) fn apply_boot_caps(items: &PageItems, letter: &str, uefi_flag: &str, 
         match &it.ctl {
             PageCtl::Check(cb, 5) => {
                 if caps.bios_ok {
-                    // Check by default when the box becomes available: a box
-                    // that was greyed out (or never touched) means the user
-                    // never made a choice, so default to on. An enabled box
-                    // the user deliberately unchecked keeps their choice.
-                    let was_off = cb.text().contains("unavailable")
-                        || cb.text().contains("built-in installer only");
+                    // Check by default when the box becomes available: the
+                    // enabled flag is the language-proof record - both
+                    // "off" states (unsupported stick, non-nofmt method)
+                    // disable the box, so a disabled box means the user
+                    // never made a choice and defaults to on. An enabled
+                    // box the user deliberately unchecked keeps their choice.
+                    let was_off = !cb.enabled();
                     cb.set_enabled(true);
-                    cb.set_text("BIOS/CSM boot (grub4dos MBR, no reformat)");
+                    cb.set_text(&crate::locale::tr("BIOS/CSM boot (grub4dos MBR, no reformat)"));
                     if first || was_off {
                         cb.set_check_state(nwg::CheckBoxState::Checked);
                     }
                 } else {
                     cb.set_enabled(false);
                     cb.set_check_state(nwg::CheckBoxState::Unchecked);
-                    cb.set_text(&format!("BIOS boot (unavailable - {})", caps.bios_why));
+                    cb.set_text(
+                        &crate::locale::tr("BIOS boot (unavailable - {E})")
+                            .replace("{E}", &caps.bios_why),
+                    );
                 }
             }
             PageCtl::Check(cb, 6) => {
                 if caps.uefi_ok {
-                    let was_off = cb.text().contains("unavailable")
-                        || cb.text().contains("built-in installer only");
+                    let was_off = !cb.enabled();
                     cb.set_enabled(true);
-                    cb.set_text("UEFI boot (BOOTX64.EFI, Secure Boot off)");
                     if first || was_off {
                         cb.set_check_state(nwg::CheckBoxState::Checked);
                     }
                 } else {
                     cb.set_enabled(false);
                     cb.set_check_state(nwg::CheckBoxState::Unchecked);
-                    cb.set_text(&format!("UEFI boot (unavailable - {})", caps.uefi_why));
+                    cb.set_text(
+                        &crate::locale::tr("UEFI boot (unavailable - {E})")
+                            .replace("{E}", &caps.uefi_why),
+                    );
                 }
             }
             _ => {}
@@ -237,13 +242,21 @@ fn iso_row_path(items: &PageItems, from: usize) -> String {
     String::new()
 }
 
-/// Write mode of the checked kind-3 method radio ("rufus" fallback).
+/// INSTALL-page write-method radios, in build order (see the `methods`
+/// array at the INSTALL page construction): position IS the mode, so
+/// harvesting never parses the (translated) label text.
+const METHOD_ORDER: &[&str] = &["nofmt", "rufus", "skip"];
+
+/// Write mode of the checked kind-3 method radio ("nofmt" when none
+/// checked). Positional over METHOD_ORDER - never parse label text.
 fn checked_method(items: &PageItems) -> &'static str {
+    let mut idx = 0usize;
     for it in items.borrow().iter() {
         if let PageCtl::Radio(rb, 3) = &it.ctl {
             if rb.check_state() == nwg::RadioButtonState::Checked {
-                return write_mode_from_label(&rb.text());
+                return METHOD_ORDER.get(idx).copied().unwrap_or("rufus");
             }
+            idx += 1;
         }
     }
     "nofmt"
@@ -264,8 +277,8 @@ pub(crate) fn apply_method_caps(
     if mode == "nofmt" {
         for it in items.borrow().iter() {
             match &it.ctl {
-                PageCtl::Check(cb, 5) => bios_tt.set_text(&cb.handle, BIOS_TT),
-                PageCtl::Check(cb, 6) => uefi_tt.set_text(&cb.handle, UEFI_TT),
+                PageCtl::Check(cb, 5) => bios_tt.set_text(&cb.handle, &crate::locale::tr(BIOS_TT)),
+                PageCtl::Check(cb, 6) => uefi_tt.set_text(&cb.handle, &crate::locale::tr(UEFI_TT)),
                 _ => {}
             }
         }
@@ -277,35 +290,19 @@ pub(crate) fn apply_method_caps(
             PageCtl::Check(cb, 5) => {
                 cb.set_enabled(false);
                 cb.set_check_state(nwg::CheckBoxState::Unchecked);
-                cb.set_text("BIOS/CSM boot (built-in installer only)");
-                bios_tt.set_text(&cb.handle, METHOD_TT);
+                cb.set_text(&crate::locale::tr("BIOS/CSM boot (built-in installer only)"));
+                bios_tt.set_text(&cb.handle, &crate::locale::tr(METHOD_TT));
             }
             PageCtl::Check(cb, 6) => {
                 cb.set_enabled(false);
                 cb.set_check_state(nwg::CheckBoxState::Unchecked);
-                cb.set_text("UEFI boot (built-in installer only)");
-                uefi_tt.set_text(&cb.handle, METHOD_TT);
+                cb.set_text(&crate::locale::tr("UEFI boot (built-in installer only)"));
+                uefi_tt.set_text(&cb.handle, &crate::locale::tr(METHOD_TT));
             }
             _ => {}
         }
     }
     refresh_fw_note(items);
-}
-
-/// Map a write-method radio label to its mode ("rufus" | "nofmt" | "skip").
-/// Pure helper so the mapping is unit-testable (harvest itself needs live
-/// Win32 controls and is covered by the win-install-page GUI test).
-pub(crate) fn write_mode_from_label(t: &str) -> &'static str {
-    let tl = t.to_lowercase();
-    if tl.contains("non-destructive") {
-        "nofmt"
-    } else if tl.starts_with("skip") {
-        "skip"
-    } else if tl.contains("rufus") {
-        "rufus"
-    } else {
-        "nofmt"
-    }
 }
 
 /// Distro options (page 1 "Download Fresh" radios, from the PS GUI).
@@ -381,30 +378,55 @@ pub fn iso_arch_64(name: &str) -> Option<bool> {
 
 pub fn recommendation_text() -> (String, String) {
     let ram_bytes = sys::total_ram();
+    let ram_mb = ram_bytes / sys::MB;
+    let ram_gb = ram_bytes as f64 / sys::GB as f64;
+    let cpu64 = is_64bit_capable();
+    let os64 = sys::is_64bit_os();
     if ram_bytes > 0 && ram_bytes <= 256 * sys::MB {
         return (
-            "Tiny CorePlus is the recommended option.".into(),
-            format!(
-                "Your machine has only {} MB of RAM. We recommend Tiny CorePlus, which needs as little as 46 MB and runs in 128 MB -- lighter than the minimalist 0.25 GB antiX. It is 32-bit, so it runs whether or not your machine supports 64-bit.",
-                ram_bytes / sys::MB
+            crate::locale::tr("Tiny CorePlus is the recommended option."),
+            substitute_rec(
+                &crate::locale::tr("Your machine has only {M} MB of RAM. We recommend Tiny CorePlus, which needs as little as 46 MB and runs in 128 MB -- lighter than the minimalist 0.25 GB antiX. It is 32-bit, so it runs whether or not your machine supports 64-bit."),
+                ram_mb,
+                ram_gb,
+                "",
             ),
         );
     }
     // Pure decision matrix (unit-tested below); probes stay at the edges.
-    recommendation_for(is_64bit_capable(), sys::is_64bit_os(), ram_bytes as f64 / sys::GB as f64)
+    let (title_id, body_tpl) = recommendation_template(cpu64, os64, ram_gb);
+    let wow = if cpu64 && !os64 {
+        crate::locale::tr(" Note: the Windows running here is 32-bit, but your CPU does support 64-bit, so 64-bit live USBs boot normally.")
+    } else {
+        String::new()
+    };
+    (
+        crate::locale::tr(&title_id),
+        substitute_rec(&crate::locale::tr(&body_tpl), ram_mb, ram_gb, &wow),
+    )
 }
 
-/// Recommendation text from probed facts. `cpu64` = hardware long mode,
+/// Substitute {M} (MiB integer), {G0}/{G1} (GiB, 0/1 decimals) and {W}
+/// (pre-translated note or "") into a recommendation template. Pure.
+fn substitute_rec(template: &str, ram_mb: u64, ram_gb: f64, wow: &str) -> String {
+    template
+        .replace("{M}", &ram_mb.to_string())
+        .replace("{G0}", &format!("{:.0}", ram_gb))
+        .replace("{G1}", &format!("{:.1}", ram_gb))
+        .replace("{W}", wow)
+}
+
+/// Recommendation template from probed facts. `cpu64` = hardware long mode,
 /// `os64` = installed Windows is 64-bit. The two differ on 32-bit Windows
 /// atop a 64-bit CPU - where 64-bit live USBs still boot fine.
-fn recommendation_for(cpu64: bool, os64: bool, ram_gb: f64) -> (String, String) {
+/// Returns (title msgid, body template); {W} is present only when the
+/// 32-bit-Windows note applies. Templates stay English here so the matrix
+/// is unit-testable without a language; recommendation_text() translates
+/// and substitutes at the display boundary.
+fn recommendation_template(cpu64: bool, os64: bool, ram_gb: f64) -> (String, String) {
     // 32-bit Windows on 64-bit hardware: say so once, then recommend
     // exactly as for 64-bit Windows (same ISOs boot).
-    let wow_note = if cpu64 && !os64 {
-        " Note: the Windows running here is 32-bit, but your CPU does support 64-bit, so 64-bit live USBs boot normally."
-    } else {
-        ""
-    };
+    let w = if cpu64 && !os64 { "{W}" } else { "" };
     if !cpu64 {
         (
             "antiX 26 is the recommended option.".into(),
@@ -413,34 +435,22 @@ fn recommendation_for(cpu64: bool, os64: bool, ram_gb: f64) -> (String, String) 
     } else if ram_gb >= 4.0 {
         (
             "Linux Mint Cinnamon is the recommended option.".into(),
-            format!(
-                "Your machine supports 64-bit and has {:.0} GB of RAM, meeting Cinnamon's recommended 4 GB spec. There is no need to use the minimalist 0.25 GB antiX.{}",
-                ram_gb, wow_note
-            ),
+            "Your machine supports 64-bit and has {G0} GB of RAM, meeting Cinnamon's recommended 4 GB spec. There is no need to use the minimalist 0.25 GB antiX.".to_string() + w,
         )
     } else if ram_gb >= 2.0 {
         (
             "Linux Mint Cinnamon is the recommended option.".into(),
-            format!(
-                "Your machine supports 64-bit and has {:.0} GB of RAM, meeting Cinnamon's minimum requirements of 2 GB, but not the recommended 4 GB. Consider enabling the experimental pagefile.sys swap. Your machine may be slow, but we still recommend Cinnamon over the minimalist 0.25 GB antiX.{}",
-                ram_gb, wow_note
-            ),
+            "Your machine supports 64-bit and has {G0} GB of RAM, meeting Cinnamon's minimum requirements of 2 GB, but not the recommended 4 GB. Consider enabling the experimental pagefile.sys swap. Your machine may be slow, but we still recommend Cinnamon over the minimalist 0.25 GB antiX.".to_string() + w,
         )
     } else if ram_gb >= 1.0 {
         (
             "Lubuntu 24.04 is the recommended option (Xubuntu 24.04 also viable).".into(),
-            format!(
-                "Your machine supports 64-bit and has {:.0} GB of RAM (1-2 GB). We recommend Lubuntu 24.04, which is light enough for 1 GB. Xubuntu 24.04 is also a viable option on 1 GB, but it is a bit heavier and should still run.{}",
-                ram_gb, wow_note
-            ),
+            "Your machine supports 64-bit and has {G0} GB of RAM (1-2 GB). We recommend Lubuntu 24.04, which is light enough for 1 GB. Xubuntu 24.04 is also a viable option on 1 GB, but it is a bit heavier and should still run.".to_string() + w,
         )
     } else {
         (
             "antiX 26 is the recommended option.".into(),
-            format!(
-                "Your machine supports 64-bit, but only has {:.1} GB of RAM. We recommend the minimalist 0.25 GB antiX distro.{}",
-                ram_gb, wow_note
-            ),
+            "Your machine supports 64-bit, but only has {G1} GB of RAM. We recommend the minimalist 0.25 GB antiX distro.".to_string() + w,
         )
     }
 }
@@ -615,20 +625,20 @@ fn spawn_hw_rating(tx: mpsc::Sender<HwMsg>, bundle_dir: String) {
 /// 0) for an out-of-range index on real Windows, hanging the loop forever
 /// (works under wine only because wine returns 0). Insert columns directly.
 fn lv_insert_column_direct(lv: &nwg::ListView, index: usize, text: &str, width: i32) {
-    // (Patch-Win95) ANSI column insert: Win95 comctl32 has no W-message
-    // support and SendMessageW itself is a stub.
-    use winapi::um::commctrl::{LVM_INSERTCOLUMNA, LVCOLUMNA, LVCF_TEXT, LVCF_WIDTH};
-    use winapi::um::winuser::SendMessageA;
+    // Unicode column insert: the ListView is created via CreateWindowExW
+    // (see vendored window.rs), so LVM_INSERTCOLUMNW carries Thai headers
+    // verbatim instead of '?'-izing them through the ANSI codepage.
+    use winapi::um::commctrl::{LVM_INSERTCOLUMNW, LVCOLUMNW, LVCF_TEXT, LVCF_WIDTH};
+    use winapi::um::winuser::SendMessageW;
     let Some(hwnd) = lv.handle.hwnd() else { return };
-    let mut atext: Vec<u8> = text.bytes().collect();
-    atext.push(0);
-    let mut col: LVCOLUMNA = unsafe { std::mem::zeroed() };
+    let mut atext: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    let mut col: LVCOLUMNW = unsafe { std::mem::zeroed() };
     col.mask = LVCF_TEXT | LVCF_WIDTH;
     col.cx = width;
-    col.pszText = atext.as_mut_ptr() as *mut i8;
+    col.pszText = atext.as_mut_ptr();
     col.cchTextMax = atext.len() as i32;
     unsafe {
-        SendMessageA(hwnd, LVM_INSERTCOLUMNA, index as usize, &col as *const LVCOLUMNA as isize);
+        SendMessageW(hwnd, LVM_INSERTCOLUMNW, index as usize, &col as *const LVCOLUMNW as isize);
     }
 }
 
@@ -1591,6 +1601,19 @@ pub struct GuiWork {
     /// Set when the SFS->HDD copy was already performed inside the GUI
     /// working phase so main() does not repeat it.
     pub sfs_hdd_done: bool,
+    /// Set when the ENTIRE post-write tail (lsl files, rust tools,
+    /// drivers, HDD copy, finalize, boot-sector commit, shortcuts) already
+    /// ran inside the dialog on its own stage bars. main() then skips all
+    /// of it and the reboot spawn is immediate - nothing waits behind the
+    /// boot button.
+    pub tail_done: bool,
+    /// Target volume letter the in-dialog tail completed on.
+    pub vol_letter: Option<String>,
+    /// shutdown.exe args decided in-dialog (after the in-dialog boot setup
+    /// on the Boot-setup bar). main() spawns the reboot with no extra work.
+    pub reboot_args: Option<String>,
+    /// Telemetry boot_method recorded in-dialog ("usb-one-time" etc).
+    pub boot_method: Option<String>,
 }
 
 impl GuiWork {
@@ -1607,9 +1630,46 @@ impl GuiWork {
             boot_choice: None,
             back: true,
             sfs_hdd_done: false,
+            tail_done: false,
+            vol_letter: None,
+            reboot_args: None,
+            boot_method: None,
         }
     }
 }
+
+/// Working-phase stages. EVERY long step after the Install click runs
+/// inside the dialog and owns one label + one progress bar, so the user
+/// watches each phase fill its own bar and the reboot button never sits
+/// behind hidden console work. Indices are shared with main.rs (the tail
+/// driver) - append only, never reorder.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WorkStage {
+    Iso = 0,
+    UsbWrite = 1,
+    UsbCheck = 2,
+    LslFiles = 3,
+    RustTools = 4,
+    Drivers = 5,
+    HddCopy = 6,
+    Finalize = 7,
+    BootSectors = 8,
+    BootSetup = 9,
+}
+
+pub const WORK_STAGES: &[&str] = &[
+    "ISO download",
+    "USB write",
+    "USB check",
+    "LSL files",
+    "Rust tools",
+    "Drivers",
+    "HDD copy",
+    "Finalize",
+    "Boot sectors",
+    "Boot setup",
+];
+pub const WORK_STAGE_COUNT: usize = 10;
 
 /// Raw-HWND facade over the wizard window while the working phase runs and
 /// during the FINISHED / FAILED summary page shown at the very end.
@@ -1630,6 +1690,9 @@ pub struct WorkingUi {
     nav_cancel: usize,
     dl: usize, // "Downloading ..." label (hidden on the final page)
     dlbar: usize, // the persistent ISO progress bar (hidden on the final page)
+    pub stage_labels: Vec<usize>, // one label per WORK_STAGES entry
+    pub stage_bars: Vec<usize>,   // one progress bar per WORK_STAGES entry
+    pub active_stage: Cell<usize>, // set_progress routes here (besides dlbar)
     done: Rc<std::cell::Cell<bool>>, // set by the Finish/Close button click
     copy_clicked: Rc<std::cell::Cell<bool>>,
     open_clicked: Rc<std::cell::Cell<bool>>,
@@ -1670,6 +1733,116 @@ impl WorkingUi {
                 format!("{} MB", done / sys::MB)
             };
             set_wnd_text(self.dl, &text);
+        }
+        // Mirror into the active stage's own bar so every phase has live
+        // movement on its dedicated control, not just the legacy dlbar.
+        let a = self.active_stage.get();
+        if a < self.stage_bars.len() {
+            self.set_stage_progress(a, done, total);
+        }
+    }
+
+    fn set_bar_units(&self, h: usize, done: u64, total: u64) {
+        const PBM_SETRANGE32: u32 = 1030;
+        const PBM_SETPOS: u32 = 1026;
+        if h == 0 || !is_window(h) {
+            return;
+        }
+        let (max, pos) = bar_units(done, total);
+        use winapi::um::winuser::SendMessageW;
+        unsafe {
+            SendMessageW(h as _, PBM_SETRANGE32, 0, max as isize);
+            SendMessageW(h as _, PBM_SETPOS, pos as _, 0);
+        }
+    }
+
+    /// Route subsequent set_progress calls to stage `idx`'s own bar.
+    pub fn set_active_stage(&self, idx: usize) {
+        if idx < WORK_STAGE_COUNT {
+            self.active_stage.set(idx);
+        }
+        self.pump();
+    }
+
+    /// Directly drive stage `idx`'s own progress bar (0..total bytes).
+    pub fn set_stage_progress(&self, idx: usize, done: u64, total: u64) {
+        if let Some(&h) = self.stage_bars.get(idx) {
+            self.set_bar_units(h, done, total);
+            repaint(h);
+        }
+    }
+
+    /// Name the current operation on stage `idx`'s label:
+    /// "STAGE - detail". Empty detail restores the bare stage name.
+    pub fn set_stage_status(&self, idx: usize, detail: &str) {
+        if let (Some(&h), Some(&name)) = (self.stage_labels.get(idx), WORK_STAGES.get(idx)) {
+            let text = if detail.is_empty() {
+                name.to_string()
+            } else {
+                format!("{} - {}", name, detail)
+            };
+            set_wnd_text(h, &text);
+            repaint(h);
+        }
+        self.pump();
+    }
+
+    /// Mark stage `idx` complete (bar to 100%, label with check).
+    pub fn set_stage_done(&self, idx: usize) {
+        if let (Some(&b), Some(&name)) = (self.stage_bars.get(idx), WORK_STAGES.get(idx)) {
+            self.set_bar_units(b, 1, 1);
+            repaint(b);
+            if let Some(&h) = self.stage_labels.get(idx) {
+                set_wnd_text(h, &format!("{} - done", name));
+                repaint(h);
+            }
+        }
+        self.pump();
+    }
+
+    /// Show the working-phase stage rows and lay them out for the live
+    /// client size. Called once on Install; each row is label-above-bar.
+    pub fn show_stages(&self) {
+        let (cw, ch) = client_size(self.main as winapi::shared::windef::HWND);
+        self.layout_stages(cw, ch);
+        for &h in &self.stage_labels {
+            self.raw_show(h, true);
+        }
+        for &h in &self.stage_bars {
+            self.raw_show(h, true);
+        }
+        self.repaint_window();
+    }
+
+    pub fn hide_stages(&self) {
+        for &h in &self.stage_labels {
+            self.raw_show(h, false);
+        }
+        for &h in &self.stage_bars {
+            self.raw_show(h, false);
+        }
+    }
+
+    /// Position the stage rows: title lives in `status`, rows start below
+    /// it and stack label (16px) + bar (14px) with a 6px gap. Pure geometry
+    /// from the client size so resize never overlaps the nav strip.
+    pub fn layout_stages(&self, cw: i32, ch: i32) {
+        let fw = (cw - 2 * MARGIN).max(MIN_CW - 2 * MARGIN);
+        // status title near the top, then the ten stage rows
+        set_ctl_rect(self.status, MARGIN + 10, 84, (fw - 20).max(60), 40);
+        let mut y = 130;
+        let row_gap = 6;
+        for i in 0..self.stage_labels.len().min(self.stage_bars.len()).min(WORK_STAGE_COUNT) {
+            let lh = *self.stage_labels.get(i).unwrap_or(&0);
+            let bh = *self.stage_bars.get(i).unwrap_or(&0);
+            let bw = (fw - 20).max(60);
+            // keep rows above the nav strip; squeeze gaps when tiny
+            if y + 16 + 14 + row_gap > ch - NAV_H - 40 {
+                break;
+            }
+            set_ctl_rect(lh, MARGIN + 10, y, bw, 16);
+            set_ctl_rect(bh, MARGIN + 10, y + 16, bw, 14);
+            y += 16 + 14 + row_gap;
         }
     }
 
@@ -1769,6 +1942,7 @@ impl WorkingUi {
         self.raw_show(self.status, false); // working-status label
         self.raw_show(self.dl, false);
         self.raw_show(self.dlbar, false);
+        self.hide_stages();
         // action buttons above every sibling or real-mouse clicks die
         // silently on the covering control (see bring_buttons_top).
         bring_buttons_top(&[self.sum_btn, self.sum_copy, self.sum_open, self.sum_back]);
@@ -1842,7 +2016,10 @@ impl WorkingUi {
     /// mirroring the standalone boot dialog. Blocks pumping the GUI until
     /// a choice is made; window close / Escape means Don't reboot. `can_usb`
     /// hides the one-time-boot button where bcdedit can't work. The window
-    /// is destroyed on return - the console tail + reboot follow.
+    /// stays alive on return - the caller runs the (fast, in-dialog)
+    /// boot setup on the Boot-setup stage bar and only then closes the
+    /// window, so the reboot() spawn is the last thing before the OS
+    /// leaves and never waits behind hidden work.
     pub fn ask_boot_choice(&self, body: &str, can_usb: bool) -> crate::boot::BootChoice {
         use crate::boot::BootChoice;
         let (cw, ch) = client_size(self.main as winapi::shared::windef::HWND);
@@ -1885,6 +2062,7 @@ impl WorkingUi {
         self.raw_show(self.status, false);
         self.raw_show(self.dl, false);
         self.raw_show(self.dlbar, false);
+        self.hide_stages();
         // same silent-click-eater guard as the summary page: the four
         // stacked actions must be the topmost siblings (see
         // bring_buttons_top). Hidden (can_usb=false) buttons stay hidden.
@@ -1954,8 +2132,9 @@ impl WorkingUi {
             }
             std::thread::sleep(std::time::Duration::from_millis(60));
         }
-        // page's job is done - destroy the window; the console tail and the
-        // reboot itself follow (both need no window).
+        // page's job is done - the window stays alive; the caller finishes
+        // the boot setup (bcdedit/shortcuts already done in-dialog) with the
+        // Boot-setup bar visible and then closes + reboots with no extra work.
         let picked = choice.unwrap_or(BootChoice::None);
         blog(&format!("boot choice: {}", match picked { // DIAG-TEMP: ungated
             BootChoice::Usb => "usb",
@@ -1963,7 +2142,6 @@ impl WorkingUi {
             BootChoice::Fw => "fw",
             BootChoice::None => "none",
         }));
-        self.close();
         picked
     }
 
@@ -2258,11 +2436,11 @@ pub fn run_gui(
         .flags(nwg::WindowFlags::MAIN_WINDOW)
         .size((DEF_CW, DEF_CH))
         .center(true)
-        .title(&format!(
-            "lsl-usb installer {}",
-            std::fs::read_to_string("VERSION")
+        .title(&crate::locale::tr("lsl-usb installer {V}").replace(
+            "{V}",
+            &std::fs::read_to_string("VERSION")
                 .map(|s| s.trim().to_string())
-                .unwrap_or_default()
+                .unwrap_or_default(),
         ))
         .build(&mut window);
     #[allow(deprecated)]
@@ -2297,9 +2475,9 @@ pub fn run_gui(
     let sb_text = format!(
         "Secure Boot: {}",
         match crate::boot::secure_boot_status() {
-            sys::SecBoot::Enabled => "Enabled - Mint's signed shim usually boots fine; you may see a one-time 'MOK management' screen (choose Enroll MOK).",
-            sys::SecBoot::Disabled => "Disabled - no Secure Boot issues expected.",
-            sys::SecBoot::Unknown => "Unknown - could not query (BIOS firmware, or run as Administrator for a firmware-level query).",
+            sys::SecBoot::Enabled => crate::locale::tr("Enabled - Mint's signed shim usually boots fine; you may see a one-time 'MOK management' screen (choose Enroll MOK)."),
+            sys::SecBoot::Disabled => crate::locale::tr("Disabled - no Secure Boot issues expected."),
+            sys::SecBoot::Unknown => crate::locale::tr("Unknown - could not query (BIOS firmware, or run as Administrator for a firmware-level query)."),
         }
     );
     let _ = nwg::Label::builder()
@@ -2317,7 +2495,7 @@ pub fn run_gui(
         .build(&mut frame_hw);
         let frame_hw = Rc::new(frame_hw);
     let _ = nwg::Label::builder()
-        .text("Linux hardware compatibility (linux-hardware.org LKDDb): rating devices...")
+        .text(&crate::locale::tr("Linux hardware compatibility (linux-hardware.org LKDDb): rating devices..."))
         .position((10, 6))
         .size((820, 20))
         .parent(&*frame_hw)
@@ -2349,17 +2527,17 @@ pub fn run_gui(
     }
     install_hw_custom_draw(&lv_hw, &*frame_hw);
     for (i, (text, width)) in [
-        ("Category", 110),
-        ("Support", 250),
-        ("Device", 314),
-        ("ID", 100),
-        ("www", 64),
+        (crate::locale::tr("Category"), 110),
+        (crate::locale::tr("Support"), 250),
+        (crate::locale::tr("Device"), 314),
+        ("ID".to_string(), 100),
+        ("www".to_string(), 64),
     ].iter().enumerate() {
         lv_insert_column_direct(&lv_hw, i, text, *width);
     }
     let mut btn_reboot: nwg::Button = Default::default();
     let _ = nwg::Button::builder()
-        .text("Reboot")
+        .text(&crate::locale::tr("Reboot"))
         .position((8, 706))
         .size((90, 28))
         .parent(&window)
@@ -2381,8 +2559,9 @@ pub fn run_gui(
     );
     let rec_help = if have_mint_hint.is_some() {
         format!(
-            "{} An up-to-date Mint ISO is already on this machine - it will be reused (no download needed).",
-            rec_help
+            "{} {}",
+            rec_help,
+            crate::locale::tr("An up-to-date Mint ISO is already on this machine - it will be reused (no download needed).")
         )
     } else {
         rec_help
@@ -2605,11 +2784,11 @@ pub fn run_gui(
         // paint over the following row.
         let path_head = format!("{}  ({:.2} GB)", iso, sz as f64 / sys::GB as f64);
         let suffix = if too_new {
-            "<- 64-bit: will NOT boot this 32-bit machine"
+            crate::locale::tr("<- 64-bit: will NOT boot this 32-bit machine")
         } else if is_the_mint {
-            "<- recommended (up-to-date, reuse instead of downloading)"
+            crate::locale::tr("<- recommended (up-to-date, reuse instead of downloading)")
         } else {
-            ""
+            String::new()
         };
         let path_label = if suffix.is_empty() {
             path_head
@@ -2666,14 +2845,14 @@ pub fn run_gui(
 
     // fixed controls at the bottom of the page
     let _ = nwg::Button::builder()
-        .text("Install Everything (voidtools)")
+        .text(&crate::locale::tr("Install Everything (voidtools)"))
         .position((10, 566))
         .size((400, 26))
         .parent(&*frame_iso)
         .build(&mut btn_everything);
         let btn_everything = Rc::new(btn_everything);
     if !crate::lslfiles::everything_path().is_empty() {
-        btn_everything.set_text("Everything already installed (search ready)");
+        btn_everything.set_text(&crate::locale::tr("Everything already installed (search ready)"));
     }
 
     // ---- page 2: flatpaks (scrollable checkbox grid + extras) ----
@@ -2684,7 +2863,7 @@ pub fn run_gui(
         .build(&mut frame_fp);
         let frame_fp = Rc::new(frame_fp);
     let _ = nwg::Label::builder()
-        .text("Flatpak apps to preload (checked = installed from Windows):")
+        .text(&crate::locale::tr("Flatpak apps to preload (checked = installed from Windows):"))
         .position((10, 6))
         .size((560, 18))
         .parent(&*frame_fp)
@@ -2714,7 +2893,7 @@ pub fn run_gui(
     {
         let mut cb: Box<nwg::CheckBox> = Box::default();
         let _ = nwg::CheckBox::builder()
-            .text("FSearch (Everything-style file search)")
+            .text(&crate::locale::tr("FSearch (Everything-style file search)"))
             .position((10, 240))
             .size((560, 20))
             .parent(&*frame_fp)
@@ -2730,7 +2909,7 @@ pub fn run_gui(
         });
         let mut l: Box<nwg::Label> = Box::default();
         let _ = nwg::Label::builder()
-            .text("Extra flatpak IDs (comma-separated):")
+            .text(&crate::locale::tr("Extra flatpak IDs (comma-separated):"))
             .position((10, 270))
             .size((560, 18))
             .parent(&*frame_fp)
@@ -2817,7 +2996,7 @@ pub fn run_gui(
             sys.push(PageItem { ctl: PageCtl::Check(cb, kind), x, y, w: -20, h: 20, idx: 0 });
         };
         let mut sys = sys_items.borrow_mut();
-        push_lbl(&mut sys, "WSL VHDX paths (one per line):", 10, 6, -20, 18, false);
+        push_lbl(&mut sys, &crate::locale::tr("WSL VHDX paths (one per line):"), 10, 6, -20, 18, false);
         let mut vhdx: Box<nwg::TextBox> = Box::default();
         let _ = nwg::TextBox::builder()
             .flags(multiline_edit_flags())
@@ -2836,7 +3015,7 @@ pub fn run_gui(
         // (Win10/11) re-assert the height (see multiline_edit_flags).
         vhdx.set_size(410, 160);
         sys.push(PageItem { ctl: PageCtl::Edit(vhdx, 1), x: 10, y: 26, w: -20, h: 160, idx: 0 });
-        push_lbl(&mut sys, "LSL_DATA_DIR (Linux path, e.g. /mnt/c/Users/you/lsl-usb):", 10, 192, -20, 18, false);
+        push_lbl(&mut sys, &crate::locale::tr("LSL_DATA_DIR (Linux path, e.g. /mnt/c/Users/you/lsl-usb):"), 10, 192, -20, 18, false);
         let default_data = format!(
             "/mnt/c/Users/{}/lsl-usb",
             sys::env_var("USERNAME").unwrap_or_default()
@@ -2851,7 +3030,7 @@ pub fn run_gui(
         sys.push(PageItem { ctl: PageCtl::EditLine(data, 2), x: 10, y: 212, w: -134, h: 22, idx: 0 });
         let mut browse: Box<nwg::Button> = Box::default();
         let _ = nwg::Button::builder()
-            .text("Browse...")
+            .text(&crate::locale::tr("Browse..."))
             .position((760, 211))
             .size((90, 24))
             .parent(&*frame_sys)
@@ -2901,7 +3080,7 @@ pub fn run_gui(
         let mut wifi = wifi_items.borrow_mut();
         let mut master: Box<nwg::CheckBox> = Box::default();
         let _ = nwg::CheckBox::builder()
-            .text("Copy Wifi Settings to LSL")
+            .text(&crate::locale::tr("Copy Wifi Settings to LSL"))
             .position((10, 6))
             .size((560, 20))
             .parent(&*frame_wifi)
@@ -2910,7 +3089,7 @@ pub fn run_gui(
         wifi.push(PageItem { ctl: PageCtl::Check(master, 9), x: 10, y: 6, w: -20, h: 20, idx: 0 });
         let mut cap: Box<nwg::Label> = Box::default();
         let _ = nwg::Label::builder()
-            .text("Networks to copy (checked = include in wifi.sh):")
+            .text(&crate::locale::tr("Networks to copy (checked = include in wifi.sh):"))
             .position((10, 30))
             .size((560, 18))
             .parent(&*frame_wifi)
@@ -2920,7 +3099,7 @@ pub fn run_gui(
         if wifi_names.is_empty() {
             let mut none: Box<nwg::Label> = Box::default();
             let _ = nwg::Label::builder()
-                .text("No saved wifi profiles found.")
+                .text(&crate::locale::tr("No saved wifi profiles found."))
                 .position((20, WIFI_Y0))
                 .size((560, 20))
                 .parent(&*frame_wifi)
@@ -2979,7 +3158,7 @@ pub fn run_gui(
         // title (bold) - the win-install-page GUI test keys on this text
         let mut title: Box<nwg::Label> = Box::default();
         let _ = nwg::Label::builder()
-            .text("INSTALL NOW")
+            .text(&crate::locale::tr("INSTALL NOW"))
             .position((10, iy))
             .size((560, 24))
             .parent(&*frame_install)
@@ -2989,7 +3168,7 @@ pub fn run_gui(
         iy += 28;
         let mut help: Box<nwg::Label> = Box::default();
         let _ = nwg::Label::builder()
-            .text("Choose the target USB first, then how to write the image.")
+            .text(&crate::locale::tr("Choose the target USB first, then how to write the image."))
             .position((10, iy))
             .size((560, 18))
             .parent(&*frame_install)
@@ -3002,7 +3181,7 @@ pub fn run_gui(
         // follow it. Removable volumes, first pre-checked.
         let mut cap: Box<nwg::Label> = Box::default();
         let _ = nwg::Label::builder()
-            .text("Target USB (for the non-destructive copy):")
+            .text(&crate::locale::tr("Target USB (for the non-destructive copy):"))
             .position((10, iy))
             .size((560, 18))
             .parent(&*frame_install)
@@ -3018,7 +3197,7 @@ pub fn run_gui(
         if targets.is_empty() {
             let mut none: Box<nwg::Label> = Box::default();
             let _ = nwg::Label::builder()
-                .text("[No removable USB drives detected]")
+                .text(&crate::locale::tr("[No removable USB drives detected]"))
                 .position((26, iy))
                 .size((560, 20))
                 .parent(&*frame_install)
@@ -3049,7 +3228,7 @@ pub fn run_gui(
         // Bold heading above the method list (matches the section captions).
         let mut method_cap: Box<nwg::Label> = Box::default();
         let _ = nwg::Label::builder()
-            .text("Write method:")
+            .text(&crate::locale::tr("Write method:"))
             .position((10, iy))
             .size((560, 18))
             .parent(&*frame_install)
@@ -3076,9 +3255,9 @@ pub fn run_gui(
         };
         let mut rufus_tt: Option<&'static mut nwg::Tooltip> = None;
         let methods = [
-            ("Built-in non-destructive (recommended - no reformat, keeps existing files; BIOS + UEFI)", "nofmt"),
-            ("Rufus (well tested, UEFI + BIOS; rewrites the stick)", "rufus"),
-            ("Skip - I will write the USB myself (like --skip-rufus)", "skip"),
+            (crate::locale::tr("Built-in non-destructive (recommended - no reformat, keeps existing files; BIOS + UEFI)"), "nofmt"),
+            (crate::locale::tr("Rufus (well tested, UEFI + BIOS; rewrites the stick)"), "rufus"),
+            (crate::locale::tr("Skip - I will write the USB myself (like --skip-rufus)"), "skip"),
         ];
         for (n, (text, mode)) in methods.iter().enumerate() {
             let mut rb: Box<nwg::RadioButton> = Box::default();
@@ -3088,7 +3267,7 @@ pub fn run_gui(
                 } else {
                     nwg::RadioButtonFlags::VISIBLE
                 })
-                .text(*text)
+                .text(text)
                 .position((10, iy))
                 .size((780, 20))
                 .parent(&*frame_install)
@@ -3102,7 +3281,9 @@ pub fn run_gui(
                 }
                 rufus_tt.as_mut().unwrap().register(
                     rb.as_ref(),
-                    "Rufus requires Windows 7 or later - use the built-in non-destructive write instead.",
+                    &crate::locale::tr(
+                        "Rufus requires Windows 7 or later - use the built-in non-destructive write instead.",
+                    ),
                 );
             } else if effective_pre == *mode {
                 rb.set_check_state(nwg::RadioButtonState::Checked);
@@ -3117,16 +3298,16 @@ pub fn run_gui(
         for (kind, text) in [(5u8, "BIOS/CSM boot (grub4dos MBR, no reformat)"), (6u8, "UEFI boot (BOOTX64.EFI, Secure Boot off)")] {
             let mut cb: Box<nwg::CheckBox> = Box::default();
             let _ = nwg::CheckBox::builder()
-                .text(text)
+                .text(&crate::locale::tr(text))
                 .position((10, iy))
                 .size((780, 20))
                 .parent(&*frame_install)
                 .build(&mut cb);
             cb.set_check_state(nwg::CheckBoxState::Checked);
             if kind == 5 {
-                bios_tt.register(cb.as_ref(), BIOS_TT);
+                bios_tt.register(cb.as_ref(), &crate::locale::tr(BIOS_TT));
             } else {
-                uefi_tt.register(cb.as_ref(), UEFI_TT);
+                uefi_tt.register(cb.as_ref(), &crate::locale::tr(UEFI_TT));
             }
             items.push(PageItem { ctl: PageCtl::Check(cb, kind), x: 10, y: iy, w: -20, h: 20, idx: 0 });
             iy += 24;
@@ -3154,12 +3335,12 @@ pub fn run_gui(
         {
             let mut cb: Box<nwg::CheckBox> = Box::default();
             let _ = nwg::CheckBox::builder()
-                .text("Check whole USB after writing (slow: fills free space, verifies, cleans up)")
+                .text(&crate::locale::tr("Check whole USB after writing (slow: fills free space, verifies, cleans up)"))
                 .position((10, iy))
                 .size((780, 20))
                 .parent(&*frame_install)
                 .build(&mut cb);
-            check_tt.register(cb.as_ref(), "Adds a DeleteMe folder, fills free space with 4 GB pseudo-random chunks, reads every byte back with OS caching DISABLED (bad/fake sticks cannot hide), then deletes DeleteMe. Catches dying and fake-capacity flash.");
+            check_tt.register(cb.as_ref(), &crate::locale::tr("Adds a DeleteMe folder, fills free space with 4 GB pseudo-random chunks, reads every byte back with OS caching DISABLED (bad/fake sticks cannot hide), then deletes DeleteMe. Catches dying and fake-capacity flash."));
             items.push(PageItem { ctl: PageCtl::Check(cb, 8), x: 10, y: iy, w: -20, h: 20, idx: 0 });
             iy += 24;
         }
@@ -3200,7 +3381,7 @@ pub fn run_gui(
 
     // ---- nav buttons ----
     let _ = nwg::Button::builder()
-        .text("< Back")
+        .text(&crate::locale::tr("< Back"))
         .position((660, 706))
         .size((90, 28))
         .parent(&window)
@@ -3208,14 +3389,14 @@ pub fn run_gui(
         let btn_back = Rc::new(btn_back);
     btn_back.set_enabled(false);
     let _ = nwg::Button::builder()
-        .text("Next >")
+        .text(&crate::locale::tr("Next >"))
         .position((756, 706))
         .size((96, 28))
         .parent(&window)
         .build(&mut btn_next);
         let btn_next = Rc::new(btn_next);
     let _ = nwg::Button::builder()
-        .text("Cancel")
+        .text(&crate::locale::tr("Cancel"))
         .position((562, 706))
         .size((90, 28))
         .parent(&window)
@@ -3248,13 +3429,38 @@ pub fn run_gui(
     // stays visible instead of vanishing before Rufus appears
     let mut lbl_working: nwg::Label = Default::default();
     let _ = nwg::Label::builder()
-        .text("Preparing the USB install...")
+        .text(&crate::locale::tr("Preparing the USB install..."))
         .position((60, 320))
         .size((760, 100))
         .parent(&window)
         .build(&mut lbl_working);
     lbl_working.set_font(Some(&font_bold));
     lbl_working.set_visible(false);
+
+    // ---- working-phase per-stage progress (EVERY long step owns a bar) ----
+    // Ten label+bar rows, hidden until Install. nwg ownership stays here
+    // (plain locals like lbl_dl); WorkingUi only holds their HWNDs.
+    let mut stage_lbl_ctl: Vec<nwg::Label> = Vec::new();
+    let mut stage_bar_ctl: Vec<nwg::ProgressBar> = Vec::new();
+    for name in WORK_STAGES.iter() {
+        let mut lb: nwg::Label = Default::default();
+        let _ = nwg::Label::builder()
+            .text(*name)
+            .position((22, 130))
+            .size((800, 16))
+            .parent(&window)
+            .build(&mut lb);
+        lb.set_visible(false);
+        stage_lbl_ctl.push(lb);
+        let mut pb: nwg::ProgressBar = Default::default();
+        let _ = nwg::ProgressBar::builder()
+            .position((22, 146))
+            .size((800, 14))
+            .parent(&window)
+            .build(&mut pb);
+        pb.set_visible(false);
+        stage_bar_ctl.push(pb);
+    }
 
     // ---- FINISHED / FAILED summary page ----
     // A dedicated frame + heading + readonly body + one button, all hidden
@@ -3286,7 +3492,7 @@ pub fn run_gui(
         .parent(&window)
         .build(&mut sum_body);
     let _ = nwg::Button::builder()
-        .text("Finish")
+        .text(&crate::locale::tr("Finish"))
         .position((DEF_CW - MARGIN - 96, 706))
         .size((96, 28))
         .parent(&window)
@@ -3296,13 +3502,13 @@ pub fn run_gui(
     let mut sum_copy: nwg::Button = Default::default();
     let mut sum_open: nwg::Button = Default::default();
     let _ = nwg::Button::builder()
-        .text("Copy")
+        .text(&crate::locale::tr("Copy"))
         .position((DEF_CW - MARGIN - 96 - 96 - 8, 706))
         .size((90, 28))
         .parent(&window)
         .build(&mut sum_copy);
     let _ = nwg::Button::builder()
-        .text("Open manual download")
+        .text(&crate::locale::tr("Open manual download"))
         .position((MARGIN, 706))
         .size((150, 28))
         .parent(&window)
@@ -3320,7 +3526,7 @@ pub fn run_gui(
     // method (e.g. Rufus) instead of only closing with an error code.
     let mut sum_back: nwg::Button = Default::default();
     let _ = nwg::Button::builder()
-        .text("< Back to install options")
+        .text(&crate::locale::tr("< Back to install options"))
         .position((MARGIN, 706))
         .size((170, 28))
         .parent(&window)
@@ -3537,14 +3743,18 @@ pub fn run_gui(
             btn_back.set_enabled(true);
             btn_next.set_enabled(true);
             btn_reboot.set_visible(false);
-            btn_next.set_text(nav_label(INSTALL_PAGE));
+            btn_next.set_text(&nav_label(INSTALL_PAGE));
             // ...with the built-in non-destructive method preselected, so
             // the hotkey lands ready to Install (programmatic check needs
             // the explicit uncheck - BM_SETCHECK has no group exclusivity,
             // only clicks do).
+            // Positional: methods[0] is the built-in writer (see
+            // METHOD_ORDER); never parse the translated label.
+            let mut first = true;
             for it in install_items.borrow().iter() {
                 if let PageCtl::Radio(rb, 3) = &it.ctl {
-                    let builtin = write_mode_from_label(&rb.text()) == "nofmt";
+                    let builtin = first;
+                    first = false;
                     rb.set_check_state(if builtin {
                         nwg::RadioButtonState::Checked
                     } else {
@@ -3715,6 +3925,12 @@ pub fn run_gui(
                         wifi_content: wifi_content,
                         install_content: install_content,
                     }, cw, ch);
+                    // Working phase: keep the ten stage rows laid out too.
+                    if working_c.get() {
+                        if let Some(u) = ui_cell.borrow().as_ref() {
+                            u.layout_stages(cw, ch);
+                        }
+                    }
                 }
             }
             Event::OnMinMaxInfo => {
@@ -3806,7 +4022,7 @@ pub fn run_gui(
                         frame_wifi_c.set_visible(p2.get() == 4);
                         frame_install_c.set_visible(p2.get() == INSTALL_PAGE);
                         btn_back_c.set_enabled(p2.get() > 0);
-                        btn_next_c.set_text(nav_label(p2.get()));
+                        btn_next_c.set_text(&nav_label(p2.get()));
                         btn_reboot_c.set_visible(p2.get() == 0);
                     } else {
                         // ---- Install clicked: enter the working phase ----
@@ -3847,6 +4063,8 @@ pub fn run_gui(
                         lbl_dl.set_visible(false);
                         pb_dl.set_visible(false);
                         lbl_working.set_visible(true);
+                        let stage_labels: Vec<usize> = stage_lbl_ctl.iter().map(|c| c.handle.hwnd().map(|h| h as usize).unwrap_or(0)).collect();
+                        let stage_bars: Vec<usize> = stage_bar_ctl.iter().map(|c| c.handle.hwnd().map(|h| h as usize).unwrap_or(0)).collect();
                         let ui = WorkingUi {
                             main: window.handle.hwnd().map(|h| h as usize).unwrap_or(0),
                             status: lbl_working.handle.hwnd().map(|h| h as usize).unwrap_or(0),
@@ -3862,6 +4080,9 @@ pub fn run_gui(
                             nav_cancel: btn_cancel_c.handle.hwnd().map(|h| h as usize).unwrap_or(0),
                             dl: lbl_dl.handle.hwnd().map(|h| h as usize).unwrap_or(0),
                             dlbar: pb_dl.handle.hwnd().map(|h| h as usize).unwrap_or(0),
+                            stage_labels,
+                            stage_bars,
+                            active_stage: Cell::new(0),
                             done: final_done.clone(),
                             copy_clicked: copy_clicked.clone(),
                             open_clicked: open_clicked.clone(),
@@ -3872,7 +4093,14 @@ pub fn run_gui(
                             boot_fw: boot_fw.clone(),
                             boot_none: boot_none.clone(),
                         };
+                        if let Some(ref u) = ui_cell.borrow().as_ref() {
+                            u.show_stages();
+                            u.set_status(&crate::locale::tr("Preparing the USB install..."));
+                        }
                         ui_cell.replace(Some(ui));
+                        if let Some(ref u) = ui_cell.borrow().as_ref() {
+                            u.show_stages();
+                        }
                         // The callback (main's on_confirm) runs right after
                         // the dispatch loop ends - the window stays visible
                         // the whole time and the callback pumps it through
@@ -3892,7 +4120,7 @@ pub fn run_gui(
                         frame_install_c.set_visible(p2.get() == INSTALL_PAGE);
                         btn_back_c.set_enabled(p2.get() > 0);
                         btn_next_c.set_enabled(true);
-                        btn_next_c.set_text(nav_label(p2.get()));
+                        btn_next_c.set_text(&nav_label(p2.get()));
                         btn_reboot_c.set_visible(p2.get() == 0);
                     }
                 } else if handle == btn_cancel_c.handle {
@@ -3920,7 +4148,7 @@ pub fn run_gui(
                 } else if handle == btn_everything_c.handle {
                     if crate::lslfiles::everything_path().is_empty() {
                         btn_everything_c.set_enabled(false);
-                        btn_everything_c.set_text("Installing Everything... (index building in background)");
+                        btn_everything_c.set_text(&crate::locale::tr("Installing Everything... (index building in background)"));
                         let tx2 = tx.clone();
                         std::thread::spawn(move || {
                             let es = crate::lslfiles::install_everything();
@@ -3982,15 +4210,18 @@ pub fn run_gui(
                     }
                     // INSTALL-page method click: BIOS/UEFI boxes belong
                     // to the built-in installer - grey out elsewhere.
+                    // Positional over METHOD_ORDER (see checked_method).
+                    let mut midx = 0usize;
                     for it in install_items.borrow().iter() {
                         if let PageCtl::Radio(rb, 3) = &it.ctl {
                             if rb.handle.hwnd().map(|h| h as usize) == Some(click_hwnd) {
-                                let mode = write_mode_from_label(&rb.text());
+                                let mode = METHOD_ORDER.get(midx).copied().unwrap_or("rufus");
                                 let letter = checked_target_letter(&install_items);
                                 apply_method_caps(&install_items, &bios_tt_c, &uefi_tt_c, mode, &letter);
                                 glog(&format!("method click mode={}", mode));
                                 break;
                             }
+                            midx += 1;
                         }
                     }
                     // INSTALL-page target click: refresh the BIOS/UEFI
@@ -4096,10 +4327,10 @@ pub fn run_gui(
                         }
                         HwMsg::EverythingDone(ok) => {
                             btn_everything_c.set_enabled(true);
-                            btn_everything_c.set_text(if ok {
-                                "Everything installed - index building in background"
+                            btn_everything_c.set_text(&if ok {
+                                crate::locale::tr("Everything installed - index building in background")
                             } else {
-                                "Everything install failed - see console"
+                                crate::locale::tr("Everything install failed - see console")
                             });
                         }
                     }
@@ -4241,7 +4472,7 @@ pub fn run_gui(
         frame_fp.set_visible(false);
         frame_sys.set_visible(false);
         frame_wifi.set_visible(false);
-        btn_next.set_text(nav_label(INSTALL_PAGE));
+        btn_next.set_text(&nav_label(INSTALL_PAGE));
         confirmed.set(false);
         working.set(false);
         nwg::dispatch_thread_events();
@@ -4509,6 +4740,7 @@ fn harvest_gui_result(
             // exactly one is always selected, so the wizard always
             // expresses a choice and the console never needs to re-ask
             let mut mode = String::from("rufus");
+            let mut hidx = 0usize;
             for it in install_items.borrow().iter() {
                 if let PageCtl::Radio(rb, 3) = &it.ctl {
                     glog(&format!(
@@ -4517,9 +4749,10 @@ fn harvest_gui_result(
                         rb.check_state() == nwg::RadioButtonState::Checked
                     ));
                     if rb.check_state() == nwg::RadioButtonState::Checked {
-                        mode = write_mode_from_label(&rb.text()).to_string();
+                        mode = METHOD_ORDER.get(hidx).copied().unwrap_or("rufus").to_string();
                         break;
                     }
+                    hidx += 1;
                 }
             }
             Some(mode)
@@ -4733,6 +4966,9 @@ pub fn test_boot_page() -> crate::boot::BootChoice {
         nav_cancel: 0,
         dl: 0,
         dlbar: 0,
+        stage_labels: Vec::new(),
+        stage_bars: Vec::new(),
+        active_stage: Cell::new(0),
         done: Rc::new(Cell::new(false)),
         copy_clicked: Rc::new(Cell::new(false)),
         open_clicked: Rc::new(Cell::new(false)),
@@ -4772,34 +5008,54 @@ mod tests {
 
     #[test]
     fn nav_button_says_next_before_install_page() {
+        // Pinned to English: nav_label translates (see locale.rs).
+        let _guard = crate::locale::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("LSL_LANG", "en");
+        }
         // the button LEADING to the install page must read "Next >", never
         // "Install" (win-install-page GUI test asserts the live button)
         for page in 0..INSTALL_PAGE {
             assert_eq!(nav_label(page), "Next >", "page {}", page);
+        }
+        unsafe {
+            std::env::remove_var("LSL_LANG");
         }
     }
 
     #[test]
     fn recommendation_matrix() {
         // true 32-bit-only hardware -> antiX, and the 64-bit warning stands
-        let (title, body) = recommendation_for(false, false, 8.0);
+        let (title, body) = recommendation_template(false, false, 8.0);
         assert!(title.contains("antiX"));
         assert!(body.contains("does not support 64-bit"));
         // 32-bit Windows on 64-bit CPU: full 64-bit recommendation PLUS the
-        // note (this is the case IsWow64Process gets wrong on its own)
-        let (title, body) = recommendation_for(true, false, 8.0);
+        // note slot (this is the case IsWow64Process gets wrong on its own).
+        // Templates carry {W} exactly where the note goes, so this matrix
+        // needs no language pinning - static words stay put in every locale.
+        let (title, body) = recommendation_template(true, false, 8.0);
         assert!(title.contains("Cinnamon"));
-        assert!(body.contains("32-bit"));
+        assert!(body.contains("{W}"));
         assert!(!body.contains("does not support 64-bit"));
-        // 64-bit Windows: same recommendation, no note
-        let (title2, body2) = recommendation_for(true, true, 8.0);
+        // 64-bit Windows: same recommendation, no note slot
+        let (title2, body2) = recommendation_template(true, true, 8.0);
         assert_eq!(title, title2);
-        assert!(!body2.contains("32-bit"));
+        assert!(!body2.contains("{W}"));
         // low RAM on 64-bit hardware still goes light, note or not
-        let (title, _) = recommendation_for(true, false, 0.5);
+        let (title, _) = recommendation_template(true, false, 0.5);
         assert!(title.contains("antiX"));
-        let (title, _) = recommendation_for(true, true, 1.5);
+        let (title, _) = recommendation_template(true, true, 1.5);
         assert!(title.contains("Lubuntu"));
+    }
+
+    #[test]
+    fn substitute_rec_fills_all_slots() {
+        let out = substitute_rec("RAM {M} MB / {G0} GB / {G1} GB{W}", 512, 8.0, " NOTE");
+        assert_eq!(out, "RAM 512 MB / 8 GB / 8.0 GB NOTE");
+        // unknown markers pass through untouched
+        assert_eq!(substitute_rec("no slots", 1, 1.0, ""), "no slots");
     }
 
     #[test]
@@ -4826,9 +5082,9 @@ mod tests {
         // so the two cannot disagree).
         let per_line = 86; // push_lbl/relayout width at the default frame
         let bodies = [
-            (recommendation_for(true, true, 8.0).1, 78), // Cinnamon help
-            (recommendation_for(false, false, 8.0).1, 78), // antiX help
-            (recommendation_for(true, false, 0.5).1, 78), // antiX + WOW note
+            (recommendation_template(true, true, 8.0).1, 78), // Cinnamon help
+            (recommendation_template(false, false, 8.0).1, 78), // antiX help
+            (recommendation_template(true, false, 0.5).1, 78), // antiX + WOW note
             (PAGEFILE_NOTE.to_string(), 76),              // sys-page note
         ];
         for (body, height) in bodies {
@@ -4850,30 +5106,26 @@ mod tests {
 
     #[test]
     fn nav_button_says_install_on_install_page() {
+        // Pinned to English: nav_label translates (see locale.rs).
+        let _guard = crate::locale::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("LSL_LANG", "en");
+        }
         assert_eq!(nav_label(INSTALL_PAGE), INSTALL_LABEL);
         assert_eq!(nav_label(INSTALL_PAGE), "Install");
+        unsafe {
+            std::env::remove_var("LSL_LANG");
+        }
     }
 
     #[test]
-    fn write_mode_labels_map() {
-        assert_eq!(
-            write_mode_from_label("Rufus (well tested, UEFI + BIOS; rewrites the stick)"),
-            "rufus"
-        );
-        assert_eq!(
-            write_mode_from_label("Built-in non-destructive (recommended - no reformat, keeps existing files; BIOS + UEFI)"),
-            "nofmt"
-        );
-        assert_eq!(
-            write_mode_from_label("Skip - I will write the USB myself (like --skip-rufus)"),
-            "skip"
-        );
-        // case-insensitive, like the harvest path
-        assert_eq!(write_mode_from_label("SKIP everything"), "skip");
-        assert_eq!(write_mode_from_label("NON-DESTRUCTIVE copy"), "nofmt");
-        assert_eq!(write_mode_from_label("RUFUS portable"), "rufus");
-        // unknown labels fall back to nofmt (the default), never to an empty/invalid mode
-        assert_eq!(write_mode_from_label("???"), "nofmt");
+    fn method_order_matches_build_order() {
+        // checked_method + the click/hotkey/harvest sites are positional
+        // over METHOD_ORDER, so the build order below is load-bearing: the
+        // first radio must stay the built-in writer, then Rufus, then skip.
+        assert_eq!(METHOD_ORDER, &["nofmt", "rufus", "skip"]);
     }
 
     #[test]
@@ -4905,4 +5157,139 @@ mod tests {
         assert_eq!(first_url("no url here"), None);
         assert_eq!(first_url(""), None);
     }
+
+    #[test]
+    fn button_label_survives_thai_locale() {
+        // Regression: vendored nwg used to pass all control text through
+        // to_ansi, which replaces every non-ASCII byte with '?'.
+        // Thai translations like "ถัดไป >" became "???? >".
+        let _guard = crate::locale::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("LSL_LANG", "th");
+        }
+
+        // nwg init is process-global and safe to call multiple times
+        let _ = nwg::init();
+
+        let mut window: nwg::Window = Default::default();
+        let _ = nwg::Window::builder()
+            .size((100, 100))
+            .build(&mut window);
+
+        let mut btn: nwg::Button = Default::default();
+        let thai = crate::locale::tr("Next >");
+        let _ = nwg::Button::builder()
+            .text(&thai)
+            .parent(&window)
+            .build(&mut btn);
+
+        let fetched = btn.text();
+        assert_eq!(
+            fetched, "ถัดไป >",
+            "button label should be Thai (got '{}' instead)", fetched
+        );
+
+        unsafe {
+            std::env::remove_var("LSL_LANG");
+        }
+    }
+
+    #[test]
+    fn list_view_item_survives_thai_locale() {
+        // Regression: vendored nwg insert_item passes text through to_ansi,
+        // which replaces every non-ASCII byte with '?'.
+        let _guard = crate::locale::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("LSL_LANG", "th");
+        }
+
+        let _ = nwg::init();
+
+        let mut window: nwg::Window = Default::default();
+        let _ = nwg::Window::builder()
+            .size((100, 100))
+            .build(&mut window);
+
+        let mut lv: nwg::ListView = Default::default();
+        let _ = nwg::ListView::builder()
+            .parent(&window)
+            .list_style(nwg::ListViewStyle::Detailed)
+            .build(&mut lv);
+
+        let thai = crate::locale::tr("Next >");
+        lv.insert_item(nwg::InsertListViewItem {
+            index: Some(0),
+            column_index: 0,
+            text: Some(thai.clone()),
+            ..Default::default()
+        });
+
+        let fetched = lv
+            .item(0, 0, 256)
+            .map(|i| i.text)
+            .unwrap_or_default();
+        assert_eq!(
+            fetched, "ถัดไป >",
+            "list view item should be Thai (got '{}' instead)", fetched
+        );
+
+        unsafe {
+            std::env::remove_var("LSL_LANG");
+        }
+    }
+
+    #[test]
+    fn list_view_column_header_survives_thai_locale() {
+        // Regression: lv_insert_column_direct used LVM_INSERTCOLUMNA, which
+        // '?'-izes non-ANSI header text ("Category" -> "?????????").
+        let _guard = crate::locale::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("LSL_LANG", "th");
+        }
+
+        let _ = nwg::init();
+
+        let mut window: nwg::Window = Default::default();
+        let _ = nwg::Window::builder()
+            .size((100, 100))
+            .build(&mut window);
+
+        let mut lv: nwg::ListView = Default::default();
+        let _ = nwg::ListView::builder()
+            .parent(&window)
+            .list_style(nwg::ListViewStyle::Detailed)
+            .build(&mut lv);
+
+        super::lv_insert_column_direct(&lv, 0, &crate::locale::tr("Category"), 110);
+
+        use winapi::um::commctrl::{LVM_GETCOLUMNW, LVCOLUMNW, LVCF_TEXT};
+        use winapi::um::winuser::SendMessageW;
+        let hwnd = lv.handle.hwnd().expect("list view hwnd");
+        let mut buf = [0u16; 64];
+        let mut col: LVCOLUMNW = unsafe { std::mem::zeroed() };
+        col.mask = LVCF_TEXT;
+        col.pszText = buf.as_mut_ptr();
+        col.cchTextMax = buf.len() as i32;
+        let ok = unsafe {
+            SendMessageW(hwnd, LVM_GETCOLUMNW, 0, &col as *const LVCOLUMNW as isize)
+        };
+        assert_ne!(ok, 0, "LVM_GETCOLUMNW failed");
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        let fetched = String::from_utf16_lossy(&buf[..end]);
+        assert_eq!(
+            fetched, "หมวดหมู่",
+            "list view column header should be Thai (got '{}' instead)", fetched
+        );
+
+        unsafe {
+            std::env::remove_var("LSL_LANG");
+        }
+    }
+
 }

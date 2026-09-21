@@ -358,10 +358,16 @@ fn run() {
                 boot_choice: None,
                 back: false,
                 sfs_hdd_done: false,
+                tail_done: false,
+                vol_letter: None,
+                reboot_args: None,
+                boot_method: None,
             };
         }
         // a fresh download picked on page 1 may still be running: join it
         // with the window open (progress bar keeps updating)
+        ui.set_active_stage(gui::WorkStage::Iso as usize);
+        ui.set_stage_status(gui::WorkStage::Iso as usize, "resolving...");
         ui.wait_downloads();
         let iso = match resolve_iso(
             &g.iso_path,
@@ -386,6 +392,7 @@ fn run() {
             }
             std::process::exit(1);
         }
+        ui.set_stage_done(gui::WorkStage::Iso as usize);
         // Arch consistency with the ISO page: a 64-bit image on a
         // 32-bit-only machine would not boot. Back-to-options returns to
         // the wizard to pick the recommended 32-bit distro instead.
@@ -485,16 +492,24 @@ fn run() {
                 // on the console would stall the working phase. Flag-pinned
                 // targets keep the typed gate (raw-sector writes must never
                 // hinge on a stale flag).
+                ui.set_active_stage(gui::WorkStage::UsbWrite as usize);
+                ui.set_stage_status(gui::WorkStage::UsbWrite as usize, "writing...");
                 match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some(), opts.skip_verify, &extra_isos) {
                     Ok((t, metrics, pending)) => {
-                        // Whole-USB check while the wizard is still open
-                        // (live status); a failure offers Back-to-options.
+                        use gui::WorkStage as ST;
+                        ui.set_active_stage(ST::UsbWrite as usize);
+                        ui.set_stage_done(ST::UsbWrite as usize);
                         let mut check_rep = None;
                         if g.check_usb || opts.check_usb {
+                            ui.set_active_stage(ST::UsbCheck as usize);
+                            ui.set_stage_status(ST::UsbCheck as usize, "checking surface...");
                             ui.set_status("Write done - checking the whole USB surface (slow, cache bypassed)...");
                             ui.pump();
                             match usbcheck::check_whole_usb(&t.letter, Some(ui)) {
-                                Ok(r) => check_rep = Some(r),
+                                Ok(r) => {
+                                    check_rep = Some(r);
+                                    ui.set_stage_done(ST::UsbCheck as usize);
+                                }
                                 Err(e) => {
                                     if fatal_gui(&e, ui) {
                                         return gui::GuiWork::back();
@@ -503,66 +518,111 @@ fn run() {
                                 }
                             }
                             check_done = true;
-                        }
-                        // Write the telemetry probe NOW so it survives even if the user
-                        // closes the wizard without picking a boot option (they may reboot
-                        // manually via the Start Menu). The boot_method is updated later
-                        // when they actually choose.
-                        crate::telemetry::write_probe(&t.letter, "pending");
-                        // Copy squashfs to HDD while the window is still open so the user
-                        // sees live progress instead of a frozen final page.
-                        if g.sfs_hdd && !g.data_dir.is_empty() {
-                            ui.set_status("Copying squashfs layers to HDD...");
+                        } else {
+                            ui.set_stage_status(ST::UsbCheck as usize, "skipped");
+                            ui.set_stage_progress(ST::UsbCheck as usize, 1, 1);
                             ui.pump();
-                            crate::lslfiles::copy_sfs_to_hdd_with_progress(
-                                &t.letter,
-                                &g.data_dir,
-                                &mut |name, done, total, phase| {
-                                    if done == 0 && total > 0 {
-                                        ui.set_status(&format!(
-                                            "{} {} ({:.1} GB)...",
-                                            match phase {
-                                                crate::lslfiles::SfsPhase::Copying => "Copying",
-                                                crate::lslfiles::SfsPhase::Hashing => "Hashing for manifest",
-                                            },
-                                            name,
-                                            total as f64 / crate::sys::GB as f64
-                                        ));
-                                    }
-                                    ui.set_progress(done, total);
-                                    ui.pump();
-                                },
-                            );
                         }
-                        // finished: show the summary page (window stays open)
+                        crate::telemetry::write_probe(&t.letter, "pending");
+                        // EVERYTHING after the write runs here, in the dialog,
+                        // each step on its own stage bar. Nothing is left for
+                        // after the reboot click.
+                        if let Err(e) = gui_tail_in_dialog(&g, &opts, &t.letter, &pending, ui, g.distro_arch, g.download_iso.clone().map(|(_, n)| n), &g.iso_path) {
+                            if fatal_gui(&e, ui) {
+                                return gui::GuiWork::back();
+                            }
+                            std::process::exit(1);
+                        }
                         ui.show_final(
                             "lslsetup - finished",
                             &summary_for(&g, &opts, &iso, "nofmt", Some(&metrics), check_rep.as_ref()),
                             true,
                         );
-                        // Boot choice as the next page of the SAME window
-                        // (no close-and-reopen dialog): manual key hint included.
-                        let mut boot_body = crate::locale::tr("The USB stick is ready. Reboot into it now, or later by hand.\n");
-                        boot_body.push_str(&crate::boot::boot_key_hint());
-                        if let Some(warn) = crate::boot::usb_boot_readiness() {
-                            boot_body.push_str("\n\nWARNING: ");
-                            boot_body.push_str(&warn);
-                        }
+                        // Boot choice + boot setup stay in the SAME window.
+                        // The reboot() spawn below is the last thing before
+                        // the OS leaves: no drops, no bcdedit, no waiting.
                         let can_usb = crate::boot::can_set_next_boot();
-                        if !can_usb {
-                            boot_body.push_str(&format!("\n\n{}", crate::locale::tr("One-time USB boot is not available on this PC. The Firmware Boot Menu option is reliable.")));
-                        }
-                        let boot_choice = ui.ask_boot_choice(&boot_body, can_usb);
+                        let mut boot_error: Option<String> = None;
+                        let (boot_choice, reboot_args, boot_method) = loop {
+                            let mut boot_body = crate::locale::tr("The USB stick is ready. Reboot into it now, or later by hand.\n");
+                            boot_body.push_str(&crate::boot::boot_key_hint());
+                            if let Some(warn) = crate::boot::usb_boot_readiness() {
+                                boot_body.push_str("\n\nWARNING: ");
+                                boot_body.push_str(&warn);
+                            }
+                            if !can_usb {
+                                boot_body.push_str(&format!("\n\n{}", crate::locale::tr("One-time USB boot is not available on this PC. The Firmware Boot Menu option is reliable.")));
+                            }
+                            if let Some(e) = &boot_error {
+                                boot_body.push_str(&format!("\n\nFAILED: {}", e));
+                            }
+                            let choice = ui.ask_boot_choice(&boot_body, can_usb);
+                            ui.set_active_stage(ST::BootSetup as usize);
+                            match choice {
+                                crate::boot::BootChoice::Usb => {
+                                    ui.set_stage_status(ST::BootSetup as usize, "setting one-time boot...");
+                                    ui.set_status("Setting one-time USB boot...");
+                                    ui.set_stage_progress(ST::BootSetup as usize, 0, 1);
+                                    ui.pump();
+                                    match crate::boot::set_next_boot_usb() {
+                                        Ok(desc) => {
+                                            out::info(&format!("Set one-time boot to the USB ({}).", desc));
+                                            ui.set_stage_done(ST::BootSetup as usize);
+                                            if !crate::telemetry::update_latest_probe(&t.letter, "usb-one-time") {
+                                                crate::telemetry::write_probe(&t.letter, "usb-one-time");
+                                            }
+                                            break (choice, "/r /t 0".to_string(), "usb-one-time".to_string());
+                                        }
+                                        Err(e) => {
+                                            out::warn(&format!("Could not set one-time USB boot:\n{}", e));
+                                            ui.set_stage_status(ST::BootSetup as usize, "one-time boot failed - pick again");
+                                            ui.pump();
+                                            boot_error = Some(e);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                crate::boot::BootChoice::Adv => {
+                                    ui.set_stage_status(ST::BootSetup as usize, "advanced menu...");
+                                    ui.set_stage_done(ST::BootSetup as usize);
+                                    if !crate::telemetry::update_latest_probe(&t.letter, "advanced-menu") {
+                                        crate::telemetry::write_probe(&t.letter, "advanced-menu");
+                                    }
+                                    break (choice, "/r /o /f /t 0".to_string(), "advanced-menu".to_string());
+                                }
+                                crate::boot::BootChoice::Fw => {
+                                    ui.set_stage_status(ST::BootSetup as usize, "firmware menu...");
+                                    ui.set_stage_done(ST::BootSetup as usize);
+                                    let args = crate::boot::reboot_args().to_string();
+                                    if !crate::telemetry::update_latest_probe(&t.letter, "firmware-menu") {
+                                        crate::telemetry::write_probe(&t.letter, "firmware-menu");
+                                    }
+                                    break (choice, args, "firmware-menu".to_string());
+                                }
+                                crate::boot::BootChoice::None => {
+                                    ui.set_stage_status(ST::BootSetup as usize, "no reboot");
+                                    ui.set_stage_progress(ST::BootSetup as usize, 1, 1);
+                                    ui.pump();
+                                    break (choice, String::new(), String::new());
+                                }
+                            }
+                        };
+                        ui.close();
+                        check_done = true;
                         gui::GuiWork {
                             iso,
                             mode,
                             rufus_proc: None,
                             known: Vec::new(),
                             nofmt_letter: Some(t.letter.clone()),
-                            nofmt_pending: pending,
+                            nofmt_pending: None,
                             boot_choice: Some(boot_choice),
                             back: false,
-                            sfs_hdd_done: g.sfs_hdd && !g.data_dir.is_empty(),
+                            sfs_hdd_done: true,
+                            tail_done: true,
+                            vol_letter: Some(t.letter.clone()),
+                            reboot_args: Some(reboot_args),
+                            boot_method: Some(boot_method),
                         }
                     }
                     Err(e) => {
@@ -588,6 +648,10 @@ fn run() {
                     boot_choice: None,
                     back: false,
                     sfs_hdd_done: false,
+                    tail_done: false,
+                    vol_letter: None,
+                    reboot_args: None,
+                    boot_method: None,
                 }
             }
             _ => {
@@ -640,6 +704,10 @@ fn run() {
                     boot_choice: None,
                     back: false,
                     sfs_hdd_done: false,
+                    tail_done: false,
+                    vol_letter: None,
+                    reboot_args: None,
+                    boot_method: None,
                 }
             }
         }
@@ -736,6 +804,22 @@ fn run() {
     // GUI nofmt flow already asked in-window (same window, next page).
     let mut gui_boot_choice = work.as_ref().and_then(|w| w.boot_choice.clone());
 
+    // In-dialog tail (GUI nofmt): EVERYTHING already ran on the stage
+    // bars and the boot setup is decided - reboot immediately with no
+    // extra work waiting behind the button.
+    if let Some(w) = work.as_ref() {
+        if w.tail_done {
+            let w = work.take().unwrap();
+            let args = w.reboot_args.clone().unwrap_or_default();
+            if args.is_empty() {
+                out::info("Not rebooting.");
+                return;
+            }
+            out::info(&format!("Rebooting now ({}:, {}) - all install work already finished in the dialog...", w.vol_letter.clone().unwrap_or_default(), w.boot_method.clone().unwrap_or_default()));
+            boot::reboot(&args);
+            return;
+        }
+    }
     if vol.is_none() {
         if let Some(w) = work.take() {
             // The working phase already resolved the ISO and started the
@@ -1462,6 +1546,257 @@ pub(crate) fn resolve_page_iso(url: &str) -> Option<(String, String)> {
 /// Returns true when the user clicked "Back to install options" (caller
 /// must unwind to the wizard via GuiWork::back()), false when the page was
 /// closed (caller exits with an error code).
+/// In-dialog tail: EVERY post-write step runs here while the dialog is
+/// open, each on its own stage bar (see gui::WORK_STAGES). The reboot button
+/// therefore never sits behind hidden console work - after the boot choice
+/// the reboot() spawn is immediate.
+/// Mirrors the console tail below step for step (lsl files, rust tools,
+/// drivers, HDD copy, finalize, boot-sector commit, shortcuts); any error
+/// is returned for fatal_gui (Back-to-options) instead of exiting outright.
+#[allow(clippy::too_many_arguments)]
+fn gui_tail_in_dialog(
+    g: &gui::GuiResult,
+    opts: &cli::Opts,
+    vol_letter: &str,
+    pending: &Option<crate::nofmt::PendingMbr>,
+    ui: &gui::WorkingUi,
+    distro_arch: Option<&'static str>,
+    download_iso_name: Option<String>,
+    iso_path_for_arch: &str,
+) -> Result<(), String> {
+    use gui::WorkStage as ST;
+    wait_volume_ready(vol_letter);
+    let vol = sys::list_volumes()
+        .into_iter()
+        .find(|v| v.letter.eq_ignore_ascii_case(vol_letter))
+        .ok_or_else(|| format!("Target volume {} disappeared after the write.", vol_letter))?;
+    assert_usb_capacity(&vol, "");
+
+    ui.set_active_stage(ST::LslFiles as usize);
+    ui.set_stage_status(ST::LslFiles as usize, "copying...");
+    ui.set_status("Dropping lsl-usb files onto the USB...");
+    out::step("Dropping lsl-usb files onto the USB...");
+    ui.set_stage_progress(ST::LslFiles as usize, 0, 1);
+    ui.pump();
+    if let Err(e) = lslfiles::install_lsl_files(vol_letter, &opts.bundle_dir) {
+        return Err(e);
+    }
+    ui.set_stage_done(ST::LslFiles as usize);
+
+    ui.set_active_stage(ST::RustTools as usize);
+    let want_rust = opts.preload_rust_tools || g.rust_tools;
+    if want_rust {
+        ui.set_stage_status(ST::RustTools as usize, "installing...");
+        let hay = format!("{} {}", download_iso_name.unwrap_or_default(), iso_path_for_arch).to_lowercase();
+        let arch = distro_arch
+            .map(|x| x.to_string())
+            .or_else(|| {
+                if hay.contains("i386") || hay.contains("i686") || hay.contains("386") || hay.contains("32-bit") || hay.contains("tinycore") {
+                    Some("i686".to_string())
+                } else if hay.contains("64") {
+                    Some("x86_64".to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                let pae = std::env::var("PROCESSOR_ARCHITEW6432").unwrap_or_default();
+                let pa = std::env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default();
+                if pae.contains("64") || pa.contains("64") { "x86_64".to_string() } else { "i686".to_string() }
+            });
+        out::step(&format!("Preloading Rust CLI tools (fd/bat/zoxide, {}) onto the USB...", arch));
+        ui.set_status(&format!("Preloading Rust CLI tools ({})...", arch));
+        ui.set_stage_progress(ST::RustTools as usize, 0, 1);
+        ui.pump();
+        lslfiles::install_rust_tools(vol_letter, &arch);
+        ui.set_stage_done(ST::RustTools as usize);
+    } else {
+        out::info("Skipping Rust tools (unchecked).");
+        ui.set_stage_status(ST::RustTools as usize, "skipped");
+        ui.set_stage_progress(ST::RustTools as usize, 1, 1);
+        ui.pump();
+    }
+
+    ui.set_active_stage(ST::Drivers as usize);
+    if g.drivers || opts.drivers {
+        ui.set_stage_status(ST::Drivers as usize, "preloading...");
+        ui.set_status("Preloading network drivers...");
+        out::step("Preloading network drivers for this machine...");
+        ui.set_stage_progress(ST::Drivers as usize, 0, 1);
+        ui.pump();
+        let report = hardware::install_driver_packages(vol_letter, false);
+        for l in &report {
+            out::info(&format!("  {}", l));
+        }
+        ui.set_stage_status(ST::Drivers as usize, "rating...");
+        ui.pump();
+        out::info("Rating network devices against linux-hardware.org (LKDDb)...");
+        let net_hw = hardware::network_hardware();
+        if !net_hw.is_empty() {
+            if net::has_transport() {
+                let compat_lines = hardware::hardware_compat_report(&net_hw, &opts.bundle_dir);
+                for l in &compat_lines {
+                    out::info(&format!("  {}", l));
+                }
+                let _ = append_file(&format!("{}:\\lsl-drivers.txt", vol_letter), &compat_lines.join("\r\n"));
+            } else {
+                out::warn("  No HTTP transport on this Windows - LKDDb ratings unavailable.");
+            }
+        }
+        ui.set_stage_done(ST::Drivers as usize);
+    } else {
+        out::info("Skipping network driver preload (unchecked).");
+        ui.set_stage_status(ST::Drivers as usize, "skipped");
+        ui.set_stage_progress(ST::Drivers as usize, 1, 1);
+        ui.pump();
+    }
+
+    ui.set_active_stage(ST::HddCopy as usize);
+    if g.sfs_hdd && !g.data_dir.is_empty() {
+        ui.set_stage_status(ST::HddCopy as usize, "copying...");
+        ui.set_status("Copying squashfs layers to HDD...");
+        out::step("Copying Linux squashfs layers to the NTFS HDD for faster boot...");
+        ui.pump();
+        crate::lslfiles::copy_sfs_to_hdd_with_progress(
+            vol_letter,
+            &g.data_dir,
+            &mut |name, done, total, phase| {
+                if done == 0 && total > 0 {
+                    let op = match phase {
+                        crate::lslfiles::SfsPhase::Copying => "Copying",
+                        crate::lslfiles::SfsPhase::Hashing => "Hashing for manifest",
+                    };
+                    ui.set_stage_status(ST::HddCopy as usize, &format!("{} {}", op, name));
+                    ui.set_status(&format!("{} {} ({:.1} GB)...", op, name, total as f64 / crate::sys::GB as f64));
+                }
+                ui.set_stage_progress(ST::HddCopy as usize, done, total.max(1));
+                ui.set_progress(done, total);
+                ui.pump();
+            },
+        );
+        ui.set_stage_done(ST::HddCopy as usize);
+    } else {
+        out::info("Skipping squashfs-to-HDD copy (unchecked).");
+        ui.set_stage_status(ST::HddCopy as usize, "skipped");
+        ui.set_stage_progress(ST::HddCopy as usize, 1, 1);
+        ui.pump();
+    }
+
+    ui.set_active_stage(ST::Finalize as usize);
+    let mut fin_done: u64 = 0;
+    let fin_total: u64 = 7;
+    let mut fin_tick = |ui: &gui::WorkingUi, what: &str| {
+        fin_done += 1;
+        ui.set_stage_status(ST::Finalize as usize, what);
+        ui.set_stage_progress(ST::Finalize as usize, fin_done, fin_total);
+        ui.set_status(what);
+        ui.pump();
+    };
+    if !g.data_dir.is_empty() {
+        fin_tick(ui, "Setting LSL_DATA_DIR...");
+        let env_file = format!("{}:\\lsl-usb.env", vol_letter);
+        if sys::path_exists(&env_file) {
+            lslfiles::env_file_set(&env_file, "LSL_DATA_DIR", &g.data_dir);
+            out::info(&format!("Set LSL_DATA_DIR={} in lsl-usb.env", g.data_dir));
+        }
+    } else {
+        fin_tick(ui, "LSL_DATA_DIR skipped...");
+    }
+    if g.reclaim_win_swap {
+        fin_tick(ui, "Setting swap reclaim...");
+        let env_file = format!("{}:\\lsl-usb.env", vol_letter);
+        if sys::path_exists(&env_file) {
+            lslfiles::env_file_set(&env_file, "LSL_RECLAIM_WIN_SWAP", "1");
+            out::info("Set LSL_RECLAIM_WIN_SWAP=1 in lsl-usb.env");
+        }
+    } else {
+        fin_tick(ui, "Swap reclaim off...");
+        out::info("Leaving LSL_RECLAIM_WIN_SWAP off (unchecked).");
+    }
+    fin_tick(ui, "Locating WSL VHDX...");
+    {
+        out::step("Locating WSL VHDX files...");
+        let vhdx = detect::wsl_vhdx_paths(&g.wsl_vhdx);
+        if !vhdx.is_empty() {
+            let conf = format!("{}:\\lsl-wsl-vhdx.conf", vol_letter);
+            let _ = std::fs::write(&conf, vhdx.join("\r\n"));
+            out::info(&format!("Wrote {} VHDX path(s).", vhdx.len()));
+        } else {
+            out::warn("No WSL VHDX files found; Linux will still auto-detect WSL rootfs dirs at boot.");
+        }
+    }
+    fin_tick(ui, "Writing flatpak refs...");
+    {
+        out::step("Preloading flatpak refs...");
+        let mut apps = g.flatpak_ids.clone();
+        apps.extend(opts.flatpak_apps.clone());
+        lslfiles::write_flatpak_refs(vol_letter, &apps);
+    }
+    fin_tick(ui, "Checking Everything index...");
+    {
+        if lslfiles::everything_path().is_empty() {
+            out::step("Everything (voidtools) not found - installing the portable version...");
+            let _ = lslfiles::install_everything();
+        }
+    }
+    fin_tick(ui, "Exporting EFU...");
+    {
+        if g.efu {
+            out::step("Exporting Everything index (EFU)...");
+            lslfiles::write_everything_efu(vol_letter);
+        } else {
+            out::info("Skipping Everything index export (unchecked).");
+        }
+    }
+    fin_tick(ui, "Writing wifi.sh...");
+    {
+        if g.wifi {
+            out::step("Generating wifi.sh from Windows saved wifi profiles (netsh)...");
+            match wifi::generate_wifi_sh(&g.wifi_networks) {
+                Some((body, n)) => {
+                    let wifi_sh = format!("{}:\\wifi.sh", vol_letter);
+                    if std::fs::write(&wifi_sh, &body).is_ok() {
+                        out::info(&format!("wifi.sh written ({} network(s)).", n));
+                        for s in [
+                            format!("{}:\\casper\\lsl-firstboot.done", vol_letter),
+                            format!("{}:\\casper\\lsl-firstboot.FAILED", vol_letter),
+                            format!("{}:\\casper\\lsl-firstboot.FAILED.reason", vol_letter),
+                            format!("{}:\\casper\\lsl-firstboot.attempts", vol_letter),
+                            format!("{}:\\casper\\lsl-firstboot.no-network", vol_letter),
+                        ] {
+                            let _ = std::fs::remove_file(s);
+                        }
+                    } else {
+                        out::warn("wifi.sh could not be written.");
+                    }
+                }
+                None => {}
+            }
+        } else {
+            out::info("Skipping wifi.sh (unchecked).");
+        }
+    }
+    ui.set_stage_done(ST::Finalize as usize);
+
+    ui.set_active_stage(ST::BootSectors as usize);
+    ui.set_stage_status(ST::BootSectors as usize, "committing...");
+    ui.set_status("Finalizing boot sectors...");
+    ui.pump();
+    if let Some(p) = pending {
+        out::step("Committing boot sectors...");
+        if let Err(e) = nofmt::commit_boot_sectors(p) {
+            return Err(e);
+        }
+    }
+    let shortcuts = boot::create_boot_shortcuts();
+    if !shortcuts.is_empty() {
+        out::info(&format!("Created shortcut(s): {}", shortcuts.join(", ")));
+    }
+    out::step("Done.");
+    ui.set_stage_done(ST::BootSectors as usize);
+    Ok(())
+}
+
 fn fatal_gui(msg: &str, ui: &gui::WorkingUi) -> bool {
     // Print to the console AND keep the wizard window open showing the
     // reason on the FAILED page - the window is never just destroyed with no
