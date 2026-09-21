@@ -1,0 +1,7 @@
+Have Always, Yes, No, Never ON THE SAME DIALOG.
+
+translations.
+
+Check UEFI and BIOS by default.
+
+No format install by default?
