@@ -164,15 +164,49 @@ prompt_choice() {
     esac
 }
 
+# Rewrite layerfs-path in every boot config so the NEXT boot stacks `new`.
+# casper walks dot-suffixes UPWARD from the layer named on the kernel
+# cmdline, so the appended layer only goes live if the configs point at
+# IT (walking down through z0 to the base). Mirrors what the installer
+# writes: /cdrom/menu.lst (grub4dos BIOS), /cdrom/EFI/BOOT/grub.cfg
+# (signed GRUB2 UEFI) and the \efi\grub\menu.lst mirror
+# (grub4dos-for-UEFI).
+repoint_layerfs_refs() {
+    local new="$1" f found=0
+    for f in /cdrom/menu.lst /cdrom/EFI/BOOT/grub.cfg /cdrom/efi/grub/menu.lst; do
+        [ -f "$f" ] || continue
+        if grep -q "layerfs-path=" "$f" 2>/dev/null; then
+            sed -i "s|layerfs-path=[^ ]*|layerfs-path=${new}|g" "$f" 2>/dev/null
+            found=1
+        fi
+    done
+    if [ "$found" -eq 1 ]; then
+        echo "Boot configs updated: layerfs-path now stacks ${new##*/}"
+        log "layerfs-path repointed to ${new}"
+    else
+        echo "WARNING: no boot config with layerfs-path found; the new layer will NOT stack on the next boot." >&2
+        log "WARNING: no layerfs-path boot refs found to update."
+    fi
+}
+
 write_append_layer() {
-    local ts layer meta need sz
+    local ts layer meta need sz prev stem
     ts="$(date +%Y%m%d%H%M%S)"
-    # Naming: dot-chained (filesystem.z0.<ts>) so casper's layerfs-path
-    # parent walk stacks base + z0 + this layer. (An underscore stem
-    # like filesystem_z<ts> has NO dot-parents, so casper would boot
-    # the layer ALONE - no /sbin/init - and drop to initramfs.)
-    layer="/cdrom/casper/filesystem.z0.${ts}.squashfs"
-    meta="/cdrom/casper/filesystem.z0.${ts}.sh"
+    # casper stacks layers by stripping dot-suffixes UPWARD from the layer
+    # named on the kernel cmdline (layerfs-path=...). A dot-SIBLING name
+    # (filesystem.z0.<ts>) is never stacked - it is not an ancestor of
+    # anything the cmdline names (the Sep 16-21 layers sat inert, 5x761MB,
+    # for exactly this reason). The new layer must EXTEND the current
+    # newest chain name so the walk reaches it through z0 down to the base
+    # (an underscore stem like filesystem_z<ts> has NO dot-parents, so
+    # casper would boot the layer ALONE - no /sbin/init - initramfs drop).
+    stem="filesystem.z0"
+    prev="$(ls -1 /cdrom/casper/filesystem.z0.*.squashfs 2>/dev/null | sort | tail -n1)"
+    if [ -n "$prev" ]; then
+        stem="$(basename "${prev%.squashfs}")"
+    fi
+    layer="/cdrom/casper/${stem}.${ts}.squashfs"
+    meta="/cdrom/casper/${stem}.${ts}.sh"
     # Free-space guard: avoid a cryptic mksquashfs failure on a full FAT partition.
     sz="$(du -sm /tmp/squashfs/upper 2>/dev/null | awk '{print $1}')"; sz="${sz:-0}"
     need="$(( sz + 64 ))"
@@ -201,8 +235,15 @@ write_append_layer() {
     # a content-addressed object store (multi-GB) that must NEVER be baked into
     # a FAT32-capped layer file - flatpaks live in the FAT-hosted 'lsl-fat'
     # installation as direct files instead (see install_flatpaks_fat).
-    mksquashfs /tmp/squashfs/upper "$layer" -comp zstd -Xcompression-level 22 \
-        -wildcards -e "var/lib/flatpak/*" "var/cache/apt/archives/*" "var/lib/apt/lists/*"
+    if ! mksquashfs /tmp/squashfs/upper "$layer" -comp zstd -Xcompression-level 22 \
+        -wildcards -e "var/lib/flatpak/*" "var/cache/apt/archives/*" "var/lib/apt/lists/*"; then
+        # Never leave a partial layer behind: the next append would extend
+        # a corrupt chain link and every later boot would panic on it.
+        rm -f "$layer" "$meta" 2>/dev/null || true
+        echo "ERROR: mksquashfs failed; removed the partial layer." >&2
+        log "Append failed: mksquashfs error; partial layer removed."
+        return 1
+    fi
     if [ -n "${squashfs_config_used_host:-}" ] && [ -f "$squashfs_config_used_host" ]; then
         cp -a "$squashfs_config_used_host" "$meta"
         echo "Saved config script snapshot: $meta"
@@ -210,6 +251,7 @@ write_append_layer() {
     else
         echo "No squashfs_config.sh path recorded; skipping ${meta##*/}"
     fi
+    repoint_layerfs_refs "$layer"
     echo "Layer written. Reboot to have casper include it."
 }
 
@@ -579,6 +621,15 @@ case "$choice" in
         fi
         echo "filesystem.squashfs updated successfully!"
         log "filesystem.squashfs updated successfully (merged)."
+        # The merged base now contains everything the dotted chain held.
+        # Point the boot configs back at plain z0: a stale dotted layer
+        # stacked OVER the merged base would shadow its newer files.
+        repoint_layerfs_refs /cdrom/casper/filesystem.z0.squashfs
+        # Best-effort removal of the now-redundant chain layers. Files
+        # whose loop devices still back the LIVE overlay may refuse to
+        # unlink (EBUSY on vfat) - those are inert now and can be deleted
+        # after the next reboot.
+        rm -f /cdrom/casper/filesystem.z0.*.squashfs /cdrom/casper/filesystem.z0.*.sh 2>/dev/null || true
         ;;
     skip)
         echo "Skipping persistence."

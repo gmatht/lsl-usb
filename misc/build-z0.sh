@@ -3,8 +3,9 @@
 # ============================================================================
 # The nofmt installer ships the output as casper/filesystem.z0.squashfs
 # (embedded from rust9x/lslsetup/assets/filesystem.z0.squashfs via
-# include_bytes! in src/lslfiles.rs); casper's layerfs-path parent walk
-# stacks base + z0 + firstboot-built layers. Rebuild whenever misc/ changes
+# include_bytes! in src/lslfiles.rs); casper's layerfs-path walk stacks
+# base + z0 + whatever layer the boot configs NAME (bin/uproot repoints
+# them when it appends). Rebuild whenever misc/ changes
 # and commit the blob (cargo test checks hsqs magic/size).
 #
 # Usage: ./misc/build-z0.sh [OUTPUT]

@@ -38,6 +38,13 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   Reboot later and no timer: it never reboots on its own (`LSL_FIRSTBOOT_REBOOT`,
   `LSL_FIRSTBOOT_FLAG_DIR` to tune/skip; `LSL_FIRSTBOOT_REBOOT_TIMEOUT=0`
   keeps the explicit reboot-immediately escape hatch).
+- Layer-stacking fix: casper only stacks the chain the kernel cmdline NAMES
+  (it strips dot-suffixes upward from `layerfs-path`), so `uproot`'s appended
+  `filesystem.z0.<ts>.squashfs` dot-siblings never went live (five 761 MB
+  layers sat inert). Appends now EXTEND the newest chain name and repoint
+  `layerfs-path` in `menu.lst` / `EFI/BOOT/grub.cfg` / `efi/grub/menu.lst`;
+  merge reverts the refs to plain z0 and clears the chain; a failed mksquashfs
+  no longer leaves a partial chain link behind.
 - Boot + dialog telemetry that survives reboot: the progress/reboot dialogs
   trace every launch (including the previously silent "already complete"
   exit) to `/run/lsl-firstboot/dialog-trace.log`, flushed to the stick by

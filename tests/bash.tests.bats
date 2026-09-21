@@ -541,6 +541,81 @@ EOF
     [[ "$output" == *"root"* ]]   # proceeds to the root check
 }
 
+@test "uproot: append extends the newest layer chain and repoints boot refs" {
+    # casper stacks layers by stripping dot-suffixes UPWARD from the layer
+    # named on the kernel cmdline (layerfs-path). A sibling name like
+    # filesystem.z0.<new-ts> is NEVER stacked (the Sep 16-21 layers sat
+    # inert for exactly this reason): the new layer must EXTEND the current
+    # newest name, and menu.lst / grub.cfg must point at it.
+    CD="$TMPDIR_TEST/cdrom"
+    mkdir -p "$CD/casper" "$CD/EFI/BOOT"
+    touch "$CD/casper/filesystem.squashfs" "$CD/casper/filesystem.z0.squashfs" \
+          "$CD/casper/filesystem.z0.20260921085616.squashfs"
+    printf 'kernel /vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs quiet\n' > "$CD/menu.lst"
+    printf 'linux /vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs quiet\n' > "$CD/EFI/BOOT/grub.cfg"
+    cp bin/uproot "$TMPDIR_TEST/uproot.sh"
+    sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/uproot.sh"
+    eval "$(sed -n '/^write_append_layer()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    eval "$(sed -n '/^repoint_layerfs_refs()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    mkdir -p /tmp/squashfs/upper
+    mksquashfs() { echo "$*" >> "$TMPDIR_TEST/mk.log"; }
+    lsl_ensure_cdrom_space() { return 0; }
+    lsl_cdrom_is_vfat() { return 1; }
+    log() { :; }
+    upper_bytes=123
+    write_append_layer
+    # the new layer EXTENDS the newest existing name
+    grep -qE "caser/filesystem\.z0\.20260921085616\.[0-9]+\.squashfs|casper/filesystem\.z0\.20260921085616\.[0-9]+\.squashfs" "$TMPDIR_TEST/mk.log"
+    # and the boot configs now stack it
+    new="$(sed -n 's/.*layerfs-path=\([^ ]*\).*/\1/p' "$CD/menu.lst")"
+    [[ "$new" == *casper/filesystem.z0.20260921085616.*.squashfs ]]
+    new2="$(sed -n 's/.*layerfs-path=\([^ ]*\).*/\1/p' "$CD/EFI/BOOT/grub.cfg")"
+    [[ "$new2" == *casper/filesystem.z0.20260921085616.*.squashfs ]]
+    [ "$new" = "$new2" ]
+}
+
+@test "uproot: append starts a fresh chain when no dotted layer exists" {
+    CD="$TMPDIR_TEST/cdrom"
+    mkdir -p "$CD/casper" "$CD/EFI/BOOT"
+    touch "$CD/casper/filesystem.squashfs" "$CD/casper/filesystem.z0.squashfs"
+    printf 'kernel /vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs quiet\n' > "$CD/menu.lst"
+    cp bin/uproot "$TMPDIR_TEST/uproot.sh"
+    sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/uproot.sh"
+    eval "$(sed -n '/^write_append_layer()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    eval "$(sed -n '/^repoint_layerfs_refs()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    mkdir -p /tmp/squashfs/upper
+    mksquashfs() { echo "$*" >> "$TMPDIR_TEST/mk.log"; }
+    lsl_ensure_cdrom_space() { return 0; }
+    lsl_cdrom_is_vfat() { return 1; }
+    log() { :; }
+    upper_bytes=123
+    write_append_layer
+    grep -qE "casper/filesystem\.z0\.[0-9]+\.squashfs" "$TMPDIR_TEST/mk.log"
+    new="$(sed -n 's/.*layerfs-path=\([^ ]*\).*/\1/p' "$CD/menu.lst")"
+    [[ "$new" == *casper/filesystem.z0.*.squashfs ]]
+    [[ "$new" != *z0.squashfs ]]   # repointed, not left at the stub z0
+}
+
+@test "uproot: repoint_layerfs_refs updates every boot config location" {
+    CD="$TMPDIR_TEST/cdrom"
+    mkdir -p "$CD/EFI/BOOT" "$CD/efi/grub"
+    printf 'kernel /vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs quiet\n' > "$CD/menu.lst"
+    printf 'linux /vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs quiet\n' > "$CD/EFI/BOOT/grub.cfg"
+    printf 'kernel /vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs quiet\n' > "$CD/efi/grub/menu.lst"
+    cp bin/uproot "$TMPDIR_TEST/uproot.sh"
+    sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/uproot.sh"
+    eval "$(sed -n '/^repoint_layerfs_refs()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    log() { :; }
+    repoint_layerfs_refs "$CD/casper/filesystem.z0.20991231235959.20991231235959.squashfs"
+    for f in "$CD/menu.lst" "$CD/EFI/BOOT/grub.cfg" "$CD/efi/grub/menu.lst"; do
+        grep -q "layerfs-path=$CD/casper/filesystem.z0.20991231235959.20991231235959.squashfs" "$f"
+    done
+    # a location that does not exist is skipped, not an error
+    repoint_layerfs_refs "$CD/casper/filesystem.z0.squashfs"
+    grep -q "layerfs-path=$CD/casper/filesystem.z0.squashfs " "$CD/menu.lst" ||
+        grep -q "layerfs-path=$CD/casper/filesystem.z0.squashfs$" "$CD/menu.lst"
+}
+
 # --- build.sh: produces the bundle ---
 @test "build.sh produces the bundle" {
     run bash build.sh
