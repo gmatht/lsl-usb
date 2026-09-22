@@ -1576,6 +1576,66 @@ pub fn spawn_clean_env(cmd: &str, args: &[String]) -> SysResult<Child> {
 }
 
 // ---------------------------------------------------------------------------
+// Fast Startup / hibernate switch (WHYFAIL6 §5)
+// ---------------------------------------------------------------------------
+/// Outcome of attempting `powercfg /h off`. Warn-don't-abort contract:
+/// every failure path returns detail text for the caller to log; nothing
+/// here panics or exits.
+pub struct FastStartupOff {
+    pub hiberfil_gone: bool,
+    pub detail: String, // human-readable, logged by the caller
+}
+
+/// System drive's hiberfil.sys path (presence = hibernate/Fast Startup on).
+pub fn hiberfil_path() -> String {
+    let drive = env_var("SystemDrive").unwrap_or_else(|| "C:".into());
+    format!("{}\\hiberfil.sys", drive.trim_end_matches('\\'))
+}
+
+/// Disable hibernate + Fast Startup (`powercfg /h off`). Skips cleanly
+/// when hiberfil.sys is already absent; requires elevation to take
+/// effect (the installer elevates, headless CLI may not - failure is
+/// reported, never fatal). Undo any time with `powercfg /h on`.
+pub fn set_fast_startup_off() -> FastStartupOff {
+    let hiber = hiberfil_path();
+    if !path_exists(&hiber) {
+        return FastStartupOff {
+            hiberfil_gone: true,
+            detail: "hiberfil.sys absent - Fast Startup/hibernate already off.".into(),
+        };
+    }
+    let before = file_size(&hiber).unwrap_or(0);
+    let args = vec!["/h".to_string(), "off".to_string()];
+    let spawned = spawn("powercfg", &args);
+    let mut code: Option<u32> = None;
+    if let Ok(child) = &spawned {
+        if child.wait(60_000) {
+            code = child.exit_code();
+        }
+    }
+    match (spawned.is_ok(), code) {
+        (true, Some(0)) => {
+            let gone = !path_exists(&hiber);
+            FastStartupOff {
+                hiberfil_gone: gone,
+                detail: if gone {
+                    format!(
+                        "powercfg /h off succeeded - hiberfil.sys removed, ~{} MB freed; future shutdowns are clean for Linux.",
+                        before / 1_048_576
+                    )
+                } else {
+                    "powercfg /h off exited 0 but hiberfil.sys is still present - a reboot may be needed to finish.".into()
+                },
+            }
+        }
+        _ => FastStartupOff {
+            hiberfil_gone: false,
+            detail: "powercfg /h off failed (needs elevation?) - Fast Startup stays on; reclaim will keep skipping hibernated volumes. Undo N/A.".into(),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Console helpers (color output; gracefully no-op when redirected)
 // ---------------------------------------------------------------------------
 unsafe extern "system" {

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=lsl-shutdown
+Comment=Save home snapshot and shut down
+Exec=bash /cdrom/bin/lsl-shutdown-gui
+Icon=system-shutdown
+Terminal=false
+Categories=System;Utility;

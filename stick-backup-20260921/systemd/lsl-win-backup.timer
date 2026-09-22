@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily LSL Windows-folder backup (squashfs)
+# See /cdrom/bin/lsl-win-backup.sh --estimate
+
+[Timer]
+# Run daily in the small hours; RandomizedDelaySec spreads load across machines.
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+RandomizedDelaySec=600
+Unit=lsl-win-backup.service
+
+[Install]
+WantedBy=timers.target

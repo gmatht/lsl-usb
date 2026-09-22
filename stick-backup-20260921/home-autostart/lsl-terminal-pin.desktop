@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=LSL terminal pin
+Comment=Pin the terminal (kitty, else wezterm) to Cinnamon favorites/panel
+Exec=/cdrom/bin/lsl-pin-favorites
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

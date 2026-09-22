@@ -88,6 +88,23 @@ fn claim_gui_singleton() -> bool {
     last != ERROR_ALREADY_EXISTS
 }
 
+/// WHYFAIL6 §5: honor the Fast-Startup checkbox (`powercfg /h off`), and
+/// warn loudly when the pagefile reclaim is armed while hiberfil.sys still
+/// blocks it (otherwise the reclaim is a silent no-op on exactly the
+/// machines where users most likely tick it). Never aborts the install.
+fn apply_fast_startup_choice(fast_off: bool, reclaim: bool) {
+    if fast_off {
+        let r = sys::set_fast_startup_off();
+        if r.hiberfil_gone {
+            out::info(&r.detail);
+        } else {
+            out::warn(&r.detail);
+        }
+    } else if reclaim && sys::path_exists(&sys::hiberfil_path()) {
+        out::warn("Reclaim armed but hiberfil.sys exists (Fast Startup is ON): the reclaim will be SKIPPED on hibernated volumes. Re-run with --fast-startup-off (or tick the Fast Startup box) to make it effective. Undo any time with: powercfg /h on");
+    }
+}
+
 fn run() {
     // When launched via WSL interop the current directory can be a
     // \\wsl.localhost\... UNC path. ShellExecute (URL opening, Rufus
@@ -311,6 +328,7 @@ fn run() {
     let mut preload_drivers = opts.drivers;
     let mut copy_sfs_hdd = opts.sfs_hdd;
     let mut reclaim_win_swap = opts.reclaim_win_swap;
+    let mut fast_startup_off = opts.fast_startup_off;
     let mut rust_tools = false;
     let mut distro_arch: Option<&'static str> = None;
     let mut reuse_usb: Option<String> = None;
@@ -753,6 +771,7 @@ fn run() {
         preload_drivers = g.drivers;
         copy_sfs_hdd = g.sfs_hdd;
         reclaim_win_swap = g.reclaim_win_swap;
+        fast_startup_off = g.fast_startup_off;
         rust_tools = g.rust_tools;
         want_check = want_check || g.check_usb;
         distro_arch = g.distro_arch;
@@ -1086,6 +1105,7 @@ fn run() {
     } else {
         out::info("Leaving LSL_RECLAIM_WIN_SWAP off (unchecked in installer).");
     }
+    apply_fast_startup_choice(fast_startup_off, reclaim_win_swap);
 
     // Skip the SFS copy when the GUI nofmt path already performed it
     // inside the working phase (live progress bar).
@@ -1101,7 +1121,9 @@ fn run() {
     let vhdx = detect::wsl_vhdx_paths(&wsl_vhdx);
     if !vhdx.is_empty() {
         let conf = format!("{}:\\lsl-wsl-vhdx.conf", vol.letter);
-        let _ = std::fs::write(&conf, vhdx.join("\r\n"));
+        // LF + trailing newline: the guest reads this with `while read`,
+        // which drops a final unterminated line, and bash chokes on CR.
+        let _ = std::fs::write(&conf, vhdx.join("\n") + "\n");
         out::info(&format!(
             "Wrote {} VHDX path(s) to {} (Linux mounts them via detect-wsl/guestmount).",
             vhdx.len(),
@@ -1713,13 +1735,16 @@ fn gui_tail_in_dialog(
         fin_tick(ui, "Swap reclaim off...");
         out::info("Leaving LSL_RECLAIM_WIN_SWAP off (unchecked).");
     }
+    fin_tick(ui, "Fast Startup / hibernate...");
+    apply_fast_startup_choice(g.fast_startup_off, g.reclaim_win_swap);
     fin_tick(ui, "Locating WSL VHDX...");
     {
         out::step("Locating WSL VHDX files...");
         let vhdx = detect::wsl_vhdx_paths(&g.wsl_vhdx);
         if !vhdx.is_empty() {
             let conf = format!("{}:\\lsl-wsl-vhdx.conf", vol_letter);
-            let _ = std::fs::write(&conf, vhdx.join("\r\n"));
+            // LF + trailing newline (see note at the other write site).
+            let _ = std::fs::write(&conf, vhdx.join("\n") + "\n");
             out::info(&format!("Wrote {} VHDX path(s).", vhdx.len()));
         } else {
             out::warn("No WSL VHDX files found; Linux will still auto-detect WSL rootfs dirs at boot.");
@@ -1911,6 +1936,9 @@ fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str, metr
     if g.reclaim_win_swap {
         lines.push("  - reclaim Windows swap".into());
     }
+    if g.fast_startup_off {
+        lines.push("  - Fast Startup/hibernate off (powercfg /h off)".into());
+    }
     if g.rust_tools {
         lines.push("  - rust tools: fd, bat, zoxide".into());
     }
@@ -1986,6 +2014,9 @@ fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str, metr
     }
     if g.reclaim_win_swap {
         a.push("--reclaim-win-swap".into());
+    }
+    if g.fast_startup_off {
+        a.push("--fast-startup-off".into());
     }
     if g.rust_tools {
         a.push("--preload-rust-tools".into());

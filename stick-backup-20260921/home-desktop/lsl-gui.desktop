@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=lsl-gui
+Comment=Launch WSL Distribution (GUI)
+Exec=bash /cdrom/bin/lsl-gui
+Icon=terminal
+Terminal=false
+Categories=System;Utility;

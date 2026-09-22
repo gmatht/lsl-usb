@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Brave Web Browser
+Comment=Access the Internet
+Exec=/usr/bin/brave-browser-stable %U
+Icon=brave-browser
+Terminal=false
+Categories=Network;WebBrowser;

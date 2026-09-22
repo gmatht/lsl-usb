@@ -776,7 +776,7 @@ lsl_mount_vhdx() {
         echo "(guestmount: used LIBGUESTFS_BACKEND=direct)" >&2
         return 0
     fi
-    if run_privileged guestmount -a "$vhdx_file" -i "$mount_point -o allow_other " 2>/dev/null; then
+    if run_privileged guestmount -a "$vhdx_file" -i "$mount_point" -o allow_other 2>/dev/null; then
         echo "(guestmount: used sudo)" >&2
         return 0
     fi
@@ -803,6 +803,25 @@ lsl_mount_vhdx() {
             return 0
         fi
     done
+
+    # Read-write failed throughout: the image is probably dirty (Windows left
+    # it hibernated, or Fast Startup is on) and libguestfs refuses rw. Retry
+    # the appliance read-only so a dirty image stays readable instead of
+    # failing outright; mount_and_chroot already reports the ro state and
+    # points at --overlay-disk for a writable session.
+    echo "Read-write mount failed; retrying read-only (dirty-image fallback)..." >&2
+    if guestmount -r -a "$vhdx_file" -i "$mount_point" -o allow_other 2>/dev/null; then
+        echo "(guestmount: read-only fallback)" >&2
+        return 0
+    fi
+    if LIBGUESTFS_BACKEND=direct guestmount -r -a "$vhdx_file" -i "$mount_point" -o allow_other 2>/dev/null; then
+        echo "(guestmount: read-only fallback, direct)" >&2
+        return 0
+    fi
+    if run_privileged guestmount -r -a "$vhdx_file" -i "$mount_point" -o allow_other 2>/dev/null; then
+        echo "(guestmount: read-only fallback, sudo)" >&2
+        return 0
+    fi
 
     # No libguestfs appliance (supermin often breaks without KVM): use qemu-nbd + mount.
     if lsl_mount_vhdx_qemu_nbd "$vhdx_file" "$mount_point"; then
@@ -843,7 +862,12 @@ lsl_mount_vhdx_qemu_nbd() {
             while IFS= read -r part; do
                 [ -n "$part" ] || continue
                 [ -b "$part" ] || continue
-                run_privileged mount "$part" "$mount_point" 2>/dev/null || continue
+                if ! run_privileged mount "$part" "$mount_point" 2>/dev/null; then
+                    # Dirty inner filesystem: take it read-only rather than
+                    # skipping the partition entirely.
+                    run_privileged mount -o ro "$part" "$mount_point" 2>/dev/null || continue
+                    echo "(qemu-nbd: $part mounted read-only)" >&2
+                fi
                 if lsl_resolve_linux_root "$mount_point" >/dev/null 2>&1; then
                     echo "(mounted via qemu-nbd: $part)" >&2
                     return 0

@@ -29,6 +29,11 @@ assert '[ "$(lsl_desktop_user)" = zorin ]' 'lsl_desktop_user: /home fallback -> 
 # # --- fallback: nothing -> mint ---------------------------------------------
 ls() { return 1; }
 assert '[ "$(lsl_desktop_user)" = mint ]' 'lsl_desktop_user: final fallback -> mint'
+# Restore the real commands: these mocks are plain shell functions, so they
+# leaked into every later test (the layer-prune cases below call ls/wc and got
+# the stub's "zorin"). Unset at the end of each block that stubs a coreutils
+# command; getent/ls/df are all stubbed in this file.
+unset -f ls getent
 
 # # --- lsl_is_usb_mode --------------------------------------------------------
 LSL_DATA_DIR=/cdrom
@@ -53,6 +58,7 @@ df() { echo "Avail"; echo "${LSL_TEST_AVAIL:-0}"; }
 LSL_TEST_AVAIL=500; assert 'lsl_ensure_cdrom_space 256' '500 MiB free, need 256 -> ok'
 LSL_TEST_AVAIL=100; assert '! lsl_ensure_cdrom_space 256' '100 MiB free, need 256 -> not ok'
 LSL_TEST_AVAIL=0;   assert 'lsl_ensure_cdrom_space 256' 'unknown free -> non-blocking ok'
+unset -f df
 
 # --- lsl_data_dir_is_persistent ----------------------------------------------
 # Mock findmnt to return a fixed fstype for every query (TARGET + FSTYPE).
@@ -187,13 +193,70 @@ assert '[ "$R_ENVCR" -eq 0 ]' 'lsl_load_config: stray CR in environment trimmed'
 assert '[ "$R_RES" -eq 0 ]' 'lsl_resolve_data_dir: trims CR'
 
 # The stick's env file must win over a stale copy in the live $HOME.
-mkdir -p "$ENV_TMP/home"
+# LSL_CDROM stubs the stick mount so this runs off-stick (no /cdrom here).
+mkdir -p "$ENV_TMP/home" "$ENV_TMP/cdrom"
+printf 'LSL_DATA_DIR=/cdrom/usbhome\n' > "$ENV_TMP/cdrom/lsl-usb.env"
 printf 'LSL_DATA_DIR=/nonexistent-shadow\n' > "$ENV_TMP/home/lsl-usb.env"
-( unset LSL_ENV_FILE; export HOME="$ENV_TMP/home"
-  [ "$(lsl_env_file)" = /cdrom/lsl-usb.env ] ) && R_SHADOW=0 || R_SHADOW=1
+( unset LSL_ENV_FILE; export HOME="$ENV_TMP/home" LSL_CDROM="$ENV_TMP/cdrom"
+  [ "$(lsl_env_file)" = "$ENV_TMP/cdrom/lsl-usb.env" ] ) && R_SHADOW=0 || R_SHADOW=1
 assert '[ "$R_SHADOW" -eq 0 ]' 'lsl_env_file: /cdrom/lsl-usb.env preferred over $HOME copy'
 
 rm -rf "$ENV_TMP"
+
+# --- layer prune: fail-safe deletion of superseded squashfs layers -----------
+# Regression for the bug where 5 SUCCESSFUL firstboots left 5x761MB (3.6 GB) of
+# layers, 4 inert because menu.lst named only the newest: cleanup ran only on the
+# retry path, which never fired. Equally important is that the prune must never
+# delete the layer the boot config names - an early revision of it did exactly
+# that (it compared a hardcoded /cdrom path against STICK_DIR-relative files,
+# failed to match, and removed the layer the cmdline pointed at).
+LAYER_TMP="$(mktemp -d)"
+mkdir -p "$LAYER_TMP/casper"
+mk_layer() { dd if=/dev/zero of="$LAYER_TMP/casper/filesystem.z0.$1.squashfs" bs=1k count=1 2>/dev/null; }
+set_names() { printf 'kernel /vmlinuz layerfs-path=%s\n' "$1" > "$LAYER_TMP/menu.lst"; }
+
+# Drive the firstboot helper (it is a script, so extract the one function).
+run_prune() {
+    { echo 'set -uo pipefail'; echo "STICK_DIR=$LAYER_TMP"; echo 'log() { :; }'
+      sed -n '/^lsl_firstboot_prune_orphan_layers()/,/^}/p' misc/lsl-firstboot.sh
+      echo 'lsl_firstboot_prune_orphan_layers'; } > "$LAYER_TMP/drive.sh"
+    bash "$LAYER_TMP/drive.sh" >/dev/null 2>&1 || true
+}
+count_layers() { ls "$LAYER_TMP"/casper/filesystem.z0.*.squashfs 2>/dev/null | wc -l | tr -d ' '; }
+
+# 1. Superseded layers are reaped; the named one survives.
+mk_layer 20260916164712; mk_layer 20260919045856; mk_layer 20260921085616
+set_names /cdrom/casper/filesystem.z0.20260921085616.squashfs
+run_prune
+assert '[ "$(count_layers)" = 1 ]' 'layer prune: superseded layers removed'
+assert '[ -f "$LAYER_TMP/casper/filesystem.z0.20260921085616.squashfs" ]' \
+       'layer prune: the layer named by the boot config survives'
+
+# 2. No boot config -> delete nothing (fail safe).
+rm -f "$LAYER_TMP/menu.lst"
+mk_layer 20260916164712
+run_prune
+assert '[ "$(count_layers)" = 2 ]' 'layer prune: no boot config -> deletes nothing'
+
+# 3. Boot config names a layer that does not exist -> delete nothing.
+set_names /cdrom/casper/filesystem.z0.doesnotexist.squashfs
+run_prune
+assert '[ "$(count_layers)" = 2 ]' 'layer prune: unresolvable named layer -> deletes nothing'
+
+# 4. A dot-extension of the named layer is an ancestor casper reads: keep it.
+rm -f "$LAYER_TMP"/casper/filesystem.z0.*.squashfs
+mk_layer 20260921085616
+mk_layer 20260921085616.20260922000000
+mk_layer 20260916164712
+set_names /cdrom/casper/filesystem.z0.20260921085616.squashfs
+run_prune
+assert '[ -f "$LAYER_TMP/casper/filesystem.z0.20260921085616.squashfs" ]' \
+       'layer prune: keeps the named layer'
+assert '[ -f "$LAYER_TMP/casper/filesystem.z0.20260921085616.20260922000000.squashfs" ]' \
+       'layer prune: keeps dot-extensions (casper ancestors) of the named layer'
+assert '[ ! -f "$LAYER_TMP/casper/filesystem.z0.20260916164712.squashfs" ]' \
+       'layer prune: still removes an unrelated older layer'
+rm -rf "$LAYER_TMP"
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"

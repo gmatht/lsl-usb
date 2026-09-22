@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=LSL home read-only warning
+Comment=Notify if /home is mounted read-only (e.g. NTFS dirty flag)
+Exec=/cdrom/bin/lsl-home-readonly-warning
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

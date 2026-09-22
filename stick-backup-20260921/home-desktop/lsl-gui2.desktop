@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=lsl-gui2
+Comment=Mount a WSL distribution (LSL)
+Exec=bash /cdrom/bin/lsl-gui2
+Icon=computer
+Terminal=false
+Categories=System;Utility;

@@ -1,0 +1,17 @@
+[Unit]
+Description=LSL Windows-folder backup to squashfs (incremental + full)
+# Backs up selected Windows folders (on mounted NTFS) to squashfs under
+# LSL_BACKUP_DIR. Reads /cdrom/lsl-usb.env for config. Network is not required
+# (backups are local), but some sources live on drives that appear after mount.
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /cdrom/bin/lsl-win-backup.sh --run
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=0
+# No RemainAfterExit needed: a timer triggers this oneshot each day.
+
+[Install]
+WantedBy=multi-user.target

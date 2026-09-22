@@ -42,6 +42,7 @@ pub struct Opts {
     pub drivers: bool,          // stage network drivers (default on)
     pub sfs_hdd: bool,          // copy squashfs to the HDD cache
     pub reclaim_win_swap: bool, // reclaim the Windows swapfile
+    pub fast_startup_off: bool, // powercfg /h off (WHYFAIL6 §5)
 }
 
 impl Default for Opts {
@@ -96,6 +97,7 @@ impl Default for Opts {
             drivers: true,
             sfs_hdd: false,
             reclaim_win_swap: false,
+            fast_startup_off: false,
         }
     }
 }
@@ -157,6 +159,7 @@ Options:
   --no-drivers                Do not stage out-of-tree network drivers
   --sfs-hdd-cache             Copy the squashfs to the HDD cache
   --reclaim-win-swap          Reclaim the Windows swapfile
+  --fast-startup-off          Turn off Fast Startup/hibernate (powercfg /h off)
   --help                     This text
 ";
 
@@ -221,6 +224,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--no-drivers" => o.drivers = false,
             "--sfs-hdd-cache" => o.sfs_hdd = true,
             "--reclaim-win-swap" => o.reclaim_win_swap = true,
+            "--fast-startup-off" => o.fast_startup_off = true,
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown option: {}\n\n{}", other, USAGE)),
         }
@@ -247,6 +251,7 @@ mod tests {
             "--no-drivers",
             "--sfs-hdd-cache",
             "--reclaim-win-swap",
+            "--fast-startup-off",
             "--preload-rust-tools",
             "--extra-iso", "D:\\a.iso",
             "--extra-iso", "D:\\b.iso",
@@ -259,6 +264,7 @@ mod tests {
         assert!(!o.drivers);
         assert!(o.sfs_hdd);
         assert!(o.reclaim_win_swap);
+        assert!(o.fast_startup_off);
         assert!(o.preload_rust_tools);
         assert_eq!(o.extra_isos, vec!["D:\\a.iso".to_string(), "D:\\b.iso".to_string()]);
     }
@@ -271,6 +277,7 @@ mod tests {
         assert!(o.drivers);
         assert!(!o.sfs_hdd);
         assert!(!o.reclaim_win_swap);
+        assert!(!o.fast_startup_off);
         assert!(o.data_dir.is_empty());
         assert!(o.wifi_networks.is_empty());
         assert!(o.extra_isos.is_empty());

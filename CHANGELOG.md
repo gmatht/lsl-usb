@@ -55,6 +55,16 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   `user@display` with a `/proc/uptime` fallback when no boot stamp exists.
 - Test harness (PowerShell, ~55 assertions) + bats (~77 tests) + CI + release workflow.
 - `VALIDATION.md` (real-hardware checklist), `VERSION`, `CHANGELOG.md`.
+- `bin/lsl-gui2`: working GUI launcher (GTK/zenity/terminal fallback, no
+  wezterm or catalog dependency); `config.sh` installs an `lsl-gui2.desktop`
+  entry for it when staged, alongside the now `-r`-gated `lsl-gui` entry.
+- `bin/lsl-restore-stick-from-repo.sh`: re-stage repo-managed files onto a
+  damaged stick (refuses to run against an empty repo).
+- Installer "Turn off Windows Fast Startup / hibernate" checkbox
+  (`powercfg /h off`, default off, undo with `powercfg /h on`) in
+  `lslsetup.exe` (wizard + `--fast-startup-off`), with a note explaining it
+  un-blocks the pagefile reclaim; the installer warns loudly when the
+  reclaim is armed while `hiberfil.sys` still exists.
 
 ### Changed
 - `install.sh` appends a new squashfs layer by default (`LSL_INSTALL_MERGE=1`
@@ -67,6 +77,37 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
 - `lsl` reads `find_everything.efu` catalogs alongside `find_*.zstd`.
 
 ### Fixed
+- Superseded squashfs layers were never reaped on the success path. Every
+  successful firstboot appended a fresh `filesystem.z0.<ts>.squashfs` and
+  repointed `menu.lst` at it, orphaning the previous one; the only cleanup
+  (`lsl_firstboot_drop_prior_appended_layers`) runs while the success stamp is
+  *missing*, so on a stick where every attempt succeeded nothing was ever
+  pruned. Casper stacks only the layer named on the kernel cmdline (and its
+  dot-ancestors), so the orphans were inert dead weight - 5x761MB = 3.6 GB on a
+  32 GB FAT stick. `uproot` now prunes as part of `write_append_layer`, and
+  `lsl-firstboot.sh` prunes again at the finale. Both refuse to delete anything
+  unless they can positively resolve the layer the boot config names, and never
+  remove that layer, its dot-ancestors, or the base layers; a first revision
+  compared a hardcoded `/cdrom` path against `STICK_DIR`-relative files, failed
+  to match, and deleted the layer the cmdline pointed at (a bricked boot).
+- Persistent `/home` was not mounted (silent tmpfs overlay fallback): the env file
+  `lsl-usb.env` has no `.gitattributes` rule, so it was checked out CRLF on
+  Windows and bash sourced values with a trailing CR. `LSL_DATA_DIR` then resolved
+  to `/mnt/c/Users/lsl-usb\r`, which matched neither `/cdrom` nor `/persist` in
+  `lsl_is_usb_mode` and could not be resolved by `findmnt`, so `onboot.sh`
+  concluded the data dir was not persistent and fell back to a volatile
+  tmpfs/overlay `/home` with no log line explaining why. Fixed at three levels:
+  `lsl-usb.env`/`*.env`/`*.bats` now pinned to `eol=lf`; `lsl_load_config`
+  normalises CRLF/BOM before sourcing (and never lets a stale `$HOME/lsl-usb.env`
+  shadow the stick's copy); and `onboot.sh` exports `LSL_ENV_FILE` before sourcing
+  `lsl-common.sh` and logs the env file, data dir and mode it selected, plus a
+  warning when HDD mode cannot confirm a persistent volume.
+- `lsl_load_config` no longer clobbers an `LSL_DATA_DIR` the caller set explicitly
+  (`lsl_resolve_data_dir` calls it, so the override was silently discarded).
+- Stale CRLF in the working tree made `tests/mount_all.tests.sh`,
+  `tests/lsl-merge-suggest.tests.sh`, `tests/overlay-merge.tests.sh`,
+  `tests/lsl-reclaim-win-swap.tests.sh` and `tests/overlayfs-whiteout.tests.sh`
+  fail with `syntax error near unexpected token $'\r'`; renormalised.
 - `persist-wifi.sh` no longer unconditionally remounts `/cdrom` ro (broke
   `uproot`'s later writes).
 - `install.ps1`: several StrictMode crashes (missing registry properties,
@@ -78,6 +119,22 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   never matched `hivexget` output, so D:–Z: never resolved (caught by a new unit
   test). Resolution now uses the partition GUID against `PARTUUID` (GPT) with an
   MBR disk-signature + offset fallback.
+- `lslsetup.exe` nofmt payload: `FIRSTBOOT_TOOLKIT` now embeds the full
+  `/cdrom/bin` boot payload (`lsl-gui`, `lsl-gui2`, `lsl-shutdown-gui`,
+  `mount_all.sh`, `lsl-pin-favorites`, `lsl-home-readonly-warning`,
+  `lsl-reclaim-win-swap.sh`, `clean-old-system-patches.sh`, `wsl-boot-setup`)
+  instead of a partial set - every desktop, autostart, service and onboot
+  reference resolves on a fresh install (pinned by a new unit test).
+- `lsl-wsl-vhdx.conf` is now written LF with a trailing newline (was CRLF
+  with no terminator, silently dropping the last VHDX entry in readers).
+- `lsl` mounts dirty VHDX images read-only instead of failing: new
+  `guestmount -r` fallback ladder plus `-o ro` retry in the qemu-nbd path
+  (the existing read-only notice already points at `--overlay-disk` for a
+  writable session); also fixed a misquoted sudo guestmount invocation.
+- `lsl_env_file` honors `LSL_CDROM` (same convention as `config.sh`), making
+  the stick-vs-`$HOME` precedence test hermetic off-stick.
+- Rebuilt `assets/filesystem.z0.squashfs` from current `misc/` (picks up the
+  firstboot success-path layer prune).
 
 ### Added
 - `bin/lsl-diag.sh`: collect first-boot/onboot diagnostics (logs, mount state,

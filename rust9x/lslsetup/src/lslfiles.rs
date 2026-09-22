@@ -122,6 +122,23 @@ static FIRSTBOOT_TOOLKIT: &[(&str, &str)] = &[
     // (2026-09-22: it was missing from the stick entirely).
     ("bin\\uphome", include_str!("../../../bin/uphome")),
     ("bin\\lsl-flush-home.sh", include_str!("../../../bin/lsl-flush-home.sh")),
+    // Desktop + autostart + onboot payload (2026-09-22 post-mortems): the
+    // nofmt installer writes /cdrom/bin from this array only, so every
+    // script the boot references must be embedded -
+    //   config.sh desktop entries  -> lsl-gui, lsl-gui2, lsl-shutdown-gui
+    //   config.sh autostart entries -> lsl-pin-favorites, lsl-home-readonly-warning
+    //   onboot.sh (unconditional)  -> mount_all.sh
+    //   reclaim service ExecStart   -> lsl-reclaim-win-swap.sh
+    //   onboot.sh (-r gated)        -> clean-old-system-patches.sh, wsl-boot-setup
+    ("bin\\lsl-gui", include_str!("../../../bin/lsl-gui")),
+    ("bin\\lsl-gui2", include_str!("../../../bin/lsl-gui2")),
+    ("bin\\lsl-shutdown-gui", include_str!("../../../bin/lsl-shutdown-gui")),
+    ("bin\\mount_all.sh", include_str!("../../../bin/mount_all.sh")),
+    ("bin\\lsl-pin-favorites", include_str!("../../../bin/lsl-pin-favorites")),
+    ("bin\\lsl-home-readonly-warning", include_str!("../../../bin/lsl-home-readonly-warning")),
+    ("bin\\lsl-reclaim-win-swap.sh", include_str!("../../../bin/lsl-reclaim-win-swap.sh")),
+    ("bin\\clean-old-system-patches.sh", include_str!("../../../bin/clean-old-system-patches.sh")),
+    ("bin\\wsl-boot-setup", include_str!("../../../bin/wsl-boot-setup")),
     ("systemd\\onboot.service", include_str!("../../../systemd/onboot.service")),
     ("systemd\\lsl-boot-stamp.service", include_str!("../../../systemd/lsl-boot-stamp.service")),
     ("systemd\\lsl-btrfs-growd.service", include_str!("../../../systemd/lsl-btrfs-growd.service")),
@@ -990,6 +1007,31 @@ mod firstboot_toolkit_tests {
                 e.unwrap().1.replace("\r\n", "\n").starts_with("#!/bin/bash\n"),
                 "{} must be a bash script", name
             );
+        }
+    }
+
+    #[test]
+    fn toolkit_covers_desktop_and_onboot_payload() {
+        // Regression 2026-09-22 (WHYFAIL6 §4, WHYFAIL5 follow-ups): the
+        // desktop entries config.sh writes, the autostart entries, and the
+        // unconditional `bash /cdrom/bin/mount_all.sh` in onboot.sh all
+        // resolved to files the nofmt installer never staged - the stick's
+        // bin/ was partial for months. Every /cdrom/bin/* reference on the
+        // boot path must be embedded here.
+        for name in [
+            "bin\\lsl-gui",
+            "bin\\lsl-gui2",
+            "bin\\lsl-shutdown-gui",
+            "bin\\mount_all.sh",
+            "bin\\lsl-pin-favorites",
+            "bin\\lsl-home-readonly-warning",
+            "bin\\lsl-reclaim-win-swap.sh",
+            "bin\\clean-old-system-patches.sh",
+            "bin\\wsl-boot-setup",
+        ] {
+            let e = FIRSTBOOT_TOOLKIT.iter().find(|(r, _)| *r == name);
+            assert!(e.is_some(), "{} missing from FIRSTBOOT_TOOLKIT", name);
+            assert!(!e.unwrap().1.is_empty(), "{} embedded empty", name);
         }
     }
 

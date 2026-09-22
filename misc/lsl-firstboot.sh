@@ -789,6 +789,51 @@ rm -f "$ATTEMPT_FILE" 2>/dev/null || true
 # no-network count (a later offline boot starts its own count).
 rm -f "$FAILED_MARKER" "$FAILED_REASON" "$NET_FAIL_FILE" 2>/dev/null || true
 rm -f /run/lsl-firstboot.no-network 2>/dev/null || true
+
+# Reap layers earlier SUCCESSFUL firstboots orphaned. uproot already prunes as
+# part of writing a layer; this is the belt-and-braces pass for a boot that
+# reaches the finale. The retry-path cleanup (lsl_firstboot_drop_prior_appended
+# _layers) only fires while the stamp is missing, so on a stick where every
+# attempt succeeded nothing ever pruned: this one had 5x761MB (3.6 GB) of
+# layers, 4 of them inert because menu.lst named only the newest.
+#
+# Same fail-safe rules as uproot's prune_superseded_layers: delete nothing
+# unless we positively resolve the layer the boot config names, and never
+# remove that layer, its dot-progenitors, or the base layers.
+lsl_firstboot_prune_orphan_layers() {
+    local stick="${STICK_DIR:-/cdrom}" active b l n=0
+    # `|| true`: with `set -euo pipefail` a missing menu.lst (or no match)
+    # makes grep exit 1/2 and would abort the whole firstboot with no log.
+    active="$(grep -o 'layerfs-path=[^ ]*' "$stick/menu.lst" 2>/dev/null | head -n1 || true)"
+    active="${active#layerfs-path=}"
+    case "$active" in /cdrom/*) active="$stick/${active#/cdrom/}" ;; esac
+    if [ -z "$active" ] || [ ! -f "$active" ]; then
+        log "Layer prune skipped: boot config names no resolvable layer."
+        return 0
+    fi
+    for l in "$stick"/casper/filesystem.z0.[0-9]*.squashfs; do
+        [ -e "$l" ] || continue
+        b="$(basename "$l")"
+        case "$b" in
+            filesystem.z0.squashfs|filesystem_z0_firstboot.squashfs) continue ;;
+        esac
+        [ "$b" = "$(basename "$active")" ] && continue
+        case "${b%.squashfs}" in
+            "$(basename "${active%.squashfs}")".*) continue ;;
+        esac
+        if rm -f "$l" "${l%.squashfs}.sh" 2>/dev/null; then
+            n=$((n + 1)); log "Pruned orphaned layer: $b"
+        fi
+    done
+    # if/then, not `[ ... ] && log`: under `set -e` the && form returns 1 when
+    # n=0 and would abort the run.
+    if [ "$n" -gt 0 ]; then
+        log "Pruned $n orphaned layer(s) left by earlier successful firstboots."
+    fi
+    return 0
+}
+lsl_firstboot_prune_orphan_layers
+
 task_done packages
 task_done layer
 flush_home_final

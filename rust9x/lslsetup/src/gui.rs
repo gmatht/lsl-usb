@@ -98,6 +98,7 @@ pub struct GuiResult {
     pub drivers: bool,
     pub sfs_hdd: bool,
     pub reclaim_win_swap: bool,
+    pub fast_startup_off: bool, // powercfg /h off (WHYFAIL6 §5)
     pub rust_tools: bool,
     pub distro_arch: Option<&'static str>,      // Some("i686"/"x86_64") when a fresh distro is selected
     pub download_iso: Option<(String, String)>, // (url, name) when fresh download chosen
@@ -986,6 +987,9 @@ fn wrap_text(text: &str, per_line: usize) -> String {
 /// multiline-label contract test below - keep in sync if reworded).
 pub(crate) const PAGEFILE_NOTE: &str = "Renames pagefile.sys and each WSL2 swapfile.vhdx (after a clean-shutdown check) and uses that space as compressed swap. Used only if Windows was shut down normally (no Fast Startup / hibernate) - otherwise the reclaim is skipped entirely.";
 
+/// System-page Fast-Startup note (WHYFAIL6 §5; same height contract test).
+pub(crate) const FASTSTARTUP_NOTE: &str = "Disables hibernate and Fast Startup (powercfg /h off) and deletes hiberfil.sys (~40% of RAM). Makes every shutdown genuinely clean for Linux and un-blocks the pagefile reclaim above, which is a silent no-op while hiberfil.sys exists. Undo any time with: powercfg /h on";
+
 /// One control on a scrollable page. Built straight into the Box so the
 /// win32 control has exactly one owner (nwg's Drop DESTROYS the window, so
 /// nwg controls must never be cloned-and-kept — see the ScrollBar note in
@@ -1006,7 +1010,7 @@ pub(crate) enum PageCtl {
 ///              Check (none); Lbl 0
 ///   FP page:   Check 0=app 1=fsearch; Lbl 1=extra caption; Edit 1=extra ids
 ///   SYS page:  Edit 1=vhdx 2=data dir; Btn 3=browse; Check 4=efu 5=drivers
-///              6=sfs 7=reclaim 8=rust tools; Lbl 0
+///              6=sfs 7=reclaim 8=rust tools 10=fast-startup-off; Lbl 0
 ///   WIFI page: Check 9=wifi master; Lbl 0
 ///
 /// A scrollable-page item: control + placement in the scroll space.
@@ -3074,7 +3078,9 @@ pub fn run_gui(
         push_check(&mut sys, "Copy Linux squashfs layers to your NTFS drive for faster boot", 10, 306, 6, true);
         push_check(&mut sys, "Reclaim Windows pagefile.sys + WSL2 swapfile as compressed swap", 10, 328, 7, false);
         push_lbl(&mut sys, PAGEFILE_NOTE, 20, 350, -30, 76, false);
-        push_check(&mut sys, "Preload Rust CLI tools for the selected distro (fd / bat / zoxide)", 10, 430, 8, false);
+        push_check(&mut sys, "Turn off Windows Fast Startup / hibernate (powercfg /h off)", 10, 430, 10, false);
+        push_lbl(&mut sys, FASTSTARTUP_NOTE, 20, 452, -30, 80, false);
+        push_check(&mut sys, "Preload Rust CLI tools for the selected distro (fd / bat / zoxide)", 10, 536, 8, false);
     }
     if let Err(e) = nwg::ScrollBar::builder()
         .flags(nwg::ScrollBarFlags::VERTICAL | nwg::ScrollBarFlags::VISIBLE)
@@ -3086,7 +3092,7 @@ pub fn run_gui(
         glog(&format!("scrollbar build error: {e:?}"));
     }
 
-    let sys_content = 430 + 20 + 10;
+    let sys_content = 536 + 20 + 10;
 
     // ---- page 4: wifi (master switch + per-network list) ----
     let _ = nwg::Frame::builder()
@@ -4691,6 +4697,7 @@ fn harvest_gui_result(
     let mut drivers = false;
     let mut sfs = false;
     let mut reclaim = false;
+    let mut fast_off = false;
     let mut rust_tools = false;
     for it in sys_items.borrow().iter() {
         match &it.ctl {
@@ -4705,6 +4712,7 @@ fn harvest_gui_result(
                     6 => sfs = on,
                     7 => reclaim = on,
                     8 => rust_tools = on,
+                    10 => fast_off = on,
                     _ => {}
                 }
             }
@@ -4752,6 +4760,7 @@ fn harvest_gui_result(
         rust_tools,
         distro_arch,
         reclaim_win_swap: reclaim,
+        fast_startup_off: fast_off,
         download_iso,
         use_existing_usb: reuse_usb,
         write_mode: {
@@ -5105,6 +5114,7 @@ mod tests {
             (recommendation_template(false, false, 8.0).1, 78), // antiX help
             (recommendation_template(true, false, 0.5).1, 78), // antiX + WOW note
             (PAGEFILE_NOTE.to_string(), 76),              // sys-page note
+            (FASTSTARTUP_NOTE.to_string(), 80),           // sys-page note
         ];
         for (body, height) in bodies {
             let wrapped = wrap_text(&body, per_line);

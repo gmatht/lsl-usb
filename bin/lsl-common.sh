@@ -4,10 +4,70 @@
 
 LSL_ENV_FILE="${LSL_ENV_FILE:-/cdrom/lsl-usb.env}"
 
-lsl_load_config() {
-    if [ -f "$LSL_ENV_FILE" ]; then
-        . "$LSL_ENV_FILE"
+# Read LSL_ENV_FILE defensively.
+#
+# The env file lives on the FAT stick, which users edit from Windows, so it can
+# arrive with CRLF line endings. Sourcing that raw gives values with a trailing
+# CR: `LSL_DATA_DIR=/mnt/c/Users/lsl-usb\r` matches neither the /cdrom nor the
+# /persist prefix in lsl_is_usb_mode, and findmnt cannot resolve the path, so
+# onboot.sh concluded the data dir was not persistent and fell back to a
+# volatile tmpfs /home ("persistent home not mounted"). Normalise CRLF (and a
+# leading BOM) before sourcing, and never let a stale copy shadow the stick:
+# prefer /cdrom/lsl-usb.env when it exists, then $HOME/lsl-usb.env.
+lsl_env_file() {
+    local f
+    # An explicit LSL_ENV_FILE always wins - the caller asked for that file, and
+    # re-probing after a load would let another candidate clobber it.
+    f="${LSL_ENV_FILE:-}"
+    if [ -n "$f" ] && [ -f "$f" ]; then
+        printf '%s\n' "$f"
+        return 0
     fi
+    # Otherwise prefer the stick's file over any stale copy in the live $HOME,
+    # which used to shadow it (a $HOME copy then silently supplied the wrong
+    # data dir). LSL_CDROM override (same convention as config.sh) keeps this
+    # testable off-stick; default is the live /cdrom mount.
+    for f in "${LSL_CDROM:-/cdrom}/lsl-usb.env" "${HOME:-}/lsl-usb.env"; do
+        [ -n "$f" ] && [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+    done
+    return 1
+}
+
+lsl_load_config() {
+    local f tmp rc
+    # Remember a data dir the caller set explicitly: sourcing the env file must
+    # not clobber it. Without this, every call to lsl_resolve_data_dir (which
+    # calls us) would reload LSL_DATA_DIR from the env file and silently discard
+    # a value the caller had just set - the tests and any script that overrides
+    # LSL_DATA_DIR for one call depend on it sticking.
+    local preset="${LSL_DATA_DIR:-}"
+    if f="$(lsl_env_file)"; then
+        # Source in THIS shell: a process substitution (`. <(sed ...)`) runs in
+        # a subshell and would discard every assignment. Normalise a
+        # Windows-edited file (CRLF, BOM) into a private temp copy first.
+        tmp="$(mktemp 2>/dev/null || echo /tmp/lsl-env.$$)"
+        if sed -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' "$f" >"$tmp" 2>/dev/null; then
+            # shellcheck source=/dev/null
+            . "$tmp"
+            rc=$?
+        else
+            rc=1
+        fi
+        rm -f "$tmp"
+        if [ "$rc" -ne 0 ]; then
+            echo "lsl: WARNING: could not read env file $f" >&2
+        fi
+        LSL_ENV_FILE="$f"
+        export LSL_ENV_FILE
+        [ -n "$preset" ] && LSL_DATA_DIR="$preset"
+    fi
+    # Belt and braces: trim any stray CR that survived. The env file is already
+    # normalised above, but an export inherited from the environment can still
+    # carry one. NOTE: do not write this as "${VAR%$'\r'}" - verified that such
+    # an expansion inside this function silently matches the empty string and
+    # leaves the value untouched (the same expression at top level works). tr is
+    # unambiguous.
+    LSL_DATA_DIR="$(printf '%s' "${LSL_DATA_DIR:-}" | tr -d '\r')"
     : "${LSL_DATA_DIR:=/mnt/c/Users/lsl-usb}"
     : "${LSL_HOME_IDLE_SEC:=300}"
     : "${LSL_HOME_BTRFS_MIB:=4096}"
@@ -33,8 +93,14 @@ lsl_desktop_user() {
 }
 
 lsl_resolve_data_dir() {
+    lsl_load_config
     local d
     d="${LSL_DATA_DIR:-/mnt/c/Users/lsl-usb}"
+    # Trim CR/whitespace: a CRLF env file would otherwise put the trailing CR
+    # into the path and send lsl_is_usb_mode down the wrong branch. (tr, not
+    # "${d%$'\r'}": see the note in lsl_load_config.)
+    d="$(printf '%s' "$d" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -n "$d" ] || d=/mnt/c/Users/lsl-usb
     mkdir -p "$d" 2>/dev/null || true
     if [ -d "$d" ]; then
         readlink -f "$d" 2>/dev/null || echo "$d"
@@ -198,7 +264,10 @@ lsl_vhdx_append() {
 # Lines: name|vhdx_path| (third field empty) for merge with parse_wsl_report.
 lsl_vhdx_saved_distro_lines() {
     local p
-    while IFS= read -r p; do
+    # `|| [ -n "$p" ]`: vhdx.list is written by the Windows installer and has NO
+    # trailing newline, so a plain `while read` drops its LAST entry (that is
+    # how the Ubuntu 22.04 image vanished from every list on this stick).
+    while IFS= read -r p || [ -n "$p" ]; do
         [ -z "$p" ] && continue
         printf '%s|%s|\n' "$(basename "$p" .vhdx)" "$p"
     done < <(lsl_vhdx_paths_stdout)

@@ -570,6 +570,8 @@ EOF
     sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/uproot.sh"
     eval "$(sed -n '/^write_append_layer()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
     eval "$(sed -n '/^repoint_layerfs_refs()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    eval "$(sed -n '/^prune_superseded_layers()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    eval "$(sed -n '/^active_layer_path()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
     mkdir -p /tmp/squashfs/upper
     mksquashfs() { echo "$*" >> "$TMPDIR_TEST/mk.log"; }
     lsl_ensure_cdrom_space() { return 0; }
@@ -596,6 +598,8 @@ EOF
     sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/uproot.sh"
     eval "$(sed -n '/^write_append_layer()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
     eval "$(sed -n '/^repoint_layerfs_refs()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    eval "$(sed -n '/^prune_superseded_layers()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    eval "$(sed -n '/^active_layer_path()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
     mkdir -p /tmp/squashfs/upper
     mksquashfs() { echo "$*" >> "$TMPDIR_TEST/mk.log"; }
     lsl_ensure_cdrom_space() { return 0; }

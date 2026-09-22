@@ -1,0 +1,29 @@
+--- /mnt/c/GitHub/lsl-usb/bin/lsl-gui	2026-09-12 16:45:56.382899200 +0000
++++ /cdrom/bin/lsl-gui	2026-09-21 18:26:26.000000000 +0000
+@@ -9,4 +9,25 @@
+ # shellcheck source=/dev/null
+ . "$LSL_SCRIPT_DIR/lsl-common.sh"
+ 
+-wezterm start -- sudo bash -c "bash $LSL_SCRIPT --choose --pause-on-quit; read"
++# Terminal to host the chooser. wezterm is the intended one but is NOT in the
++# base image (kitty is; config.sh even ships a kitty.conf), so a hard wezterm
++# dependency means the desktop icon dies with "wezterm: command not found".
++# Fall back through the terminals that actually exist on a live boot.
++_pick_term() {
++    for t in wezterm kitty x-terminal-emulator gnome-terminal xterm; do
++        command -v "$t" >/dev/null 2>&1 && { printf '%s\n' "$t"; return 0; }
++    done
++    return 1
++}
++
++_term="$(_pick_term)" || {
++    echo "lsl-gui: no terminal emulator found (tried wezterm kitty x-terminal-emulator gnome-terminal xterm)" >&2
++    exit 1
++}
++
++case "$_term" in
++    wezterm) exec wezterm start -- sudo bash -c "bash $LSL_SCRIPT --choose --pause-on-quit; read" ;;
++    kitty)   exec kitty -- sudo bash -c "bash $LSL_SCRIPT --choose --pause-on-quit; read" ;;
++    gnome-terminal) exec gnome-terminal -- sudo bash -c "bash $LSL_SCRIPT --choose --pause-on-quit; read" ;;
++    *)       exec "$_term" -e sudo bash -c "bash $LSL_SCRIPT --choose --pause-on-quit; read" ;;
++esac

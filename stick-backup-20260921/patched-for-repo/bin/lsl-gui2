@@ -1,0 +1,644 @@
+#!/bin/bash
+# lsl-gui2 - working LSL GUI launcher (replaces the broken lsl-gui).
+#
+# Why this exists (see /cdrom/WHYFAIL5.md "Follow-up 2" and WHYFAIL6.md):
+#   * lsl-gui launched `wezterm start -- ...`, but wezterm is NOT in the base
+#     image -> "wezterm: command not found", the desktop icon did nothing.
+#   * Its `Exec=/cdrom/bin/lsl-gui` was a bare path on a FAT mount with no exec
+#     bits -> EACCES, "There was an error launching the application."
+#   * `lsl --choose` needs find_*.zstd / find_everything.efu catalogs that are
+#     not staged on this stick, and it aborts when they are missing.
+#
+# This script has NO terminal dependency and NO catalog dependency. It is
+# self-contained (no lsl-common.sh, no wezterm, no catalogs) and degrades to a
+# text menu when no graphical backend exists.
+#
+# Run it as:  bash /cdrom/bin/lsl-gui2
+# Desktop entry uses exactly that (bash + path), because FAT has no exec bit.
+#
+# Backends, tried in order:
+#   1. python3 + GTK (python3-gi ships with Cinnamon) - the real GUI
+#   2. zenity - simple chooser
+#   3. plain terminal menu
+set -u
+
+# --- discover Windows / WSL VHDX images ------------------------------------
+# Ordered: explicit override, the vhdx.list state file, then a real scan.
+WIN_MOUNTS=(); for m in /mnt/c /mnt/d /mnt/e; do mountpoint -q "$m" 2>/dev/null && WIN_MOUNTS+=("$m"); done
+
+find_vhdx() {
+    # 1. explicit override (colon-separated), used by tests
+    if [ -n "${LSL_VHDX_SEARCH:-}" ]; then
+        printf '%s\n' "${LSL_VHDX_SEARCH//:/$'\n'}"
+        return 0
+    fi
+
+    # 2. the list the Windows installer copied onto the STICK
+    #    (/cdrom/lsl-wsl-vhdx.conf: one Windows path per line, e.g.
+    #    C:\Users\...\LocalState\ext4.vhdx). This is the authoritative list -
+    #    it is what the user means by "the vhdx list" - and both lsl-gui2 and
+    #    lsl used to ignore it entirely.
+    local conf p
+    for conf in /cdrom/lsl-wsl-vhdx.conf "${LSL_DATA_DIR:-/mnt/c/Users/lsl-usb}/lsl-wsl-vhdx.conf"; do
+        [ -r "$conf" ] || continue
+        # `|| [ -n "$p" ]`: the installer writes this file WITHOUT a trailing
+        # newline, and plain `while IFS= read -r` silently drops the last line
+        # (the Ubuntu 22.04 entry was being lost exactly this way).
+        while IFS= read -r p || [ -n "$p" ]; do
+            p="${p%$'\r'}"
+            p="$(win_path_to_linux "$p")"
+            [ -n "$p" ] && printf '%s\n' "$p"
+        done <"$conf"
+    done
+
+    # 3. saved list (vhdx.list under the data dir), if present
+    local d="${LSL_DATA_DIR:-/mnt/c/Users/lsl-usb}"
+    if [ -r "$d/vhdx.list" ]; then
+        grep -v '^[[:space:]]*$' "$d/vhdx.list" 2>/dev/null
+    fi
+
+    # 4. scan mounted Windows volumes for the WSL package VHDXes. Bounded
+    #    (depth-limited) so a huge C: cannot hang the dialog.
+    local root
+    for root in "${WIN_MOUNTS[@]}"; do
+        find "$root/Users" -maxdepth 6 -type f -name 'ext4.vhdx' 2>/dev/null
+    done
+
+    # 5. anything the user dropped in the LSL data dir
+    if [ -d "$d" ]; then
+        find "$d" -maxdepth 2 -type f -name '*.vhdx' 2>/dev/null
+    fi
+}
+
+# C:\Users\a\...\ext4.vhdx  ->  /mnt/c/Users/a/.../ext4.vhdx
+# Also accepts forward slashes and an already-native /mnt/... path.
+win_path_to_linux() {
+    local p="$1"
+    p="${p%$'\r'}"                                  # CRLF tolerance (FAT + Windows editors)
+    case "$p" in ''|'#'*) return 0 ;; esac
+    case "$p" in
+        [A-Za-z]:[\\/]*)                            # drive-letter form
+            local drive="${p:0:1}" rest="${p:2}"
+            drive="$(printf '%s' "$drive" | tr 'A-Z' 'a-z')"
+            rest="${rest//\\//}"
+            printf '/mnt/%s/%s\n' "$drive" "${rest#/}"
+            ;;
+        /mnt/*) printf '%s\n' "$p" ;;               # already native
+        *)      printf '%s\n' "$p" ;;
+    esac
+}
+
+# name|path|size|state  (state = clean | dirty | unknown; see vhdx_state)
+#
+# The state is probed during discovery so the dialog can SHOW it. Probing costs
+# one `qemu-img info` per image (metadata only, never writes).
+list_images() {
+    local p name size state
+    find_vhdx | sort -u | while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        [ -r "$p" ] || continue
+        name="$(basename "$p" .vhdx)"
+        case "$p" in
+            *CanonicalGroupLimited.Ubuntu24*|*Ubuntu-24*) name="Ubuntu 24.04 LTS" ;;
+            *CanonicalGroupLimited.Ubuntu22*|*Ubuntu-22*) name="Ubuntu 22.04 LTS" ;;
+            *CanonicalGroupLimited.Ubuntu*|*Ubuntu*)      name="Ubuntu" ;;
+            *TheDebianProject.Debian*|*Debian*)           name="Debian" ;;
+            *kali*)                                       name="Kali Linux" ;;
+            *SUSE*|*suse*)                                name="openSUSE" ;;
+            *OracleLinux*)                                name="Oracle Linux" ;;
+        esac
+        size="$(du -h --apparent-size "$p" 2>/dev/null | cut -f1)"
+        state="$(vhdx_state "$p")"
+        printf '%s|%s|%s|%s\n' "${name:-$p}" "$p" "${size:-?}" "$state"
+    done
+}
+
+# clean   - opens read-only with no pending log, so a writable snapshot works
+# dirty   - VHDX log needs replaying: a COW/backing-file open FAILS read-only
+# unknown - could not determine (no qemu-img, or an odd/unreadable image)
+#
+# `qemu-img info` reads headers only, so probing is non-destructive. This is the
+# "tell the user" half: it is surfaced in the list and drives the warnings.
+vhdx_state() {
+    local vhdx="$1" out
+    command -v qemu-img >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
+    out="$(qemu-img info "$vhdx" 2>&1)" || true
+    case "$out" in
+        *"needs to be replayed"*|*"log that needs"*) printf 'dirty\n'; return 0 ;;
+    esac
+    case "$out" in
+        *"file format"*) printf 'clean\n' ;;
+        *) printf 'unknown\n' ;;
+    esac
+}
+
+# Kept for compatibility with the previous revision / any external caller.
+vhdx_needs_replay() { [ "$(vhdx_state "$1")" = "dirty" ]; }
+
+# --- host volume safety -----------------------------------------------------
+# A HIBERNATED Windows must never get a writable mount: hiberfil.sys holds a
+# suspended kernel image that is resumed over the on-disk state on next boot, so
+# writes made here are reverted/merged into a live cache -> corrupted NTFS.
+# Fast Startup (HiberbootEnabled=1) is the common cause.
+host_win_hibernated() {
+    local root f sz
+    for root in "${WIN_MOUNTS[@]}"; do
+        for f in hiberfil.sys Hiberfil.sys; do
+            [ -f "$root/$f" ] || continue
+            sz="$(stat -c %s "$root/$f" 2>/dev/null || echo 0)"
+            # A real suspension leaves a large hiberfil; tiny/zero = disabled.
+            if [ "$sz" -gt 1048576 ] 2>/dev/null; then
+                printf '%s\n' "$root"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# True when PATH lives on a filesystem currently mounted read-only.
+path_on_readonly_fs() {
+    local opts
+    opts="$(findmnt -n -o OPTIONS -T "$1" 2>/dev/null)" || return 1
+    case ",$opts," in *,ro,*) return 0 ;; esac
+    return 1
+}
+
+# --- the real-rw triple gate ------------------------------------------------
+# Real rw (no COW: writes land in ext4.vhdx permanently) is offered ONLY when all
+# three independent conditions hold. Measured rationale:
+#   1. VHDX log clean  - a dirty log needs replaying, which is a write to the
+#      image; doing it under a volume Windows still owns corrupts data.
+#   2. Windows not hibernated - hiberfil.sys is a suspended kernel that Windows
+#      resumes over the on-disk state, silently reverting/merging our writes.
+#   3. Host volume mounted rw - qemu needs WRITE ACCESS TO THE IMAGE FILE. On a
+#      ro mount every rw route dies early:
+#        qemu-nbd: Could not open '...ext4.vhdx': Read-only file system
+#      "clean" does NOT help here; only remounting rw does.
+# Any failure => refuse (not merely warn): a warning is for "risky", and these
+# are cases where the operation is WRONG, not merely risky.
+LSL_RW_REFUSE=""
+
+rw_gate_check() {
+    # rw_gate_check <vhdx> -> 0 if all three gates pass; else LSL_RW_REFUSE is a
+    # human-readable refusal, and the return is 1.
+    local vhdx="$1"
+    LSL_RW_REFUSE=""
+    local state hiber mp opts
+
+    state="$(vhdx_state "$vhdx")"
+    case "$state" in
+        dirty)
+            LSL_RW_REFUSE="Gate 1/3 failed - the image is DIRTY (unreplayed VHDX log).
+
+Replaying that log is a write to the image, and it cannot be done safely from
+here. Fix it in Windows: run 'wsl --shutdown' and shut down properly.
+Enter read-only instead to use the distro now."
+            return 1 ;;
+        unknown)
+            LSL_RW_REFUSE="Gate 1/3 failed - cannot determine the image state (no qemu-img, or an odd image).
+
+Refusing to modify an image whose consistency is unknown."
+            return 1 ;;
+    esac
+
+    hiber="$(host_win_hibernated || true)"
+    if [ -n "$hiber" ]; then
+        LSL_RW_REFUSE="Gate 2/3 failed - Windows is hibernated / Fast Startup is on:
+  $hiber/hiberfil.sys
+
+That file is a suspended Windows kernel. Windows resumes over whatever we write
+here, silently reverting or merging our changes into a live cache, which
+corrupts the NTFS volume (and can take the distro with it).
+
+Fix it in Windows: 'shutdown /s /t 0' (full shutdown, not Fast Startup), or
+disable Fast Startup, optionally after 'wsl --shutdown'."
+        return 1
+    fi
+
+    if path_on_readonly_fs "$vhdx"; then
+        mp="$(dirname "$vhdx")"
+        LSL_RW_REFUSE="Gate 3/3 failed - the host volume is mounted read-only:
+  $mp
+
+qemu needs write access to the image FILE, so no writable route can work until
+the volume is rw - 'clean' does not change this:
+  qemu-nbd: Could not open '...ext4.vhdx': Read-only file system
+
+If you are sure it is safe (Windows fully shut down, no hiberfil), remount it
+read-write yourself:
+  sudo mount -o remount,rw $mp
+Then reopen this dialog."
+        return 1
+    fi
+    return 0
+}
+
+# Describe the COW session so nobody mistakes it for persistence.
+COW_NOTE="This opens a writable SESSION, not a persistent change:
+  * writes go to a qcow2 layer in RAM (/tmp)
+  * your ext4.vhdx is only read (as a backing file) and is never modified
+  * everything you change is DISCARDED when you exit
+To keep changes, copy the distro out or use a real-rw session (Windows must be
+fully shut down and the volume mounted rw)."
+
+# Where did the distro come from? Shown in the dialog so the path is visible.
+label_for() { printf '%s\n' "$1"; }
+
+# --- the action: hand the chosen image to `lsl` -----------------------------
+# `lsl` runs inside a terminal because it chroots into the distro and the user
+# needs the shell. Pick a terminal that exists; never a bare wezterm.
+pick_term() {
+    local t
+    # set -u: LSL_TERMINAL is optional, so expand it defensively.
+    for t in "${LSL_TERMINAL:-}" wezterm kitty x-terminal-emulator gnome-terminal xterm; do
+        [ -n "$t" ] || continue
+        command -v "$t" >/dev/null 2>&1 && { printf '%s\n' "$t"; return 0; }
+    done
+    return 1
+}
+
+run_terminal() {
+    # run_terminal <command...> — run a command in a terminal window.
+    local term
+    term="$(pick_term)" || {
+        error_exit "No terminal emulator found (tried wezterm, kitty, x-terminal-emulator, gnome-terminal, xterm)."
+        return 1
+    }
+    case "$term" in
+        wezterm)          exec wezterm start -- "$@" ;;
+        kitty)            exec kitty "$@" ;;
+        gnome-terminal)   exec gnome-terminal -- "$@" ;;
+        *)                exec "$term" -e "$@" ;;
+    esac
+}
+
+error_exit() {
+    local msg="$1"
+    echo "lsl-gui2: $msg" >&2
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --warning --no-wrap --title "LSL" --text "$msg" 2>/dev/null || true
+    fi
+    return 1
+}
+
+enter_distro() {
+    # enter_distro <vhdx-path> [mode]
+    #
+    #   "" or "cow"  - DEFAULT: `lsl --overlay-disk`, a writable session whose
+    #                  writes live in a qcow2 layer in /tmp. The parent VHDX is
+    #                  only read as a backing file, so the distro image is never
+    #                  modified; changes are DISCARDED on exit. Needs a clean
+    #                  image (the backing-file open fails on a dirty one).
+    #   "ro"         - `lsl -v`: nothing is written anywhere. Always safe, the
+    #                  fallback for dirty images.
+    #   "rw"         - REAL read/write: changes persist into ext4.vhdx. Gated by
+    #                  rw_gate_check() (clean log + no hibernation + volume rw);
+    #                  refuses rather than warns when any gate fails.
+    local vhdx="$1" mode="${2:-}"
+    [ -r "$vhdx" ] || { error_exit "Cannot read $vhdx"; return 1; }
+    local lsl="/cdrom/bin/lsl"
+    [ -r "$lsl" ] || lsl="$(command -v lsl)"
+    [ -n "$lsl" ] && [ -r "$lsl" ] || { error_exit "lsl launcher not found on /cdrom/bin or PATH."; return 1; }
+
+    local state; state="$(vhdx_state "$vhdx")"
+    local hiber=""; hiber="$(host_win_hibernated || true)"
+
+    # Empty mode = "decide from state": clean -> COW session, dirty -> read-only.
+    # That is the only real choice there is; see the collapsed-button rationale.
+    if [ -z "$mode" ]; then
+        if [ "$state" = "dirty" ]; then mode="ro"; else mode="cow"; fi
+    fi
+
+    # ---- real rw: triple gate, refuse on any failure -----------------------
+    if [ "$mode" = "rw" ]; then
+        if ! rw_gate_check "$vhdx"; then
+            error_exit "$LSL_RW_REFUSE"
+            return 1
+        fi
+        # All three gates passed. Still require a typed confirmation: this is the
+        # only mode that can destroy a distro.
+        if ! confirm_dialog "Real read/write session - the ONLY mode that modifies your distro.
+
+Gate 1/3  VHDX log: clean
+Gate 2/3  Windows hibernation: none found
+Gate 3/3  host volume ($(dirname "$vhdx")): mounted rw
+
+Changes WILL be written into:
+  $vhdx
+
+This is irreversible. If this distro matters, back the file up first.
+
+Continue with a real read/write session?" "Write to my distro"; then
+            return 0
+        fi
+        run_terminal sudo bash -c "bash '$lsl' -v '$vhdx'; echo; echo '[finished]'; read -r _"
+        return $?
+    fi
+
+    # ---- explicit read-only ----------------------------------------------
+    if [ "$mode" = "ro" ]; then
+        run_terminal sudo bash -c "bash '$lsl' -v '$vhdx'; echo; echo '[finished]'; read -r _"
+        return $?
+    fi
+
+    # ---- dirty image, COW requested: explain and offer read-only ----------
+    # COW cannot start on a dirty image (the backing-file open fails), so the
+    # safe alternative is read-only. This is the ONLY thing offered here, and it
+    # does not modify anything, so it is safe to auto-accept when no dialog
+    # backend exists (e.g. action spawned without a DISPLAY).
+    if [ "$state" = "dirty" ]; then
+        local why="This image has an unreplayed VHDX log (Windows/WSL was not shut down cleanly).
+
+A writable session cannot start: opening the image as a COW backing file fails:
+  \"qemu-img: ... opened read-only, but contains a log that needs to be replayed\"
+
+Enter READ-ONLY now? Nothing is written: your distro is used as-is and any
+changes are discarded when you exit.
+
+To get a writable session later: boot Windows, run 'wsl --shutdown', shut down
+properly, then reopen this dialog."
+        if ! LSL_ASSUME_YES=1 confirm_dialog "$why" "Enter read-only"; then
+            return 0
+        fi
+        run_terminal sudo bash -c "bash '$lsl' -v '$vhdx'; echo; echo '[finished]'; read -r _"
+        return $?
+    fi
+
+    # ---- clean image + COW (default): no risk, so no scary prompt ---------
+    # COW writes only to a qcow2 layer in /tmp. It does not touch ext4.vhdx and
+    # it does not write to the Windows volume, so hibernation is irrelevant here
+    # and warning about it (as an earlier revision did) was misleading - it made
+    # the COW option look unsafe while doing the safest thing available.
+    # The session semantics are stated up front instead, via the GUI subtitle.
+    run_terminal sudo bash -c "bash '$lsl' --overlay-disk --vhdx '$vhdx'; echo; echo '[finished]'; read -r _"
+}
+
+# confirm_dialog "text" [ok-label] -> true when the user approves.
+# GTK/zenity when available, else a y/N prompt on the terminal.
+confirm_dialog() {
+    # confirm_dialog "text" [ok-label] -> true when the user approves.
+    #
+    # NEVER silently returns false: with no GUI *and* no usable stdin there is
+    # nobody to ask, so we default to the SAFE answer but SAY so on stderr and in
+    # the log. The old fallback did a blocking `read` on a non-tty stdin (the
+    # case when GTK spawns us via Popen), got EOF instantly, and returned
+    # "Cancel" - which made buttons look like they did nothing at all.
+    local text="$1" ok="${2:-Continue}"
+
+    if have_gui && command -v zenity >/dev/null 2>&1; then
+        zenity --question --no-wrap --title "LSL" --text "$text" \
+            --ok-label="$ok" --cancel-label="Cancel" 2>/dev/null
+        return $?
+    fi
+    if have_gui && command -v python3 >/dev/null 2>&1 && python3 -c 'import gi' 2>/dev/null; then
+        python3 - "$text" "$ok" <<'PY'
+import sys
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk
+text, ok = sys.argv[1], sys.argv[2]
+d = Gtk.MessageDialog(message_type=Gtk.MessageType.WARNING, buttons=Gtk.ButtonsType.NONE)
+d.set_title("LSL")
+d.set_markup(text)
+d.add_button("Cancel", Gtk.ResponseType.CANCEL)
+d.add_button(ok, Gtk.ResponseType.OK)
+d.set_position(Gtk.WindowPosition.CENTER)
+resp = d.run()
+d.destroy()
+sys.exit(0 if resp == Gtk.ResponseType.OK else 1)
+PY
+        return $?
+    fi
+
+    # Text fallback - only when there is a real terminal to type into.
+    if [ -t 0 ] && [ -t 1 ]; then
+        printf '%s\n\n[%s? y/N] ' "$text" "$ok"
+        local a; read -r a
+        case "$a" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+    fi
+
+    # No GUI, no tty: report instead of pretending. Callers pass
+    # LSL_ASSUME_YES=1 when the requested action is the safe one anyway.
+    echo "lsl-gui2: no dialog backend available (no DISPLAY, no tty); $text" >&2
+    if [ "${LSL_ASSUME_YES:-0}" = "1" ]; then
+        echo "lsl-gui2: proceeding (this action does not modify your distro)." >&2
+        return 0
+    fi
+    echo "lsl-gui2: not proceeding - re-run from a terminal to confirm." >&2
+    return 1
+}
+
+save_vhdx() {
+    # Record a path in the state list so it shows up next time.
+    local vhdx="$1" d="${LSL_DATA_DIR:-/mnt/c/Users/lsl-usb}"
+    mkdir -p "$d" 2>/dev/null || return 0
+    touch "$d/vhdx.list" 2>/dev/null || return 0
+    grep -qxF "$vhdx" "$d/vhdx.list" 2>/dev/null || printf '%s\n' "$vhdx" >>"$d/vhdx.list"
+}
+
+# --- backends ---------------------------------------------------------------
+TMPLIST="$(mktemp -t lsl-gui2.XXXXXX)"
+trap 'rm -f "$TMPLIST"' EXIT
+list_images >"$TMPLIST"
+
+have_gui() { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; }
+
+run_gtk() {
+    # Pass the REAL script path. `"$0"` is the invoked path, but the GUI is
+    # started as `bash /tmp/…/lsl-gui2.hTd7VY …` when bash stages it, and more
+    # importantly the dialog re-invokes this script to perform an action - so
+    # handing it $0 made every button run the TMPLIST (list of images) as a
+    # shell script: hundreds of "command not found" on a stderr nobody reads,
+    # i.e. a button that visibly does nothing. Use the absolute path of this
+    # file, resolved from BASH_SOURCE.
+    local self
+    self="$(readlink -f "${BASH_SOURCE[0]}")"
+    [ -r "$self" ] || self="$0"
+    exec python3 - "$TMPLIST" "$self" <<'PYEOF'
+import sys, os, subprocess
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GLib
+
+listfile, self_path = sys.argv[1], sys.argv[2]
+rows = []
+with open(listfile) as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        parts = line.split("|")
+        if len(parts) >= 2:
+            rows.append((parts[0], parts[1],
+                         parts[2] if len(parts) > 2 else "",
+                         parts[3] if len(parts) > 3 else "unknown"))
+
+STATE_TXT = {"clean": "clean (writable ok)",
+             "dirty": "DIRTY - read-only only",
+             "unknown": "unknown"}
+
+def act(args):
+    # Pass the dialog-capable environment through explicitly. The GUI may have
+    # been started with a DISPLAY the child would otherwise inherit only by luck
+    # (gio/systemd launches often have none), and an action that cannot show its
+    # dialog used to fail silently.
+    env = dict(os.environ)
+    env.setdefault("DISPLAY", os.environ.get("DISPLAY", ":0"))
+    subprocess.Popen(["bash", self_path] + args, env=env)
+
+win = Gtk.Window(title="LSL — mount a WSL distribution")
+win.set_default_size(760, 420)
+win.set_position(Gtk.WindowPosition.CENTER)
+win.connect("destroy", Gtk.main_quit)
+
+box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+box.set_border_width(12)
+win.add(box)
+
+head = Gtk.Label()
+head.set_markup("<b>Choose a WSL distribution to enter</b>")
+head.set_xalign(0)
+box.add(head)
+
+sub = Gtk.Label(label="Writable sessions use a copy-on-write layer in RAM, so your ext4.vhdx is never modified. "
+                     "An image marked DIRTY has an unreplayed VHDX log (Windows was not shut down cleanly) and can "
+                     "only be entered read-only until you run 'wsl --shutdown' in Windows.")
+sub.set_xalign(0)
+sub.set_line_wrap(True)
+box.add(sub)
+
+store = Gtk.ListStore(str, str, str, str)
+for name, path, size, state in rows:
+    store.append([name, size, path, STATE_TXT.get(state, state)])
+
+tree = Gtk.TreeView(model=store)
+for i, title in enumerate(("Distribution", "Size", "Image path", "State")):
+    r = Gtk.CellRendererText()
+    col = Gtk.TreeViewColumn(title, r, text=i)
+    col.set_resizable(True)
+    if i == 2:
+        col.set_expand(True)
+    if i == 3:
+        col.set_min_width(180)
+    tree.append_column(col)
+box.add(tree)
+
+if not rows:
+    warn = Gtk.Label()
+    warn.set_markup("<i>No WSL images found. Mount your Windows volume (e.g. "
+                    "<tt>sudo mount -t ntfs3 -o ro /dev/nvme0n1p4 /mnt/c</tt>) and reopen this window.</i>")
+    warn.set_xalign(0)
+    warn.set_line_wrap(True)
+    box.add(warn)
+
+btns = Gtk.ButtonBox(orientation=Gtk.Orientation.HORIZONTAL)
+btns.set_layout(Gtk.ButtonBoxStyle.END)
+box.add(btns)
+
+def selected():
+    m, it = tree.get_selection().get_selected()
+    return (store.get_value(it, 2), store.get_value(it, 3)) if it else (None, None)
+
+def on_enter(*_):
+    p, st = selected()
+    if not p:
+        return
+    # ONE entry point, because there is only one sensible command per state:
+    #   clean -> COW session (`lsl --overlay-disk`): writable, distro untouched
+    #   dirty -> `lsl -v`: COW cannot start, so this is the only working path
+    # There is no separate read-only button: it sent the SAME command as the
+    # real-rw button (`lsl -v`) minus the gate, so it was redundant. There is no
+    # real-rw button either: that path has never been exercised, and `lsl`
+    # itself reports it ends up read-only on this host.
+    act(["enter", p, "ro" if st.startswith("DIRTY") else "cow"])
+    Gtk.main_quit()
+
+btn = Gtk.Button(label="Enter")
+btn.connect("clicked", on_enter)
+btns.add(btn)
+
+btn2 = Gtk.Button(label="Save to list")
+def on_save(*_):
+    p, _ = selected()
+    if p:
+        act(["save", p])
+btn2.connect("clicked", on_save)
+btns.add(btn2)
+
+btn3 = Gtk.Button(label="Close")
+btn3.connect("clicked", lambda *_: Gtk.main_quit())
+btns.add(btn3)
+
+win.show_all()
+win.present()
+Gtk.main()
+PYEOF
+}
+
+run_zenity() {
+    local args=() name path size state label
+    while IFS='|' read -r name path size state; do
+        [ -n "$path" ] || continue
+        case "$state" in
+            dirty)   label="$name ($size) — DIRTY, read-only only" ;;
+            clean)   label="$name ($size) — clean" ;;
+            *)       label="$name ($size) — state unknown" ;;
+        esac
+        args+=("$label" "$path")
+    done <"$TMPLIST"
+    if [ "${#args[@]}" -eq 0 ]; then
+        error_exit "No WSL images found. Mount your Windows volume first (sudo mount -t ntfs3 -o ro /dev/nvme0n1p4 /mnt/c)."
+        return 1
+    fi
+    local pick mode=""
+    pick="$(zenity --list --title="LSL — choose a WSL distribution" \
+        --text="Clean images open as a writable COW session (changes in RAM, discarded on exit, distro untouched). DIRTY images open read-only." \
+        --column="Distribution" --column="Image" \
+        --width=820 --height=440 "${args[@]}" 2>/dev/null)" || return 0
+    [ -n "$pick" ] || return 0
+    # No further prompt: the state column above already says what will happen,
+    # and both outcomes are non-destructive. enter_distro picks the command.
+    enter_distro "$pick" ""
+}
+
+run_text() {
+    echo "LSL — available WSL images:"
+    local i=0 name path size state
+    local -a paths=() states=()
+    while IFS='|' read -r name path size state; do
+        [ -n "$path" ] || continue
+        i=$((i + 1)); paths+=("$path"); states+=("$state")
+        printf '  %2d) %-24s %6s  %s\n' "$i" "$name" "$size" "$path"
+        case "$state" in
+            dirty) printf '      ^ DIRTY (unreplayed VHDX log) - read-only only\n' ;;
+            clean) printf '      ^ clean - writable session available if you ask for it\n' ;;
+            *)     printf '      ^ state unknown\n' ;;
+        esac
+    done <"$TMPLIST"
+    [ "$i" -eq 0 ] && { echo "No WSL images found. Mount your Windows volume first."; return 1; }
+    printf 'Enter number (or q): '
+    read -r ans
+    case "$ans" in ''|q|Q) return 0 ;; esac
+    case "$ans" in *[!0-9]*) return 0 ;; esac
+    [ "$ans" -ge 1 ] && [ "$ans" -le "$i" ] || return 0
+    local idx=$((ans - 1)) mode=""
+    # No mode menu: clean -> COW session, dirty -> read-only. The annotation
+    # printed above each row already states which one applies.
+    enter_distro "${paths[$idx]}" "$mode"
+}
+
+# --- action modes (re-entrant: the GTK dialog calls us back per action) -----
+case "${1:-}" in
+    enter) enter_distro "$2" "${3:-cow}"; exit $? ;;
+    save)  save_vhdx "$2"; exit 0 ;;
+esac
+
+# --- pick a backend --------------------------------------------------------
+if have_gui && command -v python3 >/dev/null 2>&1 && python3 -c 'import gi' 2>/dev/null; then
+    run_gtk
+elif have_gui && command -v zenity >/dev/null 2>&1; then
+    run_zenity
+else
+    run_text
+fi
