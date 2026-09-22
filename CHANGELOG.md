@@ -55,9 +55,11 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   `user@display` with a `/proc/uptime` fallback when no boot stamp exists.
 - Test harness (PowerShell, ~55 assertions) + bats (~77 tests) + CI + release workflow.
 - `VALIDATION.md` (real-hardware checklist), `VERSION`, `CHANGELOG.md`.
-- `bin/lsl-gui2`: working GUI launcher (GTK/zenity/terminal fallback, no
-  wezterm or catalog dependency); `config.sh` installs an `lsl-gui2.desktop`
-  entry for it when staged, alongside the now `-r`-gated `lsl-gui` entry.
+- `bin/lsl-gui`: working GUI launcher (GTK/zenity/terminal fallback, no
+  wezterm or catalog dependency); `config.sh` installs an `lsl-gui.desktop`
+  entry for it when staged. The old terminal launcher is now `bin/lsl-tui`
+  (it never was a GUI) with its own `lsl-tui.desktop` entry; both entries
+  are `-r`-gated so un-staged programs are never advertised.
 - `bin/lsl-restore-stick-from-repo.sh`: re-stage repo-managed files onto a
   damaged stick (refuses to run against an empty repo).
 - Installer "Turn off Windows Fast Startup / hibernate" checkbox
@@ -120,7 +122,7 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   test). Resolution now uses the partition GUID against `PARTUUID` (GPT) with an
   MBR disk-signature + offset fallback.
 - `lslsetup.exe` nofmt payload: `FIRSTBOOT_TOOLKIT` now embeds the full
-  `/cdrom/bin` boot payload (`lsl-gui`, `lsl-gui2`, `lsl-shutdown-gui`,
+  `/cdrom/bin` boot payload (`lsl-gui`, `lsl-tui`, `lsl-shutdown-gui`,
   `mount_all.sh`, `lsl-pin-favorites`, `lsl-home-readonly-warning`,
   `lsl-reclaim-win-swap.sh`, `clean-old-system-patches.sh`, `wsl-boot-setup`)
   instead of a partial set - every desktop, autostart, service and onboot

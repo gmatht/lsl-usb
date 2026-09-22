@@ -136,22 +136,22 @@ install_desktop_shortcuts() {
     # Also do not advertise entries for programs that are not actually staged
     # (the stick's bin/ is only partial - lsl-gui was missing for months; see
     # WHYFAIL5.md "Follow-up 2").
-    local lsl_gui_entry="" lsl_shutdown_entry="" lsl_gui2_entry=""
-    if [[ -r /cdrom/bin/lsl-gui2 ]]; then
-        lsl_gui2_entry=$(cat <<'EOF'
+    local lsl_gui_entry="" lsl_shutdown_entry="" lsl_tui_entry=""
+    if [[ -r /cdrom/bin/lsl-tui ]]; then
+        lsl_tui_entry=$(cat <<'EOF'
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=lsl-gui2
-Comment=Launch WSL Distribution (GUI)
-Exec=bash /cdrom/bin/lsl-gui2
+Name=lsl-tui
+Comment=Launch WSL Distribution (terminal chooser)
+Exec=bash /cdrom/bin/lsl-tui
 Icon=terminal
 Terminal=false
 Categories=System;Utility;
 EOF
 )
     else
-        echo "config.sh: /cdrom/bin/lsl-gui2 not staged; skipping that desktop entry" >&2
+        echo "config.sh: /cdrom/bin/lsl-tui not staged; skipping that desktop entry" >&2
     fi
     if [[ -r /cdrom/bin/lsl-gui ]]; then
         lsl_gui_entry=$(cat <<'EOF'
@@ -186,10 +186,10 @@ EOF
         echo "config.sh: /cdrom/bin/lsl-shutdown-gui not staged; skipping that desktop entry" >&2
     fi
 
-    if [[ -n "$lsl_gui2_entry" ]]; then
-        printf '%s\n' "$lsl_gui2_entry" >/home/$LSL_DESKTOP_USER/Desktop/lsl-gui2.desktop
-        chmod +x /home/$LSL_DESKTOP_USER/Desktop/lsl-gui2.desktop
-        chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/lsl-gui2.desktop
+    if [[ -n "$lsl_tui_entry" ]]; then
+        printf '%s\n' "$lsl_tui_entry" >/home/$LSL_DESKTOP_USER/Desktop/lsl-tui.desktop
+        chmod +x /home/$LSL_DESKTOP_USER/Desktop/lsl-tui.desktop
+        chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/lsl-tui.desktop
     fi
     if [[ -n "$lsl_gui_entry" ]]; then
         printf '%s\n' "$lsl_gui_entry" >/home/$LSL_DESKTOP_USER/Desktop/lsl-gui.desktop

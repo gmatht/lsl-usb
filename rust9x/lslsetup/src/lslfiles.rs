@@ -125,13 +125,13 @@ static FIRSTBOOT_TOOLKIT: &[(&str, &str)] = &[
     // Desktop + autostart + onboot payload (2026-09-22 post-mortems): the
     // nofmt installer writes /cdrom/bin from this array only, so every
     // script the boot references must be embedded -
-    //   config.sh desktop entries  -> lsl-gui, lsl-gui2, lsl-shutdown-gui
+    //   config.sh desktop entries  -> lsl-gui, lsl-tui, lsl-shutdown-gui
     //   config.sh autostart entries -> lsl-pin-favorites, lsl-home-readonly-warning
     //   onboot.sh (unconditional)  -> mount_all.sh
     //   reclaim service ExecStart   -> lsl-reclaim-win-swap.sh
     //   onboot.sh (-r gated)        -> clean-old-system-patches.sh, wsl-boot-setup
     ("bin\\lsl-gui", include_str!("../../../bin/lsl-gui")),
-    ("bin\\lsl-gui2", include_str!("../../../bin/lsl-gui2")),
+    ("bin\\lsl-tui", include_str!("../../../bin/lsl-tui")),
     ("bin\\lsl-shutdown-gui", include_str!("../../../bin/lsl-shutdown-gui")),
     ("bin\\mount_all.sh", include_str!("../../../bin/mount_all.sh")),
     ("bin\\lsl-pin-favorites", include_str!("../../../bin/lsl-pin-favorites")),
@@ -1020,7 +1020,7 @@ mod firstboot_toolkit_tests {
         // boot path must be embedded here.
         for name in [
             "bin\\lsl-gui",
-            "bin\\lsl-gui2",
+            "bin\\lsl-tui",
             "bin\\lsl-shutdown-gui",
             "bin\\mount_all.sh",
             "bin\\lsl-pin-favorites",

@@ -1414,7 +1414,7 @@ EOF
     ! grep -q "/proc/x" "$CD/lsl-precache.list"
 }
 
-# --- bin/lsl-gui: thin stub -------------------------------------------------
+# --- lsl-btrfs-growd --------------------------------------------------------
 @test "lsl-btrfs-growd: logs a persistent marker when online growth is not applied" {
     . bin/lsl-common.sh
     eval "$(sed -n '/^free_pct()/,/^}/p' bin/lsl-btrfs-growd)"
