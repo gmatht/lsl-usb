@@ -165,6 +165,19 @@ teardown() {
     bash -n bin/lsl-shutdown-gui
 }
 
+@test "shutdown chain: sibling scripts resolve from the nofmt toolkit" {
+    # lsl-shutdown-gui resolves uphome via PATH or /cdrom/bin/uphome; uphome
+    # execs lsl-flush-home.sh (USB) and sources lsl-common.sh, and calls
+    # persist-wifi.sh. The nofmt installer writes /cdrom/bin from
+    # FIRSTBOOT_TOOLKIT only - anything referenced but not embedded fails
+    # at shutdown with "Could not find 'uphome'". Every name must exist
+    # in repo bin/ AND be embedded in the toolkit array.
+    for name in uphome lsl-flush-home.sh lsl-common.sh persist-wifi.sh; do
+        [ -f "bin/$name" ]
+        grep -qF "bin\\\\$name" rust9x/lslsetup/src/lslfiles.rs
+    done
+}
+
 # --- lsl-firstboot: dry-run with mocks ---
 setup_firstboot() {
     export LSL_FIRSTBOOT_STAMP="$TMPDIR_TEST/stamp"

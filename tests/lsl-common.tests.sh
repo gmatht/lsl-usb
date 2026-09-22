@@ -140,6 +140,61 @@ n="$(lsl_vhdx_paths_stdout | wc -l | tr -d ' ')"
 assert '[ "$n" = 1 ]' 'lsl_vhdx_append: dedupes repeated paths'
 rm -f "$VH" "$LSL_VHDX_LIST_FILE"
 
+# --- lsl_load_config / env-file parsing (CRLF regression) -------------------
+# The env file lives on the FAT stick and is edited from Windows, so it arrives
+# with CRLF endings. Sourcing it raw left a trailing CR in LSL_DATA_DIR, which
+# matched neither /cdrom nor /persist in lsl_is_usb_mode and could not be
+# resolved by findmnt - so onboot.sh decided the data dir was not persistent and
+# silently fell back to a volatile tmpfs /home.
+ENV_TMP="$(mktemp -d)"
+
+# CRLF env file: values must arrive CR-free, and other keys must be applied.
+printf 'LSL_DATA_DIR=/mnt/c/Users/lsl-usb\r\nLSL_HOME_BTRFS_MIB=512\r\n' > "$ENV_TMP/crlf.env"
+( export LSL_ENV_FILE="$ENV_TMP/crlf.env"; unset LSL_DATA_DIR LSL_HOME_BTRFS_MIB
+  lsl_load_config >/dev/null 2>&1
+  [ "$LSL_DATA_DIR" = /mnt/c/Users/lsl-usb ] && [ "$LSL_HOME_BTRFS_MIB" = 512 ] ) \
+  && R_CRLF=0 || R_CRLF=1
+assert '[ "$R_CRLF" -eq 0 ]' 'lsl_load_config: CRLF env file parsed, CR stripped, keys applied'
+
+# A CRLF env file naming a USB path must still select USB mode.
+printf 'LSL_DATA_DIR=/cdrom/usbhome\r\n' > "$ENV_TMP/usb.env"
+( export LSL_ENV_FILE="$ENV_TMP/usb.env"; unset LSL_DATA_DIR
+  lsl_load_config >/dev/null 2>&1
+  lsl_is_usb_mode ) && R_USB=0 || R_USB=1
+assert '[ "$R_USB" -eq 0 ]' 'lsl_load_config: CRLF USB path still selects USB mode'
+
+# Leading BOM tolerated.
+printf '\xEF\xBB\xBFLSL_DATA_DIR=/cdrom/bom-home\r\n' > "$ENV_TMP/bom.env"
+( export LSL_ENV_FILE="$ENV_TMP/bom.env"; unset LSL_DATA_DIR
+  lsl_load_config >/dev/null 2>&1
+  [ "$LSL_DATA_DIR" = /cdrom/bom-home ] && lsl_is_usb_mode ) && R_BOM=0 || R_BOM=1
+assert '[ "$R_BOM" -eq 0 ]' 'lsl_load_config: leading BOM stripped'
+
+# A stray CR inherited from the environment (not a file) is trimmed too.
+# lsl_env_file is stubbed off so this tests the trim, not the file's own value.
+( unset LSL_ENV_FILE; export HOME="$ENV_TMP/nohome"
+  lsl_env_file() { return 1; }
+  CR=$'\r'; export LSL_DATA_DIR="/cdrom/usbhome${CR}"
+  lsl_load_config >/dev/null 2>&1
+  [ "$LSL_DATA_DIR" = /cdrom/usbhome ] && lsl_is_usb_mode ) && R_ENVCR=0 || R_ENVCR=1
+assert '[ "$R_ENVCR" -eq 0 ]' 'lsl_load_config: stray CR in environment trimmed'
+
+# lsl_resolve_data_dir must trim CR as well (it feeds mode detection).
+( unset LSL_ENV_FILE; export HOME="$ENV_TMP/nohome"
+  lsl_env_file() { return 1; }
+  CR=$'\r'; export LSL_DATA_DIR="/cdrom/usbhome${CR}"
+  [ "$(lsl_resolve_data_dir)" = /cdrom/usbhome ] ) && R_RES=0 || R_RES=1
+assert '[ "$R_RES" -eq 0 ]' 'lsl_resolve_data_dir: trims CR'
+
+# The stick's env file must win over a stale copy in the live $HOME.
+mkdir -p "$ENV_TMP/home"
+printf 'LSL_DATA_DIR=/nonexistent-shadow\n' > "$ENV_TMP/home/lsl-usb.env"
+( unset LSL_ENV_FILE; export HOME="$ENV_TMP/home"
+  [ "$(lsl_env_file)" = /cdrom/lsl-usb.env ] ) && R_SHADOW=0 || R_SHADOW=1
+assert '[ "$R_SHADOW" -eq 0 ]' 'lsl_env_file: /cdrom/lsl-usb.env preferred over $HOME copy'
+
+rm -rf "$ENV_TMP"
+
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
