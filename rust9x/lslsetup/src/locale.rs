@@ -316,6 +316,7 @@ fn tr_th(msgid: &str) -> String {
             "เลือก USB เป้าหมายก่อน แล้วเลือกวิธีเขียนอิมเมจ".into()
         }
         "[No removable USB drives detected]" => "[ไม่พบไดรฟ์ USB แบบถอดได้]".into(),
+        "[No usable target volumes detected - plug in a stick]" => "[ไม่พบโวลุ่มเป้าหมายที่ใช้งานได้ - เสียบ USB]".into(),
         "Copy Wifi Settings to LSL" => "คัดลอกการตั้งค่า WiFi ไปยัง LSL".into(),
         "Networks to copy (checked = include in wifi.sh):" => {
             "เครือข่ายที่จะคัดลอก (ติ๊ก = ใส่ใน wifi.sh):".into()

@@ -1013,6 +1013,109 @@ pub fn downloads_dir() -> String {
     }
 }
 
+/// System-drive letter ("C") from %SystemDrive%, else %SystemRoot%, else
+/// "C". Compared case-insensitively; the system *volume* is never a
+/// nofmt target, whatever its letter (Win9x-safe: env only, no API).
+pub fn system_drive_letter() -> String {
+    let drive = env_var("SystemDrive").unwrap_or_else(|| {
+        env_var("SystemRoot")
+            .map(|r| r.chars().take(2).collect())
+            .unwrap_or_else(|| "C:".into())
+    });
+    drive
+        .chars()
+        .next()
+        .map(|c| c.to_ascii_uppercase().to_string())
+        .unwrap_or_else(|| "C".into())
+}
+
+pub fn is_system_volume(letter: &str) -> bool {
+    letter.eq_ignore_ascii_case(&system_drive_letter())
+}
+
+/// One top-level directory entry: name without path, dir flag, size
+/// (dirs report 0 — size here is only for the file listing display).
+#[derive(Clone, Debug)]
+pub struct TldEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// List top-level entries of a volume root (`X:\*`). W first (keeps
+/// Unicode names), ANSI fallback for Win95's FindFirstFileW no-op stub.
+/// Never fails hard: unlistable roots yield an empty vec (the caller
+/// treats that as "unknown contents", not "empty").
+pub fn list_tld(letter: &str) -> Vec<TldEntry> {
+    let mut out = Vec::new();
+    let pattern = format!("{}:\\*", letter);
+    let w = wide(&pattern);
+    unsafe {
+        let mut fd: winapi::um::minwinbase::WIN32_FIND_DATAW = std::mem::zeroed();
+        let h = FindFirstFileW(w.as_ptr(), &mut fd);
+        if h != INVALID_HANDLE_VALUE {
+            loop {
+                let name = from_wide(&fd.cFileName);
+                if name != "." && name != ".." && !name.is_empty() {
+                    out.push(TldEntry {
+                        name,
+                        is_dir: fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                        size: ((fd.nFileSizeHigh as u64) << 32) | fd.nFileSizeLow as u64,
+                    });
+                }
+                if FindNextFileW(h, &mut fd) == 0 {
+                    break;
+                }
+            }
+            FindClose(h);
+            out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            return out;
+        }
+    }
+    // ANSI fallback (Win95 and any W failure).
+    list_tld_ansi(letter)
+}
+
+fn list_tld_ansi(letter: &str) -> Vec<TldEntry> {
+    use winapi::um::fileapi::{FindFirstFileA, FindNextFileA};
+    use winapi::um::minwinbase::WIN32_FIND_DATAA;
+    let pattern = format!("{}:\\*", letter);
+    let mut a = Vec::with_capacity(pattern.len() + 1);
+    a.extend_from_slice(pattern.as_bytes());
+    a.push(0);
+    let mut out = Vec::new();
+    unsafe {
+        let mut fd: WIN32_FIND_DATAA = std::mem::zeroed();
+        let h = FindFirstFileA(a.as_ptr() as *const i8, &mut fd);
+        if h == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        const FILE_ATTRIBUTE_DIRECTORY_A: u32 = 0x10;
+        loop {
+            let mut name = Vec::new();
+            let mut i = 0usize;
+            while fd.cFileName[i] != 0 {
+                name.push(fd.cFileName[i] as u8);
+                i += 1;
+            }
+            let name = String::from_utf8_lossy(&name).into_owned();
+            if name != "." && name != ".." && !name.is_empty() {
+                out.push(TldEntry {
+                    name,
+                    is_dir: (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY_A) != 0,
+                    size: ((fd.nFileSizeHigh as u64) << 32) | fd.nFileSizeLow as u64,
+                });
+            }
+            if FindNextFileA(h, &mut fd) == 0 {
+                break;
+            }
+        }
+        FindClose(h);
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
+}
+
 pub fn create_dir_all(p: &str) {
     if p.is_empty() {
         return;

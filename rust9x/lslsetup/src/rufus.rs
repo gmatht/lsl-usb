@@ -17,6 +17,153 @@ pub fn cached_path() -> String {
     format!("{}\\rufus.exe", cache_dir())
 }
 
+/// Decode one JSON string literal starting just AFTER its opening quote.
+/// Returns (decoded value, byte index just past the closing quote).
+fn json_string_body(s: &str) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => return Some((out, i + 1)),
+            b'\\' => {
+                i += 1;
+                if i >= b.len() {
+                    return None;
+                }
+                match b[i] {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'n' => out.push('\n'),
+                    b't' => out.push('\t'),
+                    b'r' => out.push('\r'),
+                    b'u' => {
+                        if i + 4 >= b.len() {
+                            return None;
+                        }
+                        let hex = &s[i + 1..i + 5];
+                        let cp = u32::from_str_radix(hex, 16).ok()?;
+                        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                        i += 4;
+                    }
+                    c => out.push(c as char),
+                }
+                i += 1;
+            }
+            _ => {
+                // Copy one full UTF-8 char (asset names are ASCII, but stay
+                // correct for the release title/body this scanner skips).
+                let ch = s[i..].chars().next()?;
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    None
+}
+
+/// First string value for `key` inside one JSON object literal.
+fn json_field(obj: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let b = obj.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = obj[from..].find(&needle) {
+        let mut i = from + rel + needle.len();
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\n' || b[i] == b'\r') {
+            i += 1;
+        }
+        if i < b.len() && b[i] == b':' {
+            i += 1;
+            while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\n' || b[i] == b'\r') {
+                i += 1;
+            }
+            if i < b.len() && b[i] == b'"' {
+                if let Some((v, _)) = json_string_body(&obj[i + 1..]) {
+                    return Some(v);
+                }
+            }
+        }
+        from = from + rel + needle.len();
+    }
+    None
+}
+
+/// (asset name, browser_download_url) pairs from a GitHub releases API
+/// body, paired PER OBJECT inside the "assets" array.
+///
+/// Why not two independent key scans zipped by index: every release body
+/// also carries a top-level "name" (the release title, e.g. "10.5.0"),
+/// so the names list is one LONGER than the urls list and every pair after
+/// the first is shifted by one. fd 10.5.0 paired
+/// x86_64-unknown-linux-musl.tar.gz with the NEXT asset's URL
+/// (fd_10.5.0_amd64.deb) and all three rust-tool downloads failed with
+/// "invalid gzip header". Pair inside each {...} instead.
+pub fn github_asset_pairs(json: &str) -> Vec<(String, String)> {
+    // Locate the assets array: "assets" ws? : ws? [
+    let b = json.as_bytes();
+    let mut ai = match json.find("\"assets\"") {
+        Some(i) => i + 8,
+        None => return Vec::new(),
+    };
+    while ai < b.len() && (b[ai] == b' ' || b[ai] == b'\t' || b[ai] == b'\n' || b[ai] == b'\r' || b[ai] == b':')
+    {
+        ai += 1;
+    }
+    if ai >= b.len() || b[ai] != b'[' {
+        return Vec::new();
+    }
+    // Walk top-level objects, skipping string literals (braces in URLs
+    // and bodies must not disturb the depth count).
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut obj_start: Option<usize> = None;
+    let mut i = ai + 1;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                // skip string literal
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                    } else if b[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            b'{' => {
+                if depth == 0 {
+                    obj_start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth == 1 {
+                    if let Some(s) = obj_start {
+                        let obj = &json[s..=i];
+                        if let (Some(n), Some(u)) =
+                            (json_field(obj, "name"), json_field(obj, "browser_download_url"))
+                        {
+                            out.push((n, u));
+                        }
+                    }
+                    obj_start = None;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            b']' if depth == 0 => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Minimal JSON string-list extraction: all values for a given key, in order.
 fn json_strings(json: &str, key: &str) -> Vec<String> {
     let needle = format!("\"{}\"", key);
@@ -79,10 +226,8 @@ fn latest_rufus_asset() -> Result<(String, String), String> {
         }
         Err(HttpErr::Failed(m)) => return Err(format!("GitHub API request failed: {}", m)),
     };
-    let names = json_strings(&json, "name");
-    let urls = json_strings(&json, "browser_download_url");
     let tag = json_strings(&json, "tag_name").first().cloned().unwrap_or_default();
-    for (name, url) in names.iter().zip(urls.iter()) {
+    for (name, url) in github_asset_pairs(&json).iter() {
         let is_rufus = name.starts_with("rufus-")
             && name.ends_with(".exe")
             && name[6..name.len() - 4].chars().all(|c| c.is_ascii_digit() || c == '.');
@@ -405,6 +550,25 @@ mod tests {
     }
 
     #[test]
+    fn asset_pairs_survive_release_title_name() {
+        // Regression: fd 10.5.0 carries a top-level "name": "10.5.0"
+        // (the release title), so a positional zip of two key scans pairs
+        // every asset name with the NEXT asset's URL - the musl tarball
+        // downloaded fd_10.5.0_amd64.deb ("invalid gzip header").
+        let json = r#"{"tag_name":"v10.5.0","name":"10.5.0","assets":[
+            {"name":"fd-v10.5.0-x86_64-unknown-linux-musl.tar.gz","browser_download_url":"https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-x86_64-unknown-linux-musl.tar.gz"},
+            {"name":"fd_10.5.0_amd64.deb","browser_download_url":"https://github.com/sharkdp/fd/releases/download/v10.5.0/fd_10.5.0_amd64.deb"}
+        ]}"#;
+        let pairs = github_asset_pairs(json);
+        assert_eq!(pairs.len(), 2);
+        let hit = pairs
+            .iter()
+            .find(|(n, _)| n.contains("x86_64-unknown-linux-musl") && n.ends_with(".tar.gz"));
+        assert!(hit.is_some());
+        assert!(hit.unwrap().1.ends_with("/fd-v10.5.0-x86_64-unknown-linux-musl.tar.gz"));
+    }
+
+    #[test]
     fn sha256_known_vector() {
         let mut h = Sha256::new();
         h.update(b"abc");
@@ -437,3 +601,4 @@ mod tests {
         }
     }
 }
+

@@ -85,8 +85,9 @@ pub fn show_dry_run_report(opts: &crate::cli::Opts) {
                 .unwrap_or_else(|| "none bundled - use --uefi-bootx64 or vendor one".into())
         ));
         out::info("and, after every other drop below, flip the MBR boot code (bytes 0..440; signature + partition table kept).");
-        out::info("No formatting; existing files untouched. Target must be a removable USB drive,");
-        out::info("FAT32/NTFS, MBR-partitioned (--allow-fixed overrides the removable check).");
+        out::info("No formatting; existing files untouched. Any non-system volume is a candidate:");
+        out::info("removable+USB lists as ready, fixed/non-USB lists with a contents check + backup offer.");
+        out::info("System disk/volume, CD-ROM and unmountable volumes are always refused.");
         if opts.extra_isos.is_empty() {
             let others = crate::nofmt::detect_other_isos(&opts.iso_path);
             if others.is_empty() {
@@ -106,12 +107,19 @@ pub fn show_dry_run_report(opts: &crate::cli::Opts) {
         if !opts.usb_letter.is_empty() {
             out::info(&format!("Target pin: --usb-letter {}", opts.usb_letter));
         }
-        let targets = crate::nofmt::probe_targets(opts.allow_fixed);
-        if targets.is_empty() {
-            out::warn("No suitable USB targets detected (need a removable USB stick).");
+        let cands = crate::nofmt::probe_candidates(opts.allow_fixed);
+        let showable: Vec<&crate::nofmt::Candidate> = cands.iter().filter(|c| c.target.is_some()).collect();
+        if showable.is_empty() {
+            out::warn("No candidate volumes detected (need any non-system volume with a physical-disk mapping).");
         } else {
-            for t in &targets {
-                out::info(&format!("  candidate: {}", t.describe()));
+            for c in &showable {
+                let t = c.target.as_ref().unwrap();
+                out::info(&format!("  candidate: {}  [{}]", t.describe(), c.status_tag()));
+                if let Some(snap) = crate::nofmt::snapshot_volume(&t.letter) {
+                    for line in crate::nofmt::describe_snapshot(&snap).split('\n') {
+                        out::info(&format!("      {}", line));
+                    }
+                }
             }
         }
     } else {

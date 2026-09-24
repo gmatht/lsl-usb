@@ -522,7 +522,10 @@ where
             out::info(&format!("  copied {} -> {} ({} bytes) -> {}", base, dname, sz, dest));
         }
     }
-    let _ = std::fs::write(format!("{}\\manifest.txt", dest), manifest.join("\r\n"));
+    // LF + trailing newline: lsl-copy-sfs-hdd.sh --verify parses this with
+    // `while read` (drops a final unterminated line) and compares fields
+    // where a stray CR breaks the size check.
+    let _ = std::fs::write(format!("{}\\manifest.txt", dest), manifest.join("\n") + "\n");
 
     // Flip the env flag so lsl-precache.sh uses the HDD copies.
     let env_file = format!("{}lsl-usb.env", src_root);
@@ -616,13 +619,11 @@ pub fn install_rust_tools(vol_letter: &str, arch: &str) {
                 continue;
             }
         };
-        let names = crate::rufus::json_strings_for_tests(&json, "name");
-        let urls = crate::rufus::json_strings_for_tests(&json, "browser_download_url");
-        let asset = names
-            .iter()
-            .zip(urls.iter())
-            .find(|(n, _)| n.contains(asset_sub.as_str()) && n.ends_with(".tar.gz"))
-            .map(|(n, u)| (n.clone(), u.clone()));
+        // Paired per asset object: a positional zip of two key scans
+        // mis-pairs once the release title "name" shifts the names list.
+        let asset = crate::rufus::github_asset_pairs(&json)
+            .into_iter()
+            .find(|(n, _)| n.contains(asset_sub.as_str()) && n.ends_with(".tar.gz"));
         let Some((asset_name, asset_url)) = asset else {
             out::warn(&format!("  {}: no {} .tar.gz asset - run bin/lsl-rusttools.sh on the live USB to fetch it later.", bin, asset_sub));
             continue;

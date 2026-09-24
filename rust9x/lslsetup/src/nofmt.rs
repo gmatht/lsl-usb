@@ -996,22 +996,179 @@ impl UsbTarget {
 }
 
 /// Enumerate plausible write targets. Classification:
-///   removable + USB bus        -> included
-///   removable + unknown bus    -> included (old Windows / card reader)
-///   fixed + USB bus (USB HDD)  -> included only with allow_fixed
-///   fixed + non-USB bus        -> NEVER included (internal disks)
+///   removable + USB bus        -> Ready (listed, no content check)
+///   removable + unknown bus    -> Ready (old Windows / card reader)
+///   fixed + USB bus            -> Ready only with allow_fixed, else
+///                                 NeedsContentCheck (see below)
+///   fixed and/or known non-USB -> NeedsContentCheck: listed with a
+///     top-level-contents + utilisation warning and a backup offer
+///     (probe_candidates), never silently hidden. An empty fixed D: can
+///     thus beat a precious removable stick — the user decides on data,
+///     not on the removable flag.
+/// Hard refuses (both lists) stay unconditional: CD-ROM, unmountable,
+/// unmappable (no PhysicalDriveN), PhysicalDrive0, and the system volume.
+/// Rationale: the BIOS path writes raw sectors to \\.\PhysicalDriveN
+/// (MBR 0..440 + sectors 1..15), i.e. the whole disk, not just the
+/// volume — TLD contents cannot save a system-disk write.
+// ---------------------------------------------------------------------------
+// Content-aware safety: TLD contents + utilisation + backup offer.
+// The removable flag says nothing about data value (empty fixed D: beats a
+// precious removable stick), so fixed and/or known-non-USB volumes are no
+// longer silently hidden — they list as NeedsContentCheck with a snapshot
+// and an explicit backup offer. Boot-sector risk stays hard-refused.
+// ---------------------------------------------------------------------------
+/// Max volume-used bytes eligible for the automatic backup offer.
+pub const BACKUP_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Top-level entries shown per volume in listings.
+pub const TLD_SHOW: usize = 12;
+const RED_FLAG_NAMES: &[&str] = &[
+    "windows", "program files", "program files (x86)", "users",
+    "documents and settings", "efi", "boot", "recovery",
+    "$recycle.bin", "system volume information", "pagefile.sys",
+    "hiberfil.sys", "swapfile.sys", "inetpub",
+];
+/// Pure red-flag test (unit-tested): dir or file basename, any case.
+pub fn is_red_flag(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    RED_FLAG_NAMES.iter().any(|r| *r == lower)
+}
+/// Top-level snapshot of a volume: contents + utilisation.
+#[derive(Clone, Debug)]
+pub struct ContentSnapshot {
+    pub letter: String,
+    pub label: String,
+    pub fs: String,
+    pub total: u64,
+    pub free: u64,
+    pub used: u64,
+    pub entries: Vec<sys::TldEntry>,
+    pub red_flags: Vec<String>,
+}
+impl ContentSnapshot {
+    pub fn used_pct(&self) -> f64 {
+        if self.total == 0 { 0.0 } else { 100.0 * self.used as f64 / self.total as f64 }
+    }
+}
+/// Snapshot a mounted volume (pure IO, no prompting). None = no such
+/// volume. Unlistable roots yield empty entries (UNKNOWN, not empty).
+pub fn snapshot_volume(letter: &str) -> Option<ContentSnapshot> {
+    let v = sys::list_volumes().into_iter().find(|v| v.letter.eq_ignore_ascii_case(letter))?;
+    let entries = sys::list_tld(&v.letter);
+    let used = v.total.saturating_sub(v.free);
+    let mut red_flags = Vec::new();
+    for e in &entries {
+        if is_red_flag(&e.name) {
+            red_flags.push(if e.is_dir { format!("{} /", e.name) } else { e.name.clone() });
+        }
+    }
+    Some(ContentSnapshot { letter: v.letter, label: v.label, fs: v.fs, total: v.total, free: v.free, used, entries, red_flags })
+}
+/// Human-readable multi-line snapshot for console + dry-run.
+pub fn describe_snapshot(s: &ContentSnapshot) -> String {
+    let gb = |b: u64| b as f64 / sys::GB as f64;
+    let mut out = format!("{}: \"{}\" {}  {:.1}/{:.1} GB used ({:.0}%)  {:.1} GB free",
+        s.letter, s.label, s.fs, gb(s.used), gb(s.total), s.used_pct(), gb(s.free));
+    if s.entries.is_empty() {
+        out.push_str("\n  top-level: (unlistable - treat as UNKNOWN, not empty)");
+    } else {
+        let shown: Vec<String> = s.entries.iter().take(TLD_SHOW).map(|e| {
+            if e.is_dir { format!("{} /", e.name) } else if e.size >= sys::GB { format!("{} ({:.1} GB)", e.name, e.size as f64 / sys::GB as f64) } else if e.size >= sys::MB { format!("{} ({} MB)", e.name, e.size / sys::MB) } else { e.name.clone() }
+        }).collect();
+        out.push_str(&format!("\n  top-level ({}): {}", s.entries.len(), shown.join(", ")));
+        if s.entries.len() > TLD_SHOW {
+            out.push_str(&format!(" (+{} more)", s.entries.len() - TLD_SHOW));
+        }
+    }
+    if !s.red_flags.is_empty() {
+        out.push_str(&format!("\n  red flags: {}", s.red_flags.join(", ")));
+    }
+    out
+}
+/// Content warning: red flags > heavy use > none. Pure (unit-tested).
+pub fn content_warning(s: &ContentSnapshot) -> Option<String> {
+    if !s.red_flags.is_empty() {
+        return Some(format!("looks like a system/data drive ({}). The install keeps existing files, but the BIOS path still rewrites the disk boot sectors - be sure this is the right disk.", s.red_flags.join(", ")));
+    }
+    if s.entries.is_empty() {
+        return Some("contents could not be listed - treat as UNKNOWN, not empty.".into());
+    }
+    if s.total > 0 && s.used * 2 >= s.total && s.used > 256 * 1024 * 1024 {
+        return Some(format!("over half full ({:.0}% used). The install needs its extracts to fit alongside your files.", s.used_pct()));
+    }
+    None
+}
+/// Ready-only view (backward-compat wrapper): single source of truth is
+/// probe_candidates; kept for callers that only want no-questions targets.
+#[allow(dead_code)]
 pub fn probe_targets(allow_fixed: bool) -> Vec<UsbTarget> {
     let mut targets = Vec::new();
+    for c in probe_candidates(allow_fixed) {
+        if matches!(c.status, CandidateStatus::Ready) {
+            if let Some(t) = c.target {
+                targets.push(t);
+            }
+        }
+    }
+    targets.sort_by(|a, b| a.letter.cmp(&b.letter));
+    targets
+}
+
+/// Triage result for one volume.
+#[derive(Clone, Debug)]
+pub enum CandidateStatus { Ready, NeedsContentCheck(String), Refused(String) }
+/// One enumerated volume with its target (when mappable) + triage.
+#[derive(Clone, Debug)]
+pub struct Candidate {
+    pub volume: sys::Volume,
+    pub target: Option<UsbTarget>,
+    pub status: CandidateStatus,
+}
+impl Candidate {
+    pub fn status_tag(&self) -> String {
+        match &self.status {
+            CandidateStatus::Ready => "ready".into(),
+            CandidateStatus::NeedsContentCheck(w) => format!("check contents ({})", w),
+            CandidateStatus::Refused(w) => format!("refused ({})", w),
+        }
+    }
+}
+/// Pure triage (no IO, unit-tested).
+fn classify_status(removable: bool, bus_is_usb: Option<bool>, phys: u32, is_system: bool, bus: &str, allow_fixed: bool) -> CandidateStatus {
+    if is_system || phys == 0 {
+        return CandidateStatus::Refused("maps to the system disk (PhysicalDrive0 or the Windows volume) - never a target".into());
+    }
+    if removable && !matches!(bus_is_usb, Some(false)) {
+        return CandidateStatus::Ready;
+    }
+    if allow_fixed && bus_is_usb == Some(true) {
+        return CandidateStatus::Ready;
+    }
+    let mut why = Vec::new();
+    if !removable {
+        why.push("fixed drive (not removable)".to_string());
+    }
+    if bus_is_usb == Some(false) {
+        why.push(format!("on the {} bus, not USB", bus));
+    }
+    if why.is_empty() {
+        why.push("needs a contents check".to_string());
+    }
+    CandidateStatus::NeedsContentCheck(why.join(" + "))
+}
+/// Full enumeration: every lettered volume with triage (nothing silently
+/// hidden except CD-ROM / unmountable / unmappable). Sorted by letter.
+pub fn probe_candidates(allow_fixed: bool) -> Vec<Candidate> {
+    let mut out = Vec::new();
     for v in sys::list_volumes() {
         if v.cdrom || v.letter.is_empty() {
             continue;
         }
         if v.fs.is_empty() && v.total == 0 {
-            continue; // unmountable
+            continue;
         }
         let phys = match device_number(&v.letter) {
             Ok(n) => n,
-            Err(_) => continue, // no device-number mapping -> cannot target safely
+            Err(_) => continue,
         };
         let (bus, name) = match device_property(&format!(r"\\.\PhysicalDrive{}", phys)) {
             Some((b, n)) => (bus_name(b).to_string(), n),
@@ -1023,55 +1180,33 @@ pub fn probe_targets(allow_fixed: bool) -> Vec<UsbTarget> {
                 Some((b, _)) => bus_is_usb_tri(b),
                 None => None,
             },
-        }; // None (failed query or BusTypeUnknown) counts as unknown, not as non-USB
-        let include = if v.removable {
-            !matches!(bus_is_usb, Some(false)) // removable but NOT USB: skip unless unknown
-        } else {
-            // fixed drives only via --allow-fixed, and only when USB bus
-            allow_fixed && bus_is_usb == Some(true)
         };
-        if !include {
-            continue;
-        }
-        targets.push(UsbTarget {
-            letter: v.letter,
-            label: v.label,
-            fs: v.fs,
-            total: v.total,
-            free: v.free,
-            phys,
-            bus_is_usb,
-            bus,
-            device_name: name,
-        });
+        let is_system = sys::is_system_volume(&v.letter);
+        let status = classify_status(v.removable, bus_is_usb, phys, is_system, &bus, allow_fixed);
+        let target = Some(UsbTarget { letter: v.letter.clone(), label: v.label.clone(), fs: v.fs.clone(), total: v.total, free: v.free, phys, bus_is_usb, bus: bus.clone(), device_name: name });
+        out.push(Candidate { volume: v, target, status });
     }
-    targets.sort_by(|a, b| a.letter.cmp(&b.letter));
-    targets
+    out.sort_by(|a, b| a.volume.letter.cmp(&b.volume.letter));
+    out
 }
-
 /// Hard safety gate: is this target allowed at all?
-fn verify_target(t: &UsbTarget, allow_fixed: bool) -> Result<(), String> {
+fn verify_target(t: &UsbTarget, _allow_fixed: bool) -> Result<(), String> {
     if t.phys == 0 {
         return Err(format!(
             "refusing: \\.\\{} maps to \\\\.\\PhysicalDrive0 - that is almost certainly the system disk",
             t.letter
         ));
     }
-    if t.bus_is_usb == Some(false) {
+    if sys::is_system_volume(&t.letter) {
         return Err(format!(
-            "refusing: \\.\\{} is on the {} bus, not USB. This tool only writes to USB sticks",
-            t.letter, t.bus
+            "refusing: \\.\\{} is the Windows system volume - never a target",
+            t.letter
         ));
     }
-    let vols = sys::list_volumes();
-    if let Some(v) = vols.iter().find(|v| v.letter.eq_ignore_ascii_case(&t.letter)) {
-        if !v.removable && !allow_fixed {
-            return Err(format!(
-                "refusing: \\.\\{} is not a removable drive. Pass --allow-fixed if you really mean it",
-                t.letter
-            ));
-        }
-    }
+    // Fixed and/or known-non-USB volumes are NOT refused here: they route
+    // to the content gate (snapshot + warning + backup offer) in
+    // install_from_iso via content_check_reason. Only the boot-risk
+    // refuses above are unconditional.
     Ok(())
 }
 
@@ -1085,66 +1220,65 @@ pub fn choose_target(letter_hint: &str, allow_fixed: bool) -> Result<UsbTarget, 
         );
     }
     verify_assets()?;
-    let targets = probe_targets(allow_fixed);
-
+    // Full triage: Ready + NeedsContentCheck are both selectable (the
+    // content gate runs later in install_from_iso, where `ui` is known).
+    // Refused volumes (system disk/volume, CD-ROM class) never select.
+    let cands = probe_candidates(allow_fixed);
+    let selectable: Vec<&Candidate> = cands.iter().filter(|c| c.target.is_some() && !matches!(c.status, CandidateStatus::Refused(_))).collect();
+    let describe_cand = |c: &Candidate| {
+        let t = c.target.as_ref().unwrap();
+        match &c.status {
+            CandidateStatus::Ready => t.describe(),
+            CandidateStatus::NeedsContentCheck(w) => format!("{}  [check contents: {}]", t.describe(), w),
+            CandidateStatus::Refused(w) => format!("{}  [refused: {}]", t.describe(), w),
+        }
+    };
     let target = if !letter_hint.is_empty() {
         let want = letter_hint.trim_end_matches(':').to_ascii_uppercase();
-        match targets.iter().find(|t| t.letter == want) {
-            Some(t) => t.clone(),
-            None => {
-                // Not among the candidates: build the precise refusal from
-                // the raw volume list (so --usb-letter C on a fixed internal
-                // disk says exactly why it was refused).
-                if let Some(v) = sys::list_volumes().iter().find(|v| v.letter == want).cloned() {
-                    let phys = device_number(&v.letter).unwrap_or(u32::MAX);
-                    let (bus, _) = device_property(&format!(r"\\.\{}:", want))
-                        .map(|(b, _)| (bus_name(b).to_string(), String::new()))
-                        .unwrap_or_else(|| ("unknown".to_string(), String::new()));
-                    let t = UsbTarget {
-                        letter: v.letter,
-                        label: v.label,
-                        fs: v.fs,
-                        total: v.total,
-                        free: v.free,
-                        phys,
-                        bus_is_usb: if bus == "unknown" { None } else { Some(bus == "USB") },
-                        bus,
-                        device_name: String::new(),
-                    };
-                    verify_target(&t, allow_fixed)?;
-                    // passed verify (e.g. query-less old Windows) but was
-                    // still filtered out of the candidate list: use it.
-                    t
-                } else {
-                    let mut msg = format!("--usb-letter {}: no such volume is mounted.\n", want);
-                    for t in &targets {
-                        msg.push_str(&format!("  {}\n", t.describe()));
-                    }
-                    return Err(msg);
+        match cands.iter().find(|c| c.volume.letter == want) {
+            Some(c) => {
+                if let CandidateStatus::Refused(w) = &c.status {
+                    return Err(format!("refusing: \\\\.\\{}: {}", want, w));
                 }
+                c.target.clone().ok_or_else(|| format!("--usb-letter {}: volume is not mappable to a physical disk.", want))?
+            }
+            None => {
+                if sys::list_volumes().iter().any(|v| v.letter == want) {
+                    // Volume exists but fell out of triage (CD-ROM /
+                    // unmountable / unmappable): refuse plainly.
+                    return Err(format!("--usb-letter {}: that volume cannot be a target (CD-ROM, unmountable, or no physical-disk mapping).", want));
+                }
+                let mut msg = format!("--usb-letter {}: no such volume is mounted.\n", want);
+                for c in &cands {
+                    if c.target.is_some() {
+                        msg.push_str(&format!("  {}\n", describe_cand(c)));
+                    }
+                }
+                return Err(msg);
             }
         }
     } else {
-        if targets.is_empty() {
+        if selectable.is_empty() {
             return Err(
-                "no suitable USB target found (need a removable USB drive with an MBR partition table). \
+                "no suitable target found (need any non-system volume with a physical-disk mapping). \
                  Plug the stick in, or use the Rufus flow."
                     .into(),
             );
         }
-        if targets.len() == 1 {
-            targets[0].clone()
+        if selectable.len() == 1 {
+            selectable[0].target.clone().unwrap()
         } else {
-        out::step("Select the USB stick for the non-destructive write:");
-        for (i, t) in targets.iter().enumerate() {
-            out::info(&format!("  {:2}. {}", i + 1, t.describe()));
+        out::step("Select the target for the non-destructive write:");
+        for (i, c) in selectable.iter().enumerate() {
+            out::info(&format!("  {:2}. {}", i + 1, describe_cand(c)));
         }
+        out::info("Fixed / non-USB entries need a contents check + backup offer before writing.");
         let ans = out::prompt(&format!(
-            "Choose a stick [1..{}], or press Enter to cancel: ",
-            targets.len()
+            "Choose a target [1..{}], or press Enter to cancel: ",
+            selectable.len()
         ));
         match ans.parse::<usize>() {
-            Ok(n) if n >= 1 && n <= targets.len() => targets[n - 1].clone(),
+            Ok(n) if n >= 1 && n <= selectable.len() => selectable[n - 1].target.clone().unwrap(),
             _ => return Err("cancelled.".into()),
         }
         }
@@ -1154,6 +1288,162 @@ pub fn choose_target(letter_hint: &str, allow_fixed: bool) -> Result<UsbTarget, 
     Ok(target)
 }
 
+/// Content-check reason for an already-chosen target: None = Ready (no
+/// gate), Some(reason) = run confirm_fixed_volume first. Mirrors
+/// classify_status so GUI (preconfirmed) and CLI share one rule.
+/// allow_fixed keeps its classic meaning: fixed+USB is Ready (no
+/// double-prompt); everything else fixed and/or known-non-USB gates.
+pub fn content_check_reason(t: &UsbTarget, allow_fixed: bool) -> Option<String> {
+    if t.phys == 0 || sys::is_system_volume(&t.letter) {
+        return None;
+    }
+    let vols = sys::list_volumes();
+    let removable = vols.iter().find(|v| v.letter.eq_ignore_ascii_case(&t.letter)).map(|v| v.removable).unwrap_or(false);
+    if removable && !matches!(t.bus_is_usb, Some(false)) {
+        return None;
+    }
+    if allow_fixed && t.bus_is_usb == Some(true) {
+        return None;
+    }
+    let mut why = Vec::new();
+    if let Some(v) = vols.iter().find(|v| v.letter.eq_ignore_ascii_case(&t.letter)) {
+        if !v.removable {
+            why.push("fixed drive (not removable)".to_string());
+        }
+    } else if !removable {
+        why.push("fixed drive (not removable)".to_string());
+    }
+    if t.bus_is_usb == Some(false) {
+        why.push(format!("on the {} bus, not USB", t.bus));
+    }
+    if why.is_empty() { None } else { Some(why.join(" + ")) }
+}
+/// Backup destination (timestamped, under %LOCALAPPDATA%).
+pub fn backup_dir_for(letter: &str) -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    format!("{}\\lsl-usb\\vol-backup-{}-{}", sys::local_app_data(), letter.to_ascii_uppercase(), secs)
+}
+/// Copy a volume tree to the backup dir (skips live system junk, never
+/// follows symlinks/junctions). Refuses when used > cap or dest lacks room.
+pub fn backup_volume_contents(letter: &str, ui: Option<&dyn WriteUi>) -> Result<String, String> {
+    let snap = snapshot_volume(letter).ok_or_else(|| format!("cannot back up {}: volume not found", letter))?;
+    if snap.used > BACKUP_MAX_BYTES {
+        return Err(format!("{}: holds {:.1} GB - too big for the automatic backup (cap {:.0} GB). Back it up by hand, then re-run and continue without backup.",
+            letter, snap.used as f64 / sys::GB as f64, BACKUP_MAX_BYTES as f64 / sys::GB as f64));
+    }
+    let dest = backup_dir_for(letter);
+    let sys_letter = sys::system_drive_letter();
+    let dest_free = sys::free_bytes(&sys_letter).unwrap_or(0);
+    if dest_free < snap.used + 64 * sys::MB {
+        return Err(format!("backup drive {}: has only {:.1} GB free but {:.1} GB is needed - free space or back up by hand, then continue without backup.",
+            sys_letter, dest_free as f64 / sys::GB as f64, snap.used as f64 / sys::GB as f64));
+    }
+    sys::create_dir_all(&dest);
+    let skip = ["$recycle.bin", "system volume information", "recycler"];
+    let mut stack: Vec<(String, String)> = snap.entries.iter().map(|e| (format!("{}:\\{}", letter, e.name), format!("{}\\{}", dest, e.name))).collect();
+    let mut files: u64 = 0;
+    let mut bytes: u64 = 0;
+    let mut skipped: u64 = 0;
+    while let Some((src, dst)) = stack.pop() {
+        let lower = src.rsplit('\\').next().unwrap_or("").to_lowercase();
+        if skip.iter().any(|s| *s == lower) {
+            skipped += 1;
+            continue;
+        }
+        let meta = match std::fs::symlink_metadata(&src) {
+            Ok(m) => m,
+            Err(_) => { skipped += 1; continue; }
+        };
+        if meta.is_dir() {
+            sys::create_dir_all(&dst);
+            match std::fs::read_dir(&src) {
+                Ok(rd) => for e in rd.flatten() {
+                    if let Some(n) = e.file_name().to_str().map(|s| s.to_string()) {
+                        stack.push((format!("{}\\{}", src, n), format!("{}\\{}", dst, n)));
+                    }
+                },
+                Err(_) => { skipped += 1; }
+            }
+        } else if meta.is_file() {
+            if let Some(i) = dst.rfind('\\') {
+                sys::create_dir_all(&dst[..i]);
+            }
+            match std::fs::copy(&src, &dst) {
+                Ok(n) => { files += 1; bytes += n; }
+                Err(_) => { skipped += 1; }
+            }
+        } else {
+            skipped += 1;
+        }
+        if files % 200 == 0 {
+            if let Some(u) = ui {
+                u.set_status(&format!("Backing up {}: - {} files", letter, files));
+                u.pump();
+            }
+        }
+    }
+    out::info(&format!("Backed up {}: ({} files, {:.1} GB{}) to {}", letter, files, bytes as f64 / sys::GB as f64,
+        if skipped > 0 { format!(", {} skipped", skipped) } else { String::new() }, dest));
+    Ok(dest)
+}
+/// Content gate for NeedsContentCheck targets. Returns true = proceed.
+/// Console: typed BACKUP / YES (repo convention). GUI: Yes/No/Cancel
+/// (Yes = backup + continue when an offer fits).
+pub fn confirm_fixed_volume(snap: &ContentSnapshot, reason: &str, ui: Option<&dyn WriteUi>) -> Result<bool, String> {
+    out::warn(&format!("{}: {} - check the contents before writing.", snap.letter, reason));
+    out::info(&describe_snapshot(snap));
+    if let Some(w) = content_warning(snap) {
+        out::warn(&w);
+    }
+    out::info("The install keeps existing files, but the BIOS path rewrites the disk boot sectors (MBR 0..440 + sectors 1..15).");
+    let offer_backup = !snap.entries.is_empty() && snap.used > 0 && snap.used <= BACKUP_MAX_BYTES;
+    match ui {
+        None => {
+            if offer_backup {
+                out::info(&format!("Contents are {:.1} GB - a backup fits under %LOCALAPPDATA%.", snap.used as f64 / sys::GB as f64));
+                let ans = out::prompt("Type BACKUP to back up and continue, YES to continue without backup, or Enter to abort: ");
+                if ans.eq_ignore_ascii_case("BACKUP") {
+                    backup_volume_contents(&snap.letter, None)?;
+                    return Ok(true);
+                }
+                if ans.eq_ignore_ascii_case("YES") {
+                    return Ok(true);
+                }
+                return Err("cancelled - nothing was written.".into());
+            }
+            if snap.used > BACKUP_MAX_BYTES {
+                out::warn(&format!("Contents are {:.1} GB - too big for the automatic backup. Back up by hand first.", snap.used as f64 / sys::GB as f64));
+            }
+            let ans = out::prompt("Type YES to use this drive anyway, or Enter to abort: ");
+            if ans.eq_ignore_ascii_case("YES") {
+                return Ok(true);
+            }
+            Err("cancelled - nothing was written.".into())
+        }
+        Some(_) => {
+            use winapi::um::winuser::{MB_ICONQUESTION, MB_ICONWARNING, MB_YESNOCANCEL, MB_YESNO, MessageBoxW};
+            let text = format!("{}: {}\n\n{}\n\n{}\n\n{}", snap.letter, reason, describe_snapshot(snap),
+                content_warning(snap).unwrap_or_else(|| "The install keeps existing files.".into()),
+                if offer_backup { "Yes = back up the contents and continue\nNo = continue WITHOUT backup\nCancel = abort" }
+                else { "Yes = use this drive anyway (back up by hand first - too big to auto-back)\nNo/Cancel = abort" });
+            let (wt, ww) = (sys::wide(&text), sys::wide("lslsetup - use this drive?"));
+            let flags = if offer_backup { MB_YESNOCANCEL } else { MB_YESNO } | if snap.red_flags.is_empty() { MB_ICONQUESTION } else { MB_ICONWARNING };
+            let r = unsafe { MessageBoxW(std::ptr::null_mut(), wt.as_ptr(), ww.as_ptr(), flags) };
+            const IDYES: i32 = 6;
+            const IDNO: i32 = 7;
+            if r == IDYES {
+                if offer_backup {
+                    backup_volume_contents(&snap.letter, ui)?;
+                }
+                return Ok(true);
+            }
+            if r == IDNO && offer_backup {
+                return Ok(true);
+            }
+            Err("cancelled - nothing was written.".into())
+        }
+    }
+}
 // ---------------------------------------------------------------------------
 // Assets (embedded, SHA-256 pinned)
 // ---------------------------------------------------------------------------
@@ -1260,6 +1550,13 @@ pub fn install_from_iso(
         return Err(why);
     }
     let target = choose_target(letter_hint, allow_fixed)?;
+    // Content gate for fixed and/or known-non-USB volumes: snapshot +
+    // warning + backup offer. Runs on EVERY path (GUI preconfirmed too —
+    // the radio click confirms the letter, not the contents).
+    if let Some(reason) = content_check_reason(&target, allow_fixed) {
+        let snap = snapshot_volume(&target.letter).ok_or_else(|| format!("cannot inspect {}: volume disappeared", target.letter))?;
+        confirm_fixed_volume(&snap, &reason, ui)?;
+    }
 
     out::step("Non-destructive write (no reformat):");
     out::info(&format!("  target: {}", target.describe()));
@@ -3982,5 +4279,85 @@ mod tests {
         std::fs::write(&bad, b"not a real iso - no casper kernel").unwrap();
         assert!(write_menu_entries(&root, &bad, "plain", "plain.iso", false, None).is_err());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn snap_for_test(entries: &[(&str, bool)], used: u64, total: u64) -> ContentSnapshot {
+        ContentSnapshot {
+            letter: "D".into(),
+            label: "DATA".into(),
+            fs: "NTFS".into(),
+            total,
+            free: total.saturating_sub(used),
+            used,
+            entries: entries.iter().map(|(n, d)| sys::TldEntry { name: n.to_string(), is_dir: *d, size: 0 }).collect(),
+            red_flags: entries.iter().filter(|(n, _)| is_red_flag(n)).map(|(n, d)| if *d { format!("{} /", n) } else { n.to_string() }).collect(),
+        }
+    }
+
+    #[test]
+    fn red_flags_catch_system_names_any_case() {
+        assert!(is_red_flag("Windows"));
+        assert!(is_red_flag("USERS"));
+        assert!(is_red_flag("pagefile.sys"));
+        assert!(is_red_flag("System Volume Information"));
+        assert!(!is_red_flag("Photos"));
+        assert!(!is_red_flag("lsl-usb"));
+        assert!(!is_red_flag("Windows.old.bak")); // exact match only, no substring scare
+    }
+
+    #[test]
+    fn content_warning_tiers() {
+        // red flags beat everything
+        let s = snap_for_test(&[("Windows", true), ("Photos", true)], 10 * sys::GB, 100 * sys::GB);
+        let w = content_warning(&s).unwrap();
+        assert!(w.contains("system/data"), "unexpected: {w}");
+        // unlistable (but non-flagged) is UNKNOWN, never safe-empty
+        let s = snap_for_test(&[], 0, 30 * sys::GB);
+        let w = content_warning(&s).unwrap();
+        assert!(w.contains("UNKNOWN"), "unexpected: {w}");
+        // over-half-full warns on space
+        let s = snap_for_test(&[("Photos", true)], 20 * sys::GB, 30 * sys::GB);
+        let w = content_warning(&s).unwrap();
+        assert!(w.contains("half full"), "unexpected: {w}");
+        // small ordinary stick: quiet
+        let s = snap_for_test(&[("Photos", true)], 1 * sys::GB, 30 * sys::GB);
+        assert!(content_warning(&s).is_none());
+        // truly empty but listable: quiet (empty fixed D: is the easy case)
+        let s = ContentSnapshot { entries: vec![], red_flags: vec![], letter: "D".into(), label: "".into(), fs: "FAT32".into(), total: 30 * sys::GB, free: 30 * sys::GB, used: 0 };
+        // empty vec means unlistable in production; a genuinely empty root
+        // still lists nothing — the gate treats both as needing a look,
+        // so assert the conservative behaviour explicitly.
+        assert!(content_warning(&s).is_some());
+    }
+
+    #[test]
+    fn classify_status_triage() {
+        // removable USB/unknown: ready
+        assert!(matches!(classify_status(true, Some(true), 1, false, "USB", false), CandidateStatus::Ready));
+        assert!(matches!(classify_status(true, None, 1, false, "unknown", false), CandidateStatus::Ready));
+        // system disk / system volume: always refused
+        assert!(matches!(classify_status(true, Some(true), 0, false, "USB", false), CandidateStatus::Refused(_)));
+        assert!(matches!(classify_status(true, Some(true), 1, true, "USB", false), CandidateStatus::Refused(_)));
+        assert!(matches!(classify_status(false, Some(true), 0, false, "USB", true), CandidateStatus::Refused(_)));
+        // fixed USB HDD: needs check by default, ready with --allow-fixed
+        assert!(matches!(classify_status(false, Some(true), 1, false, "USB", false), CandidateStatus::NeedsContentCheck(_)));
+        assert!(matches!(classify_status(false, Some(true), 1, false, "USB", true), CandidateStatus::Ready));
+        // fixed non-USB: needs check even WITH --allow-fixed (contents decide)
+        match classify_status(false, Some(false), 1, false, "SATA", true) {
+            CandidateStatus::NeedsContentCheck(w) => {
+                assert!(w.contains("fixed"), "unexpected: {w}");
+                assert!(w.contains("SATA"), "unexpected: {w}");
+            }
+            other => panic!("fixed SATA must need a check, got {:?}", other),
+        }
+        // removable but known non-USB (e.g. SD on a non-USB bus): check, not hide
+        assert!(matches!(classify_status(true, Some(false), 1, false, "SD", false), CandidateStatus::NeedsContentCheck(_)));
+    }
+
+    #[test]
+    fn backup_dir_is_timestamped_off_profile() {
+        let d = backup_dir_for("d");
+        assert!(d.contains("vol-backup-D-"), "unexpected: {d}");
+        assert!(d.starts_with(&sys::local_app_data()), "must live under the profile, not the stick: {d}");
     }
 }

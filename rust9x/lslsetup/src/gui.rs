@@ -3203,7 +3203,11 @@ pub fn run_gui(
         // (created + Rc-wrapped outside the build block - see above)
         // target USB picker (kind 4): FIRST on the page - the stick is
         // chosen before the method, so the BIOS/UEFI defaults below can
-        // follow it. Removable volumes, first pre-checked.
+        // follow it. Every non-system volume lists (ready Or check-contents
+        // with its reason); system/CD-ROM/unmountable never list. The first
+        // Ready entry is pre-checked; check-contents entries are never
+        // pre-checked (explicit pick = explicit consent, backup offer at
+        // install time).
         let mut cap: Box<nwg::Label> = Box::default();
         let _ = nwg::Label::builder()
             .text(&crate::locale::tr("Target USB (for the non-destructive copy):"))
@@ -3214,15 +3218,15 @@ pub fn run_gui(
         cap.set_font(Some(&font_bold));
         items.push(PageItem { ctl: PageCtl::Lbl(cap, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
         iy += 22;
-        let mut targets: Vec<sys::Volume> = sys::list_volumes()
+        let cands: Vec<crate::nofmt::Candidate> = crate::nofmt::probe_candidates(false)
             .into_iter()
-            .filter(|v| v.removable && !v.cdrom && !v.letter.is_empty())
+            .filter(|c| c.target.is_some() && !matches!(c.status, crate::nofmt::CandidateStatus::Refused(_)))
             .collect();
-        targets.sort_by(|a, b| a.letter.cmp(&b.letter));
-        if targets.is_empty() {
+        // targets sort by letter inside probe_candidates already.
+        if cands.is_empty() {
             let mut none: Box<nwg::Label> = Box::default();
             let _ = nwg::Label::builder()
-                .text(&crate::locale::tr("[No removable USB drives detected]"))
+                .text(&crate::locale::tr("[No usable target volumes detected - plug in a stick]"))
                 .position((26, iy))
                 .size((560, 20))
                 .parent(&*frame_install)
@@ -3230,7 +3234,17 @@ pub fn run_gui(
             items.push(PageItem { ctl: PageCtl::Lbl(none, 0), x: 26, y: iy, w: -20, h: 20, idx: 0 });
             iy += 24;
         }
-        for (n, u) in targets.iter().enumerate() {
+        let first_ready = cands.iter().position(|c| matches!(c.status, crate::nofmt::CandidateStatus::Ready));
+        for (n, c) in cands.iter().enumerate() {
+            let t = c.target.as_ref().unwrap();
+            let size_gb = t.total as f64 / crate::sys::GB as f64;
+            let text = match &c.status {
+                crate::nofmt::CandidateStatus::Ready =>
+                    format!("{}:  {}  {}  ({:.1} GB)", t.letter, t.label, t.fs, size_gb),
+                crate::nofmt::CandidateStatus::NeedsContentCheck(w) =>
+                    format!("{}:  {}  {}  ({:.1} GB)  [check contents: {}]", t.letter, t.label, t.fs, size_gb, w),
+                crate::nofmt::CandidateStatus::Refused(_) => continue, // filtered above; keep arm
+            };
             let mut rb: Box<nwg::RadioButton> = Box::default();
             let _ = nwg::RadioButton::builder()
                 .flags(if n == 0 {
@@ -3238,12 +3252,12 @@ pub fn run_gui(
                 } else {
                     nwg::RadioButtonFlags::VISIBLE
                 })
-                .text(&format!("{}:  {}  {}  ({:.1} GB)", u.letter, u.label, u.fs, u.size_gb()))
+                .text(&text)
                 .position((10, iy))
                 .size((780, 20))
                 .parent(&*frame_install)
                 .build(&mut rb);
-            if n == 0 {
+            if Some(n) == first_ready {
                 rb.set_check_state(nwg::RadioButtonState::Checked);
             }
             items.push(PageItem { ctl: PageCtl::Radio(rb, 4), x: 10, y: iy, w: -20, h: 20, idx: 0 });
@@ -3384,7 +3398,7 @@ pub fn run_gui(
         items.push(PageItem { ctl: PageCtl::Lbl(note, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
         // default the BIOS/UEFI checkboxes to the preselected stick,
         // then gate them on the preselected write method
-        let first_letter = targets.first().map(|u| u.letter.clone()).unwrap_or_default();
+        let first_letter = cands.iter().find_map(|c| c.target.as_ref().map(|t| t.letter.clone())).unwrap_or_default();
         drop(items); // release the borrow_mut above: apply re-borrows
         apply_boot_caps(&install_items, &first_letter, "", true);
         apply_method_caps(&install_items, &bios_tt, &uefi_tt, effective_pre, &first_letter);
