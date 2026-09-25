@@ -5,3 +5,6 @@ translations.
 Check UEFI and BIOS by default.
 
 No format install by default?
+
+Support F2FS?
+Support repartition?

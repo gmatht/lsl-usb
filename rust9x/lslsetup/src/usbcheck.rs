@@ -303,11 +303,32 @@ pub fn check_whole_usb(letter: &str, ui: Option<&WorkingUi>) -> Result<UsbCheckR
                     .zip(xbuf[xoff..xoff + n].iter())
                     .position(|(a, b)| a != b)
                     .unwrap_or(0);
+                let abs_off = done + off as u64;
+                // Heuristic: mismatch at a power-of-2 boundary strongly suggests
+                // address-wrap fake capacity (writes past real size loop back).
+                // Mismatch at a random offset is more likely defective cells.
+                const FAKE_BOUNDARIES: &[u64] = &[
+                    1 << 30, // 1 GB
+                    1 << 31, // 2 GB
+                    1 << 32, // 4 GB
+                    1 << 33, // 8 GB
+                    1 << 34, // 16 GB
+                    1 << 35, // 32 GB
+                ];
+                let near_boundary = FAKE_BOUNDARIES.iter().any(|b| {
+                    abs_off >= *b && abs_off < *b + BUF_BYTES as u64
+                });
+                let diagnosis = if near_boundary {
+                    "FAKE-CAPACITY STICK (address wrap at power-of-2 boundary)"
+                } else {
+                    "BAD STICK (dying/defective flash cells)"
+                };
                 close(h);
                 return Err(format!(
-                    "DATA MISMATCH on {} at file offset {:.3} GB - BAD STICK, DeleteMe left in place",
+                    "DATA MISMATCH on {} at file offset {:.3} GB - {}, DeleteMe left in place",
                     path,
-                    (done + off as u64) as f64 / 1e9
+                    abs_off as f64 / 1e9,
+                    diagnosis
                 ));
             }
             done += n as u64;
