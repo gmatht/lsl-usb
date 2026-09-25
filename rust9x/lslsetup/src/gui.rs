@@ -265,6 +265,13 @@ fn checked_method(items: &PageItems) -> &'static str {
 
 /// Gate the BIOS/UEFI checkboxes (kinds 5/6) on the write method: only
 /// the built-in (nofmt) installer uses them - Rufus/skip set up boot
+/// True when the volume already contains LSL-USB artifacts (so it is
+/// not a "new" stick that needs a fake-capacity check).
+pub(crate) fn is_lsl_stick(letter: &str) -> bool {
+    sys::path_exists(&format!("{}:\\lsl-usb.env", letter))
+        || sys::path_exists(&format!("{}:\\casper\\filesystem.squashfs", letter))
+}
+
 /// themselves, so there the boxes grey out, uncheck, and explain via
 /// label + tooltip. For nofmt the tech tooltips are restored and the
 /// target stick decides via apply_boot_caps.
@@ -506,9 +513,9 @@ pub(crate) fn build_install_page(
         .build(&mut fwline);
     items.push(PageItem { ctl: PageCtl::Lbl(fwline, 7), x: 10, y: iy, w: -20, h: 20, idx: 0 });
     iy += 24;
-    // Whole-USB surface check (Check kind 8): off by default (slow -
-    // fills free space with PRNG data and reads it back uncached).
-    // Runs after the write for Rufus AND built-in alike.
+    // Whole-USB surface check (Check kind 8): recommended for NEW
+    // sticks (no LSL-USB artifacts yet) to catch fake capacity / dying
+    // flash. Off for sticks that already look like LSL-USB (re-write).
     let mut check_tt: nwg::Tooltip = Default::default();
     let _ = nwg::Tooltip::builder().build(&mut check_tt);
     let check_tt: &'static mut nwg::Tooltip = Box::leak(Box::new(check_tt));
@@ -521,6 +528,14 @@ pub(crate) fn build_install_page(
             .parent(frame_install)
             .build(&mut cb);
         check_tt.register(cb.as_ref(), &crate::locale::tr("Adds a DeleteMe folder, fills free space with 4 GB pseudo-random chunks, reads every byte back with OS caching DISABLED (bad/fake sticks cannot hide), then deletes DeleteMe. Catches dying and fake-capacity flash."));
+        let first_letter = cands.iter().find_map(|c| {
+            if matches!(c.status, crate::nofmt::CandidateStatus::Ready) {
+                c.target.as_ref().map(|t| t.letter.clone())
+            } else { None }
+        }).unwrap_or_default();
+        if !first_letter.is_empty() && !is_lsl_stick(&first_letter) {
+            cb.set_check_state(nwg::CheckBoxState::Checked);
+        }
         items.push(PageItem { ctl: PageCtl::Check(cb, 8), x: 10, y: iy, w: -20, h: 20, idx: 0 });
         iy += 24;
     }
