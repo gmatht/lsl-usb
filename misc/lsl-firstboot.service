@@ -1,5 +1,5 @@
 [Unit]
-Description=lsl-usb first-boot setup (one-shot, per-install)
+Description=lsl-usb first-boot setup (per-install background job)
 # Runs after onboot.service (which connects wifi) and waits for the network
 # before installing packages. Wi-fi staging is also kept as a fallback.
 After=network-online.target NetworkManager.service onboot.service
@@ -10,7 +10,13 @@ StartLimitBurst=10
 StartLimitIntervalSec=600
 
 [Service]
-Type=oneshot
+# Type=simple (not oneshot) so the desktop can start in parallel:
+# oneshot blocks multi-user.target, which blocks graphical.target, which
+# blocks the display manager — by the time the desktop starts, firstboot
+# has already finished and the XDG-autostart progress dialog sees the
+# stamp and exits immediately. With simple, the dialog runs concurrently
+# and shows live progress while packages install.
+Type=simple
 ExecStart=/usr/local/sbin/lsl-firstboot.sh
 Restart=on-failure
 RestartSec=300
