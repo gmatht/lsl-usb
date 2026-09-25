@@ -306,6 +306,247 @@ pub(crate) fn apply_method_caps(
     refresh_fw_note(items);
 }
 
+/// Build (or rebuild) the INSTALL NOW page controls. `clear` destroys
+/// existing items first; used when the user goes Back to install options
+/// so newly inserted USB sticks are visible.
+pub(crate) fn build_install_page(
+    install_items: &PageItems,
+    frame_install: &nwg::Frame,
+    font_bold: &nwg::Font,
+    bios_tt: &nwg::Tooltip,
+    uefi_tt: &nwg::Tooltip,
+    write_mode_pre: &str,
+    clear: bool,
+) -> i32 {
+    if clear {
+        install_items.borrow_mut().clear();
+    }
+    let mut items = install_items.borrow_mut();
+    let mut iy = 6i32;
+    // title (bold) - the win-install-page GUI test keys on this text
+    let mut title: Box<nwg::Label> = Box::default();
+    let _ = nwg::Label::builder()
+        .text(&crate::locale::tr("INSTALL NOW"))
+        .position((10, iy))
+        .size((560, 24))
+        .parent(frame_install)
+        .build(&mut title);
+    title.set_font(Some(font_bold));
+    items.push(PageItem { ctl: PageCtl::Lbl(title, 0), x: 10, y: iy, w: -20, h: 24, idx: 0 });
+    iy += 28;
+    let mut help: Box<nwg::Label> = Box::default();
+    let _ = nwg::Label::builder()
+        .text(&crate::locale::tr("Choose the target USB first, then how to write the image."))
+        .position((10, iy))
+        .size((560, 18))
+        .parent(frame_install)
+        .build(&mut help);
+    items.push(PageItem { ctl: PageCtl::Lbl(help, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
+    iy += 26;
+    // target USB picker (kind 4): FIRST on the page - the stick is
+    // chosen before the method, so the BIOS/UEFI defaults below can
+    // follow it. Every non-system volume lists (ready Or check-contents
+    // with its reason); system/CD-ROM/unmountable never list. The first
+    // Ready entry is pre-checked; check-contents entries are never
+    // pre-checked (explicit pick = explicit consent, backup offer at
+    // install time).
+    let mut cap: Box<nwg::Label> = Box::default();
+    let _ = nwg::Label::builder()
+        .text(&crate::locale::tr("Target USB (for the non-destructive copy):"))
+        .position((10, iy))
+        .size((560, 18))
+        .parent(frame_install)
+        .build(&mut cap);
+    cap.set_font(Some(font_bold));
+    items.push(PageItem { ctl: PageCtl::Lbl(cap, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
+    iy += 22;
+    let cands: Vec<crate::nofmt::Candidate> = crate::nofmt::probe_candidates(false)
+        .into_iter()
+        .filter(|c| c.target.is_some() && !matches!(c.status, crate::nofmt::CandidateStatus::Refused(_)))
+        .collect();
+    // targets sort by letter inside probe_candidates already.
+    if cands.is_empty() {
+        let mut none: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text(&crate::locale::tr("[No usable target volumes detected - plug in a stick]"))
+            .position((26, iy))
+            .size((560, 20))
+            .parent(frame_install)
+            .build(&mut none);
+        items.push(PageItem { ctl: PageCtl::Lbl(none, 0), x: 26, y: iy, w: -20, h: 20, idx: 0 });
+        iy += 24;
+    }
+    let first_ready = cands.iter().position(|c| matches!(c.status, crate::nofmt::CandidateStatus::Ready));
+    for (n, c) in cands.iter().enumerate() {
+        let t = c.target.as_ref().unwrap();
+        let size_gb = t.total as f64 / crate::sys::GB as f64;
+        let text = match &c.status {
+            crate::nofmt::CandidateStatus::Ready =>
+                format!("{}:  {}  {}  ({:.1} GB)", t.letter, t.label, t.fs, size_gb),
+            crate::nofmt::CandidateStatus::NeedsContentCheck(w) =>
+                format!("{}:  {}  {}  ({:.1} GB)  [check contents: {}]", t.letter, t.label, t.fs, size_gb, w),
+            crate::nofmt::CandidateStatus::Refused(_) => continue, // filtered above; keep arm
+        };
+        let mut rb: Box<nwg::RadioButton> = Box::default();
+        let _ = nwg::RadioButton::builder()
+            .flags(if n == 0 {
+                nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
+            } else {
+                nwg::RadioButtonFlags::VISIBLE
+            })
+            .text(&text)
+            .position((10, iy))
+            .size((780, 20))
+            .parent(frame_install)
+            .build(&mut rb);
+        if Some(n) == first_ready {
+            rb.set_check_state(nwg::RadioButtonState::Checked);
+        }
+        items.push(PageItem { ctl: PageCtl::Radio(rb, 4), x: 10, y: iy, w: -20, h: 20, idx: 0 });
+        iy += 24;
+    }
+    // write-method radios (kind 3): one group, exactly one checked.
+    // Bold heading above the method list (matches the section captions).
+    let mut method_cap: Box<nwg::Label> = Box::default();
+    let _ = nwg::Label::builder()
+        .text(&crate::locale::tr("Write method:"))
+        .position((10, iy))
+        .size((560, 18))
+        .parent(frame_install)
+        .build(&mut method_cap);
+    method_cap.set_font(Some(font_bold));
+    items.push(PageItem { ctl: PageCtl::Lbl(method_cap, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
+    iy += 22;
+    // Rufus (any version, incl. the Win7-compatible 3.22) requires
+    // Windows 7 or later. On older Windows the radio is greyed out with
+    // an explanatory tooltip and the default falls back to the built-in
+    // non-destructive write.
+    let rufus_ok = !matches!(
+        sys::os_ver(),
+        sys::OsVer::Win9x
+            | sys::OsVer::Nt4
+            | sys::OsVer::Win2000
+            | sys::OsVer::Xp
+            | sys::OsVer::Vista
+    );
+    let effective_pre = if !rufus_ok && write_mode_pre == "rufus" {
+        "nofmt"
+    } else {
+        write_mode_pre
+    };
+    let mut rufus_tt: Option<&'static mut nwg::Tooltip> = None;
+    let methods = [
+        (crate::locale::tr("Built-in non-destructive (recommended - no reformat, keeps existing files; BIOS + UEFI)"), "nofmt"),
+        (crate::locale::tr("Rufus (well tested, UEFI + BIOS; rewrites the stick)"), "rufus"),
+        (crate::locale::tr("Skip - I will write the USB myself (like --skip-rufus)"), "skip"),
+    ];
+    for (n, (text, mode)) in methods.iter().enumerate() {
+        let mut rb: Box<nwg::RadioButton> = Box::default();
+        let _ = nwg::RadioButton::builder()
+            .flags(if n == 0 {
+                nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
+            } else {
+                nwg::RadioButtonFlags::VISIBLE
+            })
+            .text(text)
+            .position((10, iy))
+            .size((780, 20))
+            .parent(frame_install)
+            .build(&mut rb);
+        if *mode == "rufus" && !rufus_ok {
+            rb.set_enabled(false);
+            if rufus_tt.is_none() {
+                let mut tt: nwg::Tooltip = Default::default();
+                let _ = nwg::Tooltip::builder().build(&mut tt);
+                rufus_tt = Some(Box::leak(Box::new(tt)));
+            }
+            rufus_tt.as_mut().unwrap().register(
+                rb.as_ref(),
+                &crate::locale::tr(
+                    "Rufus requires Windows 7 or later - use the built-in non-destructive write instead.",
+                ),
+            );
+        } else if effective_pre == *mode {
+            rb.set_check_state(nwg::RadioButtonState::Checked);
+        }
+        items.push(PageItem { ctl: PageCtl::Radio(rb, 3), x: 10, y: iy, w: -20, h: 20, idx: 0 });
+        iy += 24;
+    }
+    // BIOS/UEFI boot checkboxes (Check kinds 5/6): on by default when
+    // the selected stick supports them, greyed out with the reason in
+    // the label when not (e.g. GPT disables BIOS, NTFS/exFAT or a
+    // missing loader disables UEFI). Refreshed on target clicks.
+    for (kind, text) in [(5u8, "BIOS/CSM boot (grub4dos MBR, no reformat)"), (6u8, "UEFI boot (BOOTX64.EFI, Secure Boot off)")] {
+        let mut cb: Box<nwg::CheckBox> = Box::default();
+        let _ = nwg::CheckBox::builder()
+            .text(&crate::locale::tr(text))
+            .position((10, iy))
+            .size((780, 20))
+            .parent(frame_install)
+            .build(&mut cb);
+        cb.set_check_state(nwg::CheckBoxState::Checked);
+        if kind == 5 {
+            bios_tt.register(cb.as_ref(), &crate::locale::tr(BIOS_TT));
+        } else {
+            uefi_tt.register(cb.as_ref(), &crate::locale::tr(UEFI_TT));
+        }
+        items.push(PageItem { ctl: PageCtl::Check(cb, kind), x: 10, y: iy, w: -20, h: 20, idx: 0 });
+        iy += 24;
+    }
+    // This-machine firmware line (Lbl kind 7): refreshed whenever the
+    // BIOS/UEFI checkboxes or the target change. Board detection says
+    // what THIS motherboard can boot; the stick may target another PC,
+    // so this warns, never blocks.
+    let mut fwline: Box<nwg::Label> = Box::default();
+    let _ = nwg::Label::builder()
+        .text("")
+        .position((10, iy))
+        .size((780, 20))
+        .parent(frame_install)
+        .build(&mut fwline);
+    items.push(PageItem { ctl: PageCtl::Lbl(fwline, 7), x: 10, y: iy, w: -20, h: 20, idx: 0 });
+    iy += 24;
+    // Whole-USB surface check (Check kind 8): off by default (slow -
+    // fills free space with PRNG data and reads it back uncached).
+    // Runs after the write for Rufus AND built-in alike.
+    let mut check_tt: nwg::Tooltip = Default::default();
+    let _ = nwg::Tooltip::builder().build(&mut check_tt);
+    let check_tt: &'static mut nwg::Tooltip = Box::leak(Box::new(check_tt));
+    {
+        let mut cb: Box<nwg::CheckBox> = Box::default();
+        let _ = nwg::CheckBox::builder()
+            .text(&crate::locale::tr("Check whole USB after writing (slow: fills free space, verifies, cleans up)"))
+            .position((10, iy))
+            .size((780, 20))
+            .parent(frame_install)
+            .build(&mut cb);
+        check_tt.register(cb.as_ref(), &crate::locale::tr("Adds a DeleteMe folder, fills free space with 4 GB pseudo-random chunks, reads every byte back with OS caching DISABLED (bad/fake sticks cannot hide), then deletes DeleteMe. Catches dying and fake-capacity flash."));
+        items.push(PageItem { ctl: PageCtl::Check(cb, 8), x: 10, y: iy, w: -20, h: 20, idx: 0 });
+        iy += 24;
+    }
+    let mut note: Box<nwg::Label> = Box::default();
+    let note_text = if rufus_ok {
+        "Rufus launches with the ISO pre-selected (you click START there). Built-in copies the image files with no format."
+    } else {
+        "Rufus requires Windows 7 or later and is disabled here - use the built-in non-destructive write (or Skip)."
+    };
+    let _ = nwg::Label::builder()
+        .text(note_text)
+        .position((10, iy))
+        .size((560, 18))
+        .parent(frame_install)
+        .build(&mut note);
+    items.push(PageItem { ctl: PageCtl::Lbl(note, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
+    // default the BIOS/UEFI checkboxes to the preselected stick,
+    // then gate them on the preselected write method
+    let first_letter = cands.iter().find_map(|c| c.target.as_ref().map(|t| t.letter.clone())).unwrap_or_default();
+    drop(items); // release the borrow_mut above: apply re-borrows
+    apply_boot_caps(install_items, &first_letter, "", true);
+    apply_method_caps(install_items, bios_tt, uefi_tt, effective_pre, &first_letter);
+    let items = install_items.borrow();
+    items.iter().map(|it| it.y + it.h).max().unwrap_or(0) + 10
+}
+
 /// Distro options (page 1 "Download Fresh" radios, from the PS GUI).
 const DISTRO_OPTIONS: &[(&str, &str)] = &[
     (
@@ -1290,7 +1531,7 @@ struct LayoutCtx<'a> {
     iso_content: &'a Cell<i32>,
     sys_content: i32,
     wifi_content: i32,
-    install_content: i32,
+    install_content: &'a Cell<i32>,
 }
 
 /// The one pass that positions EVERY control from the client size (cw, ch).
@@ -1400,7 +1641,7 @@ fn relayout(c: &LayoutCtx, cw: i32, ch: i32) {
         (c.sb_fp, c.fp, c.fp_off, c.fp_geom, c.fp_content.get(), 30, 32, 0),
         (c.sb_sys, c.sys, c.sys_off, c.sys_geom, c.sys_content, 4, 32, 0),
         (c.sb_wifi, c.wifi_items, c.wifi_off, c.wifi_geom, c.wifi_content, 4, 32, 0),
-        (c.sb_install, c.install, c.install_off, c.install_geom, c.install_content, 4, 32, 0),
+        (c.sb_install, c.install, c.install_off, c.install_geom, c.install_content.get(), 4, 32, 0),
     ];
     for (sb, items, off, geom, content, top, bot, shift) in pages {
         let (vis, max_off, top, bot_edge, shift) = page_geom(fh, top, bot, content, shift);
@@ -3177,236 +3418,15 @@ pub fn run_gui(
         .parent(&window)
         .build(&mut frame_install);
         let frame_install = Rc::new(frame_install);
-    {
-        let mut items = install_items.borrow_mut();
-        let mut iy = 6i32;
-        // title (bold) - the win-install-page GUI test keys on this text
-        let mut title: Box<nwg::Label> = Box::default();
-        let _ = nwg::Label::builder()
-            .text(&crate::locale::tr("INSTALL NOW"))
-            .position((10, iy))
-            .size((560, 24))
-            .parent(&*frame_install)
-            .build(&mut title);
-        title.set_font(Some(&font_bold));
-        items.push(PageItem { ctl: PageCtl::Lbl(title, 0), x: 10, y: iy, w: -20, h: 24, idx: 0 });
-        iy += 28;
-        let mut help: Box<nwg::Label> = Box::default();
-        let _ = nwg::Label::builder()
-            .text(&crate::locale::tr("Choose the target USB first, then how to write the image."))
-            .position((10, iy))
-            .size((560, 18))
-            .parent(&*frame_install)
-            .build(&mut help);
-        items.push(PageItem { ctl: PageCtl::Lbl(help, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
-        iy += 26;
-        // (created + Rc-wrapped outside the build block - see above)
-        // target USB picker (kind 4): FIRST on the page - the stick is
-        // chosen before the method, so the BIOS/UEFI defaults below can
-        // follow it. Every non-system volume lists (ready Or check-contents
-        // with its reason); system/CD-ROM/unmountable never list. The first
-        // Ready entry is pre-checked; check-contents entries are never
-        // pre-checked (explicit pick = explicit consent, backup offer at
-        // install time).
-        let mut cap: Box<nwg::Label> = Box::default();
-        let _ = nwg::Label::builder()
-            .text(&crate::locale::tr("Target USB (for the non-destructive copy):"))
-            .position((10, iy))
-            .size((560, 18))
-            .parent(&*frame_install)
-            .build(&mut cap);
-        cap.set_font(Some(&font_bold));
-        items.push(PageItem { ctl: PageCtl::Lbl(cap, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
-        iy += 22;
-        let cands: Vec<crate::nofmt::Candidate> = crate::nofmt::probe_candidates(false)
-            .into_iter()
-            .filter(|c| c.target.is_some() && !matches!(c.status, crate::nofmt::CandidateStatus::Refused(_)))
-            .collect();
-        // targets sort by letter inside probe_candidates already.
-        if cands.is_empty() {
-            let mut none: Box<nwg::Label> = Box::default();
-            let _ = nwg::Label::builder()
-                .text(&crate::locale::tr("[No usable target volumes detected - plug in a stick]"))
-                .position((26, iy))
-                .size((560, 20))
-                .parent(&*frame_install)
-                .build(&mut none);
-            items.push(PageItem { ctl: PageCtl::Lbl(none, 0), x: 26, y: iy, w: -20, h: 20, idx: 0 });
-            iy += 24;
-        }
-        let first_ready = cands.iter().position(|c| matches!(c.status, crate::nofmt::CandidateStatus::Ready));
-        for (n, c) in cands.iter().enumerate() {
-            let t = c.target.as_ref().unwrap();
-            let size_gb = t.total as f64 / crate::sys::GB as f64;
-            let text = match &c.status {
-                crate::nofmt::CandidateStatus::Ready =>
-                    format!("{}:  {}  {}  ({:.1} GB)", t.letter, t.label, t.fs, size_gb),
-                crate::nofmt::CandidateStatus::NeedsContentCheck(w) =>
-                    format!("{}:  {}  {}  ({:.1} GB)  [check contents: {}]", t.letter, t.label, t.fs, size_gb, w),
-                crate::nofmt::CandidateStatus::Refused(_) => continue, // filtered above; keep arm
-            };
-            let mut rb: Box<nwg::RadioButton> = Box::default();
-            let _ = nwg::RadioButton::builder()
-                .flags(if n == 0 {
-                    nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
-                } else {
-                    nwg::RadioButtonFlags::VISIBLE
-                })
-                .text(&text)
-                .position((10, iy))
-                .size((780, 20))
-                .parent(&*frame_install)
-                .build(&mut rb);
-            if Some(n) == first_ready {
-                rb.set_check_state(nwg::RadioButtonState::Checked);
-            }
-            items.push(PageItem { ctl: PageCtl::Radio(rb, 4), x: 10, y: iy, w: -20, h: 20, idx: 0 });
-            iy += 24;
-        }
-        // write-method radios (kind 3): one group, exactly one checked.
-        // Bold heading above the method list (matches the section captions).
-        let mut method_cap: Box<nwg::Label> = Box::default();
-        let _ = nwg::Label::builder()
-            .text(&crate::locale::tr("Write method:"))
-            .position((10, iy))
-            .size((560, 18))
-            .parent(&*frame_install)
-            .build(&mut method_cap);
-        method_cap.set_font(Some(&font_bold));
-        items.push(PageItem { ctl: PageCtl::Lbl(method_cap, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
-        iy += 22;
-        // Rufus (any version, incl. the Win7-compatible 3.22) requires
-        // Windows 7 or later. On older Windows the radio is greyed out with
-        // an explanatory tooltip and the default falls back to the built-in
-        // non-destructive write.
-        let rufus_ok = !matches!(
-            sys::os_ver(),
-            sys::OsVer::Win9x
-                | sys::OsVer::Nt4
-                | sys::OsVer::Win2000
-                | sys::OsVer::Xp
-                | sys::OsVer::Vista
-        );
-        let effective_pre = if !rufus_ok && write_mode_pre == "rufus" {
-            "nofmt"
-        } else {
-            write_mode_pre
-        };
-        let mut rufus_tt: Option<&'static mut nwg::Tooltip> = None;
-        let methods = [
-            (crate::locale::tr("Built-in non-destructive (recommended - no reformat, keeps existing files; BIOS + UEFI)"), "nofmt"),
-            (crate::locale::tr("Rufus (well tested, UEFI + BIOS; rewrites the stick)"), "rufus"),
-            (crate::locale::tr("Skip - I will write the USB myself (like --skip-rufus)"), "skip"),
-        ];
-        for (n, (text, mode)) in methods.iter().enumerate() {
-            let mut rb: Box<nwg::RadioButton> = Box::default();
-            let _ = nwg::RadioButton::builder()
-                .flags(if n == 0 {
-                    nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
-                } else {
-                    nwg::RadioButtonFlags::VISIBLE
-                })
-                .text(text)
-                .position((10, iy))
-                .size((780, 20))
-                .parent(&*frame_install)
-                .build(&mut rb);
-            if *mode == "rufus" && !rufus_ok {
-                rb.set_enabled(false);
-                if rufus_tt.is_none() {
-                    let mut tt: nwg::Tooltip = Default::default();
-                    let _ = nwg::Tooltip::builder().build(&mut tt);
-                    rufus_tt = Some(Box::leak(Box::new(tt)));
-                }
-                rufus_tt.as_mut().unwrap().register(
-                    rb.as_ref(),
-                    &crate::locale::tr(
-                        "Rufus requires Windows 7 or later - use the built-in non-destructive write instead.",
-                    ),
-                );
-            } else if effective_pre == *mode {
-                rb.set_check_state(nwg::RadioButtonState::Checked);
-            }
-            items.push(PageItem { ctl: PageCtl::Radio(rb, 3), x: 10, y: iy, w: -20, h: 20, idx: 0 });
-            iy += 24;
-        }
-        // BIOS/UEFI boot checkboxes (Check kinds 5/6): on by default when
-        // the selected stick supports them, greyed out with the reason in
-        // the label when not (e.g. GPT disables BIOS, NTFS/exFAT or a
-        // missing loader disables UEFI). Refreshed on target clicks.
-        for (kind, text) in [(5u8, "BIOS/CSM boot (grub4dos MBR, no reformat)"), (6u8, "UEFI boot (BOOTX64.EFI, Secure Boot off)")] {
-            let mut cb: Box<nwg::CheckBox> = Box::default();
-            let _ = nwg::CheckBox::builder()
-                .text(&crate::locale::tr(text))
-                .position((10, iy))
-                .size((780, 20))
-                .parent(&*frame_install)
-                .build(&mut cb);
-            cb.set_check_state(nwg::CheckBoxState::Checked);
-            if kind == 5 {
-                bios_tt.register(cb.as_ref(), &crate::locale::tr(BIOS_TT));
-            } else {
-                uefi_tt.register(cb.as_ref(), &crate::locale::tr(UEFI_TT));
-            }
-            items.push(PageItem { ctl: PageCtl::Check(cb, kind), x: 10, y: iy, w: -20, h: 20, idx: 0 });
-            iy += 24;
-        }
-        // This-machine firmware line (Lbl kind 7): refreshed whenever the
-        // BIOS/UEFI checkboxes or the target change. Board detection says
-        // what THIS motherboard can boot; the stick may target another PC,
-        // so this warns, never blocks.
-        let mut fwline: Box<nwg::Label> = Box::default();
-        let _ = nwg::Label::builder()
-            .text("")
-            .position((10, iy))
-            .size((780, 20))
-            .parent(&*frame_install)
-            .build(&mut fwline);
-        items.push(PageItem { ctl: PageCtl::Lbl(fwline, 7), x: 10, y: iy, w: -20, h: 20, idx: 0 });
-        iy += 24;
-        // Whole-USB surface check (Check kind 8): off by default (slow -
-        // fills free space with PRNG data and reads it back uncached).
-        // Runs after the write for Rufus AND built-in alike.
-        let mut check_tt: nwg::Tooltip = Default::default();
-        let _ = nwg::Tooltip::builder().build(&mut check_tt);
-        // Same lifetime fix (static text, never rewritten - leak it).
-        let check_tt: &'static mut nwg::Tooltip = Box::leak(Box::new(check_tt));
-        {
-            let mut cb: Box<nwg::CheckBox> = Box::default();
-            let _ = nwg::CheckBox::builder()
-                .text(&crate::locale::tr("Check whole USB after writing (slow: fills free space, verifies, cleans up)"))
-                .position((10, iy))
-                .size((780, 20))
-                .parent(&*frame_install)
-                .build(&mut cb);
-            check_tt.register(cb.as_ref(), &crate::locale::tr("Adds a DeleteMe folder, fills free space with 4 GB pseudo-random chunks, reads every byte back with OS caching DISABLED (bad/fake sticks cannot hide), then deletes DeleteMe. Catches dying and fake-capacity flash."));
-            items.push(PageItem { ctl: PageCtl::Check(cb, 8), x: 10, y: iy, w: -20, h: 20, idx: 0 });
-            iy += 24;
-        }
-        let mut note: Box<nwg::Label> = Box::default();
-        let note_text = if rufus_ok {
-            "Rufus launches with the ISO pre-selected (you click START there). Built-in copies the image files with no format."
-        } else {
-            "Rufus requires Windows 7 or later and is disabled here - use the built-in non-destructive write (or Skip)."
-        };
-        let _ = nwg::Label::builder()
-            .text(note_text)
-            .position((10, iy))
-            .size((560, 18))
-            .parent(&*frame_install)
-            .build(&mut note);
-        items.push(PageItem { ctl: PageCtl::Lbl(note, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
-        // default the BIOS/UEFI checkboxes to the preselected stick,
-        // then gate them on the preselected write method
-        let first_letter = cands.iter().find_map(|c| c.target.as_ref().map(|t| t.letter.clone())).unwrap_or_default();
-        drop(items); // release the borrow_mut above: apply re-borrows
-        apply_boot_caps(&install_items, &first_letter, "", true);
-        apply_method_caps(&install_items, &bios_tt, &uefi_tt, effective_pre, &first_letter);
-    }
-    let install_content = {
-        let items = install_items.borrow();
-        items.iter().map(|it| it.y + it.h).max().unwrap_or(0) + 10
-    };
+    let install_content = Rc::new(Cell::new(build_install_page(
+        &install_items,
+        &frame_install,
+        &font_bold,
+        &bios_tt,
+        &uefi_tt,
+        write_mode_pre,
+        false,
+    )));
     if let Err(e) = nwg::ScrollBar::builder()
         .flags(nwg::ScrollBarFlags::VERTICAL | nwg::ScrollBarFlags::VISIBLE)
         .position((826, 4))
@@ -3624,7 +3644,7 @@ pub fn run_gui(
             iso_content: &iso_content,
             sys_content: sys_content,
             wifi_content: wifi_content,
-            install_content: install_content,
+            install_content: &*install_content,
         },
         cw,
         ch,
@@ -3864,6 +3884,7 @@ pub fn run_gui(
         let iso_content = iso_content;
         let sys_content = sys_content;
         let wifi_content = wifi_content;
+        let install_content = install_content.clone();
     let frame_hw_c = frame_hw.clone();
     let frame_iso_c = frame_iso.clone();
     let frame_fp_c = frame_fp.clone();
@@ -3962,7 +3983,7 @@ pub fn run_gui(
                         iso_content: &iso_content,
                         sys_content: sys_content,
                         wifi_content: wifi_content,
-                        install_content: install_content,
+                        install_content: &*install_content,
                     }, cw, ch);
                     // Working phase: keep the ten stage rows laid out too.
                     if working_c.get() {
@@ -4514,6 +4535,46 @@ pub fn run_gui(
         btn_next.set_text(&nav_label(INSTALL_PAGE));
         confirmed.set(false);
         working.set(false);
+        // Rebuild the install page so newly inserted USB sticks appear.
+        // Preserve write-method and check-checkbox choices; let the BIOS/UEFI
+        // defaults follow the fresh target probe.
+        let saved_method = install_items.borrow().iter().find_map(|it| {
+            if let PageCtl::Radio(rb, 3) = &it.ctl {
+                if rb.check_state() == nwg::RadioButtonState::Checked {
+                    Some(rb.text())
+                } else { None }
+            } else { None }
+        });
+        let saved_check = install_items.borrow().iter().find_map(|it| {
+            if let PageCtl::Check(cb, 8) = &it.ctl {
+                Some(cb.check_state() == nwg::CheckBoxState::Checked)
+            } else { None }
+        });
+        install_content.set(build_install_page(
+            &install_items,
+            &frame_install,
+            &font_bold,
+            &bios_tt,
+            &uefi_tt,
+            write_mode_pre,
+            true,
+        ));
+        if let Some(text) = saved_method {
+            for it in install_items.borrow().iter() {
+                if let PageCtl::Radio(rb, 3) = &it.ctl {
+                    if rb.text() == text {
+                        rb.set_check_state(nwg::RadioButtonState::Checked);
+                    }
+                }
+            }
+        }
+        if let Some(checked) = saved_check {
+            for it in install_items.borrow().iter() {
+                if let PageCtl::Check(cb, 8) = &it.ctl {
+                    cb.set_check_state(if checked { nwg::CheckBoxState::Checked } else { nwg::CheckBoxState::Unchecked });
+                }
+            }
+        }
         nwg::dispatch_thread_events();
         glog("dispatch end (retry)");
     }

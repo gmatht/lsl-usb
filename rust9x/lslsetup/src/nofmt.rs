@@ -2504,11 +2504,8 @@ fn confirm_h2w_delete(letter: &str, ui: Option<&dyn WriteUi>, summary: &str) -> 
 fn mb_str(bytes: u64) -> String {
     format!("{} MB", bytes / sys::MB)
 }
-/// Delete the confirmed .h2w files, then re-check space. `free_now` and
-/// `free_before` are parameters (not queried inside) so tests can inject
-/// values; production passes fresh `sys::free_bytes(letter)` for both
-/// (before = at offer time, now = after the delete).
-fn h2w_delete_and_recheck(letter: &str, found: &[(String, u64)], need: u64, free_now: Option<u64>, free_before: u64) -> Result<bool, String> {
+/// Delete the confirmed .h2w files. Returns (failed_count, freed_bytes).
+fn h2w_delete_files(found: &[(String, u64)]) -> (usize, u64) {
     let mut failed = 0;
     let mut freed: u64 = 0;
     for (path, size) in found {
@@ -2518,14 +2515,32 @@ fn h2w_delete_and_recheck(letter: &str, found: &[(String, u64)], need: u64, free
             freed += size;
         }
     }
+    (failed, freed)
+}
+
+/// Re-check free space after deleting .h2w files. `free_now` is the
+/// post-delete query (pass `sys::free_bytes(letter)` in production;
+/// tests inject `Some(v)` or `None`).
+fn h2w_recheck(
+    letter: &str,
+    need: u64,
+    free_now: Option<u64>,
+    free_before: u64,
+    failed: usize,
+    freed: u64,
+    found_len: usize,
+) -> Result<bool, String> {
     if failed > 0 {
-        out::warn(&format!("{} .h2w file(s) could not be deleted (in use?) - continuing with what was freed.", failed));
+        out::warn(&format!(
+            "{} .h2w file(s) could not be deleted (in use?) - continuing with what was freed.",
+            failed
+        ));
     }
     match free_now {
         Some(now) if now >= need => {
             out::info(&format!(
                 "Deleted {} h2testw file(s) - continuing.",
-                found.len() - failed
+                found_len - failed
             ));
             Ok(true)
         }
@@ -2547,7 +2562,7 @@ fn h2w_delete_and_recheck(letter: &str, found: &[(String, u64)], need: u64, free
             };
             Err(format!(
                 "Deleted {} h2testw file(s) ({}) but {}: still has only {:.1} GB free ({}; needs {:.1} GB, {}) - free more space, then re-run.{}",
-                found.len() - failed, mb_str(freed),
+                found_len - failed, mb_str(freed),
                 letter, now as f64 / sys::GB as f64, mb_str(now), need as f64 / sys::GB as f64, mb_str(need),
                 missing
             ))
@@ -2597,7 +2612,9 @@ fn offer_h2w_cleanup(letter: &str, ui: Option<&dyn WriteUi>, free: u64, need: u6
     if !confirm_h2w_delete(letter, ui, &summary) {
         return Err(format!("{}\nAborted - the h2testw files were left alone.", summary));
     }
-    h2w_delete_and_recheck(letter, &found, need, sys::free_bytes(letter), free)
+    let (failed, freed) = h2w_delete_files(&found);
+    let free_now = sys::free_bytes(letter);
+    h2w_recheck(letter, need, free_now, free, failed, freed, found.len())
 }
 
 /// Bytes the file-less main pulls out of the source ISO (kernel +
@@ -3577,7 +3594,10 @@ mod tests {
         let found = h2w_files_in(&dir);
         assert_eq!(found.len(), 1);
         // Enough space after delete: Ok(true), .h2w gone, .txt kept.
-        assert!(h2w_delete_and_recheck("T", &found, 50, Some(200), 0).unwrap());
+        let (failed, freed) = h2w_delete_files(&found);
+        assert_eq!(failed, 0);
+        assert_eq!(freed, 100);
+        assert!(h2w_recheck("T", 50, Some(200), 0, failed, freed, found.len()).unwrap());
         assert!(h2w_files_in(&dir).is_empty());
         assert!(std::path::Path::new(&format!("{}\\keep.txt", dir)).exists());
         std::fs::remove_file(format!("{}\\keep.txt", dir)).unwrap();
@@ -3592,7 +3612,8 @@ mod tests {
         let found = h2w_files_in(&dir);
         // Delete happens (user confirmed), but space still short: loud Err.
         // free_before=0 with a 10-byte delete: nothing "missing", just short.
-        let err = h2w_delete_and_recheck("T", &found, u64::MAX, Some(1), 0).unwrap_err();
+        let (failed, freed) = h2w_delete_files(&found);
+        let err = h2w_recheck("T", u64::MAX, Some(1), 0, failed, freed, found.len()).unwrap_err();
         assert!(err.contains("still has only"), "unexpected: {err}");
         assert!(!err.contains("held elsewhere"), "10 freed bytes must not trip the missing-space hint: {err}");
         assert!(h2w_files_in(&dir).is_empty());
@@ -3601,7 +3622,8 @@ mod tests {
         sys::create_dir_all(&dir);
         std::fs::write(format!("{}\\9.h2w", dir), vec![7u8; 10]).unwrap();
         let found = h2w_files_in(&dir);
-        let err = h2w_delete_and_recheck("T", &found, 1, None, 0).unwrap_err();
+        let (failed, freed) = h2w_delete_files(&found);
+        let err = h2w_recheck("T", 1, None, 0, failed, freed, found.len()).unwrap_err();
         assert!(err.contains("could not re-check"), "unexpected: {err}");
         let _ = std::fs::remove_dir(&dir);
     }
@@ -3617,7 +3639,8 @@ mod tests {
         let found = h2w_files_in(&dir);
         assert_eq!(found.len(), 1);
         let before = 1000u64;
-        let err = h2w_delete_and_recheck("T", &found, u64::MAX, Some(before), before).unwrap_err();
+        let (failed, freed) = h2w_delete_files(&found);
+        let err = h2w_recheck("T", u64::MAX, Some(before), before, failed, freed, found.len()).unwrap_err();
         assert!(err.contains("70 MB"), "must state what the delete freed: {err}");
         assert!(err.contains("held elsewhere"), "must name the missing-space cause: {err}");
         assert!(err.contains("chkdsk T: /f"), "must suggest the repair: {err}");
