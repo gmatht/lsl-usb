@@ -301,6 +301,12 @@ fi
 DATA_DIR="$(lsl_resolve_data_dir)"
 mkdir -p "$DATA_DIR" 2>/dev/null || true
 
+# Desktop user: every path that follows depends on this. config.sh sets its
+# own copy (it may run in a chroot), but onboot.sh must not rely on it.
+LSL_DESKTOP_USER="$(lsl_desktop_user)"
+export LSL_DESKTOP_USER
+echo "lsl: desktop_user=${LSL_DESKTOP_USER:-<unset>}"
+
 # Which env file / data dir / mode we picked, and whether the mode is what the
 # config asked for. Without this the CRLF env bug was completely silent: the
 # only symptom was a tmpfs /home with no explanation in any log.
@@ -426,9 +432,11 @@ else
     HOME_IMG="$(lsl_home_btrfs_path)"
     CACHE_IMG="$(lsl_cache_btrfs_path)"
     mkdir -p "$(dirname "$HOME_IMG")"
+    home_is_fresh=0
     if [ ! -f "$HOME_IMG" ]; then
         truncate -s "${LSL_HOME_BTRFS_MIB:-4096}M" "$HOME_IMG"
         mkfs.btrfs -f "$HOME_IMG" >/dev/null
+        home_is_fresh=1
     else
         # Grow to the configured size at boot (unmounted) - reliable; online
         # growth of a busy /home loop device often fails.
@@ -440,7 +448,19 @@ else
     else
         lsl_grow_btrfs_image "$CACHE_IMG" "${LSL_CACHE_BTRFS_MIB:-2048}"
     fi
-    mount -o loop,compress=zstd:3,relatime "$HOME_IMG" /home
+    if [ "$home_is_fresh" = "1" ]; then
+        # Seed fresh home.btrfs from the live /home so the desktop user's
+        # login home, dotfiles, and session config survive first boot.
+        mkdir -p /run/lsl-live-home
+        mount --bind /home /run/lsl-live-home
+        mount -o loop,compress=zstd:3,relatime "$HOME_IMG" /home
+        echo "Seeding new home.btrfs from live /home (user=${LSL_DESKTOP_USER:-?})..."
+        cp -a /run/lsl-live-home/. /home/ 2>/dev/null || true
+        umount /run/lsl-live-home
+        rmdir /run/lsl-live-home 2>/dev/null || true
+    else
+        mount -o loop,compress=zstd:3,relatime "$HOME_IMG" /home
+    fi
     command -v btrfs >/dev/null 2>&1 && btrfs filesystem resize max /home 2>/dev/null || true
 
     lsl_prepare_bash_log "$LSL_BASH_LOG"
