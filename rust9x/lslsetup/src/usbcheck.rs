@@ -228,7 +228,7 @@ pub fn check_whole_usb(letter: &str, ui: Option<&WorkingUi>) -> Result<UsbCheckR
                         break;
                     }
                     close(h);
-                    return Err(format!("write failed on {} at +{:.1} GB (error {}) - DeleteMe left in place", path, done as f64 / 1e9, e));
+                    return Err(format!("write failed on {} at +{:.1} GB (error {}) - BAD STICK. Request a refund if recently purchased; otherwise bin it and buy a reputable brand. DeleteMe left in place.", path, done as f64 / 1e9, e));
                 }
                 if wrote == 0 {
                     close(h);
@@ -280,7 +280,7 @@ pub fn check_whole_usb(letter: &str, ui: Option<&WorkingUi>) -> Result<UsbCheckR
                 if ok == FALSE {
                     let e = unsafe { GetLastError() };
                     close(h);
-                    return Err(format!("read failed on {} at +{:.1} GB (error {}) - BAD STICK, DeleteMe left in place", path, done as f64 / 1e9, e));
+                    return Err(format!("read failed on {} at +{:.1} GB (error {}) - BAD STICK. Request a refund if recently purchased; otherwise bin it and buy a reputable brand. DeleteMe left in place.", path, done as f64 / 1e9, e));
                 }
                 if got == 0 {
                     break;
@@ -290,7 +290,7 @@ pub fn check_whole_usb(letter: &str, ui: Option<&WorkingUi>) -> Result<UsbCheckR
             if got_total != n {
                 close(h);
                 return Err(format!(
-                    "short file on {} (expected {:.1} GB, device returned {:.1} GB) - FAKE-CAPACITY STICK, DeleteMe left in place",
+                    "short file on {} (expected {:.1} GB, device returned {:.1} GB) - FAKE-CAPACITY STICK. Request a refund immediately — on marketplaces like eBay the seller may disappear once the protection window closes. DeleteMe left in place.",
                     path,
                     *len as f64 / 1e9,
                     (done + got_total as u64) as f64 / 1e9
@@ -318,17 +318,20 @@ pub fn check_whole_usb(letter: &str, ui: Option<&WorkingUi>) -> Result<UsbCheckR
                 let near_boundary = FAKE_BOUNDARIES.iter().any(|b| {
                     abs_off >= *b && abs_off < *b + BUF_BYTES as u64
                 });
-                let diagnosis = if near_boundary {
-                    "FAKE-CAPACITY STICK (address wrap at power-of-2 boundary)"
+                let (diagnosis, action) = if near_boundary {
+                    ("FAKE-CAPACITY STICK (address wrap at power-of-2 boundary)",
+                     "Request a refund immediately — on marketplaces like eBay the seller may disappear once the protection window closes.")
                 } else {
-                    "BAD STICK (dying/defective flash cells)"
+                    ("BAD STICK (dying/defective flash cells)",
+                     "Request a refund if recently purchased; otherwise bin it and buy a reputable brand.")
                 };
                 close(h);
                 return Err(format!(
-                    "DATA MISMATCH on {} at file offset {:.3} GB - {}, DeleteMe left in place",
+                    "DATA MISMATCH on {} at file offset {:.3} GB - {}. {}",
                     path,
                     abs_off as f64 / 1e9,
-                    diagnosis
+                    diagnosis,
+                    action
                 ));
             }
             done += n as u64;
