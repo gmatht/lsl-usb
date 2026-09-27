@@ -543,8 +543,8 @@ pub(crate) fn build_install_page(
     // Boot to RAM (Check kind 9): hydrate the squashfs into RAM so the
     // USB can be removed after the background copy finishes. Adds a
     // "Boot to RAM" entry to the boot menu and injects a small initrd
-    // with the dm-clone hook. Off by default (needs >=2x squashfs size
-    // in free RAM to be practical).
+    // with the dm-clone hook. On by default (systems with <4 GB RAM can
+    // uncheck; the normal boot entry always remains available).
     {
         let mut cb: Box<nwg::CheckBox> = Box::default();
         let _ = nwg::CheckBox::builder()
@@ -553,6 +553,7 @@ pub(crate) fn build_install_page(
             .size((780, 20))
             .parent(frame_install)
             .build(&mut cb);
+        cb.set_check_state(nwg::CheckBoxState::Checked);
         items.push(PageItem { ctl: PageCtl::Check(cb, 9), x: 10, y: iy, w: -20, h: 20, idx: 0 });
         iy += 24;
     }
@@ -3353,7 +3354,7 @@ pub fn run_gui(
         push_lbl(&mut sys, PAGEFILE_NOTE, 20, 350, -30, 76, false);
         push_check(&mut sys, "Turn off Windows Fast Startup / hibernate (powercfg /h off)", 10, 430, 10, false);
         push_lbl(&mut sys, FASTSTARTUP_NOTE, 20, 452, -30, 80, false);
-        push_check(&mut sys, "Preload Rust CLI tools for the selected distro (fd / bat / zoxide)", 10, 536, 8, false);
+        push_check(&mut sys, "Preload Rust CLI tools for the selected distro (fd / bat / zoxide)", 10, 536, 8, true);
     }
     if let Err(e) = nwg::ScrollBar::builder()
         .flags(nwg::ScrollBarFlags::VERTICAL | nwg::ScrollBarFlags::VISIBLE)
