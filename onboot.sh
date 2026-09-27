@@ -444,8 +444,20 @@ elif lsl_is_usb_mode || [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
         fi
         mount /cdrom -o remount,ro 2>/dev/null || true
     fi
-    mount /cdrom/home.sfs "$LSL_HOME_LOWER"
-    mount -t overlay overlay -o "lowerdir=${LSL_HOME_LOWER}/,upperdir=${LSL_HOME_UPPER},workdir=${LSL_HOME_WORK}" /home
+    # Only stack the overlay when the home.sfs lower really mounted: a failed
+    # mount leaves $LSL_HOME_LOWER an empty dir, and the overlay would then
+    # expose an EMPTY /home (the live user's home disappears; autologin falls
+    # back to the greeter).
+    if mount /cdrom/home.sfs "$LSL_HOME_LOWER"; then
+        mount -t overlay overlay -o "lowerdir=${LSL_HOME_LOWER}/,upperdir=${LSL_HOME_UPPER},workdir=${LSL_HOME_WORK}" /home
+    else
+        echo "lsl: could not mount /cdrom/home.sfs; keeping the live /home (no persistence this boot)." >&2
+    fi
+    # The home image is keyed to LSL_DATA_DIR, not to the booted distro: one
+    # seeded by another live user (an Ubuntu home.sfs holding /home/ubuntu,
+    # reused on this Mint stick) has no /home/<user> here. Guarantee it, exactly
+    # as the RAM-home branch does.
+    lsl_ensure_user_home /home
     {
         echo "LSL_HOME_LOWER=$LSL_HOME_LOWER"
         echo "LSL_HOME_UPPER=$LSL_HOME_UPPER"
@@ -486,6 +498,12 @@ else
         mount -o loop,compress=zstd:3,relatime "$HOME_IMG" /home
     fi
     command -v btrfs >/dev/null 2>&1 && btrfs filesystem resize max /home 2>/dev/null || true
+
+    # A home.btrfs seeded by a different live user (an Ubuntu /home/ubuntu
+    # reused on this Mint stick whose user is /home/mint) has no home for THIS
+    # boot's user; autologin then dies and drops back to the greeter. Guarantee
+    # the user's home on every persistent-home path (see the USB branch).
+    lsl_ensure_user_home /home
 
     lsl_prepare_bash_log "$LSL_BASH_LOG"
     mkdir -p "$LSL_CACHE_MOUNT"

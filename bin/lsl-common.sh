@@ -92,6 +92,34 @@ lsl_desktop_user() {
     printf '%s\n' "$u"
 }
 
+# Ensure the desktop user's home exists under HOME_ROOT, seeded from skel when
+# missing or empty, and owned by the user. A persistent /home is keyed to
+# LSL_DATA_DIR, not to the live distro, so an image seeded by a different live
+# user (e.g. an Ubuntu stick's home.btrfs holding /home/ubuntu, reused on a Mint
+# stick whose user is /home/mint) leaves LIGHTDM's autologin user without a home
+# - the session dies and drops back to the greeter. The RAM-home branch rebuilds
+# the user's home every boot; every persistent-home path must guarantee it too.
+# $1 = home root (default /home), $2 = user (default $LSL_DESKTOP_USER),
+# $3 = skel dir (default /etc/skel; overridable for tests).
+lsl_ensure_user_home() {
+    local root="${1:-/home}" user="${2:-${LSL_DESKTOP_USER:-}}" skel="${3:-/etc/skel}"
+    [ -n "$user" ] || return 0
+    local h="$root/$user"
+    local created=0
+    if [ ! -d "$h" ]; then
+        mkdir -p "$h" 2>/dev/null || return 0
+        created=1
+    fi
+    if [ "$created" = "1" ] || [ -z "$(ls -A "$h" 2>/dev/null)" ]; then
+        if [ -d "$skel" ]; then
+            cp -a "$skel/." "$h/" 2>/dev/null || true
+        fi
+        echo "lsl: created $h for the live user $user" >&2
+    fi
+    chown -R "$user:$user" "$h" 2>/dev/null || chown -R "$user" "$h" 2>/dev/null || true
+    return 0
+}
+
 lsl_resolve_data_dir() {
     lsl_load_config
     local d

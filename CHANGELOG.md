@@ -83,6 +83,17 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
 - `lsl` reads `find_everything.efu` catalogs alongside `find_*.zstd`.
 
 ### Fixed
+- Persistent `/home` could hide the live user's home: the home image
+  (`home.btrfs` / `home.sfs`) is keyed to `LSL_DATA_DIR`, not to the booted
+  distro, so an image seeded by another live user - e.g. an Ubuntu-seeded
+  `home.btrfs` holding `/home/ubuntu` reused on a Mint stick whose user is
+  `/home/mint` - left `/home/<user>` missing. Autologin then died and fell
+  back to the greeter, while the RAM-only `(Boot to RAM, no persistence)`
+  entry (which rebuilds the user's home each boot) logged in normally.
+  `onboot.sh` now guarantees the desktop user's home exists and is owned by
+  the user on every persistent-home path (`lsl_ensure_user_home`, seeded from
+  `/etc/skel`), and no longer stacks the USB home overlay when the `home.sfs`
+  lower mount failed (an empty lower would expose an empty `/home`).
 - Superseded squashfs layers were never reaped on the success path. Every
   successful firstboot appended a fresh `filesystem.z0.<ts>.squashfs` and
   repointed `menu.lst` at it, orphaning the previous one; the only cleanup

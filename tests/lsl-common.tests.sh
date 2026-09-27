@@ -258,6 +258,27 @@ assert '[ ! -f "$LAYER_TMP/casper/filesystem.z0.20260916164712.squashfs" ]' \
        'layer prune: still removes an unrelated older layer'
 rm -rf "$LAYER_TMP"
 
+# --- lsl_ensure_user_home: rebuild a missing user home ----------------------
+# Regression: a persistent /home is keyed to LSL_DATA_DIR, not to the distro. A
+# home image seeded by another live user (Ubuntu /home/ubuntu) reused on a Mint
+# stick (user /home/mint) has no home for this boot's user, so LIGHTDM autologin
+# dies and falls back to the greeter while the RAM-home entry logs in fine.
+HROOT="$(mktemp -d)"; HSKEL="$(mktemp -d)"
+printf 'skel\n' > "$HSKEL/.profile"
+lsl_ensure_user_home "$HROOT" mint "$HSKEL" 2>/dev/null
+assert '[ -d "$HROOT/mint" ]' 'lsl_ensure_user_home: creates the missing user home'
+assert '[ -f "$HROOT/mint/.profile" ]' 'lsl_ensure_user_home: seeds a new home from skel'
+# A pre-existing, non-empty home is left alone (never re-seeded / clobbered).
+printf 'keep\n' > "$HROOT/mint/keep.txt"; rm -f "$HROOT/mint/.profile"
+lsl_ensure_user_home "$HROOT" mint "$HSKEL" 2>/dev/null
+assert '[ -f "$HROOT/mint/keep.txt" ]' 'lsl_ensure_user_home: keeps an existing home'
+assert '[ ! -f "$HROOT/mint/.profile" ]' 'lsl_ensure_user_home: does not re-seed a non-empty home'
+# An empty user name is a no-op (never creates /home//).
+HROOT2="$(mktemp -d)"
+lsl_ensure_user_home "$HROOT2" "" "$HSKEL" 2>/dev/null
+assert '[ -z "$(ls -A "$HROOT2")" ]' 'lsl_ensure_user_home: empty user is a no-op'
+rm -rf "$HROOT" "$HROOT2" "$HSKEL"
+
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
