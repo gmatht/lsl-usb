@@ -1,6 +1,6 @@
 #!/bin/bash
 # Mount the live user's /home: RAM-only (Boot to RAM, no persistence), a
-# tmpfs-overlay over /cdrom/home.sfs (USB mode), or a loop-mounted
+# tmpfs-overlay over the per-distro home.sfs (USB mode), or a loop-mounted
 # home.btrfs/cache.btrfs pair on the LSL data dir (HDD mode).
 #
 # Split out of onboot.sh so the display manager can wait for the /home mount
@@ -23,6 +23,10 @@ export LSL_ENV_FILE
 . "$SCRIPT_DIR/lsl-common.sh"
 
 lsl_load_config
+
+# Adopt a pre-per-distro home/cache image (first boot after this change).
+lsl_home_migrate_legacy
+HOME_SFS="$(lsl_home_sfs_path)"
 
 # HDD mode's data dir lives on a Windows volume (/mnt/c/...); mount the drives
 # here (idempotent) so this unit can run before onboot.sh does its own mount.
@@ -114,19 +118,19 @@ elif lsl_is_usb_mode || [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
         mount -t tmpfs -o "size=${LSL_HOME_TMPFS_MIB:-2048}M" tmpfs "$LSL_HOME_TMPFS"
     fi
     mkdir -p "$LSL_HOME_UPPER" "$LSL_HOME_WORK" "$LSL_HOME_LOWER"
-    if [ ! -f /cdrom/home.sfs ]; then
+    if [ ! -f $HOME_SFS ]; then
         # First boot of a Windows-installed image: seed home.sfs from the live
         # /home (keeps the mint user's login home) so the USB-mode overlay works.
         mount /cdrom -o remount,rw 2>/dev/null || true
-        echo "Creating /cdrom/home.sfs from live /home (first boot)..."
+        echo "Creating $HOME_SFS from live /home (first boot)..."
         if command -v mksquashfs >/dev/null 2>&1; then
             sz="$(du -sm /home 2>/dev/null | awk '{print $1}')"; sz="${sz:-0}"
             need_mib="$(( sz + 64 ))"
             if lsl_ensure_cdrom_space "$need_mib"; then
-                if mksquashfs /home /cdrom/home.sfs -comp zstd >/dev/null 2>&1; then
-                    echo "Created /cdrom/home.sfs ($(du -h /cdrom/home.sfs 2>/dev/null | cut -f1))."
+                if mksquashfs /home $HOME_SFS -comp zstd >/dev/null 2>&1; then
+                    echo "Created $HOME_SFS ($(du -h $HOME_SFS 2>/dev/null | cut -f1))."
                 else
-                    echo "ERROR: mksquashfs failed while creating /cdrom/home.sfs - /home will NOT persist." >&2
+                    echo "ERROR: mksquashfs failed while creating $HOME_SFS - /home will NOT persist." >&2
                     echo "       Check that /cdrom is writable and has ~${need_mib} MiB free; reboot and retry." >&2
                 fi
             else
@@ -134,7 +138,7 @@ elif lsl_is_usb_mode || [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
                 echo "       USB-mode home persistence will not work until space is freed (or a larger stick is used)." >&2
             fi
         else
-            echo "ERROR: mksquashfs not found - /cdrom/home.sfs NOT created; USB-mode home will not persist." >&2
+            echo "ERROR: mksquashfs not found - $HOME_SFS NOT created; USB-mode home will not persist." >&2
         fi
         mount /cdrom -o remount,ro 2>/dev/null || true
     fi
@@ -142,15 +146,14 @@ elif lsl_is_usb_mode || [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
     # mount leaves $LSL_HOME_LOWER an empty dir, and the overlay would then
     # expose an EMPTY /home (the live user's home disappears; autologin falls
     # back to the greeter).
-    if mount /cdrom/home.sfs "$LSL_HOME_LOWER"; then
+    if mount $HOME_SFS "$LSL_HOME_LOWER"; then
         mount -t overlay overlay -o "lowerdir=${LSL_HOME_LOWER}/,upperdir=${LSL_HOME_UPPER},workdir=${LSL_HOME_WORK}" /home
     else
-        echo "lsl: could not mount /cdrom/home.sfs; keeping the live /home (no persistence this boot)." >&2
+        echo "lsl: could not mount $HOME_SFS; keeping the live /home (no persistence this boot)." >&2
     fi
-    # The home image is keyed to LSL_DATA_DIR, not to the booted distro: one
-    # seeded by another live user (an Ubuntu home.sfs holding /home/ubuntu,
-    # reused on this Mint stick) has no /home/<user> here. Guarantee it, exactly
-    # as the RAM-home branch does.
+    # Even a per-distro home image can lack THIS boot's user home (a legacy
+    # image adopted from another distro, or one created before the user
+    # existed); autologin dies without it, so guarantee it like the RAM branch.
     lsl_ensure_user_home /home
     {
         echo "LSL_HOME_LOWER=$LSL_HOME_LOWER"
@@ -193,10 +196,9 @@ else
     fi
     command -v btrfs >/dev/null 2>&1 && btrfs filesystem resize max /home 2>/dev/null || true
 
-    # A home.btrfs seeded by a different live user (an Ubuntu /home/ubuntu
-    # reused on this Mint stick whose user is /home/mint) has no home for THIS
-    # boot's user; autologin then dies and drops back to the greeter. Guarantee
-    # the user's home on every persistent-home path (see the USB branch).
+    # As in the USB branch: even a per-distro home.btrfs can lack this boot's
+    # user home (legacy adoption, or a home created before the user). Autologin
+    # dies without it, so guarantee it on every persistent-home path.
     lsl_ensure_user_home /home
 
     lsl_prepare_bash_log "$LSL_BASH_LOG"

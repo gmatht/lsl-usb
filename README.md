@@ -338,6 +338,10 @@ is ordered `Before=display-manager.service` so the greeter never starts on a
 - Loads `/cdrom/lsl-usb.env`.
 - Calls `mount_all.sh` for Windows drives.
 - Applies USB/HDD home mode (the mount itself runs earlier, in `lsl-home.service`).
+- Home/cache images are per-distro (`home-<id>.btrfs`, `cache-<id>.btrfs`,
+  `/cdrom/home-<id>.sfs`), so re-imaging the stick with another distro does not
+  reuse the previous home; a pre-existing legacy `home.btrfs`/`home.sfs` is
+  adopted by the first distro that boots.
 - Enables cache/Nix mount layout in HDD mode.
 - Starts zram swap setup (configurable with `LSL_ZRAM_MIB`).
 - Refreshes generated fstab block.

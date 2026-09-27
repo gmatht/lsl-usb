@@ -279,6 +279,17 @@ lsl_ensure_user_home "$HROOT2" "" "$HSKEL" 2>/dev/null
 assert '[ -z "$(ls -A "$HROOT2")" ]' 'lsl_ensure_user_home: empty user is a no-op'
 rm -rf "$HROOT" "$HROOT2" "$HSKEL"
 
+# --- per-distro home/cache image names --------------------------------------
+LSL_DISTRO_KEY="linuxmint"
+assert '[ "$(lsl_distro_key)" = linuxmint ]' 'lsl_distro_key: override wins'
+LSL_DATA_DIR=/mnt/c/Users/lsl-usb
+assert 'case "$(lsl_home_btrfs_path)" in */home-linuxmint.btrfs) true;; *) false;; esac' 'home.btrfs path is per-distro'
+assert 'case "$(lsl_cache_btrfs_path)" in */cache-linuxmint.btrfs) true;; *) false;; esac' 'cache.btrfs path is per-distro'
+assert '[ "$(lsl_home_sfs_path)" = "/cdrom/home-linuxmint.sfs" ]' 'usb home.sfs path is per-distro'
+LSL_DISTRO_KEY="a b/c" 
+assert '[ "$(lsl_distro_key)" = "a_b_c" ]' 'lsl_distro_key: sanitises the id'
+unset LSL_DISTRO_KEY
+
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

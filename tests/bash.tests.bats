@@ -1027,14 +1027,14 @@ EOF
     # Overlay work dirs default to /run (unwritable for non-root CI) -
     # point them at scratch too.
     mkdir -p "$TMPDIR_TEST/lower" "$TMPDIR_TEST/upper" "$TMPDIR_TEST/work"
-    run env LSL_DATA_DIR="$CD/lsl-data" LSL_HOME_LOWER="$TMPDIR_TEST/lower" LSL_HOME_UPPER="$TMPDIR_TEST/upper" LSL_HOME_WORK="$TMPDIR_TEST/work" bash "$TMPDIR_TEST/flush.sh"
+    run env LSL_DATA_DIR="$CD/lsl-data" LSL_DISTRO_KEY=test LSL_HOME_LOWER="$TMPDIR_TEST/lower" LSL_HOME_UPPER="$TMPDIR_TEST/upper" LSL_HOME_WORK="$TMPDIR_TEST/work" bash "$TMPDIR_TEST/flush.sh"
     # Print captured output on failure: bats otherwise shows only the assert
     # line, which cannot diagnose container-only failures like this one.
     # (Single %s format: a leading --- in the format trips bash printf
     # option parsing.)
     if [ "$status" -ne 0 ]; then printf '%s\n' "--- flush.sh output:" "$output" "--- end"; fi
     [ "$status" -eq 0 ]
-    [ -f "$CD/home.sfs" ]
+    [ -f "$CD/home-test.sfs" ]
 }
 
 @test "lsl-flush-home: skips a RAM (tmpfs) home" {
@@ -1628,5 +1628,80 @@ EOF
     # exactly two mentions: the definition and the backgrounded call
     run bash -c 'grep -c lsl_wait_for_wifi onboot.sh'
     [ "$output" = "2" ]
+}
+
+# --- Boot to RAM (ramclone): dm-clone status parsing + boot hook + dialog -----
+# dm-clone STATUSTYPE_INFO is
+#   0 <len> clone <metablock> <used>/<total> <regionsize> <hydrated>/<total> <hydrating> ...
+# The hydrated/total pair is FIELD 7. The old code read fields 4/5 and so always
+# reported 0% / never signalled completion, so no "safe to remove" ever appeared.
+@test "lsl-ramclone-status: parses hydration from field 7 of the dm-clone status" {
+    MOCKS="$TMPDIR_TEST/bin"; mkdir -p "$MOCKS"
+    printf '#!/bin/bash\ncase "$1" in status) echo "0 2000000 clone 128 1024/1024 2048 512/2048 1 0 1 hydration_threshold 1 rw" ;; esac\n' > "$MOCKS/dmsetup"
+    chmod +x "$MOCKS/dmsetup"
+    mkdir -p "$TMPDIR_TEST/ramclone"; : > "$TMPDIR_TEST/ramclone/status"
+    sed "s#/run/#$TMPDIR_TEST/#g" bin/lsl-ramclone-status > "$TMPDIR_TEST/ram-status"
+    run env PATH="$MOCKS:$PATH" bash "$TMPDIR_TEST/ram-status"
+    [ "$status" -eq 1 ]
+    [ "$(printf '%s\n' "$output" | head -n1)" = "25" ]
+}
+
+@test "lsl-ramclone-status: exit 0 and 100% when hydration is complete" {
+    MOCKS="$TMPDIR_TEST/bin"; mkdir -p "$MOCKS"
+    printf '#!/bin/bash\ncase "$1" in status) echo "0 2000000 clone 128 2048/2048 2048 2048/2048 0 0 1 hydration_threshold 1 rw" ;; esac\n' > "$MOCKS/dmsetup"
+    chmod +x "$MOCKS/dmsetup"
+    mkdir -p "$TMPDIR_TEST/ramclone"; : > "$TMPDIR_TEST/ramclone/status"
+    sed "s#/run/#$TMPDIR_TEST/#g" bin/lsl-ramclone-status > "$TMPDIR_TEST/ram-status"
+    run env PATH="$MOCKS:$PATH" bash "$TMPDIR_TEST/ram-status"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s\n' "$output" | head -n1)" = "100" ]
+}
+
+@test "lsl-ramclone-status: exit 2 when ramclone is not active" {
+    sed "s#/run/#$TMPDIR_TEST/#g" bin/lsl-ramclone-status > "$TMPDIR_TEST/ram-status"
+    run bash "$TMPDIR_TEST/ram-status"
+    [ "$status" -eq 2 ]
+}
+
+@test "live-ramclone: dm-clone table includes the mandatory region size" {
+    # Without the region-size arg the kernel rejects the table (argc < 4) and
+    # Boot to RAM silently copied nothing.
+    grep -q 'clone \$META_DEV \$DEST_DEV \$ORIGIN_DEV \$REGION' initramfs/live-ramclone
+    grep -q '^REGION=2048$' initramfs/live-ramclone
+}
+
+@test "live-ramclone: base and other chain layers resolve to distinct RAM backings" {
+    # The base maps to the clone; every other chain layer (z0 / appended) is
+    # copied into tmpfs and looped there, so no USB squashfs stays open.
+    grep -q '/dev/mapper/clone' initramfs/live-ramclone
+    grep -q 'RAMDIR/backdev' initramfs/live-ramclone
+    grep -q 'for _lsl_img in \$_lsl_chain' initramfs/live-ramclone
+}
+
+@test "live-ramclone: POSIX sh syntax" {
+    sh -n initramfs/live-ramclone
+}
+
+@test "lsl-ramclone-progress: no-op when ramclone is not on the cmdline" {
+    printf 'BOOT_IMAGE=/vmlinuz quiet splash\n' > "$TMPDIR_TEST/cmdline"
+    run env LSL_CMDLINE_FILE="$TMPDIR_TEST/cmdline" LSL_RAMCLONE_DIR="$TMPDIR_TEST/ramclone" \
+        bash misc/lsl-ramclone-progress.sh
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "lsl-ramclone-progress: syntax" {
+    bash -n misc/lsl-ramclone-progress.sh
+}
+
+@test "lsl-ramclone-progress.desktop runs the staged dialog script" {
+    grep -q '^Exec=/usr/local/bin/lsl-ramclone-progress.sh$' misc/lsl-ramclone-progress.desktop
+    grep -q '^X-GNOME-Autostart-enabled=true$' misc/lsl-ramclone-progress.desktop
+}
+
+@test "lsl-progress-gtk.py: parses and has the ramclone mode" {
+    python3 -c "import ast; ast.parse(open('misc/lsl-progress-gtk.py').read())"
+    grep -q 'def run_ramclone' misc/lsl-progress-gtk.py
+    grep -q '"--ramclone"' misc/lsl-progress-gtk.py
 }
 

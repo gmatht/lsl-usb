@@ -1412,12 +1412,16 @@ function Copy-SfsToHdd {
 
     # Candidate layer basenames: the firstboot layer, the base root image, home
     # snapshot, and any appended filesystem_z*.squashfs layers.
-    $bases = @('filesystem_z0_firstboot.squashfs', 'filesystem.squashfs', 'home.sfs')
+    $bases = @('filesystem_z0_firstboot.squashfs', 'filesystem.squashfs')
     $casperPath = Join-Path $srcRoot 'casper'
     if (Test-Path $casperPath) {
         foreach ($f in (Get-ChildItem -Path $casperPath -Filter 'filesystem_*.squashfs' -ErrorAction SilentlyContinue)) {
             $bases += $f.Name
         }
+    }
+    # home snapshot: legacy home.sfs or the per-distro home-<id>.sfs.
+    foreach ($f in (Get-ChildItem -Path $srcRoot -Filter 'home*.sfs' -ErrorAction SilentlyContinue)) {
+        $bases += $f.Name
     }
     $bases = $bases | Sort-Object -Unique
 
@@ -1425,7 +1429,7 @@ function Copy-SfsToHdd {
     $manifestLines = @('# LSL squashfs layers copied to HDD for faster boot',
                        "SourceUSB=$($Vol.DriveLetter):", "Date=$(Get-Date -Format u)")
     foreach ($base in $bases) {
-        if ($base -eq 'home.sfs') { $s = Join-Path $srcRoot 'home.sfs' }
+        if ($base -like 'home*.sfs') { $s = Join-Path $srcRoot $base }
         else { $s = Join-Path $casperPath $base }
         if (Test-Path $s) {
             # casper's multi-layer LAYERFS_PATH chain stacks filesystem.z0 over

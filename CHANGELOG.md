@@ -121,6 +121,12 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   them) in the first-boot layer, so the display-manager ordering applies from
   the very first boot of an `install.ps1` stick, as it already did for the
   nofmt installer's embedded layer.
+- Home and cache images are now per-distro: `home-<id>.btrfs` /
+  `cache-<id>.btrfs` in `LSL_DATA_DIR` and `/cdrom/home-<id>.sfs` for USB mode
+  (`<id>` from `/etc/os-release`, else the desktop user). Re-imaging a stick
+  with another distro no longer reuses the previous home; a pre-existing
+  legacy `home.btrfs`/`cache.btrfs`/`home.sfs` is adopted by the first distro
+  to boot (`lsl_home_migrate_legacy`).
 - Superseded squashfs layers were never reaped on the success path. Every
   successful firstboot appended a fresh `filesystem.z0.<ts>.squashfs` and
   repointed `menu.lst` at it, orphaning the previous one; the only cleanup

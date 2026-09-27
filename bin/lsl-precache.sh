@@ -53,7 +53,7 @@ total_ram_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo)"
 
 # Gather the full-image targets and decide whether a FULL pass is affordable.
 if [ -z "$FULL_TARGETS" ]; then
-    for f in /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_*.squashfs /cdrom/home.sfs; do
+    for f in /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_*.squashfs /cdrom/home*.sfs; do
         [ -f "$f" ] || continue
         FULL_TARGETS="$FULL_TARGETS $f"
     done
@@ -66,7 +66,7 @@ fi
 # layer) is ignored and we fall back to reading the USB.
 if [ "${LSL_SFS_HDD_CACHE:-0}" = "1" ]; then
     hdd_targets=""
-    for f in /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_*.squashfs /cdrom/home.sfs; do
+    for f in /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_*.squashfs /cdrom/home*.sfs; do
         [ -f "$f" ] || continue
         hdd="${LSL_DATA_DIR:-/mnt/c/Users/lsl-usb}/sfs/$(basename "$f")"
         if [ -f "$hdd" ] && [ "$(stat -c %s "$hdd" 2>/dev/null || echo 0)" = "$(stat -c %s "$f" 2>/dev/null || echo 0)" ]; then

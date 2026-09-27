@@ -57,7 +57,7 @@ source_layers() {
     for f in "$CDROM/casper/filesystem_z0_firstboot.squashfs" \
              "$CDROM/casper/filesystem.squashfs" \
              "$CDROM/casper/filesystem_"*.squashfs \
-             "$CDROM/home.sfs"; do
+             "$CDROM/home"*.sfs; do
         [ -f "$f" ] && printf '%s\n' "$f"
     done
 }

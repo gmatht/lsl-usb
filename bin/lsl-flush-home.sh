@@ -1,5 +1,5 @@
 #!/bin/bash
-# Flush merged /home to /cdrom/home.sfs (USB mode). Linear mksquashfs write.
+# Flush merged /home to the per-distro home.sfs (USB mode). Linear mksquashfs write.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,6 +8,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 lsl_load_config
 lsl_source_state
+
+HOME_SFS="$(lsl_home_sfs_path)"
 
 # RAM-only home (Boot to RAM, no persistence): /home is a tmpfs, so there is
 # nothing to persist - and squashing it to home.sfs would defeat the point.
@@ -53,17 +55,17 @@ if ! lsl_ensure_cdrom_space "$need_mib"; then
 fi
 mksquashfs /home "$tmp_sfs" -comp zstd -b 512K -one-file-system -noappend
 
-if [ -f /cdrom/home.sfs ]; then
-    mv /cdrom/home.sfs "/cdrom/home_${ts}.sfs"
+if [ -f "$HOME_SFS" ]; then
+    mv "$HOME_SFS" "/cdrom/home_${ts}.sfs"
 fi
-mv "$tmp_sfs" /cdrom/home.sfs
+mv "$tmp_sfs" "$HOME_SFS"
 
 echo "Remounting home overlay with fresh upper..."
 umount /home
 umount "$LOWER" 2>/dev/null || true
 
 mkdir -p "$LOWER"
-mount /cdrom/home.sfs "$LOWER"
+mount "$HOME_SFS" "$LOWER"
 
 find "${UPPER}" -mindepth 1 -delete 2>/dev/null || true
 find "${WORK}" -mindepth 1 -delete 2>/dev/null || true

@@ -217,14 +217,59 @@ LSL_HOME_WORK="${LSL_HOME_WORK:-/run/lsl-home-overlay/work}"
 LSL_HOME_TMPFS="${LSL_HOME_TMPFS:-/run/lsl-home-overlay}"
 LSL_CACHE_MOUNT="${LSL_CACHE_MOUNT:-/mnt/lsl-cache}"
 
+# Distro key for per-distro home/cache images. The home image is keyed to
+# LSL_DATA_DIR, so without this a stick re-imaged with another distro would
+# reuse the previous one's /home (only the missing user home is recreated).
+# LSL_DISTRO_KEY overrides the autodetection (tests).
+lsl_distro_key() {
+    local id="${LSL_DISTRO_KEY:-}"
+    if [ -z "$id" ] && [ -r /etc/os-release ]; then
+        id="$(sed -n 's/^ID=//p' /etc/os-release | head -n1 | tr -d '"')"
+    fi
+    [ -n "$id" ] || id="${LSL_DESKTOP_USER:-}"
+    [ -n "$id" ] || id=default
+    id="$(printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '_' | sed -e 's/^_*//' -e 's/_*$//')"
+    [ -n "$id" ] || id=default
+    printf '%s\n' "$id"
+}
+
 lsl_home_btrfs_path() {
     lsl_load_config
-    printf '%s/home.btrfs' "$(lsl_resolve_data_dir)"
+    printf '%s/home-%s.btrfs' "$(lsl_resolve_data_dir)" "$(lsl_distro_key)"
 }
 
 lsl_cache_btrfs_path() {
     lsl_load_config
-    printf '%s/cache.btrfs' "$(lsl_resolve_data_dir)"
+    printf '%s/cache-%s.btrfs' "$(lsl_resolve_data_dir)" "$(lsl_distro_key)"
+}
+
+# USB-mode home snapshot, also per-distro.
+lsl_home_sfs_path() {
+    printf '%s/home-%s.sfs' "${LSL_CDROM:-/cdrom}" "$(lsl_distro_key)"
+}
+
+# Adopt a pre-per-distro image so switching distros does not silently start from
+# scratch: the FIRST distro to boot claims the legacy file. Idempotent, and it
+# never fails the caller (a read-only data dir or /cdrom just skips).
+lsl_home_migrate_legacy() {
+    local d old new
+    d="$(lsl_resolve_data_dir)"
+    for old in "$d/home.btrfs" "$d/cache.btrfs"; do
+        [ -f "$old" ] || continue
+        new="$d/$(basename "$old" .btrfs)-$(lsl_distro_key).btrfs"
+        if [ ! -e "$new" ]; then
+            mv "$old" "$new" 2>/dev/null && echo "lsl: adopted legacy $(basename "$old") as $(basename "$new")" >&2
+        fi
+    done
+    old="${LSL_CDROM:-/cdrom}/home.sfs"
+    new="$(lsl_home_sfs_path)"
+    if [ -f "$old" ] && [ ! -e "$new" ]; then
+        if mount "${LSL_CDROM:-/cdrom}" -o remount,rw 2>/dev/null; then
+            mv "$old" "$new" 2>/dev/null && echo "lsl: adopted legacy home.sfs as $(basename "$new")" >&2
+            mount "${LSL_CDROM:-/cdrom}" -o remount,ro 2>/dev/null || true
+        fi
+    fi
+    return 0
 }
 
 lsl_state_file() {

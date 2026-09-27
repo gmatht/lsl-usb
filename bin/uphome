@@ -15,7 +15,7 @@ if [ "$(findmnt -n -o FSTYPE --target /home 2>/dev/null || true)" = "tmpfs" ]; t
 fi
 
 if lsl_is_usb_mode; then
-    echo "USB mode: flushing merged /home to /cdrom/home.sfs…"
+    echo "USB mode: flushing merged /home to the stick's per-distro home image…"
     exec "$SCRIPT_DIR/lsl-flush-home.sh"
 fi
 

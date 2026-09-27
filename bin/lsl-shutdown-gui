@@ -169,7 +169,7 @@ confirm_and_run() {
     local save_mode="$1"
     local power_mode="$2"
     local uphome_cmd=""
-    local save_msg="Saving home snapshot to /cdrom/home.sfs…"
+    local save_msg="Saving home snapshot to the stick's home image…"
 
     if [ -f /cdrom/bin/lsl-common.sh ]; then
         # shellcheck source=/dev/null
