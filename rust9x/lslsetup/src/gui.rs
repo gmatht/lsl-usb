@@ -108,6 +108,7 @@ pub struct GuiResult {
     pub bios_boot: bool,                       // INSTALL-page "BIOS boot" checkbox (default: supported)
     pub uefi_boot: bool,                       // INSTALL-page "UEFI boot" checkbox (default: supported)
     pub check_usb: bool,                       // INSTALL-page "Check whole USB" checkbox (default: off, slow)
+    pub ramclone: bool,                        // INSTALL-page "Boot to RAM" checkbox (default: off)
     pub extra_isos: Vec<String>,               // page-1 "extra boot" checkboxes (loopback-only, no firstboot)
     pub download_extras: Vec<(String, String)>, // page-1 kind-11 ticks: (url, name) to download, then loopback-only
 }
@@ -537,6 +538,22 @@ pub(crate) fn build_install_page(
             cb.set_check_state(nwg::CheckBoxState::Checked);
         }
         items.push(PageItem { ctl: PageCtl::Check(cb, 8), x: 10, y: iy, w: -20, h: 20, idx: 0 });
+        iy += 24;
+    }
+    // Boot to RAM (Check kind 9): hydrate the squashfs into RAM so the
+    // USB can be removed after the background copy finishes. Adds a
+    // "Boot to RAM" entry to the boot menu and injects a small initrd
+    // with the dm-clone hook. Off by default (needs >=2x squashfs size
+    // in free RAM to be practical).
+    {
+        let mut cb: Box<nwg::CheckBox> = Box::default();
+        let _ = nwg::CheckBox::builder()
+            .text(&crate::locale::tr("Boot to RAM (hydrate squashfs into RAM — allows USB ejection when done)"))
+            .position((10, iy))
+            .size((780, 20))
+            .parent(frame_install)
+            .build(&mut cb);
+        items.push(PageItem { ctl: PageCtl::Check(cb, 9), x: 10, y: iy, w: -20, h: 20, idx: 0 });
         iy += 24;
     }
     let mut note: Box<nwg::Label> = Box::default();
@@ -4920,6 +4937,17 @@ fn harvest_gui_result(
             let mut on = false;
             for it in install_items.borrow().iter() {
                 if let PageCtl::Check(cb, 8) = &it.ctl {
+                    on = cb.check_state() == nwg::CheckBoxState::Checked;
+                    break;
+                }
+            }
+            on
+        },
+        ramclone: {
+            // INSTALL-page Boot to RAM check (kind 9); default off
+            let mut on = false;
+            for it in install_items.borrow().iter() {
+                if let PageCtl::Check(cb, 9) = &it.ctl {
                     on = cb.check_state() == nwg::CheckBoxState::Checked;
                     break;
                 }

@@ -641,6 +641,17 @@ pub fn menu_entry_direct(title: &str, kern_rel: &str, init_rel: &str) -> String 
     )
 }
 
+/// Same as menu_entry_direct but adds the ramclone initrd and kernel flag.
+pub fn menu_entry_direct_ramclone(title: &str, kern_rel: &str, init_rel: &str) -> String {
+    format!(
+        "\ntitle {title}\n\
+         find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
+         kernel {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone rootdelay=15 quiet splash\n\
+         initrd {init_rel} /casper/initrd.ramclone.gz\n\
+         boot\n"
+    )
+}
+
 /// Header comment block for a fresh menu.lst (documents the direct
 /// kernel/initrd pattern for ISOs the chainloader path does not like).
 pub fn default_menu() -> String {
@@ -1528,6 +1539,8 @@ pub fn install_from_iso(
     preconfirmed: bool,
     skip_verify: bool,
     extra_isos: &[String],
+    ramclone: bool,
+    bundle_dir: &str,
 ) -> Result<(UsbTarget, WriteMetrics, Option<PendingMbr>), String> {
     if !want_bios && !want_uefi {
         // Say WHY, not just that: the GUI greys out unsupported paths (the
@@ -1603,7 +1616,7 @@ pub fn install_from_iso(
         }
     }
 
-    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, active_uefi_loader(), ui, skip_verify, extra_isos)?;
+    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, active_uefi_loader(), ui, skip_verify, extra_isos, ramclone, bundle_dir)?;
     Ok((target, metrics, pending))
 }
 
@@ -1954,6 +1967,54 @@ fn write_menu_entries(
     Ok((dtitle, kern_rel, init_rel))
 }
 
+/// Add a "Boot to RAM" menu entry next to the existing direct-kernel entry.
+/// The small ramclone initrd must already exist on the stick.
+pub fn add_ramclone_boot_entries(
+    root: &str,
+    title: &str,
+    kern_rel: &str,
+    init_rel: &str,
+    uefi: bool,
+) -> Result<(), String> {
+    let ramclone_title = format!("{} (Boot to RAM)", title.trim_end_matches(" (direct kernel)"));
+    // BIOS menu (grub4dos)
+    let menu_path = format!("{}menu.lst", root);
+    if let Ok(mut menu) = std::fs::read_to_string(&menu_path) {
+        let dentry = menu_entry_direct_ramclone(&ramclone_title, kern_rel, init_rel);
+        let (m, added) = refresh_menu_entry(&menu, &ramclone_title, &dentry);
+        menu = m;
+        if added {
+            std::fs::write(&menu_path, menu).map_err(|e| format!("write menu.lst: {}", e))?;
+            out::info(&format!("menu.lst entry '{}' (Boot to RAM)", ramclone_title));
+        }
+    }
+    // UEFI grub4dos mirror
+    if uefi {
+        let uefi_menu_path = format!("{}efi\\grub\\menu.lst", root);
+        if let Ok(mut um) = std::fs::read_to_string(&uefi_menu_path) {
+            let dentry = menu_entry_direct_ramclone(&ramclone_title, kern_rel, init_rel);
+            let (m, added) = refresh_menu_entry(&um, &ramclone_title, &dentry);
+            um = m;
+            if added {
+                std::fs::write(&uefi_menu_path, um).map_err(|e| format!("write efi\\grub\\menu.lst: {}", e))?;
+                out::info(&format!("efi\\grub\\menu.lst entry '{}' (Boot to RAM)", ramclone_title));
+            }
+        }
+    }
+    // GRUB2 cfg
+    let grub_cfg = format!("{}EFI\\BOOT\\grub.cfg", root);
+    if let Ok(mut cfg) = std::fs::read_to_string(&grub_cfg) {
+        let entry = uefi_cfg_direct_ramclone(&ramclone_title, kern_rel, init_rel);
+        let (c, added) = upsert_grub_entry(&cfg, &ramclone_title, &entry);
+        cfg = c;
+        if added {
+            std::fs::write(&grub_cfg, cfg).map_err(|e| format!("write grub.cfg: {}", e))?;
+            out::info(&format!("grub.cfg entry '{}' (Boot to RAM)", ramclone_title));
+        }
+    }
+    Ok(())
+}
+
 /// Same-path comparison for ISO dedupe (Windows: case-insensitive,
 /// slash-insensitive). Pure so the multiboot offer logic is unit-testable.
 fn is_same_iso(a: &str, b: &str) -> bool {
@@ -2263,6 +2324,8 @@ fn install_files(
     ui: Option<&dyn WriteUi>,
     skip_verify: bool,
     extra_isos: &[String],
+    ramclone: bool,
+    bundle_dir: &str,
 ) -> Result<(String, bool, WriteMetrics), String> {
     let root = format!("{}:\\", t.letter);
     // Resolve the UEFI loader up front: the menu-mirror decision depends on
@@ -2322,6 +2385,13 @@ fn install_files(
     // the signed GRUB2 chain reads grub.cfg instead.
     let (title, kern_rel, init_rel) =
         write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui)?;
+    if ramclone {
+        if let Err(e) = crate::lslfiles::install_ramclone_initrd(&t.letter, bundle_dir) {
+            out::warn(&format!("ramclone initrd not created ({}); Boot to RAM entry skipped.", e));
+        } else if let Err(e) = add_ramclone_boot_entries(&root, &title, &kern_rel, &init_rel, uefi_res.mirror_menu()) {
+            out::warn(&format!("ramclone boot entries not added ({}).", e));
+        }
+    }
     // UEFI side-load (files only; FAT32 stick). Signed shim -> GRUB2 works
     // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need
     // Secure Boot OFF (see assets/SIGNED-UEFI.txt).
@@ -2650,7 +2720,7 @@ fn main_extract_bytes(iso_path: &str) -> u64 {
     need
 }
 
-fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool, extra_isos: &[String]) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
+fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool, extra_isos: &[String], ramclone: bool, bundle_dir: &str) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
     let fs_uc = t.fs.to_ascii_uppercase();
     // grub4dos reads FAT12/16/32 and NTFS only. exFAT (the default on many
     // large sticks) is NOT readable by grub4dos, so a stick left exFAT cannot
@@ -2759,7 +2829,7 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         }
         out::step("GPT stick: files-only UEFI install (no raw sectors touched).");
         report_board(false, true);
-        let (title, uefi_ok, metrics) = install_files(t, iso, uefi_bootx64, false, true, uefi_loader, ui, skip_verify, extra_isos)?;
+        let (title, uefi_ok, metrics) = install_files(t, iso, uefi_bootx64, false, true, uefi_loader, ui, skip_verify, extra_isos, ramclone, bundle_dir)?;
         report_bootability(false, "GPT stick - grub4dos BIOS stage1 has nowhere to live (sectors 1-15 are the GPT header/table)", uefi_ok, &title);
         return Ok((metrics, None));
     }
@@ -3002,6 +3072,16 @@ fn uefi_cfg_direct(title: &str, kern_rel: &str, init_rel: &str) -> String {
          \x20   search --no-floppy --set=root --file {kern_rel}\n\
          \x20   linux {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs rootdelay=15 quiet splash\n\
          \x20   initrd {init_rel}\n\
+         }}\n"
+    )
+}
+
+fn uefi_cfg_direct_ramclone(title: &str, kern_rel: &str, init_rel: &str) -> String {
+    format!(
+        "menuentry \"{title}\" {{\n\
+         \x20   search --no-floppy --set=root --file {kern_rel}\n\
+         \x20   linux {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone rootdelay=15 quiet splash\n\
+         \x20   initrd {init_rel} /casper/initrd.ramclone.gz\n\
          }}\n"
     )
 }

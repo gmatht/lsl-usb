@@ -512,7 +512,7 @@ fn run() {
                 // hinge on a stale flag).
                 ui.set_active_stage(gui::WorkStage::UsbWrite as usize);
                 ui.set_stage_status(gui::WorkStage::UsbWrite as usize, &crate::locale::tr("writing..."));
-                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some(), opts.skip_verify, &extra_isos) {
+                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some(), opts.skip_verify, &extra_isos, g.ramclone, &opts.bundle_dir) {
                     Ok((t, metrics, pending)) => {
                         use gui::WorkStage as ST;
                         ui.set_active_stage(ST::UsbWrite as usize);
@@ -951,7 +951,7 @@ fn run() {
             } else {
                 opts.extra_isos.clone()
             };
-            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false, opts.skip_verify, &extra_isos) {
+            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false, opts.skip_verify, &extra_isos, false, &opts.bundle_dir) {
                 Ok((t, _metrics, pending)) => {
                     pending_mbr = pending;
                     vol = sys::list_volumes()

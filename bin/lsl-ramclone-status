@@ -1,0 +1,42 @@
+#!/bin/bash
+# lsl-ramclone-status - report dm-clone hydration progress.
+#
+# Reads /run/ramclone/status and dmsetup status to report:
+#   - overall percent hydrated
+#   - whether the USB is safe to eject
+#   - current hydration rate (if available)
+#
+# Exit codes:
+#   0  - hydration complete, USB safe to eject
+#   1  - hydration in progress (percent printed to stdout)
+#   2  - ramclone not active
+#   3  - error querying status
+
+set -uo pipefail
+
+RAMCLONE_DIR="/run/ramclone"
+[ -f "$RAMCLONE_DIR/status" ] || { echo "ramclone not active"; exit 2; }
+
+# dm-clone status line: "0 <sectors> clone <hyd> <total> <...>"
+# The hydrated/total region count is the key metric.
+status_line=$(dmsetup status clone 2>/dev/null)
+[ -n "$status_line" ] || { echo "error querying dm-clone status"; exit 3; }
+
+# Parse: the third field is "clone", fourth is hydrated, fifth is total.
+read -r _start _end _type hyd total _rest <<< "$status_line"
+[ -n "$hyd" ] && [ -n "$total" ] && [ "$total" -gt 0 ] 2>/dev/null || {
+    echo "error parsing dm-clone status"
+    exit 3
+}
+
+pct=$(( hyd * 100 / total ))
+
+if [ "$hyd" -eq "$total" ]; then
+    echo "100"
+    echo "Hydration complete — USB is safe to eject."
+    exit 0
+else
+    echo "$pct"
+    echo "Hydrating: $pct% ($hyd / $total regions) — do not remove USB yet."
+    exit 1
+fi

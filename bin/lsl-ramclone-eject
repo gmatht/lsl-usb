@@ -1,0 +1,93 @@
+#!/bin/bash
+# lsl-ramclone-eject - safely eject the USB after dm-clone hydration.
+#
+# When hydration is 100%, this script:
+#   1) verifies the RAM destination (sha256 of /dev/ram0)
+#   2) reloads the dm-clone table to a plain linear RAM mapping
+#   3) detaches the origin loop and meta loop
+#   4) unmounts the USB
+#   5) powers off the USB device
+#
+# Usage: sudo lsl-ramclone-eject [--force]
+#   --force  skip the verify step (not recommended)
+
+set -uo pipefail
+
+FORCE=0
+for a in "$@"; do
+    case "$a" in
+        --force) FORCE=1 ;;
+        -h|--help)
+            echo "Usage: $0 [--force]"
+            echo "  Safely eject the USB after dm-clone hydration is complete."
+            exit 0
+            ;;
+    esac
+done
+
+RAMCLONE_DIR="/run/ramclone"
+[ -f "$RAMCLONE_DIR/status" ] || { echo "ramclone not active" >&2; exit 2; }
+
+# Check hydration status.
+status_line=$(dmsetup status clone 2>/dev/null)
+[ -n "$status_line" ] || { echo "error querying dm-clone status" >&2; exit 3; }
+read -r _start _end _type hyd total _rest <<< "$status_line"
+if [ "$hyd" -ne "$total" ] 2>/dev/null; then
+    echo "Hydration not complete ($hyd / $total regions). Use lsl-ramclone-status to monitor." >&2
+    exit 1
+fi
+
+# Optional verify: sha256 of the RAM destination.
+if [ "$FORCE" -eq 0 ]; then
+    echo "Verifying RAM destination..."
+    # If a manifest was saved at setup time, compare.
+    if [ -f "$RAMCLONE_DIR/dest.sha256" ]; then
+        want=$(cat "$RAMCLONE_DIR/dest.sha256")
+        got=$(sha256sum /dev/ram0 | awk '{print $1}')
+        if [ "$got" != "$want" ]; then
+            echo "VERIFY FAILED: RAM destination does not match expected hash." >&2
+            echo "  expected: $want" >&2
+            echo "  actual:   $got" >&2
+            exit 3
+        fi
+        echo "Verify OK."
+    else
+        echo "No manifest found — skipping verify (use --force to suppress this message)."
+    fi
+fi
+
+SECT=$(cat "$RAMCLONE_DIR/sectors" 2>/dev/null)
+[ -n "$SECT" ] || SECT=$(dmsetup table clone 2>/dev/null | awk '{print $2}')
+[ -n "$SECT" ] || { echo "cannot determine clone size" >&2; exit 3; }
+
+# Detach: suspend → reload linear → resume.
+echo "Detaching USB origin..."
+dmsetup suspend clone 2>/dev/null || true
+dmsetup reload clone --table "0 $SECT linear /dev/ram0 0" 2>/dev/null || {
+    echo "dm table reload failed" >&2
+    dmsetup resume clone 2>/dev/null || true
+    exit 3
+}
+dmsetup resume clone 2>/dev/null || true
+
+# Clean up loops.
+ORIGIN=$(cat "$RAMCLONE_DIR/origin_loop" 2>/dev/null)
+METAD=$(cat "$RAMCLONE_DIR/meta_loop" 2>/dev/null)
+[ -n "$ORIGIN" ] && losetup -d "$ORIGIN" 2>/dev/null || true
+[ -n "$METAD" ] && losetup -d "$METAD" 2>/dev/null || true
+
+# Unmount the USB.
+mountpoint -q /cdrom 2>/dev/null && umount /cdrom 2>/dev/null || true
+mountpoint -q /isodevice 2>/dev/null && umount /isodevice 2>/dev/null || true
+
+# Power off the stick if we can identify it.
+STICK_DEV=$(cat "$RAMCLONE_DIR/stick_dev" 2>/dev/null)
+if [ -n "$STICK_DEV" ] && [ -b "$STICK_DEV" ]; then
+    echo "Powering off $STICK_DEV..."
+    udisksctl power-off -b "$STICK_DEV" 2>/dev/null || hdparm -Y "$STICK_DEV" 2>/dev/null || true
+fi
+
+echo "USB detached. The session is now running entirely from RAM."
+rm -f "$RAMCLONE_DIR/status"
+echo "done" > "$RAMCLONE_DIR/status"
+exit 0

@@ -4,7 +4,7 @@
 
 use crate::sys::{self, file_size, out, path_exists};
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::io::{Read, Write};
 
 pub fn sha256_file(path: &str) -> Option<String> {
     match sha256_file_progress(path, &mut |_, _| true) {
@@ -139,6 +139,8 @@ static FIRSTBOOT_TOOLKIT: &[(&str, &str)] = &[
     ("bin\\lsl-reclaim-win-swap.sh", include_str!("../../../bin/lsl-reclaim-win-swap.sh")),
     ("bin\\clean-old-system-patches.sh", include_str!("../../../bin/clean-old-system-patches.sh")),
     ("bin\\wsl-boot-setup", include_str!("../../../bin/wsl-boot-setup")),
+    ("bin\\lsl-ramclone-status", include_str!("../../../bin/lsl-ramclone-status")),
+    ("bin\\lsl-ramclone-eject", include_str!("../../../bin/lsl-ramclone-eject")),
     ("systemd\\onboot.service", include_str!("../../../systemd/onboot.service")),
     ("systemd\\lsl-boot-stamp.service", include_str!("../../../systemd/lsl-boot-stamp.service")),
     ("systemd\\lsl-btrfs-growd.service", include_str!("../../../systemd/lsl-btrfs-growd.service")),
@@ -947,7 +949,6 @@ mod manifest_hash_progress_tests {
         let chunk = vec![0xABu8; 1 << 20];
         let mut f = std::fs::File::create(&path).unwrap();
         for _ in 0..3 {
-            use std::io::Write;
             f.write_all(&chunk).unwrap();
         }
         drop(f);
@@ -1043,4 +1044,87 @@ mod firstboot_toolkit_tests {
         assert!(Z0_BLOB.len() >= 4096 && Z0_BLOB.len() <= 1 << 20, "z0 size implausible: {}", Z0_BLOB.len());
         assert_eq!(&Z0_BLOB[0..4], &[0x68, 0x73, 0x71, 0x73], "z0 must start with hsqs magic");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cpio newc packer (gzip-compressed small initrd for ramclone hook injection).
+// The kernel unpacks concatenated initrds in order; a trailing archive with
+// the hook at the right path is sufficient — no need to unpack the original.
+// ---------------------------------------------------------------------------
+
+fn cpio_newc_header(name: &str, size: u64, mode: u32) -> Vec<u8> {
+    let namesize = name.len() + 1; // include null terminator
+    format!(
+        "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+        0,       // c_ino
+        mode,    // c_mode
+        0,       // c_uid
+        0,       // c_gid
+        1,       // c_nlink
+        0,       // c_mtime
+        size,    // c_filesize
+        0,       // c_devmajor
+        0,       // c_devminor
+        0,       // c_rdevmajor
+        0,       // c_rdevminor
+        namesize,// c_namesize
+        0,       // c_check
+    )
+    .into_bytes()
+}
+
+fn cpio_pad4(n: usize) -> usize {
+    (4 - (n % 4)) % 4
+}
+
+fn cpio_newc_file(name: &str, data: &[u8], mode: u32) -> Vec<u8> {
+    let mut out = cpio_newc_header(name, data.len() as u64, mode);
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    out.extend_from_slice(&vec![0u8; cpio_pad4(name.len() + 1)]);
+    out.extend_from_slice(data);
+    out.extend_from_slice(&vec![0u8; cpio_pad4(data.len())]);
+    out
+}
+
+fn cpio_newc_trailer() -> Vec<u8> {
+    cpio_newc_file("TRAILER!!!", &[], 0)
+}
+
+/// Create a gzip-compressed cpio initrd containing the ramclone hook at the
+/// paths both casper and live-boot will execute. Returns the compressed bytes.
+pub fn make_ramclone_initrd(hook_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut archive = Vec::new();
+    // Place the hook at all paths any initramfs framework might execute.
+    let paths = [
+        "scripts/casper-premount/9990-live-ramclone",
+        "scripts/casper-bottom/9990-live-ramclone",
+        "scripts/live-premount/9990-live-ramclone",
+    ];
+    for path in paths {
+        archive.extend_from_slice(&cpio_newc_file(path, hook_bytes, 0o100755));
+    }
+    archive.extend_from_slice(&cpio_newc_trailer());
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&archive).map_err(|e| format!("gzip encode: {}", e))?;
+    encoder.finish().map_err(|e| format!("gzip finish: {}", e))
+}
+
+/// Write the ramclone small-initrd to the stick if the hook script exists in
+/// the bundle. The boot menu references this as a second initrd.
+pub fn install_ramclone_initrd(vol_letter: &str, bundle_dir: &str) -> Result<(), String> {
+    let hook = format!("{}\\initramfs\\live-ramclone", bundle_dir);
+    if !path_exists(&hook) {
+        return Err("ramclone hook not found in bundle".into());
+    }
+    let data = std::fs::read(&hook).map_err(|e| format!("read hook: {}", e))?;
+    let compressed = make_ramclone_initrd(&data)?;
+    let dest = format!("{}:\\casper\\initrd.ramclone.gz", vol_letter);
+    std::fs::write(&dest, &compressed).map_err(|e| format!("write ramclone initrd: {}", e))?;
+    out::info(&format!(
+        "ramclone initrd ready ({} bytes, hook at {} paths).",
+        compressed.len(),
+        3
+    ));
+    Ok(())
 }

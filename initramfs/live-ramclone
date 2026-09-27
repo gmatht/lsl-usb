@@ -1,0 +1,78 @@
+#!/bin/sh
+# live-ramclone - initramfs hook for dm-clone boot-to-RAM.
+#
+# When the kernel cmdline contains 'ramclone', this hook:
+#   1) finds the live squashfs on the USB
+#   2) creates a brd (RAM block device) as the hydration destination
+#   3) sets up dm-clone with the squashfs loop as origin and brd as dest
+#   4) mounts the squashfs on /dev/mapper/clone
+#   5) background hydration copies from USB to RAM automatically
+#
+# The boot menu passes 'ramclone' for the "Boot to RAM" entry.
+# On first boot the hook is injected into the initrd by the installer;
+# if missing, the parameter is ignored and the system boots normally.
+#
+# Supports live-boot (/run/medium/live) and casper (/cdrom/casper) layouts.
+# For casper, a companion casper-bottom script completes the redirect.
+set +e
+
+grep -qw ramclone /proc/cmdline 2>/dev/null || return 0 2>/dev/null || exit 0
+
+# Idempotent: if clone already exists, nothing to do.
+[ -e /dev/mapper/clone ] && return 0 2>/dev/null || exit 0
+
+# Find the squashfs file on the live medium.
+SQFS=""
+for cand in /run/medium/live/filesystem.squashfs \
+            /cdrom/casper/filesystem.squashfs \
+            /isodevice/casper/filesystem.squashfs \
+            /run/live/medium/live/filesystem.squashfs; do
+    [ -f "$cand" ] && { SQFS="$cand"; break; }
+done
+[ -n "$SQFS" ] || return 0 2>/dev/null || exit 0
+
+BYTES=$(stat -c %s "$SQFS" 2>/dev/null || echo "")
+[ -n "$BYTES" ] || return 0 2>/dev/null || exit 0
+SECT=$((BYTES / 512))
+[ $((BYTES % 512)) -eq 0 ] || return 0 2>/dev/null || exit 0
+
+# Modules: dm-clone + brd (block ramdisk).  brd pages allocate on first write.
+modprobe dm_clone 2>/dev/null || return 0 2>/dev/null || exit 0
+modprobe brd rd_nr=1 rd_size=$((BYTES / 1024)) 2>/dev/null || return 0 2>/dev/null || exit 0
+
+# Metadata bitmap: tmpfs file, loop-bound, writable.
+META_BYTES=$((8 * 1024 * 1024))
+truncate -s $META_BYTES /run/ramclone.meta 2>/dev/null || return 0 2>/dev/null || exit 0
+METAD=$(losetup --find --show /run/ramclone.meta 2>/dev/null)
+[ -b "$METAD" ] || return 0 2>/dev/null || exit 0
+
+# Origin: read-only loop over the squashfs file.
+ORIGIN=$(losetup --find --show --read-only "$SQFS" 2>/dev/null)
+[ -b "$ORIGIN" ] || { losetup -d "$METAD" 2>/dev/null; return 0 2>/dev/null || exit 0; }
+
+# Table: 1 MiB regions (2048 sectors), 32 regions per kcopyd job.
+# Omitting the threshold parameter means hydration runs to completion.
+dmsetup create clone --table \
+  "0 $SECT clone $METAD $((META_BYTES / 512)) /dev/ram0 $SECT $ORIGIN $SECT 2048 32" \
+  2>/dev/null || { losetup -d "$ORIGIN" 2>/dev/null; losetup -d "$METAD" 2>/dev/null; return 0 2>/dev/null || exit 0; }
+
+# Record state for runtime scripts.
+mkdir -p /run/ramclone
+echo "$SQFS"   > /run/ramclone/sqfs
+echo "$ORIGIN" > /run/ramclone/origin_loop
+echo "$METAD"  > /run/ramclone/meta_loop
+echo "/dev/ram0" > /run/ramclone/dest_dev
+echo "active"  > /run/ramclone/status
+
+# For live-boot: the squashfs can be mounted directly on /dev/mapper/clone.
+# For casper: a casper-bottom script swaps the casper loop for the clone.
+# We create a marker so both paths know dm-clone is ready.
+touch /run/ramclone/ready
+
+# Log to console and journal for post-mortem debugging.
+{
+    echo "ramclone: dm-clone active"
+    echo "ramclone: sqfs=$SQFS origin=$ORIGIN dest=/dev/ram0"
+    echo "ramclone: hydration running in background"
+} > /dev/console 2>/dev/null
+return 0 2>/dev/null || exit 0
