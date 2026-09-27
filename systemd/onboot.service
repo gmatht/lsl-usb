@@ -2,14 +2,10 @@
 Description=On Boot
 After=NetworkManager.service
 Before=network-online.target
-# The greeter must not start on a /home that onboot.sh is about to swap: a
-# session that begins on the live /home and then has the persistent one mounted
-# underneath it dies and drops back to the greeter. Nothing orders the display
-# manager after us otherwise (lightdm.service only waits on
-# systemd-user-sessions/getty/plymouth). Order it after us, while keeping the
-# critical path short - onboot.sh backgrounds its wifi wait so this ordering
-# cannot delay login.
-Before=display-manager.service
+# /home is mounted by lsl-home.service, which the greeter itself waits on
+# (Before=display-manager.service); run after it so the home-dependent steps
+# here (flatpak view, cache/log binds, autostart entries) see the real /home.
+After=lsl-home.service
 
 [Service]
 Type=oneshot

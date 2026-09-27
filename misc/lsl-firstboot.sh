@@ -332,15 +332,17 @@ lsl_firstboot_cleanup_partial_layers() {
     done
 }
 
-# --- unconditional: ensure onboot.service is installed ---
-# The live ISO's z0 layer may predate onboot.service. Install it from the
-# FAT partition so /cdrom/onboot.sh (including wifi.sh) runs every boot.
-# Idempotent: harmless if already present.
-if [ -r /cdrom/systemd/onboot.service ] && [ ! -f /etc/systemd/system/onboot.service ]; then
-    cp /cdrom/systemd/onboot.service /etc/systemd/system/onboot.service 2>/dev/null || true
-    systemctl daemon-reload 2>/dev/null || true
-    systemctl enable onboot.service 2>/dev/null || true
-fi
+# --- unconditional: ensure the boot units are installed ---
+# The live ISO's z0 layer may predate these units. Install them from the FAT
+# partition so onboot.sh runs and /home is mounted before the display manager
+# every boot. Idempotent: harmless if already present.
+for _lsl_unit in onboot.service lsl-home.service; do
+    if [ -r "/cdrom/systemd/$_lsl_unit" ] && [ ! -f "/etc/systemd/system/$_lsl_unit" ]; then
+        cp "/cdrom/systemd/$_lsl_unit" "/etc/systemd/system/$_lsl_unit" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable "$_lsl_unit" 2>/dev/null || true
+    fi
+done
 
 # --- unconditional: stage wifi profiles ---
 # If the user re-ran lslsetup.exe to update wifi.sh, we must stage the

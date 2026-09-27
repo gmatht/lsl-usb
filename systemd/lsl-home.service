@@ -1,0 +1,17 @@
+[Unit]
+Description=Mount the LSL live /home before the desktop
+# Mounting /home is quick and is the ONLY thing the greeter must wait for: a
+# session that starts before /home is final begins on the live /home, has the
+# persistent one mounted underneath it, dies, and drops back to the greeter.
+# Order the display manager after THIS unit (not after all of onboot.service,
+# whose duration must not gate login).
+After=local-fs.target
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/cdrom/bin/lsl-mount-home.sh
+
+[Install]
+WantedBy=multi-user.target

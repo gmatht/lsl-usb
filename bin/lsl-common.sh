@@ -120,6 +120,15 @@ lsl_ensure_user_home() {
     return 0
 }
 
+lsl_prepare_bash_log() {
+    local f="$1"
+    mkdir -p "$(dirname "$f")" 2>/dev/null || true
+    touch "$f" 2>/dev/null || true
+    chmod a+rw "$f" 2>/dev/null || true
+    printf '%s\n' "$f" >/run/lsl-bash-log.path
+}
+
+
 lsl_resolve_data_dir() {
     lsl_load_config
     local d

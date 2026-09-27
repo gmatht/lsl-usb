@@ -24,7 +24,7 @@ for f in lsl-firstboot.sh lsl-firstboot-progress.sh lsl-progress-gtk.py lsl-firs
          lsl-firstboot-progress.desktop lsl-boot-time.desktop \
          lsl-firstboot-failed.sh lsl-firstboot-failed.desktop \
          lsl-merge-suggest.sh lsl-merge-suggest.desktop \
-         "$REPO_ROOT/systemd/onboot.service"; do
+         "$REPO_ROOT/systemd/onboot.service" "$REPO_ROOT/systemd/lsl-home.service"; do
     case "$f" in /*) check="$f" ;; *) check="$M/$f" ;; esac
     [ -f "$check" ] || { echo "missing $check" >&2; exit 1; }
 done
@@ -39,6 +39,7 @@ install -m 755 "$M/lsl-firstboot-reboot.sh" /tmp/z0build/usr/local/bin/lsl-first
 install -m 755 "$M/lsl-progress-gtk.py" /tmp/z0build/usr/local/bin/lsl-progress-gtk.py
 install -m 644 "$M/lsl-firstboot.service" /tmp/z0build/etc/systemd/system/lsl-firstboot.service
 install -m 644 "$REPO_ROOT/systemd/onboot.service" /tmp/z0build/etc/systemd/system/onboot.service
+install -m 644 "$REPO_ROOT/systemd/lsl-home.service" /tmp/z0build/etc/systemd/system/lsl-home.service
 install -m 644 "$M/lsl-firstboot-progress.desktop" /tmp/z0build/etc/xdg/autostart/lsl-firstboot-progress.desktop
 install -m 644 "$M/lsl-boot-time.desktop" /tmp/z0build/etc/xdg/autostart/lsl-boot-time.desktop
 install -m 755 "$M/lsl-firstboot-failed.sh" /tmp/z0build/usr/local/bin/lsl-firstboot-failed.sh
@@ -47,6 +48,7 @@ install -m 755 "$M/lsl-merge-suggest.sh" /tmp/z0build/usr/local/bin/lsl-merge-su
 install -m 644 "$M/lsl-merge-suggest.desktop" /tmp/z0build/etc/xdg/autostart/lsl-merge-suggest.desktop
 ln -s ../lsl-firstboot.service /tmp/z0build/etc/systemd/system/multi-user.target.wants/lsl-firstboot.service
 ln -s ../onboot.service /tmp/z0build/etc/systemd/system/multi-user.target.wants/onboot.service
+ln -s ../lsl-home.service /tmp/z0build/etc/systemd/system/multi-user.target.wants/lsl-home.service
 
 # LF-guard: /bin/bash chokes on CRLF from Windows checkouts.
 if grep -rlq $'\r' /tmp/z0build/usr /tmp/z0build/etc 2>/dev/null; then

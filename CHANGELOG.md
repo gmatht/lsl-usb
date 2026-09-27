@@ -102,6 +102,12 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   failure, from a race. `onboot.service` is now
   `Before=display-manager.service`, and `onboot.sh` backgrounds its (up to
   ~5 minute) wifi wait so that ordering cannot delay login.
+- Split the `/home` mount out of `onboot.sh` into `bin/lsl-mount-home.sh`,
+  run by the new early `lsl-home.service` (`Before=display-manager.service`,
+  `After=local-fs.target`). The greeter now waits only for the home mount
+  rather than for all of `onboot.service`; `onboot.service` runs
+  `After=lsl-home.service` and the script call is idempotent (the
+  `/run/lsl-usb.state` marker makes the second call a no-op).
 - Superseded squashfs layers were never reaped on the success path. Every
   successful firstboot appended a fresh `filesystem.z0.<ts>.squashfs` and
   repointed `menu.lst` at it, orphaning the previous one; the only cleanup

@@ -1600,17 +1600,27 @@ EOF
     rm -rf "$T"
 }
 
-# --- onboot: display-manager ordering + backgrounded wifi wait ---------------
-@test "onboot.service orders the display manager after onboot (no /home swap mid-login)" {
-    # lightdm.service only waits on systemd-user-sessions/getty/plymouth, so
-    # without this ordering the greeter can start on the live /home and then
-    # have the persistent one mounted underneath it.
-    grep -qE '^Before=.*display-manager\.service' systemd/onboot.service
+# --- lsl-home.service: /home before the greeter; onboot after it ------------
+@test "lsl-home.service mounts /home before the display manager" {
+    # A session that starts before /home is final has the persistent home mounted
+    # underneath it, dies, and drops back to the greeter.
+    grep -qE '^Before=.*display-manager\.service' systemd/lsl-home.service
+    grep -q '^ExecStart=/cdrom/bin/lsl-mount-home\.sh$' systemd/lsl-home.service
+    # gated on neither onboot.service nor its own duration: the greeter waits
+    # only for the home mount
+    ! grep -qE '^(After|Before)=.*onboot\.service' systemd/lsl-home.service
 }
 
-@test "onboot.sh runs the wifi wait in the background (must not gate the greeter)" {
-    # onboot.service is Before=display-manager.service, so a synchronous wifi
-    # wait (bounded at ~5 minutes) would delay login whenever there is no network.
+@test "onboot.service runs after lsl-home.service and no longer gates the greeter" {
+    grep -qE '^After=.*lsl-home\.service' systemd/onboot.service
+    ! grep -qE '^Before=.*display-manager\.service' systemd/onboot.service
+}
+
+@test "onboot.sh delegates the /home mount and backgrounds the wifi wait" {
+    # The moved block must be gone from onboot.sh, and the mount delegated.
+    grep -q '/cdrom/bin/lsl-mount-home.sh' onboot.sh
+    ! grep -q 'lsl_home=tmpfs' onboot.sh
+    bash -n bin/lsl-mount-home.sh
     grep -q '^lsl_wait_for_wifi()' onboot.sh
     grep -q '^lsl_wait_for_wifi &$' onboot.sh
     # exactly two mentions: the definition and the backgrounded call

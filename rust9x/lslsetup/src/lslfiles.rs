@@ -147,6 +147,7 @@ static FIRSTBOOT_TOOLKIT: &[(&str, &str)] = &[
     // missing half of the "boot telemetry" work - without it the autostart
     // silently fails and boot-times.log never exists (2026-09-21 post-mortem).
     ("bin\\lsl-boot-time.sh", include_str!("../../../bin/lsl-boot-time.sh")),
+    ("bin\\lsl-mount-home.sh", include_str!("../../../bin/lsl-mount-home.sh")),
     // Shutdown chain: lsl-shutdown-gui resolves uphome via PATH or
     // /cdrom/bin/uphome, and uphome execs lsl-flush-home.sh in USB mode.
     // The nofmt installer writes /cdrom/bin from this array only, so
@@ -174,6 +175,7 @@ static FIRSTBOOT_TOOLKIT: &[(&str, &str)] = &[
     ("bin\\lsl-ramclone-status", include_str!("../../../bin/lsl-ramclone-status")),
     ("bin\\lsl-ramclone-eject", include_str!("../../../bin/lsl-ramclone-eject")),
     ("systemd\\onboot.service", include_str!("../../../systemd/onboot.service")),
+    ("systemd\\lsl-home.service", include_str!("../../../systemd/lsl-home.service")),
     ("systemd\\lsl-boot-stamp.service", include_str!("../../../systemd/lsl-boot-stamp.service")),
     ("systemd\\lsl-btrfs-growd.service", include_str!("../../../systemd/lsl-btrfs-growd.service")),
     ("systemd\\lsl-home-flushd.service", include_str!("../../../systemd/lsl-home-flushd.service")),

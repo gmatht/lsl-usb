@@ -420,7 +420,7 @@ install_systemd_units() {
     # daemon-reload may fail in a chroot without a running systemd;
     # the enable symlinks are still created, so do not fail the script.
     $systemctl_cmd daemon-reload 2>/dev/null || true
-    $systemctl_cmd enable onboot.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service lsl-reclaim-win-swap.service 2>/dev/null || true
+    $systemctl_cmd enable onboot.service lsl-home.service lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service lsl-boot-stamp.service lsl-reclaim-win-swap.service 2>/dev/null || true
     if [[ -z "$CFG_ROOT" ]]; then
         $systemctl_cmd enable lsl-win-backup.timer 2>/dev/null || true
     fi
