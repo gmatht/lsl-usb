@@ -641,7 +641,7 @@ pub fn menu_entry_direct(title: &str, kern_rel: &str, init_rel: &str) -> String 
     )
 }
 
-/// Same as menu_entry_direct but adds the ramclone initrd and kernel flag.
+/// Same as menu_entry_direct but adds the ramclone kernel flag.
 pub fn menu_entry_direct_ramclone(title: &str, kern_rel: &str, init_rel: &str) -> String {
     format!(
         "\ntitle {title}\n\
@@ -652,7 +652,11 @@ pub fn menu_entry_direct_ramclone(title: &str, kern_rel: &str, init_rel: &str) -
     )
 }
 
-/// Normal boot entry with HDD-mirror initrd appended.
+/// Normal boot entry with the HDD-mirror initrd appended. The hook inside it
+/// is SOURCED by casper-premount's ORDER file (run_scripts sources ORDER
+/// instead of executing the directory), which is also why the secondary
+/// initrd's ORDER must re-run the base's own casper-premount scripts - simply
+/// overwriting ORDER with the hook name would silently disable them.
 pub fn menu_entry_direct_hddmirror(title: &str, kern_rel: &str, init_rel: &str) -> String {
     format!(
         "\ntitle {title}\n\
@@ -1984,10 +1988,38 @@ fn write_menu_entries(
     Ok((dtitle, kern_rel, init_rel))
 }
 
-/// Add a "Boot to RAM" menu entry next to the existing direct-kernel entry.
-/// The small ramclone initrd must already exist on the stick.
-/// When `hddmirror` is true, the HDD-mirror initrd is loaded first so both
-/// hooks run (ramclone skips when LAYERFS_PATH is already set).
+/// grub4dos menu block for a Boot-to-RAM entry. `extra` is appended to the
+/// kernel flags: "" keeps the persistent home, " lsl_home=tmpfs" boots a
+/// RAM-only home (onboot.sh honours the flag).
+fn ramclone_menu_entry(title: &str, kern_rel: &str, initrd: &str, extra: &str) -> String {
+    format!(
+        "\ntitle {title}\n\
+         find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
+         kernel {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone{extra} rootdelay=15 quiet splash\n\
+         initrd {initrd}\n\
+         boot\n"
+    )
+}
+
+/// GRUB2 (signed chain) menuentry for a Boot-to-RAM entry.
+fn ramclone_grub_entry(title: &str, kern_rel: &str, initrd: &str, extra: &str) -> String {
+    format!(
+        "menuentry \"{title}\" {{\n\
+         \x20   search --no-floppy --set=root --file {kern_rel}\n\
+         \x20   linux {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone{extra} rootdelay=15 quiet splash\n\
+         \x20   initrd {initrd}\n\
+         }}\n"
+    )
+}
+
+/// Add the "Boot to RAM" entries next to the existing direct-kernel entry.
+/// The small ramclone initrd must already exist on the stick. When `hddmirror`
+/// is true, the HDD-mirror initrd is loaded first so both hooks run (ramclone
+/// skips when LAYERFS_PATH is already set).
+///
+/// Two variants are written so the choice is made at boot time: the plain entry
+/// keeps the persistent home, the "(no persistence)" one boots a RAM-only home
+/// (kernel flag `lsl_home=tmpfs`) so nothing touches home.sfs/home.btrfs.
 pub fn add_ramclone_boot_entries(
     root: &str,
     title: &str,
@@ -1996,63 +2028,67 @@ pub fn add_ramclone_boot_entries(
     uefi: bool,
     hddmirror: bool,
 ) -> Result<(), String> {
-    let ramclone_title = format!("{} (Boot to RAM)", title.trim_end_matches(" (direct kernel)"));
-    let initrd_extra = if hddmirror {
+    let base = title.trim_end_matches(" (direct kernel)");
+    let initrd_line = if hddmirror {
         format!("{} /casper/initrd.hddmirror.gz /casper/initrd.ramclone.gz", init_rel)
     } else {
         format!("{} /casper/initrd.ramclone.gz", init_rel)
     };
+    let variants = [
+        (format!("{base} (Boot to RAM)"), ""),
+        (format!("{base} (Boot to RAM, no persistence)"), " lsl_home=tmpfs"),
+    ];
     // BIOS menu (grub4dos)
     let menu_path = format!("{}menu.lst", root);
     if let Ok(mut menu) = std::fs::read_to_string(&menu_path) {
-        let dentry = format!(
-            "\ntitle {ramclone_title}\n\
-             find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
-             kernel {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone rootdelay=15 quiet splash\n\
-             initrd {initrd_extra}\n\
-             boot\n"
-        );
-        let (m, added) = refresh_menu_entry(&menu, &ramclone_title, &dentry);
-        menu = m;
-        if added {
+        let mut changed = false;
+        for (rtitle, extra) in &variants {
+            let (m, added) =
+                refresh_menu_entry(&menu, rtitle, &ramclone_menu_entry(rtitle, kern_rel, &initrd_line, extra));
+            menu = m;
+            if added {
+                changed = true;
+                out::info(&format!("menu.lst entry '{}'", rtitle));
+            }
+        }
+        if changed {
             std::fs::write(&menu_path, menu).map_err(|e| format!("write menu.lst: {}", e))?;
-            out::info(&format!("menu.lst entry '{}' (Boot to RAM)", ramclone_title));
         }
     }
     // UEFI grub4dos mirror
     if uefi {
         let uefi_menu_path = format!("{}efi\\grub\\menu.lst", root);
         if let Ok(mut um) = std::fs::read_to_string(&uefi_menu_path) {
-            let dentry = format!(
-                "\ntitle {ramclone_title}\n\
-                 find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
-                 kernel {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone rootdelay=15 quiet splash\n\
-                 initrd {initrd_extra}\n\
-                 boot\n"
-            );
-            let (m, added) = refresh_menu_entry(&um, &ramclone_title, &dentry);
-            um = m;
-            if added {
+            let mut changed = false;
+            for (rtitle, extra) in &variants {
+                let (m, added) =
+                    refresh_menu_entry(&um, rtitle, &ramclone_menu_entry(rtitle, kern_rel, &initrd_line, extra));
+                um = m;
+                if added {
+                    changed = true;
+                    out::info(&format!("efi\\grub\\menu.lst entry '{}'", rtitle));
+                }
+            }
+            if changed {
                 std::fs::write(&uefi_menu_path, um).map_err(|e| format!("write efi\\grub\\menu.lst: {}", e))?;
-                out::info(&format!("efi\\grub\\menu.lst entry '{}' (Boot to RAM)", ramclone_title));
             }
         }
     }
     // GRUB2 cfg
     let grub_cfg = format!("{}EFI\\BOOT\\grub.cfg", root);
     if let Ok(mut cfg) = std::fs::read_to_string(&grub_cfg) {
-        let entry = format!(
-            "menuentry \"{ramclone_title}\" {{\n\
-             \x20   search --no-floppy --set=root --file {kern_rel}\n\
-             \x20   linux {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone rootdelay=15 quiet splash\n\
-             \x20   initrd {initrd_extra}\n\
-             }}\n"
-        );
-        let (c, added) = upsert_grub_entry(&cfg, &ramclone_title, &entry);
-        cfg = c;
-        if added {
+        let mut changed = false;
+        for (rtitle, extra) in &variants {
+            let (c, added) =
+                upsert_grub_entry(&cfg, rtitle, &ramclone_grub_entry(rtitle, kern_rel, &initrd_line, extra));
+            cfg = c;
+            if added {
+                changed = true;
+                out::info(&format!("grub.cfg entry '{}'", rtitle));
+            }
+        }
+        if changed {
             std::fs::write(&grub_cfg, cfg).map_err(|e| format!("write grub.cfg: {}", e))?;
-            out::info(&format!("grub.cfg entry '{}' (Boot to RAM)", ramclone_title));
         }
     }
     Ok(())
@@ -2436,6 +2472,14 @@ fn install_files(
     };
     let (title, kern_rel, init_rel) =
         write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui, hddmirror_ok)?;
+    // UEFI side-load (files only; FAT32 stick). Signed shim -> GRUB2 works
+    // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need
+    // Secure Boot OFF (see assets/SIGNED-UEFI.txt). This MUST run before
+    // add_ramclone_boot_entries: that appends into EFI\BOOT\grub.cfg, which
+    // install_uefi_resolved creates - on a fresh stick the read would fail and
+    // the "Boot to RAM" grub.cfg entry would be silently dropped (the entry
+    // showed on BIOS/grub4dos but never under the signed-GRUB2 UEFI chain).
+    let uefi_ok = install_uefi_resolved(&root, &title, &kern_rel, &init_rel, uefi_bootx64, uefi_loader)?;
     if ramclone {
         if let Err(e) = crate::lslfiles::install_ramclone_initrd(&t.letter, bundle_dir) {
             out::warn(&format!("ramclone initrd not created ({}); Boot to RAM entry skipped.", e));
@@ -2443,10 +2487,6 @@ fn install_files(
             out::warn(&format!("ramclone boot entries not added ({}).", e));
         }
     }
-    // UEFI side-load (files only; FAT32 stick). Signed shim -> GRUB2 works
-    // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need
-    // Secure Boot OFF (see assets/SIGNED-UEFI.txt).
-    let uefi_ok = install_uefi_resolved(&root, &title, &kern_rel, &init_rel, uefi_bootx64, uefi_loader)?;
     // Extra loopback-only ISOs (no firstboot, no extraction) ride along
     // after the primary's UEFI files, so their grub.cfg entries land in an
     // already-multiboot-safe file.
@@ -3069,6 +3109,16 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     };
     let (title, kern_rel, init_rel) =
         write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui, hddmirror_ok)?;
+    // UEFI side-load (files only; FAT32 stick). Signed shim -> GRUB2 works
+    // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need
+    // Secure Boot OFF. Skipped when UEFI boot is unchecked. Written before
+    // add_ramclone_boot_entries so that entry's grub.cfg append finds the file
+    // (see install_files - otherwise the Boot to RAM entry never shows UEFI).
+    if want_uefi {
+        install_uefi_resolved(&root, &title, &kern_rel, &init_rel, uefi_bootx64, uefi_loader)?;
+    } else {
+        out::info("UEFI boot not selected - EFI files skipped.");
+    }
     if ramclone {
         if let Err(e) = crate::lslfiles::install_ramclone_initrd(&t.letter, bundle_dir) {
             out::warn(&format!("ramclone initrd not created ({}); Boot to RAM entry skipped.", e));
@@ -3083,15 +3133,6 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     // z0 firstboot layer (lsl-firstboot.service et al.): the menu's
     // layerfs-path points at it, so it ships embedded, not hand-staged.
     crate::lslfiles::install_z0_layer(&root)?;
-
-    // UEFI side-load (files only; FAT32 stick). Signed shim -> GRUB2 works
-    // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need
-    // Secure Boot OFF. Skipped when UEFI boot is unchecked.
-    if want_uefi {
-        install_uefi_resolved(&root, &title, &kern_rel, &init_rel, uefi_bootx64, uefi_loader)?;
-    } else {
-        out::info("UEFI boot not selected - EFI files skipped.");
-    }
 
     // Extra loopback-only ISOs (no firstboot, no extraction) ride along
     // after the primary's UEFI files, so their grub.cfg entries land in an
@@ -3913,6 +3954,44 @@ mod tests {
             m2.lines().filter(|l| l.trim_start().starts_with("title ")).count(),
             2
         );
+    }
+
+    #[test]
+    fn ramclone_entries_offer_persistence_and_ram_home() {
+        // The single "Boot to RAM" GUI checkbox writes BOTH entries, so the
+        // persistent-vs-RAM-home choice is made at boot time.
+        let initrd = "/_ISO/mint/initrd /casper/initrd.ramclone.gz";
+        let persistent = ramclone_menu_entry("Mint (Boot to RAM)", "/_ISO/mint/vmlinuz", initrd, "");
+        let ephemeral = ramclone_menu_entry(
+            "Mint (Boot to RAM, no persistence)",
+            "/_ISO/mint/vmlinuz",
+            initrd,
+            " lsl_home=tmpfs",
+        );
+        assert!(persistent.contains("ramclone rootdelay=15"), "{}", persistent);
+        assert!(!persistent.contains("lsl_home=tmpfs"), "{}", persistent);
+        assert!(ephemeral.contains("ramclone lsl_home=tmpfs rootdelay=15"), "{}", ephemeral);
+        // Distinct titles so both coexist in one menu.
+        let titles = |s: &str| {
+            s.lines()
+                .find(|l| l.trim_start().starts_with("title "))
+                .unwrap_or("")
+                .to_string()
+        };
+        assert_ne!(titles(&persistent), titles(&ephemeral));
+        let (m, a1) = upsert_menu(&default_menu(), &titles(&persistent), &persistent);
+        let (m, a2) = upsert_menu(&m, &titles(&ephemeral), &ephemeral);
+        assert!(a1 && a2);
+        assert_eq!(m.lines().filter(|l| l.trim_start().starts_with("title ")).count(), 2);
+        // The GRUB2 variant carries the same flag.
+        let g = ramclone_grub_entry(
+            "Mint (Boot to RAM, no persistence)",
+            "/_ISO/mint/vmlinuz",
+            initrd,
+            " lsl_home=tmpfs",
+        );
+        assert!(g.contains("menuentry \"Mint (Boot to RAM, no persistence)\""));
+        assert!(g.contains("ramclone lsl_home=tmpfs"));
     }
 
     #[test]

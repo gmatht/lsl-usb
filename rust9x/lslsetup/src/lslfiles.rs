@@ -36,6 +36,38 @@ where
     }
 }
 
+/// Parse an existing manifest.txt into `(name, size, sha256)` rows so a
+/// re-run can reuse a layer's recorded hash instead of re-reading the whole
+/// file. Comment/header lines (`#`, `SourceUSB`, `Date`) are skipped, as are
+/// rows with no `sha256:` field.
+fn read_manifest_hashes(path: &str) -> Vec<(String, u64, Option<String>)> {
+    let mut rows = Vec::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return rows;
+    };
+    for line in text.lines() {
+        let Some(eq) = line.find('=') else { continue };
+        let name = &line[..eq];
+        if name.is_empty() || name.starts_with('#') || name == "SourceUSB" || name == "Date" {
+            continue;
+        }
+        let rest = &line[eq + 1..];
+        let size = rest
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let sha = rest
+            .split("sha256:")
+            .nth(1)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        rows.push((name.to_string(), size, sha));
+    }
+    rows
+}
+
 /// SHA-256 of a file with live (done, total) progress. `progress` returns
 /// false to abort early (mid-flight skip). Same hash as `sha256_file` on
 /// completion; use it for multi-GB files so callers can drive a progress
@@ -282,6 +314,16 @@ pub fn install_lsl_files(vol_letter: &str, bundle_dir: &str) -> Result<(), Strin
     let _ = std::fs::write(format!("{}lsl-build.txt", root), stamp);
     copied.push("lsl-build.txt".into());
 
+    // casper-md5check.service (stock Mint/Ubuntu live) verifies /cdrom against
+    // /cdrom/md5sum.txt. A stock ISO ships that file; this stick does not - its
+    // layout is deliberately not the ISO's (kernel/initrd live under /_ISO,
+    // extra squashfs layers are added), so the service fails on every boot with
+    // an alarming "Failed to start casper-md5check Verify Live ISO checksums".
+    // An empty md5sum.txt makes the check trivially succeed; the ISO checksums
+    // cannot apply to a different file layout anyway.
+    let _ = std::fs::write(format!("{}md5sum.txt", root), b"");
+    copied.push("md5sum.txt".into());
+
     if copied.is_empty() {
         return Err("No lsl files found in bundle; nothing was copied.".into());
     }
@@ -407,8 +449,10 @@ pub fn copy_sfs_to_hdd(vol_letter: &str, data_dir: &str) {
 }
 
 /// Which sub-step of the squashfs-to-HDD copy is reporting progress, so
-/// status text can name the actual operation: after each file's 0→100% copy
-/// sweep, the manifest hash makes a second 0→100% sweep over the same file.
+/// status text can name the actual operation. When a layer has to be hashed,
+/// the manifest hash makes a second 0→100% sweep over the same file after its
+/// copy sweep; a layer whose hash is reused from a prior manifest reports a
+/// single completed Hashing tick instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SfsPhase {
     Copying,
@@ -416,7 +460,9 @@ pub enum SfsPhase {
 }
 
 /// Copy squashfs layers to the HDD with live progress. Skips files that are
-/// already present with the same size (idempotent re-runs). `progress` is
+/// already present with the same size (idempotent re-runs); a skipped layer
+/// keeps the hash recorded in the existing manifest.txt rather than re-reading
+/// it, so an unchanged squashfs is not re-hashed on every run. `progress` is
 /// called before each file with `(name, 0, total, phase)`, during the copy
 /// and the manifest hash with `(name, done, total, phase)`, and after with
 /// `(name, total, total, phase)`.
@@ -465,6 +511,8 @@ where
         format!("SourceUSB={}:", vol_letter),
         format!("Date={}", now_u_string()),
     ];
+    // Hashes recorded by a previous run, so skipped layers can reuse them.
+    let prior_hashes = read_manifest_hashes(&format!("{}\\manifest.txt", dest));
     for base in &bases {
         let s = if base == "home.sfs" {
             format!("{}home.sfs", src_root)
@@ -486,16 +534,25 @@ where
         // Idempotency: skip if already on HDD with matching size.
         if path_exists(&d) && file_size(&d).unwrap_or(0) == sz && sz > 0 {
             skipped += 1;
+            // The layer bytes did not change (same size, not re-copied), so
+            // reuse the hash the previous manifest recorded for it instead of
+            // re-reading the multi-GB source over USB just to rebuild the same
+            // value. Fall back to hashing only when there is no prior entry.
+            let hash = match prior_hashes
+                .iter()
+                .find(|(n, s, _)| n == &dname && *s == sz)
+                .and_then(|(_, _, h)| h.clone())
+            {
+                Some(h) => Some(h),
+                None => {
+                    if sz > 256 * sys::MB {
+                        out::info(&format!("  hashing {} for manifest...", dname));
+                    }
+                    hash_for_manifest(&s, &dname, progress)
+                }
+            };
             progress(&dname, sz, sz, SfsPhase::Hashing);
-            // Still include in manifest so a partial run leaves a valid file.
-            // The hash re-reads the whole source file: on multi-GB layers
-            // over USB that is minutes of I/O, so announce it and keep the
-            // bar live through the progress callback (a silent hash here
-            // used to look exactly like a freeze).
-            if sz > 256 * sys::MB {
-                out::info(&format!("  hashing {} for manifest...", dname));
-            }
-            match hash_for_manifest(&s, &dname, progress) {
+            match hash {
                 Some(hash) => manifest.push(format!("{}={} sha256:{}", dname, sz, hash)),
                 None => manifest.push(format!("{}={}", dname, sz)),
             }
@@ -973,6 +1030,32 @@ mod manifest_hash_progress_tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn read_manifest_hashes_parses_rows_and_skips_headers() {
+        // Skipped layers reuse these hashes, so the parser must round-trip the
+        // manifest rows and ignore the header/comment lines.
+        let dir = std::env::temp_dir().join("lsl-manifest-parse-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("manifest.txt");
+        std::fs::write(
+            &path,
+            "# LSL squashfs layers copied to HDD for faster boot\n\
+             SourceUSB=/dev/sdb1:\n\
+             Date=2026-01-01 00:00:00 UTC\n\
+             filesystem.squashfs=3411738624 sha256:deadbeef\n\
+             home.sfs=12345\n",
+        )
+        .unwrap();
+        let rows = read_manifest_hashes(&path.to_string_lossy());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            ("filesystem.squashfs".to_string(), 3411738624, Some("deadbeef".to_string()))
+        );
+        assert_eq!(rows[1], ("home.sfs".to_string(), 12345, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -1046,6 +1129,73 @@ mod firstboot_toolkit_tests {
     }
 }
 
+#[cfg(test)]
+mod secondary_initrd_order_tests {
+    use super::*;
+
+    fn gunzip(data: &[u8]) -> Vec<u8> {
+        let mut d = flate2::read::GzDecoder::new(data);
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut d, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn order_preserves_base_casper_premount_scripts() {
+        // Regression: initramfs-tools' run_scripts SOURCES casper-premount/ORDER
+        // when it exists instead of executing every script in the directory. An
+        // ORDER that listed only our hook therefore made casper skip its own
+        // casper-premount scripts - which is what broke the normal live boot
+        // once the HDD-mirror hook became a secondary initrd. The injected ORDER
+        // must (re)run the base's scripts, then source the hooks.
+        let hdd = make_hddmirror_initrd(b"# hdd hook\n", b"# live hook\n").unwrap();
+        let casper = String::from_utf8_lossy(&gunzip(&hdd)).into_owned();
+        assert!(casper.contains("scripts/casper-premount/zz_lsl_hdd_mirror"));
+        assert!(
+            casper.contains("for f in /scripts/casper-premount/*"),
+            "ORDER must run the base's own casper-premount scripts: {}",
+            casper
+        );
+        let live = String::from_utf8_lossy(&gunzip(&hdd)).into_owned();
+        assert!(live.contains("for f in /scripts/live-premount/*"));
+
+        // Either secondary initrd's ORDER must work on its own, so both hooks
+        // are referenced (each self-guards on the kernel cmdline).
+        let ram = String::from_utf8_lossy(&gunzip(&make_ramclone_initrd(b"# ram hook\n").unwrap())).into_owned();
+        assert!(ram.contains("for f in /scripts/casper-premount/*"));
+        assert!(ram.contains("/scripts/casper-premount/9990-live-ramclone"));
+        assert!(ram.contains("/scripts/casper-premount/zz_lsl_hdd_mirror"));
+    }
+
+    #[test]
+    fn embedded_hooks_are_usable_and_lf_clean() {
+        // The nofmt installer runs standalone (no bundle beside the exe), so
+        // the hooks must be embedded - otherwise "Boot to RAM" is a no-op.
+        for (name, content) in [
+            ("live-ramclone", INITRAMFS_LIVE_RAMCLONE),
+            ("lsl_hdd_mirror.sh", INITRAMFS_HDD_MIRROR),
+            ("lsl_liveboot_mirror.sh", INITRAMFS_LIVEBOOT_MIRROR),
+        ] {
+            assert!(!content.is_empty(), "{} embedded empty", name);
+            assert!(
+                !content.replace("\r\n", "\n").contains('\r'),
+                "{} contains CR after normalize",
+                name
+            );
+        }
+        // The ramclone hook must define the override casper calls.
+        assert!(INITRAMFS_LIVE_RAMCLONE.contains("get_backing_device"));
+    }
+
+    #[test]
+    fn hook_bytes_falls_back_to_embedded_when_bundle_absent() {
+        let missing = std::env::temp_dir().join("lsl-no-such-bundle-xyz/initramfs/live-ramclone");
+        let got = hook_bytes(&missing.to_string_lossy(), INITRAMFS_LIVE_RAMCLONE).unwrap();
+        assert_eq!(got, INITRAMFS_LIVE_RAMCLONE.replace("\r\n", "\n").into_bytes());
+        assert!(!got.is_empty());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cpio newc packer (gzip-compressed small initrd for ramclone hook injection).
 // The kernel unpacks concatenated initrds in order; a trailing archive with
@@ -1091,6 +1241,292 @@ fn cpio_newc_trailer() -> Vec<u8> {
     cpio_newc_file("TRAILER!!!", &[], 0)
 }
 
+// ---------------------------------------------------------------------------
+// Cpio newc parser (for initrd repacking).
+// ---------------------------------------------------------------------------
+
+/// Parse a cpio newc archive into a filename -> (mode, data) map.
+/// Returns Err if the archive is malformed.
+fn parse_cpio_newc(data: &[u8]) -> Result<Vec<(String, u32, Vec<u8>)>, String> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 110 <= data.len() {
+        if &data[pos..pos + 6] != b"070701" {
+            return Err(format!("cpio parse: bad magic at {}", pos));
+        }
+        let read_hex = |off: usize, len: usize| -> Result<u64, String> {
+            let s = std::str::from_utf8(&data[pos + off..pos + off + len])
+                .map_err(|_| format!("cpio parse: non-utf8 header at {}", pos))?;
+            u64::from_str_radix(s, 16)
+                .map_err(|_| format!("cpio parse: bad hex at {}", pos))
+        };
+        let _ino = read_hex(6, 8)?;
+        let mode = read_hex(14, 8)? as u32;
+        let _uid = read_hex(22, 8)?;
+        let _gid = read_hex(30, 8)?;
+        let _nlink = read_hex(38, 8)?;
+        let _mtime = read_hex(46, 8)?;
+        let filesize = read_hex(54, 8)? as usize;
+        let _devmajor = read_hex(62, 8)?;
+        let _devminor = read_hex(70, 8)?;
+        let _rdevmajor = read_hex(78, 8)?;
+        let _rdevminor = read_hex(86, 8)?;
+        let namesize = read_hex(94, 8)? as usize;
+        let _check = read_hex(102, 8)?;
+        pos += 110;
+        if pos + namesize > data.len() {
+            return Err("cpio parse: truncated name".into());
+        }
+        let name = std::str::from_utf8(&data[pos..pos + namesize - 1])
+            .map_err(|_| "cpio parse: non-utf8 name".to_string())?
+            .to_string();
+        pos += namesize;
+        pos += cpio_pad4(namesize);
+        if name == "TRAILER!!!" {
+            break;
+        }
+        if pos + filesize > data.len() {
+            return Err("cpio parse: truncated data".into());
+        }
+        let file_data = data[pos..pos + filesize].to_vec();
+        pos += filesize;
+        pos += cpio_pad4(filesize);
+        out.push((name, mode, file_data));
+    }
+    Ok(out)
+}
+
+/// Build a cpio newc archive from a list of (name, mode, data) entries.
+fn build_cpio_newc(entries: &[(String, u32, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, mode, data) in entries {
+        out.extend_from_slice(&cpio_newc_file(name, data, *mode));
+    }
+    out.extend_from_slice(&cpio_newc_trailer());
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Initrd repacker: decompress, inject hooks into ORDER, recompress.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InitrdCompression {
+    None,
+    Gzip,
+    Zstd,
+    Lz4,
+}
+
+fn detect_compression(data: &[u8]) -> InitrdCompression {
+    if data.len() >= 4 && data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+        InitrdCompression::Zstd
+    } else if data.len() >= 4 && data[0..4] == [0x04, 0x22, 0x4d, 0x18] {
+        InitrdCompression::Lz4
+    } else if data.len() >= 2 && data[0..2] == [0x1f, 0x8b] {
+        InitrdCompression::Gzip
+    } else if data.len() >= 6 && data.starts_with(b"070701") {
+        InitrdCompression::None
+    } else {
+        InitrdCompression::None
+    }
+}
+
+fn decompress_initrd(data: &[u8], comp: InitrdCompression) -> Result<Vec<u8>, String> {
+    match comp {
+        InitrdCompression::None => Ok(data.to_vec()),
+        InitrdCompression::Gzip => {
+            let mut decoder = flate2::read::GzDecoder::new(data);
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut decoder, &mut out)
+                .map_err(|e| format!("gzip decompress: {}", e))?;
+            Ok(out)
+        }
+        InitrdCompression::Zstd => {
+            let mut out = Vec::new();
+            zstd::stream::copy_decode(data, &mut out)
+                .map_err(|e| format!("zstd decompress: {}", e))?;
+            Ok(out)
+        }
+        InitrdCompression::Lz4 => {
+            let mut decoder = lz4_flex::frame::FrameDecoder::new(data);
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut decoder, &mut out)
+                .map_err(|e| format!("lz4 decompress: {}", e))?;
+            Ok(out)
+        }
+    }
+}
+
+fn compress_initrd(data: &[u8], comp: InitrdCompression) -> Result<Vec<u8>, String> {
+    match comp {
+        InitrdCompression::None => Ok(data.to_vec()),
+        InitrdCompression::Gzip => {
+            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(data).map_err(|e| format!("gzip compress: {}", e))?;
+            encoder.finish().map_err(|e| format!("gzip finish: {}", e))
+        }
+        InitrdCompression::Zstd => {
+            let mut out = Vec::new();
+            zstd::stream::copy_encode(data, &mut out, 3)
+                .map_err(|e| format!("zstd compress: {}", e))?;
+            Ok(out)
+        }
+        InitrdCompression::Lz4 => {
+            let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+            std::io::Write::write_all(&mut encoder, data)
+                .map_err(|e| format!("lz4 compress: {}", e))?;
+            encoder.finish().map_err(|e| format!("lz4 finish: {}", e))
+        }
+    }
+}
+
+/// Find the start of the compressed/initrd payload after any microcode cpio prefix.
+/// Returns (prefix_bytes, payload_bytes, compression).
+fn split_initrd(data: &[u8]) -> Result<(&[u8], &[u8], InitrdCompression), String> {
+    let trailer = b"TRAILER!!!";
+    let mut pos = 0usize;
+    // Scan for cpio trailers (microcode prefix uses plain cpio newc).
+    while pos + 110 <= data.len() {
+        if &data[pos..pos + 6] != b"070701" {
+            break;
+        }
+        // Read namesize and filesize from header
+        let read_hex = |off: usize| -> Option<u64> {
+            let s = std::str::from_utf8(&data[pos + off..pos + off + 8]).ok()?;
+            u64::from_str_radix(s, 16).ok()
+        };
+        let filesize = read_hex(54).ok_or_else(|| format!("cpio header parse failed at {}", pos))? as usize;
+        let namesize = read_hex(94).ok_or_else(|| format!("cpio header parse failed at {}", pos))? as usize;
+        let name_end = pos + 110 + namesize;
+        if name_end > data.len() {
+            break;
+        }
+        let name = std::str::from_utf8(&data[pos + 110..name_end - 1]).unwrap_or("");
+        let entry_end = name_end + cpio_pad4(namesize) + filesize + cpio_pad4(filesize);
+        if entry_end > data.len() {
+            break;
+        }
+        pos = entry_end;
+        if name == "TRAILER!!!" {
+            // Skip null padding to next archive/compressed block
+            while pos < data.len() && data[pos] == 0 {
+                pos += 1;
+            }
+            if pos >= data.len() {
+                return Err("initrd: no payload after microcode prefix".into());
+            }
+            let comp = detect_compression(&data[pos..]);
+            return Ok((&data[..pos], &data[pos..], comp));
+        }
+    }
+    // No microcode prefix; entire file is the payload
+    let comp = detect_compression(data);
+    Ok((&[], data, comp))
+}
+
+/// Repack an initrd, injecting hooks into ORDER files.
+/// `hooks` is a list of (cpio_path, file_data, mode) to inject.
+/// ORDER files at scripts/casper-premount/ORDER and scripts/live-premount/ORDER
+/// are automatically extended with entries for any hooks in those directories.
+pub fn repack_initrd(initrd_path: &str, hooks: &[(String, Vec<u8>, u32)]) -> Result<Vec<u8>, String> {
+    let data = std::fs::read(initrd_path).map_err(|e| format!("read initrd: {}", e))?;
+    let (prefix, payload, comp) = split_initrd(&data)?;
+    let decompressed = decompress_initrd(payload, comp)?;
+    let mut entries = parse_cpio_newc(&decompressed)?;
+
+    // Build a set of existing paths for dedup
+    let existing: std::collections::HashSet<String> = entries.iter().map(|(n, _, _)| n.clone()).collect();
+
+    // Add hooks, skipping any that already exist
+    for (path, data, mode) in hooks {
+        if existing.contains(path) {
+            out::warn(&format!("initrd already contains {}; skipping injection", path));
+            continue;
+        }
+        entries.push((path.clone(), *mode, data.clone()));
+    }
+
+    // Patch ORDER files to include our hooks
+    let mut order_patches: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (path, _, _) in &entries {
+        if path.starts_with("scripts/casper-premount/") && path != "scripts/casper-premount/ORDER" {
+            order_patches.entry("scripts/casper-premount/ORDER".to_string())
+                .or_default()
+                .push(format!(". /{} \"$@\"", path));
+        }
+        if path.starts_with("scripts/live-premount/") && path != "scripts/live-premount/ORDER" {
+            order_patches.entry("scripts/live-premount/ORDER".to_string())
+                .or_default()
+                .push(format!(". /{} \"$@\"", path));
+        }
+    }
+
+    for (order_path, new_lines) in order_patches {
+        let mut found = false;
+        for (path, _, data) in &mut entries {
+            if *path == order_path {
+                let existing = String::from_utf8_lossy(data);
+                let mut lines: Vec<String> = existing.lines().map(|s| s.to_string()).collect();
+                for line in &new_lines {
+                    if !lines.iter().any(|l| l.trim() == line.trim()) {
+                        lines.push(line.clone());
+                    }
+                }
+                *data = lines.join("\n").into_bytes();
+                if !data.ends_with(b"\n") {
+                    data.push(b'\n');
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            // Create new ORDER file
+            let content = new_lines.join("\n") + "\n";
+            entries.push((order_path, 0o100644, content.into_bytes()));
+        }
+    }
+
+    let repacked_cpio = build_cpio_newc(&entries);
+    let repacked_compressed = compress_initrd(&repacked_cpio, comp)?;
+    let mut result = prefix.to_vec();
+    result.extend_from_slice(&repacked_compressed);
+    Ok(result)
+}
+
+/// ORDER body for scripts/casper-premount of a secondary initrd.
+///
+/// `run_scripts` (initramfs-tools) SOURCES this file when it exists INSTEAD of
+/// iterating the directory, so an ORDER that listed only our hook would make
+/// casper skip its own casper-premount scripts entirely - that is what broke
+/// the normal live boot when the HDD-mirror hook became a secondary initrd.
+/// So this ORDER first runs every base casper-premount script the way
+/// run_scripts would (as a subprocess - those scripts call `exit`), then
+/// SOURCES our hooks, which need their exports/function overrides (LAYERFS_PATH,
+/// get_backing_device) to reach casper's shell. Both hooks self-guard on the
+/// kernel cmdline, so listing both is safe whichever secondary initrd is loaded.
+const CASPER_PREMOUNT_ORDER: &[u8] =
+    b"for f in /scripts/casper-premount/*; do\n\
+case \"$f\" in\n\
+*/ORDER|*/zz_lsl_hdd_mirror|*/9990-live-ramclone) continue ;;\n\
+esac\n\
+[ -x \"$f\" ] && \"$f\" \"$@\" 2>/dev/null || true\n\
+done\n\
+. /scripts/casper-premount/zz_lsl_hdd_mirror \"$@\" 2>/dev/null || true\n\
+. /scripts/casper-premount/9990-live-ramclone \"$@\" 2>/dev/null || true\n";
+
+/// ORDER body for scripts/live-premount (Debian live-boot). Same idea:
+/// preserve the base's own live-premount scripts, then source the hook.
+const LIVE_PREMOUNT_ORDER: &[u8] =
+    b"for f in /scripts/live-premount/*; do\n\
+case \"$f\" in\n\
+*/ORDER|*/00lsl_liveboot_mirror) continue ;;\n\
+esac\n\
+[ -x \"$f\" ] && \"$f\" \"$@\" 2>/dev/null || true\n\
+done\n\
+. /scripts/live-premount/00lsl_liveboot_mirror \"$@\" 2>/dev/null || true\n";
+
 /// Create a gzip-compressed cpio initrd containing the ramclone hook for
 /// casper-premount. The hook is placed at scripts/casper-premount/ together
 /// with an ORDER file that casper's run_scripts sources. The ORDER line
@@ -1103,14 +1539,11 @@ pub fn make_ramclone_initrd(hook_bytes: &[u8]) -> Result<Vec<u8>, String> {
         hook_bytes,
         0o100755,
     ));
-    // ORDER file: casper sources each line in order. We include the HDD-mirror
-    // hook entry (guarded) so both hooks can coexist when the main initrd was
-    // repacked by build.sh. The ramclone hook skips when LAYERFS_PATH is set.
-    let order = b". /scripts/casper-premount/zz_lsl_hdd_mirror \"$@\" 2>/dev/null || true\n\
-         . /scripts/casper-premount/9990-live-ramclone \"$@\" 2>/dev/null || true\n";
+    // ORDER file: see CASPER_PREMOUNT_ORDER - it must re-run the base's own
+    // casper-premount scripts, not just ours.
     archive.extend_from_slice(&cpio_newc_file(
         "scripts/casper-premount/ORDER",
-        order,
+        CASPER_PREMOUNT_ORDER,
         0o100644,
     ));
     archive.extend_from_slice(&cpio_newc_trailer());
@@ -1119,14 +1552,31 @@ pub fn make_ramclone_initrd(hook_bytes: &[u8]) -> Result<Vec<u8>, String> {
     encoder.finish().map_err(|e| format!("gzip finish: {}", e))
 }
 
-/// Write the ramclone small-initrd to the stick if the hook script exists in
-/// the bundle. The boot menu references this as a second initrd.
+/// Embedded secondary-initrd hooks. The nofmt installer ships everything else
+/// (bin/, systemd/, the z0 layer) embedded so it runs standalone from an exe
+/// with no bundle beside it; the ramclone/hddmirror hooks must not depend on
+/// `{bundle_dir}\initramfs\` either, or checking "Boot to RAM" silently does
+/// nothing. A bundle copy still wins when present (legacy bundle parity).
+static INITRAMFS_LIVE_RAMCLONE: &str = include_str!("../../../initramfs/live-ramclone");
+static INITRAMFS_HDD_MIRROR: &str = include_str!("../../../initramfs/lsl_hdd_mirror.sh");
+static INITRAMFS_LIVEBOOT_MIRROR: &str = include_str!("../../../initramfs/lsl_liveboot_mirror.sh");
+
+/// Hook bytes for a secondary initrd: the bundle file when it exists, else the
+/// embedded copy (LF-normalized - Windows checkouts are CRLF and the guest
+/// runs these under /bin/sh).
+fn hook_bytes(path: &str, embedded: &str) -> Result<Vec<u8>, String> {
+    if path_exists(path) {
+        return std::fs::read(path).map_err(|e| format!("read {}: {}", path, e));
+    }
+    Ok(embedded.replace("\r\n", "\n").into_bytes())
+}
+
+/// Write the ramclone small-initrd to the stick from the bundle hook, falling
+/// back to the embedded copy when no bundle sits beside the exe. The boot menu
+/// references this as a second initrd.
 pub fn install_ramclone_initrd(vol_letter: &str, bundle_dir: &str) -> Result<(), String> {
     let hook = format!("{}\\initramfs\\live-ramclone", bundle_dir);
-    if !path_exists(&hook) {
-        return Err("ramclone hook not found in bundle".into());
-    }
-    let data = std::fs::read(&hook).map_err(|e| format!("read hook: {}", e))?;
+    let data = hook_bytes(&hook, INITRAMFS_LIVE_RAMCLONE)?;
     let compressed = make_ramclone_initrd(&data)?;
     let dest = format!("{}:\\casper\\initrd.ramclone.gz", vol_letter);
     std::fs::write(&dest, &compressed).map_err(|e| format!("write ramclone initrd: {}", e))?;
@@ -1149,10 +1599,9 @@ pub fn make_hddmirror_initrd(casper_hook: &[u8], live_hook: &[u8]) -> Result<Vec
         casper_hook,
         0o100755,
     ));
-    let casper_order = b". /scripts/casper-premount/zz_lsl_hdd_mirror \"$@\" 2>/dev/null || true\n";
     archive.extend_from_slice(&cpio_newc_file(
         "scripts/casper-premount/ORDER",
-        casper_order,
+        CASPER_PREMOUNT_ORDER,
         0o100644,
     ));
     // live-boot variant
@@ -1161,10 +1610,9 @@ pub fn make_hddmirror_initrd(casper_hook: &[u8], live_hook: &[u8]) -> Result<Vec
         live_hook,
         0o100755,
     ));
-    let live_order = b". /scripts/live-premount/00lsl_liveboot_mirror \"$@\" 2>/dev/null || true\n";
     archive.extend_from_slice(&cpio_newc_file(
         "scripts/live-premount/ORDER",
-        live_order,
+        LIVE_PREMOUNT_ORDER,
         0o100644,
     ));
     archive.extend_from_slice(&cpio_newc_trailer());
@@ -1173,19 +1621,14 @@ pub fn make_hddmirror_initrd(casper_hook: &[u8], live_hook: &[u8]) -> Result<Vec
     encoder.finish().map_err(|e| format!("gzip finish: {}", e))
 }
 
-/// Write the HDD-mirror small-initrd to the stick if the hook scripts exist
-/// in the bundle. The boot menu references this as a second initrd.
+/// Write the HDD-mirror small-initrd to the stick from the bundle hooks,
+/// falling back to the embedded copies when no bundle sits beside the exe.
+/// The boot menu references this as a second initrd.
 pub fn install_hddmirror_initrd(vol_letter: &str, bundle_dir: &str) -> Result<(), String> {
     let casper_hook = format!("{}\\initramfs\\lsl_hdd_mirror.sh", bundle_dir);
     let live_hook = format!("{}\\initramfs\\lsl_liveboot_mirror.sh", bundle_dir);
-    if !path_exists(&casper_hook) {
-        return Err("HDD-mirror casper hook not found in bundle".into());
-    }
-    if !path_exists(&live_hook) {
-        return Err("HDD-mirror live-boot hook not found in bundle".into());
-    }
-    let casper = std::fs::read(&casper_hook).map_err(|e| format!("read casper hook: {}", e))?;
-    let live = std::fs::read(&live_hook).map_err(|e| format!("read live-boot hook: {}", e))?;
+    let casper = hook_bytes(&casper_hook, INITRAMFS_HDD_MIRROR)?;
+    let live = hook_bytes(&live_hook, INITRAMFS_LIVEBOOT_MIRROR)?;
     let compressed = make_hddmirror_initrd(&casper, &live)?;
     let dest = format!("{}:\\casper\\initrd.hddmirror.gz", vol_letter);
     std::fs::write(&dest, &compressed).map_err(|e| format!("write hddmirror initrd: {}", e))?;
