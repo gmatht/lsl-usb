@@ -652,6 +652,17 @@ pub fn menu_entry_direct_ramclone(title: &str, kern_rel: &str, init_rel: &str) -
     )
 }
 
+/// Normal boot entry with HDD-mirror initrd appended.
+pub fn menu_entry_direct_hddmirror(title: &str, kern_rel: &str, init_rel: &str) -> String {
+    format!(
+        "\ntitle {title}\n\
+         find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
+         kernel {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs rootdelay=15 quiet splash\n\
+         initrd {init_rel} /casper/initrd.hddmirror.gz\n\
+         boot\n"
+    )
+}
+
 /// Header comment block for a fresh menu.lst (documents the direct
 /// kernel/initrd pattern for ISOs the chainloader path does not like).
 pub fn default_menu() -> String {
@@ -1540,6 +1551,7 @@ pub fn install_from_iso(
     skip_verify: bool,
     extra_isos: &[String],
     ramclone: bool,
+    hddmirror: bool,
     bundle_dir: &str,
 ) -> Result<(UsbTarget, WriteMetrics, Option<PendingMbr>), String> {
     if !want_bios && !want_uefi {
@@ -1616,7 +1628,7 @@ pub fn install_from_iso(
         }
     }
 
-    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, active_uefi_loader(), ui, skip_verify, extra_isos, ramclone, bundle_dir)?;
+    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, active_uefi_loader(), ui, skip_verify, extra_isos, ramclone, hddmirror, bundle_dir)?;
     Ok((target, metrics, pending))
 }
 
@@ -1866,6 +1878,7 @@ fn write_menu_entries(
     iso_name: &str,
     uefi: bool,
     ui: Option<&dyn WriteUi>,
+    hddmirror: bool,
 ) -> Result<(String, String, String), String> {
     let stem = safe_name.trim_end_matches(".iso");
     let ltitle = format!("{} (loopback ISO)", iso_name.trim_end_matches(".iso"));
@@ -1891,7 +1904,11 @@ fn write_menu_entries(
             ));
         }
     };
-    let dentry = menu_entry_direct(&dtitle, &kern_rel, &init_rel);
+    let dentry = if hddmirror {
+        menu_entry_direct_hddmirror(&dtitle, &kern_rel, &init_rel)
+    } else {
+        menu_entry_direct(&dtitle, &kern_rel, &init_rel)
+    };
     let (m, added) = refresh_menu_entry(&menu, &dtitle, &dentry);
     menu = m;
     if added {
@@ -1969,18 +1986,32 @@ fn write_menu_entries(
 
 /// Add a "Boot to RAM" menu entry next to the existing direct-kernel entry.
 /// The small ramclone initrd must already exist on the stick.
+/// When `hddmirror` is true, the HDD-mirror initrd is loaded first so both
+/// hooks run (ramclone skips when LAYERFS_PATH is already set).
 pub fn add_ramclone_boot_entries(
     root: &str,
     title: &str,
     kern_rel: &str,
     init_rel: &str,
     uefi: bool,
+    hddmirror: bool,
 ) -> Result<(), String> {
     let ramclone_title = format!("{} (Boot to RAM)", title.trim_end_matches(" (direct kernel)"));
+    let initrd_extra = if hddmirror {
+        format!("{} /casper/initrd.hddmirror.gz /casper/initrd.ramclone.gz", init_rel)
+    } else {
+        format!("{} /casper/initrd.ramclone.gz", init_rel)
+    };
     // BIOS menu (grub4dos)
     let menu_path = format!("{}menu.lst", root);
     if let Ok(mut menu) = std::fs::read_to_string(&menu_path) {
-        let dentry = menu_entry_direct_ramclone(&ramclone_title, kern_rel, init_rel);
+        let dentry = format!(
+            "\ntitle {ramclone_title}\n\
+             find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
+             kernel {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone rootdelay=15 quiet splash\n\
+             initrd {initrd_extra}\n\
+             boot\n"
+        );
         let (m, added) = refresh_menu_entry(&menu, &ramclone_title, &dentry);
         menu = m;
         if added {
@@ -1992,7 +2023,13 @@ pub fn add_ramclone_boot_entries(
     if uefi {
         let uefi_menu_path = format!("{}efi\\grub\\menu.lst", root);
         if let Ok(mut um) = std::fs::read_to_string(&uefi_menu_path) {
-            let dentry = menu_entry_direct_ramclone(&ramclone_title, kern_rel, init_rel);
+            let dentry = format!(
+                "\ntitle {ramclone_title}\n\
+                 find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
+                 kernel {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone rootdelay=15 quiet splash\n\
+                 initrd {initrd_extra}\n\
+                 boot\n"
+            );
             let (m, added) = refresh_menu_entry(&um, &ramclone_title, &dentry);
             um = m;
             if added {
@@ -2004,7 +2041,13 @@ pub fn add_ramclone_boot_entries(
     // GRUB2 cfg
     let grub_cfg = format!("{}EFI\\BOOT\\grub.cfg", root);
     if let Ok(mut cfg) = std::fs::read_to_string(&grub_cfg) {
-        let entry = uefi_cfg_direct_ramclone(&ramclone_title, kern_rel, init_rel);
+        let entry = format!(
+            "menuentry \"{ramclone_title}\" {{\n\
+             \x20   search --no-floppy --set=root --file {kern_rel}\n\
+             \x20   linux {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone rootdelay=15 quiet splash\n\
+             \x20   initrd {initrd_extra}\n\
+             }}\n"
+        );
         let (c, added) = upsert_grub_entry(&cfg, &ramclone_title, &entry);
         cfg = c;
         if added {
@@ -2325,6 +2368,7 @@ fn install_files(
     skip_verify: bool,
     extra_isos: &[String],
     ramclone: bool,
+    hddmirror: bool,
     bundle_dir: &str,
 ) -> Result<(String, bool, WriteMetrics), String> {
     let root = format!("{}:\\", t.letter);
@@ -2383,12 +2427,17 @@ fn install_files(
     // used the same entries are mirrored to efi\grub\menu.lst (the only
     // menu location grub4dos-for-UEFI reads - no mirror = UEFI prompt);
     // the signed GRUB2 chain reads grub.cfg instead.
+    if hddmirror {
+        if let Err(e) = crate::lslfiles::install_hddmirror_initrd(&t.letter, bundle_dir) {
+            out::warn(&format!("hddmirror initrd not created ({}); HDD mirror boot hook skipped.", e));
+        }
+    }
     let (title, kern_rel, init_rel) =
-        write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui)?;
+        write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui, hddmirror)?;
     if ramclone {
         if let Err(e) = crate::lslfiles::install_ramclone_initrd(&t.letter, bundle_dir) {
             out::warn(&format!("ramclone initrd not created ({}); Boot to RAM entry skipped.", e));
-        } else if let Err(e) = add_ramclone_boot_entries(&root, &title, &kern_rel, &init_rel, uefi_res.mirror_menu()) {
+        } else if let Err(e) = add_ramclone_boot_entries(&root, &title, &kern_rel, &init_rel, uefi_res.mirror_menu(), hddmirror) {
             out::warn(&format!("ramclone boot entries not added ({}).", e));
         }
     }
@@ -2720,7 +2769,7 @@ fn main_extract_bytes(iso_path: &str) -> u64 {
     need
 }
 
-fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool, extra_isos: &[String], ramclone: bool, bundle_dir: &str) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
+fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool, extra_isos: &[String], ramclone: bool, hddmirror: bool, bundle_dir: &str) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
     let fs_uc = t.fs.to_ascii_uppercase();
     // grub4dos reads FAT12/16/32 and NTFS only. exFAT (the default on many
     // large sticks) is NOT readable by grub4dos, so a stick left exFAT cannot
@@ -2829,7 +2878,7 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         }
         out::step("GPT stick: files-only UEFI install (no raw sectors touched).");
         report_board(false, true);
-        let (title, uefi_ok, metrics) = install_files(t, iso, uefi_bootx64, false, true, uefi_loader, ui, skip_verify, extra_isos, ramclone, bundle_dir)?;
+        let (title, uefi_ok, metrics) = install_files(t, iso, uefi_bootx64, false, true, uefi_loader, ui, skip_verify, extra_isos, ramclone, hddmirror, bundle_dir)?;
         report_bootability(false, "GPT stick - grub4dos BIOS stage1 has nowhere to live (sectors 1-15 are the GPT header/table)", uefi_ok, &title);
         return Ok((metrics, None));
     }
@@ -3009,8 +3058,13 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
                 .into(),
         );
     }
+    if hddmirror {
+        if let Err(e) = crate::lslfiles::install_hddmirror_initrd(&t.letter, bundle_dir) {
+            out::warn(&format!("hddmirror initrd not created ({}); HDD mirror boot hook skipped.", e));
+        }
+    }
     let (title, kern_rel, init_rel) =
-        write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui)?;
+        write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui, hddmirror)?;
 
     // First-boot toolkit (bin/uproot et al.): without it the first boot can
     // only stamp trivially. Embedded, LF-normalized, read-back verified.
@@ -3082,6 +3136,17 @@ fn uefi_cfg_direct_ramclone(title: &str, kern_rel: &str, init_rel: &str) -> Stri
          \x20   search --no-floppy --set=root --file {kern_rel}\n\
          \x20   linux {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone rootdelay=15 quiet splash\n\
          \x20   initrd {init_rel} /casper/initrd.ramclone.gz\n\
+         }}\n"
+    )
+}
+
+/// GRUB2 entry with HDD-mirror initrd appended.
+fn uefi_cfg_direct_hddmirror(title: &str, kern_rel: &str, init_rel: &str) -> String {
+    format!(
+        "menuentry \"{title}\" {{\n\
+         \x20   search --no-floppy --set=root --file {kern_rel}\n\
+         \x20   linux {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs rootdelay=15 quiet splash\n\
+         \x20   initrd {init_rel} /casper/initrd.hddmirror.gz\n\
          }}\n"
     )
 }
@@ -4345,7 +4410,7 @@ mod tests {
         .unwrap();
         // UEFI install: direct entry in BOTH menus, base beside casper.
         let (t, kern, init) =
-            write_menu_entries(&root, &iso, "casper.iso", "casper.iso", true, None).unwrap();
+            write_menu_entries(&root, &iso, "casper.iso", "casper.iso", true, None, false).unwrap();
         assert_eq!(t, "casper (direct kernel)");
         assert!(kern.ends_with("/vmlinuz"), "unexpected {}", kern);
         assert!(init.ends_with("initrd.lz"), "unexpected {}", init);
@@ -4366,12 +4431,12 @@ mod tests {
             uefi_menu.lines().collect::<Vec<_>>()
         );
         // Re-running is idempotent: no duplicate titles, identical bytes.
-        write_menu_entries(&root, &iso, "casper.iso", "casper.iso", true, None).unwrap();
+        write_menu_entries(&root, &iso, "casper.iso", "casper.iso", true, None, false).unwrap();
         assert_eq!(std::fs::read_to_string(format!("{}menu.lst", root)).unwrap(), root_menu);
         assert_eq!(std::fs::read_to_string(format!("{}efi\\grub\\menu.lst", root)).unwrap(), uefi_menu);
         // BIOS-only install: the mirror must not exist at all.
         let _ = std::fs::remove_dir_all(format!("{}efi", root));
-        write_menu_entries(&root, &iso, "casper.iso", "casper.iso", false, None).unwrap();
+        write_menu_entries(&root, &iso, "casper.iso", "casper.iso", false, None, false).unwrap();
         assert!(
             !std::path::Path::new(&format!("{}efi\\grub\\menu.lst", root)).exists(),
             "efi\\grub\\menu.lst must not be created for a BIOS-only install"
@@ -4380,7 +4445,7 @@ mod tests {
         // kernel; loopback needs the file, which no longer ships).
         let bad = format!("{}\\plain.iso", flat);
         std::fs::write(&bad, b"not a real iso - no casper kernel").unwrap();
-        assert!(write_menu_entries(&root, &bad, "plain", "plain.iso", false, None).is_err());
+        assert!(write_menu_entries(&root, &bad, "plain", "plain.iso", false, None, false).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -1137,3 +1137,61 @@ pub fn install_ramclone_initrd(vol_letter: &str, bundle_dir: &str) -> Result<(),
     ));
     Ok(())
 }
+
+/// Create a gzip-compressed cpio initrd containing the HDD-mirror hooks.
+/// Includes both casper-premount and live-boot-premount variants, plus
+/// ORDER files so each framework sources the hook.
+pub fn make_hddmirror_initrd(casper_hook: &[u8], live_hook: &[u8]) -> Result<Vec<u8>, String> {
+    let mut archive = Vec::new();
+    // casper variant
+    archive.extend_from_slice(&cpio_newc_file(
+        "scripts/casper-premount/zz_lsl_hdd_mirror",
+        casper_hook,
+        0o100755,
+    ));
+    let casper_order = b". /scripts/casper-premount/zz_lsl_hdd_mirror \"$@\" 2>/dev/null || true\n";
+    archive.extend_from_slice(&cpio_newc_file(
+        "scripts/casper-premount/ORDER",
+        casper_order,
+        0o100644,
+    ));
+    // live-boot variant
+    archive.extend_from_slice(&cpio_newc_file(
+        "scripts/live-premount/00lsl_liveboot_mirror",
+        live_hook,
+        0o100755,
+    ));
+    let live_order = b". /scripts/live-premount/00lsl_liveboot_mirror \"$@\" 2>/dev/null || true\n";
+    archive.extend_from_slice(&cpio_newc_file(
+        "scripts/live-premount/ORDER",
+        live_order,
+        0o100644,
+    ));
+    archive.extend_from_slice(&cpio_newc_trailer());
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&archive).map_err(|e| format!("gzip encode: {}", e))?;
+    encoder.finish().map_err(|e| format!("gzip finish: {}", e))
+}
+
+/// Write the HDD-mirror small-initrd to the stick if the hook scripts exist
+/// in the bundle. The boot menu references this as a second initrd.
+pub fn install_hddmirror_initrd(vol_letter: &str, bundle_dir: &str) -> Result<(), String> {
+    let casper_hook = format!("{}\\initramfs\\lsl_hdd_mirror.sh", bundle_dir);
+    let live_hook = format!("{}\\initramfs\\lsl_liveboot_mirror.sh", bundle_dir);
+    if !path_exists(&casper_hook) {
+        return Err("HDD-mirror casper hook not found in bundle".into());
+    }
+    if !path_exists(&live_hook) {
+        return Err("HDD-mirror live-boot hook not found in bundle".into());
+    }
+    let casper = std::fs::read(&casper_hook).map_err(|e| format!("read casper hook: {}", e))?;
+    let live = std::fs::read(&live_hook).map_err(|e| format!("read live-boot hook: {}", e))?;
+    let compressed = make_hddmirror_initrd(&casper, &live)?;
+    let dest = format!("{}:\\casper\\initrd.hddmirror.gz", vol_letter);
+    std::fs::write(&dest, &compressed).map_err(|e| format!("write hddmirror initrd: {}", e))?;
+    out::info(&format!(
+        "hddmirror initrd ready ({} bytes).",
+        compressed.len(),
+    ));
+    Ok(())
+}
