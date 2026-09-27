@@ -1606,6 +1606,8 @@ EOF
     # underneath it, dies, and drops back to the greeter.
     grep -qE '^Before=.*display-manager\.service' systemd/lsl-home.service
     grep -q '^ExecStart=/cdrom/bin/lsl-mount-home\.sh$' systemd/lsl-home.service
+    # a wedged mount must not block the greeter forever (oneshot: no default timeout)
+    grep -qE '^TimeoutStartSec=' systemd/lsl-home.service
     # gated on neither onboot.service nor its own duration: the greeter waits
     # only for the home mount
     ! grep -qE '^(After|Before)=.*onboot\.service' systemd/lsl-home.service

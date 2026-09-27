@@ -108,6 +108,10 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   rather than for all of `onboot.service`; `onboot.service` runs
   `After=lsl-home.service` and the script call is idempotent (the
   `/run/lsl-usb.state` marker makes the second call a no-op).
+- `lsl-home.service` sets a bounded `TimeoutStartSec` (a `Type=oneshot` unit
+  has no default start timeout, so a wedged mount would otherwise block the
+  greeter forever), and `bin/lsl-diag.sh` now captures its journal alongside
+  `onboot.service`.
 - Superseded squashfs layers were never reaped on the success path. Every
   successful firstboot appended a fresh `filesystem.z0.<ts>.squashfs` and
   repointed `menu.lst` at it, orphaning the previous one; the only cleanup

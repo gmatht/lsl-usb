@@ -11,6 +11,10 @@ Before=display-manager.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# A oneshot has no default start timeout, so a wedged mount (e.g. mount_all.sh
+# on a sick NTFS volume) would block the display manager forever. Bound it: a
+# hang fails this unit and login proceeds on the live /home instead.
+TimeoutStartSec=120
 ExecStart=/cdrom/bin/lsl-mount-home.sh
 
 [Install]

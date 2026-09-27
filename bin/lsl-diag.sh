@@ -124,7 +124,7 @@ if command -v mokutil >/dev/null 2>&1; then
     mokutil --sb-state > "$WORK/mokutil-sb-state.txt" 2>/dev/null || true
 fi
 if command -v journalctl >/dev/null 2>&1; then
-    journalctl -u lsl-firstboot.service -u onboot.service --no-pager -n 500 \
+    journalctl -u lsl-firstboot.service -u onboot.service -u lsl-home.service --no-pager -n 500 \
         > "$WORK/journal-lsl.txt" 2>/dev/null || true
     # The dialogs syslog-tag their lines (logger -t lsl-firstboot-progress /
     # -t lsl-firstboot-reboot); a -u unit filter EXCLUDES them - which is

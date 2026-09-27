@@ -330,11 +330,14 @@ Mode is selected from resolved `LSL_DATA_DIR`:
 
 ## Boot behavior
 
-`onboot.sh` (via `onboot.service`) does the core runtime setup:
+`onboot.sh` (via `onboot.service`) does the core runtime setup; `/home` itself
+is mounted earlier by `bin/lsl-mount-home.sh` (via `lsl-home.service`, which
+is ordered `Before=display-manager.service` so the greeter never starts on a
+`/home` that is about to be swapped):
 
 - Loads `/cdrom/lsl-usb.env`.
 - Calls `mount_all.sh` for Windows drives.
-- Applies USB/HDD home mode.
+- Applies USB/HDD home mode (the mount itself runs earlier, in `lsl-home.service`).
 - Enables cache/Nix mount layout in HDD mode.
 - Starts zram swap setup (configurable with `LSL_ZRAM_MIB`).
 - Refreshes generated fstab block.
@@ -354,7 +357,11 @@ Recommendation: **>= 4 GB RAM for first boot**.
 - `build.sh`: builds the Windows installer bundle (`dist/lsl-usb-win.zip`) - a ~4 KB `filesystem_z0_firstboot.squashfs` layer (systemd unit + scripts only, no distro binaries) plus the FAT-side file set. Runs three gates before packaging: the `install.ps1` test suite (pwsh), `shellcheck -S error` on all shell scripts, and a bundle preflight (layer contents, unit `ExecStart` paths, zip entries).
 - `misc/lsl-firstboot.sh` + `misc/lsl-firstboot.service`: run once on the first boot of a Windows-installed USB - waits for network, runs `uproot --auto-append` (installs `/cdrom/bin/squashfs_config.sh` packages in a chroot overlay and persists a new layer), stamps `/cdrom/casper/lsl-firstboot.done`, then reboots. The recipe also removes Mint's `nosnap.pref` pin and installs `snapd` by default (disable with `LSL_SNAP_SUPPORT=0`) so snaps - including any `.snap` files the Windows installer preloads to `<USB>\snaps\` - can be installed.
 - `misc/lsl-firstboot-progress.sh` + `.desktop`: user-session zenity progress dialog fed by `/run/lsl-firstboot-status` while the first-boot setup runs (the desktop is not blocked; the work is `nice`d/`ionice`d).
-- `onboot.sh`: runtime setup on every boot.
+- `onboot.sh` + `systemd/onboot.service`: runtime setup on every boot (runs after
+  `lsl-home.service`).
+- `bin/lsl-mount-home.sh` + `systemd/lsl-home.service`: mount `/home` (RAM-only,
+  USB `home.sfs` overlay, or HDD `home.btrfs`) before the display manager; also
+  guarantees the desktop user's home exists on a shared/stale home image.
 - `bin/config.sh`: sync scripts to `/cdrom`, install services/shortcuts/autostart entries.
 - `bin/uphome`: persist/sync home data.
 - `bin/uproot`: persist root image changes (also `--auto-append` for first-boot).
