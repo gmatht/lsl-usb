@@ -2231,9 +2231,19 @@ impl WorkingUi {
         self.raw_show(self.dl, false);
         self.raw_show(self.dlbar, false);
         self.hide_stages();
-        // action buttons above every sibling or real-mouse clicks die
-        // silently on the covering control (see bring_buttons_top).
-        bring_buttons_top(&[self.sum_btn, self.sum_copy, self.sum_open, self.sum_back]);
+        // The body must be a topmost sibling too: a covering frame swallows
+        // real-mouse clicks silently (see bring_buttons_top), which would make
+        // the readonly summary a look-but-cannot-select box - dragging inside
+        // it never reaches the edit. Re-top the body/heading, then the action
+        // buttons so they stay clickable.
+        bring_buttons_top(&[
+            self.sum_body,
+            self.sum_heading,
+            self.sum_btn,
+            self.sum_copy,
+            self.sum_open,
+            self.sum_back,
+        ]);
         self.repaint_window();
 
         // Give the Finish/Close button focus so Enter/Space dismisses the
@@ -2356,10 +2366,18 @@ impl WorkingUi {
         self.raw_show(self.dl, false);
         self.raw_show(self.dlbar, false);
         self.hide_stages();
-        // same silent-click-eater guard as the summary page: the four
-        // stacked actions must be the topmost siblings (see
-        // bring_buttons_top). Hidden (can_usb=false) buttons stay hidden.
-        bring_buttons_top(&[self.sum_btn, self.sum_copy, self.sum_open, self.sum_back]);
+        // same silent-click-eater guard as the summary page: the body must be
+        // re-topped so its text stays mouse-selectable, then the four stacked
+        // actions so they stay clickable (see bring_buttons_top). Hidden
+        // (can_usb=false) buttons stay hidden.
+        bring_buttons_top(&[
+            self.sum_body,
+            self.sum_heading,
+            self.sum_btn,
+            self.sum_copy,
+            self.sum_open,
+            self.sum_back,
+        ]);
         self.repaint_window();
 
         use winapi::um::winuser::SetFocus;
