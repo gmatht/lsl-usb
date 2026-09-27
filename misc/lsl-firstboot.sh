@@ -66,7 +66,7 @@ status_get() {
 status_load() {
     LSL_PHASE="$(status_get phase)"; [ -n "$LSL_PHASE" ] || LSL_PHASE="starting"
     LSL_TASK="$(status_get task)"; [ -n "$LSL_TASK" ] || LSL_TASK="stick"
-    LSL_DONE="$(status_get done)"
+    LSL_DONE="$(status_get "done")"
     LSL_PCT="$(status_get pct)"; [ -n "$LSL_PCT" ] || LSL_PCT=0
     LSL_DETAIL="$(status_get detail)"
 }
@@ -686,7 +686,7 @@ if [ ! -r "$UPROOT" ]; then
     task_done flatpak 2>/dev/null || true
     task_done packages 2>/dev/null || true
     task_done layer 2>/dev/null || true
-    task_begin done "Nothing to install — finishing…" 2>/dev/null || true
+    task_begin "done" "Nothing to install — finishing…" 2>/dev/null || true
     task_progress 100 "Done" 2>/dev/null || true
     touch "$STAMP"
     sync
@@ -837,7 +837,7 @@ lsl_firstboot_prune_orphan_layers
 task_done packages
 task_done layer
 flush_home_final
-task_begin done "Setup complete — waiting for reboot approval…"
+task_begin "done" "Setup complete — waiting for reboot approval…"
 task_progress 100 "Done — waiting for reboot approval…"
 set_phase 'done - waiting for reboot approval'
 rm -f "$STATUS"

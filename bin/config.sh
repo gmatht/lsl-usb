@@ -40,7 +40,7 @@ usage() {
 # directly. Never let cp see a self-copy again.
 cp_to_cdrom() {
     local src dst real_src real_dst
-    src="$1"; dst="${@: -1}"
+    src="$1"; dst="${*: -1}"
     real_src="$(readlink -f -- "$src" 2>/dev/null || echo "$src")"
     real_dst="$(readlink -f -- "$dst" 2>/dev/null || echo "$dst")"
     if [[ "$real_src" == "$real_dst" ]]; then
