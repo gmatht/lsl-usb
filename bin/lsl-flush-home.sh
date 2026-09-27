@@ -9,6 +9,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 lsl_load_config
 lsl_source_state
 
+# RAM-only home (Boot to RAM, no persistence): /home is a tmpfs, so there is
+# nothing to persist - and squashing it to home.sfs would defeat the point.
+if [ "$(findmnt -n -o FSTYPE --target /home 2>/dev/null || true)" = "tmpfs" ]; then
+    echo "lsl-flush-home.sh: /home is RAM (tmpfs); nothing to flush." >&2
+    exit 0
+fi
+
 if ! lsl_is_usb_mode; then
     echo "lsl-flush-home.sh: not USB mode; use btrfs sync on HDD." >&2
     exit 1

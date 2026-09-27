@@ -390,7 +390,31 @@ if ! lsl_is_usb_mode && ! lsl_data_dir_is_persistent; then
     fi
 fi
 
-if lsl_is_usb_mode || [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
+# Boot-to-RAM "(no persistence)" entry passes lsl_home=tmpfs: give the live
+# user a RAM-only home and touch no persistence at all. Building a valid
+# /home/<user> (owned by the user, seeded from /etc/skel) is required -
+# LightDM's autologin session dies without it and drops back to the greeter.
+LSL_EPHEMERAL_HOME=0
+grep -q 'lsl_home=tmpfs' "${LSL_CMDLINE_FILE:-/proc/cmdline}" 2>/dev/null && LSL_EPHEMERAL_HOME=1
+
+if [ "$LSL_EPHEMERAL_HOME" = "1" ]; then
+    mkdir -p /run/lsl-live-home
+    mount --bind /home /run/lsl-live-home 2>/dev/null || true
+    if mount -t tmpfs -o "size=${LSL_HOME_TMPFS_MIB:-2048}M" tmpfs /home; then
+        if [ -n "${LSL_DESKTOP_USER:-}" ]; then
+            mkdir -p "/home/$LSL_DESKTOP_USER"
+            cp -a /etc/skel/. "/home/$LSL_DESKTOP_USER/" 2>/dev/null || true
+            cp -a "/run/lsl-live-home/$LSL_DESKTOP_USER/." "/home/$LSL_DESKTOP_USER/" 2>/dev/null || true
+            chown -R "$LSL_DESKTOP_USER:$LSL_DESKTOP_USER" "/home/$LSL_DESKTOP_USER" 2>/dev/null || true
+        fi
+        echo "lsl: RAM-only home (Boot to RAM, no persistence); changes are lost on reboot." >&2
+    else
+        echo "lsl: could not mount tmpfs on /home; keeping the live home." >&2
+    fi
+    umount /run/lsl-live-home 2>/dev/null || true
+    rmdir /run/lsl-live-home 2>/dev/null || true
+    echo "LSL_MODE=ram" > /run/lsl-usb.state
+elif lsl_is_usb_mode || [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
     mkdir -p "$LSL_HOME_TMPFS" "$LSL_HOME_UPPER" "$LSL_HOME_WORK" "$LSL_HOME_LOWER"
     if ! mountpoint -q "$LSL_HOME_TMPFS" 2>/dev/null; then
         mount -t tmpfs -o "size=${LSL_HOME_TMPFS_MIB:-2048}M" tmpfs "$LSL_HOME_TMPFS"

@@ -8,6 +8,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 lsl_load_config
 
+# Boot-to-RAM "(no persistence)": /home is a tmpfs - nothing to persist.
+if [ "$(findmnt -n -o FSTYPE --target /home 2>/dev/null || true)" = "tmpfs" ]; then
+    echo "uphome: /home is RAM (Boot to RAM, no persistence); nothing to persist."
+    exit 0
+fi
+
 if lsl_is_usb_mode; then
     echo "USB mode: flushing merged /home to /cdrom/home.sfs…"
     exec "$SCRIPT_DIR/lsl-flush-home.sh"

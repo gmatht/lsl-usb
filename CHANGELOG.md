@@ -22,6 +22,10 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   Everything index on Linux (with `-l` long format showing sizes).
 - `lsl-toram.sh`: lazy toram (copy root to RAM, pivot, remove the USB), wired
   into `lsl-shutdown-gui` as "Load to RAM + remove USB".
+- Boot to RAM now writes two menu entries: the existing one (persistent home)
+  plus `(Boot to RAM, no persistence)`, which passes `lsl_home=tmpfs` so
+  `onboot.sh` mounts a RAM-only `/home` (rebuilt each boot from `/etc/skel`);
+  `uphome` / `lsl-flush-home.sh` skip a tmpfs home so nothing is flushed.
 - `lsl-precache.sh` + `lsl-precache-profile.sh`: page-cache warmup (hot files
   first, full-image when it fits, memory floor, bfq scheduler).
 - `lsl-boot-time.sh`: per-boot measurement with trend + precache suggestion.

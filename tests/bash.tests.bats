@@ -1037,6 +1037,16 @@ EOF
     [ -f "$CD/home.sfs" ]
 }
 
+@test "lsl-flush-home: skips a RAM (tmpfs) home" {
+    # Boot-to-RAM, no persistence: /home is a tmpfs, so there is nothing to
+    # flush - the guard must exit 0 before the /cdrom checks.
+    findmnt() { echo tmpfs; }
+    export -f findmnt
+    run env LSL_DATA_DIR=/mnt/c/Users/lsl-usb bash bin/lsl-flush-home.sh
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"RAM (tmpfs)"* ]]
+}
+
 @test "lsl-home-flushd: latest_upper_mtime returns 0 for an empty upper" {
     eval "$(sed -n '/^latest_upper_mtime()/,/^}/p' bin/lsl-home-flushd)"
     UPPER="$TMPDIR_TEST/empty-upper"
