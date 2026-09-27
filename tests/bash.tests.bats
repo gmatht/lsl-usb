@@ -1600,3 +1600,21 @@ EOF
     rm -rf "$T"
 }
 
+# --- onboot: display-manager ordering + backgrounded wifi wait ---------------
+@test "onboot.service orders the display manager after onboot (no /home swap mid-login)" {
+    # lightdm.service only waits on systemd-user-sessions/getty/plymouth, so
+    # without this ordering the greeter can start on the live /home and then
+    # have the persistent one mounted underneath it.
+    grep -qE '^Before=.*display-manager\.service' systemd/onboot.service
+}
+
+@test "onboot.sh runs the wifi wait in the background (must not gate the greeter)" {
+    # onboot.service is Before=display-manager.service, so a synchronous wifi
+    # wait (bounded at ~5 minutes) would delay login whenever there is no network.
+    grep -q '^lsl_wait_for_wifi()' onboot.sh
+    grep -q '^lsl_wait_for_wifi &$' onboot.sh
+    # exactly two mentions: the definition and the backgrounded call
+    run bash -c 'grep -c lsl_wait_for_wifi onboot.sh'
+    [ "$output" = "2" ]
+}
+

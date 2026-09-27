@@ -94,6 +94,14 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   the user on every persistent-home path (`lsl_ensure_user_home`, seeded from
   `/etc/skel`), and no longer stacks the USB home overlay when the `home.sfs`
   lower mount failed (an empty lower would expose an empty `/home`).
+- The display manager could start before `onboot.sh` had mounted the
+  persistent `/home`: nothing ordered `display-manager.service` after
+  `onboot.service` (lightdm only waits on systemd-user-sessions/getty/
+  plymouth), so a live session could begin on the live `/home` and then have
+  the persistent one mounted underneath it - the same "back to the greeter"
+  failure, from a race. `onboot.service` is now
+  `Before=display-manager.service`, and `onboot.sh` backgrounds its (up to
+  ~5 minute) wifi wait so that ordering cannot delay login.
 - Superseded squashfs layers were never reaped on the success path. Every
   successful firstboot appended a fresh `filesystem.z0.<ts>.squashfs` and
   repointed `menu.lst` at it, orphaning the previous one; the only cleanup

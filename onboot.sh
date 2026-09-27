@@ -234,6 +234,28 @@ lsl_merge_fstab() {
     rm -f "$block"
 }
 
+# Bring wifi up (bounded). Runs in the BACKGROUND at the end of this script:
+# onboot.service is ordered Before=display-manager.service so the greeter never
+# starts on a /home that is about to be swapped, but that also means anything
+# slow here would delay login - and with no saved profile or no network this
+# loop can run for ~5 minutes. KillMode=process keeps this subshell alive after
+# the main script exits (same as the nix-users retry above).
+lsl_wait_for_wifi() {
+    if [ -r /cdrom/wifi.sh ]; then
+        tries=0
+        until bash /cdrom/wifi.sh; do
+            tries=$((tries + 1))
+            if [ "$tries" -ge 60 ]; then
+                echo "wifi.sh still failing after ~5 minutes; continuing without wifi." >&2
+                break
+            fi
+            sleep 5
+        done
+    else
+        echo "No /cdrom/wifi.sh; skipping wifi wait." >&2
+    fi
+}
+
 # Sourceable for unit tests: define functions but do not run the boot logic
 # when sourced (BASH_SOURCE != $0).
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
@@ -663,21 +685,9 @@ lsl_report_boot_result() {
 }
 lsl_report_boot_result
 
-# Wait for wifi (bounded): wifi.sh may be missing (no saved profiles) or the
-# network may be down; don't block boot forever. onboot.service is
-# Type=oneshot + RemainAfterExit, so this script should exit when done.
-if [ -r /cdrom/wifi.sh ]; then
-    tries=0
-    until bash /cdrom/wifi.sh; do
-        tries=$((tries + 1))
-        if [ "$tries" -ge 60 ]; then
-            echo "wifi.sh still failing after ~5 minutes; continuing without wifi." >&2
-            break
-        fi
-        sleep 5
-    done
-else
-    echo "No /cdrom/wifi.sh; skipping wifi wait." >&2
-fi
+# Wait for wifi (bounded) - in the BACKGROUND, so the Before=display-manager
+# ordering above cannot hold the greeter for up to ~5 minutes on a box with no
+# saved network (see the function above).
+lsl_wait_for_wifi &
 echo FINISHED
 exit 0

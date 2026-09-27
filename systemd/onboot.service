@@ -2,12 +2,21 @@
 Description=On Boot
 After=NetworkManager.service
 Before=network-online.target
+# The greeter must not start on a /home that onboot.sh is about to swap: a
+# session that begins on the live /home and then has the persistent one mounted
+# underneath it dies and drops back to the greeter. Nothing orders the display
+# manager after us otherwise (lightdm.service only waits on
+# systemd-user-sessions/getty/plymouth). Order it after us, while keeping the
+# critical path short - onboot.sh backgrounds its wifi wait so this ordering
+# cannot delay login.
+Before=display-manager.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# onboot.sh backgrounds the nix-users retry loop; keep it alive after the main
-# script exits instead of killing the whole cgroup (the default KillMode).
+# onboot.sh backgrounds the nix-users retry loop and the wifi wait; keep them
+# alive after the main script exits instead of killing the whole cgroup (the
+# default KillMode).
 KillMode=process
 ExecStart=/cdrom/onboot.sh
 
