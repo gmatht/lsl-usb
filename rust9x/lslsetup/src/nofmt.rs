@@ -2427,17 +2427,19 @@ fn install_files(
     // used the same entries are mirrored to efi\grub\menu.lst (the only
     // menu location grub4dos-for-UEFI reads - no mirror = UEFI prompt);
     // the signed GRUB2 chain reads grub.cfg instead.
-    if hddmirror {
-        if let Err(e) = crate::lslfiles::install_hddmirror_initrd(&t.letter, bundle_dir) {
+    let hddmirror_ok = if hddmirror {
+        crate::lslfiles::install_hddmirror_initrd(&t.letter, bundle_dir).map_err(|e| {
             out::warn(&format!("hddmirror initrd not created ({}); HDD mirror boot hook skipped.", e));
-        }
-    }
+        }).is_ok()
+    } else {
+        false
+    };
     let (title, kern_rel, init_rel) =
-        write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui, hddmirror)?;
+        write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui, hddmirror_ok)?;
     if ramclone {
         if let Err(e) = crate::lslfiles::install_ramclone_initrd(&t.letter, bundle_dir) {
             out::warn(&format!("ramclone initrd not created ({}); Boot to RAM entry skipped.", e));
-        } else if let Err(e) = add_ramclone_boot_entries(&root, &title, &kern_rel, &init_rel, uefi_res.mirror_menu(), hddmirror) {
+        } else if let Err(e) = add_ramclone_boot_entries(&root, &title, &kern_rel, &init_rel, uefi_res.mirror_menu(), hddmirror_ok) {
             out::warn(&format!("ramclone boot entries not added ({}).", e));
         }
     }
@@ -3058,13 +3060,22 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
                 .into(),
         );
     }
-    if hddmirror {
-        if let Err(e) = crate::lslfiles::install_hddmirror_initrd(&t.letter, bundle_dir) {
+    let hddmirror_ok = if hddmirror {
+        crate::lslfiles::install_hddmirror_initrd(&t.letter, bundle_dir).map_err(|e| {
             out::warn(&format!("hddmirror initrd not created ({}); HDD mirror boot hook skipped.", e));
+        }).is_ok()
+    } else {
+        false
+    };
+    let (title, kern_rel, init_rel) =
+        write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui, hddmirror_ok)?;
+    if ramclone {
+        if let Err(e) = crate::lslfiles::install_ramclone_initrd(&t.letter, bundle_dir) {
+            out::warn(&format!("ramclone initrd not created ({}); Boot to RAM entry skipped.", e));
+        } else if let Err(e) = add_ramclone_boot_entries(&root, &title, &kern_rel, &init_rel, uefi_res.mirror_menu(), hddmirror_ok) {
+            out::warn(&format!("ramclone boot entries not added ({}).", e));
         }
     }
-    let (title, kern_rel, init_rel) =
-        write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui, hddmirror)?;
 
     // First-boot toolkit (bin/uproot et al.): without it the first boot can
     // only stamp trivially. Embedded, LF-normalized, read-back verified.
