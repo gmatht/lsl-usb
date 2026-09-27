@@ -1091,19 +1091,28 @@ fn cpio_newc_trailer() -> Vec<u8> {
     cpio_newc_file("TRAILER!!!", &[], 0)
 }
 
-/// Create a gzip-compressed cpio initrd containing the ramclone hook at the
-/// paths both casper and live-boot will execute. Returns the compressed bytes.
+/// Create a gzip-compressed cpio initrd containing the ramclone hook for
+/// casper-premount. The hook is placed at scripts/casper-premount/ together
+/// with an ORDER file that casper's run_scripts sources. The ORDER line
+/// guards the HDD-mirror hook (zz_lsl_hdd_mirror) so both can coexist.
 pub fn make_ramclone_initrd(hook_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut archive = Vec::new();
-    // Place the hook at all paths any initramfs framework might execute.
-    let paths = [
+    // Hook script: sourced by casper's run_scripts, overrides get_backing_device.
+    archive.extend_from_slice(&cpio_newc_file(
         "scripts/casper-premount/9990-live-ramclone",
-        "scripts/casper-bottom/9990-live-ramclone",
-        "scripts/live-premount/9990-live-ramclone",
-    ];
-    for path in paths {
-        archive.extend_from_slice(&cpio_newc_file(path, hook_bytes, 0o100755));
-    }
+        hook_bytes,
+        0o100755,
+    ));
+    // ORDER file: casper sources each line in order. We include the HDD-mirror
+    // hook entry (guarded) so both hooks can coexist when the main initrd was
+    // repacked by build.sh. The ramclone hook skips when LAYERFS_PATH is set.
+    let order = b". /scripts/casper-premount/zz_lsl_hdd_mirror \"$@\" 2>/dev/null || true\n\
+         . /scripts/casper-premount/9990-live-ramclone \"$@\" 2>/dev/null || true\n";
+    archive.extend_from_slice(&cpio_newc_file(
+        "scripts/casper-premount/ORDER",
+        order,
+        0o100644,
+    ));
     archive.extend_from_slice(&cpio_newc_trailer());
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(&archive).map_err(|e| format!("gzip encode: {}", e))?;
