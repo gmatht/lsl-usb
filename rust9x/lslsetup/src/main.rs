@@ -100,8 +100,13 @@ fn apply_fast_startup_choice(fast_off: bool, reclaim: bool) {
         } else {
             out::warn(&r.detail);
         }
-    } else if reclaim && sys::path_exists(&sys::hiberfil_path()) {
-        out::warn("Reclaim armed but hiberfil.sys exists (Fast Startup is ON): the reclaim will be SKIPPED on hibernated volumes. Re-run with --fast-startup-off (or tick the Fast Startup box) to make it effective. Undo any time with: powercfg /h on");
+    } else if sys::path_exists(&sys::hiberfil_path()) {
+        let extra = if reclaim {
+            " It also makes the pagefile reclaim a silent no-op."
+        } else {
+            ""
+        };
+        out::warn(&format!("Fast Startup/hibernate is ON (hiberfil.sys present): after a Fast-Startup shutdown the Windows volume mounts read-only, so HDD-mode /home (home.btrfs) cannot be written and the live boot falls back to a RAM-only home.{} Fix it with --fast-startup-off (or tick the Fast Startup box). Undo any time with: powercfg /h on", extra));
     }
 }
 

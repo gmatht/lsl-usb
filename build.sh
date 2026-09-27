@@ -95,6 +95,8 @@ install -m 755 "$REPO_ROOT/misc/lsl-firstboot-progress.sh" "$LAYER/usr/local/bin
 install -m 755 "$REPO_ROOT/misc/lsl-firstboot-reboot.sh" "$LAYER/usr/local/bin/lsl-firstboot-reboot.sh"
 install -m 755 "$REPO_ROOT/misc/lsl-progress-gtk.py" "$LAYER/usr/local/bin/lsl-progress-gtk.py"
 install -m 644 "$REPO_ROOT/misc/lsl-firstboot.service" "$LAYER/etc/systemd/system/lsl-firstboot.service"
+install -m 644 "$REPO_ROOT/systemd/onboot.service" "$LAYER/etc/systemd/system/onboot.service"
+install -m 644 "$REPO_ROOT/systemd/lsl-home.service" "$LAYER/etc/systemd/system/lsl-home.service"
 install -m 644 "$REPO_ROOT/misc/lsl-firstboot-progress.desktop" "$LAYER/etc/xdg/autostart/lsl-firstboot-progress.desktop"
 install -m 644 "$REPO_ROOT/misc/lsl-boot-time.desktop" "$LAYER/etc/xdg/autostart/lsl-boot-time.desktop"
 install -m 755 "$REPO_ROOT/misc/lsl-firstboot-failed.sh" "$LAYER/usr/local/bin/lsl-firstboot-failed.sh"
@@ -103,6 +105,8 @@ install -m 755 "$REPO_ROOT/misc/lsl-merge-suggest.sh" "$LAYER/usr/local/bin/lsl-
 install -m 644 "$REPO_ROOT/misc/lsl-merge-suggest.desktop" "$LAYER/etc/xdg/autostart/lsl-merge-suggest.desktop"
 # Enable the unit by symlink (overlayfs handles lower-layer symlinks fine).
 ln -s ../lsl-firstboot.service "$LAYER/etc/systemd/system/multi-user.target.wants/lsl-firstboot.service"
+ln -s ../onboot.service "$LAYER/etc/systemd/system/multi-user.target.wants/onboot.service"
+ln -s ../lsl-home.service "$LAYER/etc/systemd/system/multi-user.target.wants/lsl-home.service"
 
 mkdir -p "$DIST"
 mksquashfs "$LAYER" "$DIST/filesystem_z0_firstboot.squashfs" -noappend -comp zstd >/dev/null

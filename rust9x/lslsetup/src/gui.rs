@@ -1262,7 +1262,7 @@ fn wrap_text(text: &str, per_line: usize) -> String {
 pub(crate) const PAGEFILE_NOTE: &str = "Renames pagefile.sys and each WSL2 swapfile.vhdx (after a clean-shutdown check) and uses that space as compressed swap. Used only if Windows was shut down normally (no Fast Startup / hibernate) - otherwise the reclaim is skipped entirely.";
 
 /// System-page Fast-Startup note (WHYFAIL6 §5; same height contract test).
-pub(crate) const FASTSTARTUP_NOTE: &str = "Disables hibernate and Fast Startup (powercfg /h off) and deletes hiberfil.sys (~40% of RAM). Makes every shutdown genuinely clean for Linux and un-blocks the pagefile reclaim above, which is a silent no-op while hiberfil.sys exists. Undo any time with: powercfg /h on";
+pub(crate) const FASTSTARTUP_NOTE: &str = "Disables hibernate and Fast Startup (powercfg /h off) and deletes hiberfil.sys (~40% of RAM). Makes every shutdown genuinely clean for Linux and un-blocks the pagefile reclaim above, which is a silent no-op while hiberfil.sys exists. Pre-ticked when hiberfil.sys is present. Undo any time with: powercfg /h on";
 
 /// One control on a scrollable page. Built straight into the Box so the
 /// win32 control has exactly one owner (nwg's Drop DESTROYS the window, so
@@ -3370,7 +3370,10 @@ pub fn run_gui(
         push_check(&mut sys, "Copy Linux squashfs layers to your NTFS drive for faster boot", 10, 306, 6, true);
         push_check(&mut sys, "Reclaim Windows pagefile.sys + WSL2 swapfile as compressed swap", 10, 328, 7, false);
         push_lbl(&mut sys, PAGEFILE_NOTE, 20, 350, -30, 76, false);
-        push_check(&mut sys, "Turn off Windows Fast Startup / hibernate (powercfg /h off)", 10, 430, 10, false);
+        // Pre-ticked when hiberfil.sys exists: with Fast Startup on, the Windows
+        // volume mounts read-only after a Fast-Startup shutdown, so HDD-mode /home
+        // (home.btrfs) cannot be written and the live boot loses persistence.
+        push_check(&mut sys, "Turn off Windows Fast Startup / hibernate (powercfg /h off)", 10, 430, 10, crate::sys::path_exists(&crate::sys::hiberfil_path()));
         push_lbl(&mut sys, FASTSTARTUP_NOTE, 20, 452, -30, 80, false);
         push_check(&mut sys, "Preload Rust CLI tools for the selected distro (fd / bat / zoxide)", 10, 536, 8, true);
     }

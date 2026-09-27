@@ -112,6 +112,15 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   has no default start timeout, so a wedged mount would otherwise block the
   greeter forever), and `bin/lsl-diag.sh` now captures its journal alongside
   `onboot.service`.
+- The install-wizard's "Turn off Windows Fast Startup / hibernate" box is now
+  pre-ticked when `hiberfil.sys` is present (Fast Startup on makes the Windows
+  volume mount read-only after a Fast-Startup shutdown, so HDD-mode `home.btrfs`
+  cannot be written), and the headless flow warns about it even when the
+  pagefile reclaim is not selected.
+- `build.sh` now stages `onboot.service` and `lsl-home.service` (and enables
+  them) in the first-boot layer, so the display-manager ordering applies from
+  the very first boot of an `install.ps1` stick, as it already did for the
+  nofmt installer's embedded layer.
 - Superseded squashfs layers were never reaped on the success path. Every
   successful firstboot appended a fresh `filesystem.z0.<ts>.squashfs` and
   repointed `menu.lst` at it, orphaning the previous one; the only cleanup
