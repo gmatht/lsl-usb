@@ -188,6 +188,18 @@ feed_zenity() {
     # Same "PCT # text" protocol as before, but PCT is now REAL overall
     # progress (was a fake 5–95% oscillation; 1000 ≥ 100 used to close the
     # window instantly). Clamp to 1..99 while running; 100 only at the end.
+    #
+    # NEVER run this as the left side of a pipe into a zenity that was given
+    # --auto-close. Reproduced 2026-09-28: zenity 3.44 reads its stdin in a
+    # way that closes the read end after the first couple of lines, so the
+    # next `echo` here dies of SIGPIPE -- silently, without ever reaching the
+    # kill -0 guard below. The pipe then hits EOF and zenity exits 0, which the
+    # caller logged as "shown to completion". Net effect on a real boot: the
+    # window flashed for ~1s at 02:42:47 while firstboot kept running for
+    # another 23 minutes (WHYFAIL8.md). Measured: with --auto-close the writer
+    # managed 1 line; with it removed the same writer kept going for the whole
+    # test window, and the caller closes the dialog itself by sending 100
+    # (which it already does below).
     local line overall summary
     while ! stamp_present; do
         line="$(overall_and_summary)"
@@ -207,12 +219,15 @@ feed_zenity() {
 }
 
 if [ "$DIALOG_PROG" = zenity ]; then
-    feed_zenity | zenity --progress --auto-close --auto-kill \
+    # --auto-close is deliberately absent: the writer above emits 100 to close
+    # the window, and --auto-close is what killed the writer with SIGPIPE.
+    # --auto-kill stays so Cancel still takes the dialog down.
+    feed_zenity | zenity --progress --auto-kill \
         --title="lsl-usb first boot" \
         --text="Preparing your USB system (first boot)..." \
         --width=480 2>>"$DIALOG_LOG"
-    # PIPESTATUS right away: rc 0 = shown to completion, 1 = dismissed early.
-    dialog_log "progress dialog finished via zenity (consumer rc=${PIPESTATUS[1]:-?})"
+    # PIPESTATUS right away: rc 0 = closed via our 100 (or EOF), 1 = dismissed.
+    dialog_log "progress dialog finished via zenity (consumer rc=${PIPESTATUS[1]:-?}, writer rc=${PIPESTATUS[0]:-?})"
 else
     # GTK fallback polls the status file itself (rich task list), so no
     # stdin pipe is needed. It exits on its own when the stamp appears.

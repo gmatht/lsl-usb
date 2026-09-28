@@ -42,6 +42,9 @@ LSL_TASK="stick"
 LSL_DONE=""
 LSL_PCT=0
 LSL_DETAIL=""
+# Set by flush_home_final when /home could not be persisted (usb-fallback). Kept
+# as a flag so the final "done" step cannot obscure the failure in the dialog.
+LSL_HOME_FAILED=0
 
 # Atomic rewrite of the whole status file (tmp + mv avoids torn reads).
 status_write() {
@@ -204,9 +207,17 @@ notify_desktop_now() {
 
 # Final home backup: persist the merged /home to its permanent location
 # before the reboot (USB: bake into /cdrom/home.sfs via the stick's uphome;
-# HDD: btrfs sync via the same tool). Best-effort: the new layer is already
-# built, so a flush failure only logs loudly (the idle flush daemon retries
-# later) instead of failing firstboot. Never fails the service.
+# HDD: btrfs sync via the same tool). Best-effort overall: the new layer is
+# already built, so an ordinary flush error only logs loudly (the idle flush
+# daemon retries later) rather than failing firstboot.
+#
+# The one case that is NOT ordinary is a usb-fallback overlay: /home was mounted
+# transiently because the data dir was not persistent when it was mounted
+# (hivexregedit missing -> /mnt/c not mounted yet), so this boot's /home work is
+# being LOST and there is nothing the idle daemon can do about it. That must be
+# shouted before the reboot-approval dialog, not buried (FRAGILE_HOME.md rule 4).
+# Still non-blocking: the home is already gone, so a retry would only reinstall
+# packages for nothing.
 flush_home_final() {
     task_begin home "Backing up /home to its permanent location…"
     local uphome="" cand
@@ -223,6 +234,39 @@ flush_home_final() {
     log "Flushing /home to its permanent location ($uphome)..."
     if bash "$uphome" >>"$LOG" 2>&1; then
         log "Final home flush OK."
+        task_done home
+        return 0
+    fi
+
+    # The flush failed. Distinguish the transient-but-unrecoverable fallback
+    # overlay from an ordinary error by asking how /home was actually mounted.
+    local stick="${STICK_DIR:-/cdrom}" ehm=""
+    if [ -r "$stick/bin/lsl-common.sh" ]; then
+        # shellcheck source=/dev/null
+        . "$stick/bin/lsl-common.sh" 2>/dev/null || true
+        ehm="$(lsl_effective_home_mode 2>/dev/null || true)"
+    fi
+    if [ "$ehm" = "usb-fallback" ]; then
+        log "ERROR: /home is a FALLBACK tmpfs overlay (the data dir was not persistent when /home was mounted); first-boot /home changes WILL BE LOST on reboot."
+        # detail, not just phase: the progress dialog renders detail (falling
+        # back to phase), so a stale detail would hide the failure.
+        LSL_PHASE="failed - first-boot /home could not be persisted (temporary overlay)"
+        LSL_DETAIL="ERROR: this boot's /home changes WILL BE LOST on reboot (the data dir was not persistent when /home was mounted)."
+        LSL_HOME_FAILED=1
+        status_write
+        # Persistent, Windows-visible record: the live phase dies with /run.
+        mount "$stick" -o remount,rw 2>/dev/null || true
+        : > "$stick/casper/lsl-firstboot.home-failed" 2>/dev/null || true
+        {
+            echo "First-boot /home was NOT persisted: /home was mounted as a"
+            echo "temporary tmpfs overlay because the HDD data dir was not on a"
+            echo "persistent volume when /home was mounted (hivexregedit missing,"
+            echo "so /mnt/c was not mounted yet). Anything written to /home this"
+            echo "boot is lost. Reboot once /mnt/c mounts; firstboot will not re-run."
+        } > "$stick/casper/lsl-firstboot.home-failed.reason" 2>/dev/null || true
+        sync 2>/dev/null || true
+        # Tell the current desktop session now, before the reboot-approval dialog.
+        notify_desktop_now /usr/local/bin/lsl-firstboot-home-failed.sh </dev/null >/dev/null 2>&1 &
     else
         log "WARNING: final home flush failed (continuing - the idle flush daemon retries; see $LOG)."
     fi
@@ -839,9 +883,17 @@ lsl_firstboot_prune_orphan_layers
 task_done packages
 task_done layer
 flush_home_final
-task_begin "done" "Setup complete — waiting for reboot approval…"
-task_progress 100 "Done — waiting for reboot approval…"
-set_phase 'done - waiting for reboot approval'
+if [ "${LSL_HOME_FAILED:-0}" = "1" ]; then
+    # Keep the failure in front of the operator: the reboot-approval dialog is the
+    # last thing they see, and rebooting is exactly what loses this boot's /home.
+    task_begin "done" "Setup complete, but /home was NOT saved this boot."
+    task_progress 100 "Setup complete — but first-boot /home changes WILL BE LOST on reboot (temporary overlay)."
+    set_phase 'failed - setup complete but /home not persisted (temporary overlay)'
+else
+    task_begin "done" "Setup complete — waiting for reboot approval…"
+    task_progress 100 "Done — waiting for reboot approval…"
+    set_phase 'done - waiting for reboot approval'
+fi
 rm -f "$STATUS"
 touch "$STAMP"
 sync

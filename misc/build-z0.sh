@@ -18,15 +18,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 M="$REPO_ROOT/misc"
-OUT="${1:-$REPO_ROOT/rust9x/lslsetup/assets/filesystem.z0.squashfs}"
+DEFAULT_OUT="$REPO_ROOT/rust9x/lslsetup/assets/filesystem.z0.squashfs"
+OUT="${1:-$DEFAULT_OUT}"
 
-for f in lsl-firstboot.sh lsl-firstboot-progress.sh lsl-progress-gtk.py lsl-firstboot-reboot.sh lsl-firstboot.service \
+# The exact source set this layer is packed from, as repo-relative paths.
+# Used both for the existence check and for the freshness manifest below.
+Z0_MISC=(lsl-firstboot.sh lsl-firstboot-progress.sh lsl-progress-gtk.py lsl-firstboot-reboot.sh lsl-firstboot.service \
          lsl-firstboot-progress.desktop lsl-boot-time.desktop \
          lsl-firstboot-failed.sh lsl-firstboot-failed.desktop \
+         lsl-firstboot-home-failed.sh \
          lsl-merge-suggest.sh lsl-merge-suggest.desktop \
-         "$REPO_ROOT/systemd/onboot.service" "$REPO_ROOT/systemd/lsl-home.service"; do
-    case "$f" in /*) check="$f" ;; *) check="$M/$f" ;; esac
-    [ -f "$check" ] || { echo "missing $check" >&2; exit 1; }
+         lsl-ramclone-progress.sh lsl-ramclone-progress.desktop)
+Z0_SYSTEMD=(systemd/onboot.service systemd/lsl-home.service)
+Z0_SRC=()
+for f in "${Z0_MISC[@]}"; do Z0_SRC+=("misc/$f"); done
+for f in "${Z0_SYSTEMD[@]}"; do Z0_SRC+=("$f"); done
+
+for rel in "${Z0_SRC[@]}"; do
+    [ -f "$REPO_ROOT/$rel" ] || { echo "missing $REPO_ROOT/$rel" >&2; exit 1; }
 done
 
 rm -rf /tmp/z0build
@@ -44,8 +53,11 @@ install -m 644 "$M/lsl-firstboot-progress.desktop" /tmp/z0build/etc/xdg/autostar
 install -m 644 "$M/lsl-boot-time.desktop" /tmp/z0build/etc/xdg/autostart/lsl-boot-time.desktop
 install -m 755 "$M/lsl-firstboot-failed.sh" /tmp/z0build/usr/local/bin/lsl-firstboot-failed.sh
 install -m 644 "$M/lsl-firstboot-failed.desktop" /tmp/z0build/etc/xdg/autostart/lsl-firstboot-failed.desktop
+install -m 755 "$M/lsl-firstboot-home-failed.sh" /tmp/z0build/usr/local/bin/lsl-firstboot-home-failed.sh
 install -m 755 "$M/lsl-merge-suggest.sh" /tmp/z0build/usr/local/bin/lsl-merge-suggest.sh
 install -m 644 "$M/lsl-merge-suggest.desktop" /tmp/z0build/etc/xdg/autostart/lsl-merge-suggest.desktop
+install -m 755 "$M/lsl-ramclone-progress.sh" /tmp/z0build/usr/local/bin/lsl-ramclone-progress.sh
+install -m 644 "$M/lsl-ramclone-progress.desktop" /tmp/z0build/etc/xdg/autostart/lsl-ramclone-progress.desktop
 ln -s ../lsl-firstboot.service /tmp/z0build/etc/systemd/system/multi-user.target.wants/lsl-firstboot.service
 ln -s ../onboot.service /tmp/z0build/etc/systemd/system/multi-user.target.wants/onboot.service
 ln -s ../lsl-home.service /tmp/z0build/etc/systemd/system/multi-user.target.wants/lsl-home.service
@@ -69,4 +81,19 @@ echo -n "dotted-layer cleanup globs: "
 unsquashfs -cat "$OUT" usr/local/sbin/lsl-firstboot.sh 2>/dev/null | grep -c 'filesystem.z0' || true
 echo -n "CR bytes in packed service script: "
 unsquashfs -cat "$OUT" usr/local/sbin/lsl-firstboot.sh 2>/dev/null | tr -cd '\r' | wc -c
+
+# Freshness manifest (WHYFAIL10). build.rs re-hashes every source listed here
+# and fails the build if any differs from the blob's recorded state, so editing
+# misc/ without regenerating the blob can no longer ship a stale firstboot
+# layer. Written ONLY when packing the shipped blob: a temporary/alternate OUT
+# (e.g. from check-z0-freshness.sh) must not touch it, or the guard would be
+# self-defeating.
+MANIFEST="$REPO_ROOT/rust9x/lslsetup/assets/z0_sources.sha256"
+if [ "$OUT" = "$DEFAULT_OUT" ]; then
+    : > "$MANIFEST"
+    for rel in "${Z0_SRC[@]}"; do
+        printf '%s  %s\n' "$(sha256sum "$REPO_ROOT/$rel" | cut -d' ' -f1)" "$rel" >> "$MANIFEST"
+    done
+    echo "MANIFEST_OK $MANIFEST (${#Z0_SRC[@]} sources)"
+fi
 rm -rf /tmp/z0build

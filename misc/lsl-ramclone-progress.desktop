@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=lsl-usb Boot to RAM
+Comment=Show the copy-to-RAM progress and offer to detach the USB stick
+Exec=/usr/local/bin/lsl-ramclone-progress.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true

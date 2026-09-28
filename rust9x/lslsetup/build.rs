@@ -55,6 +55,75 @@ fn parse_page(html: &str) -> (String, String, String, Vec<String>) {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
+
+    // ---- Embedded z0 firstboot layer freshness (WHYFAIL10) -----------------
+    // src/lslfiles.rs embeds assets/filesystem.z0.squashfs with include_bytes!,
+    // which makes cargo depend on the BLOB, not on the misc/ sources it was
+    // packed from. So editing misc/ used to reship a stale firstboot layer
+    // silently (the firstboot progress dialog stayed broken for ~14h despite
+    // the fix being in misc/). assets/z0_sources.sha256 is rewritten by
+    // misc/build-z0.sh every time the blob is regenerated; re-hashing each
+    // listed source here fails the build if any has drifted since. Regenerate
+    // with `bash misc/build-z0.sh` (WSL/Linux; needs squashfs-tools).
+    {
+        println!("cargo:rerun-if-changed=assets/filesystem.z0.squashfs");
+        println!("cargo:rerun-if-changed=assets/z0_sources.sha256");
+        println!("cargo:rerun-if-changed=../../misc/build-z0.sh");
+        let blob_path = Path::new(&manifest).join("assets").join("filesystem.z0.squashfs");
+        let blob = fs::read(&blob_path)
+            .unwrap_or_else(|e| panic!("read {}: {}", blob_path.display(), e));
+        assert!(
+            blob.len() >= 4096 && blob[0..4] == [0x68, 0x73, 0x71, 0x73],
+            "assets/filesystem.z0.squashfs is not a squashfs blob (bad magic/size)"
+        );
+        let man_path = Path::new(&manifest).join("assets").join("z0_sources.sha256");
+        let man = fs::read_to_string(&man_path).unwrap_or_else(|e| {
+            panic!(
+                "missing {} ({}) - regenerate the embedded z0 layer with `bash misc/build-z0.sh`",
+                man_path.display(),
+                e
+            )
+        });
+        let repo_root = Path::new(&manifest).join("..").join("..");
+        let mut stale: Vec<String> = Vec::new();
+        let mut sources = 0usize;
+        for line in man.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((want, rel)) = line.split_once("  ") else {
+                panic!("malformed assets/z0_sources.sha256 line: {:?}", line);
+            };
+            println!("cargo:rerun-if-changed=../../{}", rel);
+            sources += 1;
+            match fs::read(repo_root.join(rel)) {
+                Ok(bytes) => {
+                    use sha2::Digest;
+                    let mut h = sha2::Sha256::new();
+                    h.update(&bytes);
+                    if format!("{:x}", h.finalize()) != want {
+                        stale.push(rel.to_string());
+                    }
+                }
+                Err(_) => stale.push(format!("{} (missing)", rel)),
+            }
+        }
+        assert!(sources > 0, "assets/z0_sources.sha256 lists no sources");
+        assert!(
+            stale.is_empty(),
+            "STALE embedded z0 firstboot layer (WHYFAIL10): {} source(s) changed since the \
+             blob was packed: {}. Regenerate with `bash misc/build-z0.sh` and commit BOTH \
+             assets/filesystem.z0.squashfs and assets/z0_sources.sha256.",
+            stale.len(),
+            stale.join(", ")
+        );
+        println!(
+            "cargo:warning=embedded z0 layer is fresh ({} sources verified)",
+            sources
+        );
+    }
+
     let cache_dir = Path::new(&manifest).join("..").join("..").join("lsl-hw-cache");
     let mut entries: Vec<(String, String, String, String, Vec<String>)> = Vec::new();
     if let Ok(rd) = fs::read_dir(&cache_dir) {
