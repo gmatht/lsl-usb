@@ -84,6 +84,17 @@ bash "$REPO_ROOT/tests/btrfs-growd.tests.sh" || echo "  (btrfs-growd test skippe
 echo "Running reclaim-Windows-swap unit tests..."
 bash "$REPO_ROOT/tests/lsl-reclaim-win-swap.tests.sh" || echo "  (reclaim-win-swap test failed - non-fatal)"
 
+# --- 0d) embedded z0 firstboot layer is fresh (WHYFAIL10) ------------------
+# rust9x/lslsetup embeds rust9x/lslsetup/assets/filesystem.z0.squashfs
+# (include_bytes!), so cargo depends on that blob, not on the misc/ sources it
+# is packed from - editing misc/ without regenerating used to reship a stale
+# firstboot layer silently. build.rs re-hashes the sources against
+# assets/z0_sources.sha256 at build time; cross-check the committed blob against
+# a fresh pack of misc/ here too, so a stale layer fails the bundle build (and
+# CI, which runs build.sh) instead of shipping old firstboot scripts.
+echo "Checking the embedded z0 firstboot layer is fresh (WHYFAIL10)..."
+bash "$REPO_ROOT/misc/check-z0-freshness.sh" "$REPO_ROOT"
+
 # --- 1) minimal first-boot layer -------------------------------------------
 LAYER="$STAGE/layer"
 mkdir -p "$LAYER/usr/local/sbin" "$LAYER/usr/local/bin" \

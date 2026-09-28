@@ -34,6 +34,22 @@ jobs:
             shellcheck -S warning "$f"
           done
 
+  z0-freshness:
+    name: Embedded z0 layer freshness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install squashfs-tools
+        run: sudo apt-get update && sudo apt-get install -y squashfs-tools
+      - name: Verify the embedded z0 layer matches misc/ (WHYFAIL10)
+        # rust9x/lslsetup embeds assets/filesystem.z0.squashfs (include_bytes!),
+        # so cargo depends on the blob, not on the misc/ sources it is packed
+        # from - editing misc/ without regenerating would reship a stale
+        # firstboot layer. build.rs enforces this at build time; this is the
+        # byte-accurate gate (same check build.sh runs before packaging).
+        run: bash misc/check-z0-freshness.sh "$PWD"
+
   bats:
     name: Bash tests (bats)
     runs-on: ubuntu-latest

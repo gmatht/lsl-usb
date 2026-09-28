@@ -238,8 +238,39 @@ Then mirror library/ (+ its Cargo.toml/Cargo.lock) to:
 "@
 }
 
+# ------------------------------------------------- z0 layer rebuild (WHYFAIL10)
+function Invoke-BuildZ0 {
+    # src/lslfiles.rs embeds assets/filesystem.z0.squashfs with include_bytes!,
+    # so cargo depends on the BLOB, not on the misc/ sources it is packed from -
+    # editing misc/ without regenerating used to reship a stale firstboot layer
+    # silently. build.rs re-hashes the sources against assets/z0_sources.sha256
+    # and fails the build; regenerate here first so the embedded layer always
+    # matches misc/. build-z0.sh needs bash + squashfs-tools (WSL); when that is
+    # unavailable we warn and let build.rs enforce freshness instead.
+    $repoWin = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+    if (-not (Get-Command wsl -ErrorAction SilentlyContinue)) {
+        Write-Warning 'WSL not found; skipping z0 rebuild (build.rs will verify the embedded layer is fresh).'
+        return
+    }
+    if ($repoWin -notmatch '^[A-Za-z]:\\') {
+        Write-Warning "repo path '$repoWin' is not a drive path; skipping z0 rebuild (build.rs will verify freshness)."
+        return
+    }
+    $repoWsl = '/mnt/' + $repoWin.Substring(0, 1).ToLower() + $repoWin.Substring(2).Replace('\', '/')
+    $tools = 'command -v mksquashfs >/dev/null 2>&1 && command -v unsquashfs >/dev/null 2>&1'
+    & wsl -e bash -lc $tools 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning 'mksquashfs/unsquashfs unavailable in WSL; skipping z0 rebuild (build.rs will verify freshness).'
+        return
+    }
+    Write-Host '== rebuilding embedded z0 layer from misc/ (misc/build-z0.sh)'
+    & wsl -e bash "$repoWsl/misc/build-z0.sh"
+    if ($LASTEXITCODE -ne 0) { throw '== z0 rebuild FAILED (misc/build-z0.sh)' }
+}
+
 # ------------------------------------------------------------- build phase
 function Invoke-Build {
+    Invoke-BuildZ0
     Ensure-Toolset
     Write-Host "== building ($Target)"
     $manifest = (Resolve-Path 'src\app_manifest.res').Path
