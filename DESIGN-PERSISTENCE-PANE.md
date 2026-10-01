@@ -805,6 +805,139 @@ foreign stick will not have.
 | `fatresize` fallback | assumed workable | **unproven, and untested until now — it no-ops silently, and a bare `sfdisk` shrink leaves the FS oversized (§9.2)** |
 | identifying the stick on first boot | not addressed | **volume serial (already read, discarded) + label + LSL marker + must-be-FAT**, all required to agree (§9.2b) |
 
+## 10. Could persistence hold auth (git/GitHub credentials)?
+
+Asked while the `v0.1.1` push was blocked for want of a credential: *"we have a
+persistent home here, so we can store and reuse auth between boots?"*
+
+**Yes — and this session proves it works.** Verified on the running stick:
+
+```
+$ cat /run/lsl-usb.state
+LSL_MODE=hdd                       <- a real persistent home, not the tmpfs fallback
+
+$ mount | grep " /home "
+/mnt/c/Users/lsl-usb/home-linuxmint.btrfs on /home type btrfs
+# (findmnt reports SOURCE as /dev/loop3 - the same thing, seen as the loop
+#  device rather than the file it backs onto; `losetup /dev/loop3` gives the
+#  path above)
+
+$ touch /home/ubuntu/.writetest     # then check the backing image's mtime
+/home-linuxmint.btrfs modified 2 seconds later
+```
+
+So writes to `/home` land in a btrfs image **on disk**, and survive a reboot.
+
+### But decide *which* persistence, because they differ
+
+The data dir is `/mnt/c/Users/lsl-usb` — on the **internal NVMe**
+(`/dev/nvme0n1p4`), not the stick (`/dev/sda1`). That single fact decides the
+scope of any credential placed there:
+
+| storage | survives reboot | follows the stick | readable by Windows |
+|---|---|---|---|
+| `/home/…` (hdd mode) | **yes** | **no** — it is on this machine's disk | **yes** (a file on `C:`) |
+| `/cdrom/…` (usb mode) | yes | **yes** | **yes** (FAT partition) |
+| `~/.config/gh/hosts.yml` | as above | as above | as above |
+
+So "persistent home" means **persistent on this machine**, not portable with the
+stick. A token stored there is exactly as available as the Windows drive is.
+
+### The security question this raises
+
+A credential in `/home` sits inside a plain btrfs image on an NTFS volume. It is:
+
+- **not encrypted** — no keyring, no DPAPI, no LUKS;
+- readable by anything running on the machine, and by **Windows itself**, because
+  it is just a file on `C:`;
+- readable by anything that can mount the image — including a *different* live USB,
+  since the image is in a known location.
+
+That is a lower bar than the credential it would replace. The Windows store it
+would be duplicating is DPAPI-encrypted to the user; a file in `home.btrfs` is not.
+**Putting a GitHub token there would be a downgrade**, and it should not be
+presented as "the same thing, but convenient".
+
+### If it is wanted anyway
+
+The defensible version, in order of preference:
+
+1. **Do not store it.** Authenticate per boot. This is what happened here, and it
+   is why the push needs a human — which is arguably correct for a token that can
+   write to a public repository.
+2. **Store a scoped, expiring credential.** A fine-grained PAT limited to
+   `lsl-usb` with a short expiry, so the exposure window is bounded and the blast
+   radius is one repository. Far better than a classic token.
+3. **Encrypt at rest.** The image supports it — but the key must then live
+   somewhere, and on a live-boot system with no TPM and no login keyring, "somewhere"
+   collapses to a file next to the token. Be honest that this buys little.
+4. **`gh`'s keyring mode**, if `gh` is added to the image. It uses the OS keyring
+   where there is one; on this image there is not, so it falls back to a plain file
+   anyway.
+
+**And whatever is chosen, the pane (if the user opts in) must say the two things
+that matter:** the credential is stored **unencrypted**, and it is **visible to
+Windows** because the home image lives on an NTFS volume.
+
+### What this is *not*
+
+It is not a way to make the push work from here. The blocker was never storage —
+it was that no credential exists on this side, and the one that does lives in
+Windows' DPAPI store. Persistence would let a credential survive *between boots*;
+it does not supply one, and it does not decrypt an existing one.
+
+**Not implemented, and not proposed for implementation** — recorded because the
+question is reasonable, the answer is "yes, mechanically", and the caveats are the
+part that matters.
+
+### 10.1 Why the `v0.1.1` push was blocked — the environment, recorded
+
+The push failed and the investigation is worth keeping, because the conclusion
+("there is no credential here") is not obvious and the evidence is easy to
+misread as a solvable problem. Measured:
+
+| check | result |
+|---|---|
+| `git ls-remote origin` (read) | **works** — public repo, anonymous read |
+| credential helper (`agent`) | configured, but `git credential fill` returns **nothing stored** |
+| `~/.ssh/` | empty |
+| `ssh -T git@github.com` | `Permission denied (publickey)` |
+| `GH_TOKEN` / `GITHUB_TOKEN` | unset |
+| `gh` CLI | not installed |
+| push attempt | `fatal: could not read Username for 'https://github.com': terminal prompts disabled` |
+
+**The credential exists on the Windows side and cannot be reached from here:**
+
+| location | state |
+|---|---|
+| `/mnt/c/Users/s_pam/AppData/Roaming/GitHub CLI/hosts.yml` | names `gmatht`, but `grep oauth_token` → **0 matches**; a stub |
+| `/mnt/c/Users/s_pam/AppData/Local/Microsoft/Credentials/` | 6 blobs, **DPAPI-encrypted** to the Windows user |
+| `/mnt/c/Users/GCon/AppData/Local/Microsoft/Credentials/` | 1 blob, same |
+| `.git-credentials` under `/mnt/c` | none |
+
+**And the usual bridge does not exist here.** `WSLInterop` is **not registered** in
+`/proc/sys/fs/binfmt_misc/`, and the kernel is `6.14.0-37-generic` — this is *plain
+Linux*, not WSL. So Windows binaries cannot be executed to borrow their credentials:
+
+```
+$ /mnt/c/Windows/System32/cmd.exe /c echo hello
+/mnt/c/Windows/System32/cmd.exe: 1: MZ...: not found
+```
+
+The PE is read as a shell script — no binfmt handler. That is why the Windows
+`git.exe` and `git-credential-manager.exe` (both installed, both presumably holding
+the credential) are unusable from this side.
+
+**So the blocker is structural, not a missing step.** DPAPI decryption requires the
+Windows user's login secrets; no amount of searching the filesystem substitutes for
+that. The correct resolutions are: push from a Windows session, or supply a token.
+
+**Worth recording for a different reason:** this is the *third* time this session
+found something that "exists but is unreachable" — a stale embedded script
+(`WHYFAIL15`), a `VERSION` file the nofmt path never stages (`WHYFAIL16`), and now
+a credential that is present on the machine but in a store only Windows can open.
+The pattern is a **gap between where a thing is and where it is looked for**.
+
 ## The rule worth keeping
 
 > **"The filesystem supports it" and "the platform's tools do it" are different

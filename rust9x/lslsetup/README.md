@@ -231,8 +231,28 @@ Exit codes: 0 success, 1 fatal error, 2 user cancel.
 
 ## Testing
 
+> **Where these can be run matters, and it is easy to get wrong.** The
+> rust9x/Windows toolchain lives on the Windows side
+> (`/mnt/c/Users/<user>/.cargo/bin/cargo.exe`), and there is **no Linux
+> cargo/rustc** on the live stick image. Running the Windows one from Linux
+> requires **WSL interop**, which is *not* guaranteed to be enabled:
+>
+> ```
+> $ cat /proc/sys/fs/binfmt_misc/WSLInterop          # not registered on the stick
+> $ uname -r
+> 6.14.0-37-generic                                  # plain Linux, not WSL
+> $ /mnt/c/Windows/System32/cmd.exe /c echo hello
+> /mnt/c/Windows/System32/cmd.exe: 1: MZ...: not found    # PE read as a shell script
+> ```
+>
+> So on a machine in that state the Rust unit tests **cannot be run at all** —
+> not because the toolchain is missing, but because the bridge to it is. Say so
+> in a change summary rather than implying the tests passed. The shell-level
+> suites below (`bash tests/*.tests.sh`) *do* run there.
+
 - `cargo +rust9x test --target i686-rust9x-windows-msvc` (unit tests,
-  incl. the nofmt MBR/menu.lst logic and asset-hash pins)
+  incl. the nofmt MBR/menu.lst logic and asset-hash pins) — **needs WSL interop
+  or a Windows shell; see the note above**
 - `tests/qemu-boot-test.sh` (Linux, needs qemu-system-i386 + grub-mkrescue +
   xorriso + sfdisk + mkfs.vfat, run as root): builds a disk image replicating
   exactly what the nofmt boot creator produces (using the real embedded

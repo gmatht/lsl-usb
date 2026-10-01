@@ -549,6 +549,22 @@ fix, and — importantly — what is *not* yet in effect on a booting stick.
   because `bin/lsl-pin-favorites` parsed `gsettings get` output line-wise: an `as`
   array arrives on one line, so the whole favorites list collapsed into a single
   unresolvable entry and Cinnamon silently dropped it. Companion to `WHYFAIL15`.
+- [`WHYFAIL14.md`](rust9x/lslsetup/WHYFAIL14.md) — casper's two branches are both
+  real: `layerfs-path=` selects a dot-suffix walk (with a `panic` on a missing
+  layer), its absence selects a lexical `*.squashfs` glob. The repo moved normal
+  boots to the glob branch and kept `LAYERFS_PATH` only for the HDD mirror.
+  Written because the first answer — "the dotted names were never a design" — was
+  wrong, and **fetching 60 lines of upstream `scripts/casper` is what disproved
+  it.**
+- [`WHYFAIL15.md`](rust9x/lslsetup/WHYFAIL15.md) — the fix was in `bin/`, but every
+  shipped `lslsetup.exe` embedded the old copy: `include_str!` makes a *rebuild*
+  pick up an edit and does nothing about a binary built earlier. **Pin the bytes,
+  not the path.**
+- [`WHYFAIL16.md`](rust9x/lslsetup/WHYFAIL16.md) — every build trace is blank. The
+  version is read from `<bundle>\VERSION`, which the default (nofmt) path has no
+  bundle for, and `unwrap_or_default()` turns the missing file into an empty
+  string — so `lsl-diag.sh`, whose job is "which build is failing?", prints an
+  empty section on every stick.
 - [`FRAGILE_HOME.md`](FRAGILE_HOME.md) — companion to WHYFAIL9: the three ways
   lsl-usb answers "is `/home` persistent?", all 8 call sites and the risk each
   carries, and the rules for changing persistence code safely.

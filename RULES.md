@@ -12,7 +12,7 @@ document that carries the evidence. **Where a rule and a document disagree, the
 document is authoritative** — several of the rules below are corrections of the
 first answer given, and the documents record both.
 
-**Count:** the source documents carry 69 rule blocks; the **53 collected here** are
+**Count:** the source documents carry 69 rule blocks; the **55 collected here** are
 those with a generalisable lesson (status notices and superseded-by markers are
 dropped). Sources: `WHYFAIL5/6/7/9/11/12/17` (repo root), `WHYFAIL13/14/15/16`
 (`rust9x/lslsetup/`), `DESIGN-F2FS-PERSISTENCE`, `DESIGN-PERSISTENCE-PANE`,
@@ -153,6 +153,21 @@ repeatedly: reasoning from a specification instead of running it.
 > negotiation was failing; NBD connecting was never in doubt. Prototyping the easy
 > part is a way of avoiding the hard question.
 > — `DESIGN-BOOT-TO-RAM-VARIANTS.md` §11.11
+
+> **A thing existing and a thing being reachable are different facts.** Three
+> times in one session: a fix committed but absent from the shipped binary
+> (`WHYFAIL15`), a `VERSION` file the nofmt path never stages (`WHYFAIL16`), and a
+> credential present on the machine but in a Windows DPAPI store that Linux cannot
+> open — with the usual bridge (`WSLInterop`) not registered, so even the Windows
+> `cargo.exe` cannot be executed. In each case "it is there" was true and "I can
+> use it" was false. Check the second before planning around the first.
+> — `DESIGN-PERSISTENCE-PANE.md` §10.1, `rust9x/lslsetup/WHYFAIL15/16.md`
+
+> **Say what you could not run, and why.** The Rust unit tests for `lslsetup`
+> cannot be executed on a stick where WSL interop is off — the toolchain is on the
+> Windows side and unreachable. That is a fact about the environment, not a
+> shortcoming of the change, and it belongs in the summary rather than being
+> implied by silence. — `rust9x/lslsetup/README.md`
 
 > **Find the precedent before inventing the mechanism.** Flatpaks had this exact
 > problem — gigabytes of app data that must not go into a 4 GiB-capped layer — and
