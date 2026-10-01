@@ -12,7 +12,7 @@ document that carries the evidence. **Where a rule and a document disagree, the
 document is authoritative** — several of the rules below are corrections of the
 first answer given, and the documents record both.
 
-**Count:** the source documents carry 69 rule blocks; the **55 collected here** are
+**Count:** the source documents carry 70 rule blocks; the **56 collected here** are
 those with a generalisable lesson (status notices and superseded-by markers are
 dropped). Sources: `WHYFAIL5/6/7/9/11/12/17` (repo root), `WHYFAIL13/14/15/16`
 (`rust9x/lslsetup/`), `DESIGN-F2FS-PERSISTENCE`, `DESIGN-PERSISTENCE-PANE`,
@@ -153,6 +153,13 @@ repeatedly: reasoning from a specification instead of running it.
 > negotiation was failing; NBD connecting was never in doubt. Prototyping the easy
 > part is a way of avoiding the hard question.
 > — `DESIGN-BOOT-TO-RAM-VARIANTS.md` §11.11
+
+> **A name in a mount option is not a path in your namespace.** `mount` reports the
+> root overlay's upper as `/cow/upper`, and `/cow` does not exist — even for root.
+> Both are true: `/cow` was a tmpfs in the **initramfs** namespace, and casper
+> pivoted away from it, so the name never existed in the live one. Observe that
+> upper *through `/`* (copy-ups appear at their normal paths); do not expect to
+> `cd` to it. — `WHYFAIL12.md` §8
 
 > **A thing existing and a thing being reachable are different facts.** Three
 > times in one session: a fix committed but absent from the shipped binary

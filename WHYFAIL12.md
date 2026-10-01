@@ -324,7 +324,94 @@ regenerate around the overlay.
 | tmpfs mask over identity paths | if we ever cannot scrub | weaker — empty, not correct |
 
 
+## 8. Why `/cow` is invisible (asked 2026-10-01)
+
+`mount` says the root overlay's upper is `/cow/upper`, yet `/cow` does not exist:
+
+```
+$ mount | grep "on / type"
+/cow on / type overlay (rw,relatime,
+  lowerdir=/filesystem_z20260930192536.squashfs:...,upperdir=/cow/upper,workdir=/cow/work)
+
+$ ls /cow
+ls: cannot access '/cow': No such file or directory          # even as root
+$ ls /*/cow
+ls: cannot access '/*/cow': No such file or directory
+$ df
+/cow             8077596     64820   8012776   1% /
+```
+
+**Both statements are true, and they are about different namespaces.**
+
+### What the mount line actually says
+
+`mount` prints the overlay's **source** as `/cow`. In `/proc/self/mountinfo` the
+row reads:
+
+```
+42 2 0:30 / / rw,... - overlay /cow rw,lowerdir=...,upperdir=/cow/upper,...
+            ^                                            ^
+            root = / (the overlay is mounted AT /)       source = /cow
+```
+
+So `/cow` is the **backing store** — a tmpfs that casper created in the
+**initramfs**, mounted the overlay over, and then pivoted away from. The overlay
+took over as `/`, and with it the root of that tmpfs. The *path* `/cow` existed in
+the initramfs's mount namespace; the namespace you are typing in is a different
+one, created when casper (or its `switch_root`) handed off to the real init.
+
+That is why `df` lists `/cow` with the same size as `/` — they are the same
+storage, one named as the mountpoint the kernel knows about and one named as the
+filesystem you can see. `df` reads `/proc/mounts`, which records the source name
+regardless of whether that path is reachable.
+
+### Why it cannot be reached
+
+- **Root does not help.** This is a namespace boundary, not a permission.
+- **There is nothing to bind to.** `mount --bind / /mnt` shows the overlay again,
+  because `/` *is* the overlay; `/cow` is not a second mount that got covered over,
+  it is a name from a namespace that no longer applies.
+- **The initramfs namespace is gone.** casper's process exited; the live system's
+  mount namespace is `4026531841` (`/sbin/init`). Nothing in it has `/cow`.
+
+### What to use instead
+
+The upper's *contents* are perfectly reachable — through the overlay, as ordinary
+paths:
+
+```
+$ ls -la /etc/hostname /etc/casper.conf      # copy-ups, i.e. files in the upper
+-rw-r--r-- 1 root root 437 Oct  1 02:41 /etc/casper.conf
+-rw-r--r-- 1 root root   7 Oct  1 02:41 /etc/hostname
+```
+
+Anything written since boot is a copy-up, so it lives in `/cow/upper` *and* is
+visible at its normal path. That is why `WHYFAIL12` §1 can identify the
+machine-identity files by their fresh mtimes — **the upper is observed through `/`,
+not through its own name.**
+
+And `uproot` does not need `/cow` either: it mounts its *own* overlay at
+`/tmp/squashfs/root` with `upperdir=/tmp/squashfs/upper`, which **is** a normal,
+visible path, and packs that. The confusion is easy to fall into because both
+uppers are called "the upper" and only one of them is addressable.
+
+### Summary
+
+| | casper's root overlay | uproot's config overlay |
+|---|---|---|
+| upper | `/cow/upper` | `/tmp/squashfs/upper` |
+| reachable by path? | **no** — initramfs namespace | **yes** — created by us, in this namespace |
+| how to observe it | through `/` (copy-ups) | directly |
+| packed into a layer? | **no** (RAM, discarded) | **yes** (`mksquashfs`) |
+
 ## The rule worth keeping
+
+> **A name in a mount option is not a path in your namespace.** `mount` reports the
+> root overlay's upper as `/cow/upper`, and `/cow` does not exist — not even for
+> root (§8). Both are true: `/cow` was a tmpfs in the *initramfs* namespace, and
+> casper pivoted away from it, so the name never existed in the live one. Observe
+> that upper **through `/`** (copy-ups appear at their normal paths); do not expect
+> to `cd` to it.
 
 > **Check whether you are the thing you are blaming.** I twice dismissed the
 > initrd as something that "mounts / before any script of ours runs". We *build*
