@@ -261,7 +261,7 @@ run_job() {
             local out="$dest/${name}_${ts}_full.squashfs"
             echo "  full: $cnt file(s) -> $out"
             ( cd "$src" && tar -c -f - --no-recursion -T "$listf" ) | \
-                mksquashfs - "$out" -tar -comp zstd -Xcompression-level 22 -noappend >/dev/null
+                mksquashfs - "$out" -tar -comp zstd -Xcompression-level "$LSL_SQUASHFS_COMPRESSION_LEVEL" -noappend >/dev/null
             local unc; unc="$(sum_sizes_from_list "$listf" "$src")"
             local comp; comp="$(stat -c %s "$out" 2>/dev/null || echo 0)"
             record_ratio "$name" "$unc" "$comp"
@@ -282,7 +282,7 @@ run_job() {
             local out="$dest/${name}_${ts}_incr.squashfs"
             echo "  incremental: $cnt changed file(s) since $(date -d "@$thr" '+%F %T' 2>/dev/null || echo "epoch $thr") -> $out"
             ( cd "$src" && tar -c -f - --no-recursion -T "$listf" ) | \
-                mksquashfs - "$out" -tar -comp zstd -Xcompression-level 22 -noappend >/dev/null
+                mksquashfs - "$out" -tar -comp zstd -Xcompression-level "$LSL_SQUASHFS_COMPRESSION_LEVEL" -noappend >/dev/null
             local unc; unc="$(sum_sizes_from_list "$listf" "$src")"
             local comp; comp="$(stat -c %s "$out" 2>/dev/null || echo 0)"
             echo "  incremental: wrote $(human "$comp") (raw $(human "$unc"))."

@@ -1034,9 +1034,16 @@ EOF
 }
 
 # --- bin/lsl-btrfs-growd: grow + loop refresh -------------------------------
-@test "lsl-btrfs-growd: grows the image and refreshes the loop device" {
+# try_grow() calls the shared lsl_refresh_image_loops() from bin/lsl-common.sh,
+# so both must be spliced in or the call is a bare "command not found".
+load_growd_funcs() {
     eval "$(sed -n '/^free_pct()/,/^}/p' bin/lsl-btrfs-growd)"
     eval "$(sed -n '/^try_grow()/,/^}/p' bin/lsl-btrfs-growd)"
+    eval "$(sed -n '/^lsl_refresh_image_loops()/,/^}/p' bin/lsl-common.sh)"
+}
+
+@test "lsl-btrfs-growd: grows the image and refreshes the loop device" {
+    load_growd_funcs
     IMG="$TMPDIR_TEST/home.btrfs"
     touch "$IMG"
     MIN_PCT=10
@@ -1059,8 +1066,7 @@ EOF
 }
 
 @test "lsl-btrfs-growd: discovers the loop via losetup -j when findmnt shows no loop" {
-    eval "$(sed -n '/^free_pct()/,/^}/p' bin/lsl-btrfs-growd)"
-    eval "$(sed -n '/^try_grow()/,/^}/p' bin/lsl-btrfs-growd)"
+    load_growd_funcs
     IMG="$TMPDIR_TEST/home.btrfs"
     touch "$IMG"
     MIN_PCT=10
@@ -1080,8 +1086,7 @@ EOF
 }
 
 @test "lsl-btrfs-growd: resizes the underlying fs mount, not a stacked overlay" {
-    eval "$(sed -n '/^free_pct()/,/^}/p' bin/lsl-btrfs-growd)"
-    eval "$(sed -n '/^try_grow()/,/^}/p' bin/lsl-btrfs-growd)"
+    load_growd_funcs
     IMG="$TMPDIR_TEST/home.btrfs"
     touch "$IMG"
     MIN_PCT=10
@@ -1581,6 +1586,26 @@ EOF
     # A persistent grow log must explain the busy-loop limitation.
     [ -f "$TMPDIR_TEST/datadir/lsl-btrfs-grow.log" ]
     grep -q "reboot to apply" "$TMPDIR_TEST/datadir/lsl-btrfs-grow.log"
+}
+
+@test "lsl-btrfs-growd: refreshes EVERY loop attached to the image, not just the first" {
+    # A stale loop left over from a crashed boot keeps the old size cached, so
+    # refreshing only the first device (the old head -1 behaviour) silently
+    # misses the growth. Both devices must be refreshed.
+    eval "$(sed -n '/^lsl_refresh_image_loops()/,/^}/p' bin/lsl-common.sh)"
+    IMG="$TMPDIR_TEST/home.btrfs"
+    touch "$IMG"
+    losetup() {
+        case "$1" in
+            -j) printf '/dev/loop0: [2049]:12345 (%s)\n/dev/loop1: [2050]:12345 (%s)\n' "$IMG" "$IMG" ;;
+            -c) echo "losetup -c $2" >> "$TMPDIR_TEST/losetup.log" ;;
+        esac
+    }
+    # Both devices report as block devices so neither is skipped.
+    test() { case "$1" in -b) return 0 ;; *) command test "$@" ;; esac; }
+    lsl_refresh_image_loops "$IMG"
+    grep -q "losetup -c /dev/loop0" "$TMPDIR_TEST/losetup.log"
+    grep -q "losetup -c /dev/loop1" "$TMPDIR_TEST/losetup.log"
 }
 
 @test "lsl-btrfs-growd: honors LSL_BTRFS_GROW_INTERVAL_SEC in the loop" {

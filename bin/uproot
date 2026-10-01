@@ -331,7 +331,7 @@ write_append_layer() {
     # a content-addressed object store (multi-GB) that must NEVER be baked into
     # a FAT32-capped layer file - flatpaks live in the FAT-hosted 'lsl-fat'
     # installation as direct files instead (see install_flatpaks_fat).
-    if ! mksquashfs /tmp/squashfs/upper "$layer" -comp zstd -Xcompression-level 22 \
+    if ! mksquashfs /tmp/squashfs/upper "$layer" -comp zstd -Xcompression-level "$LSL_SQUASHFS_COMPRESSION_LEVEL" \
         -wildcards -e "var/lib/flatpak/*" "var/cache/apt/archives/*" "var/lib/apt/lists/*"; then
         # Never leave a partial layer behind: the next append would extend
         # a corrupt chain link and every later boot would panic on it.
@@ -675,7 +675,7 @@ case "$choice" in
         echo "Building merged filesystem.squashfs..."
         merge_log="${usb_log_dir}/merge-${ts}.log"
         if ! (cd /tmp/squashfs/root && mksquashfs . "$new" \
-            -comp zstd -Xcompression-level 22 \
+            -comp zstd -Xcompression-level "$LSL_SQUASHFS_COMPRESSION_LEVEL" \
             -one-file-system \
             -wildcards -e "home/*" "var/cache/apt/archives/*" "var/lib/apt/lists/*") >"$merge_log" 2>&1; then
             echo "Merge failed."

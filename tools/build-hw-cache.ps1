@@ -11,32 +11,42 @@
 # times. Existing cache files are skipped (safe to re-run / resume).
 #
 # Usage:  pwsh tools/build-hw-cache.ps1 [-DelaySec 12] [-CacheDir <path>]
+#                                          [-BaseUrl <url>]
 #
-# TODO(mirror): the upstream linux-hardware.org rate-limits aggressively
-# (HTTP 429 after a handful of rapid requests; robots.txt Crawl-delay: 10s),
-# which makes both this build and the live rating fragile. Stand up a local
-# mirror of the LKDDb device pages (e.g. on www.easyp.net) and point both this
-# script and Get-LhwPage (install.ps1) at it. The mirror can be refreshed on a
-# cron, letting the bundle ship a complete, always-fresh cache with zero
-# dependence on the upstream rate limiter. The cache file format is identical
-# (lsl-lhw-<type>-<vid>-<did>.html), so only the base URL needs to change.
+# -BaseUrl (or the LSL_LHW_BASE_URL environment variable) points this build at a
+# mirror of the LKDDb device pages instead of upstream. Upstream rate-limits
+# aggressively (HTTP 429 after a handful of rapid requests; robots.txt
+# Crawl-delay: 10s), which makes this build fragile; a mirror refreshed on a cron
+# lets the bundle ship a complete, always-fresh cache with no dependence on the
+# rate limiter. The cache file format is unchanged
+# (lsl-lhw-<type>-<vid>-<did>.html), so only the base URL differs - which is why
+# install.ps1 honours the same LSL_LHW_BASE_URL override.
+#
+# Remaining TODO (not a code change): stand up the mirror host itself. That is
+# infrastructure outside this repo, so only the parameterisation lives here.
 # ---------------------------------------------------------------------------
 [CmdletBinding()]
 param(
     [int]$DelaySec = 12,
     [string]$IdFile,
-    [string]$CacheDir
+    [string]$CacheDir,
+    [string]$BaseUrl
 )
 
 $ErrorActionPreference = 'Stop'
 if (-not $IdFile)   { $IdFile   = Join-Path $PSScriptRoot 'hw-cache-ids.txt' }
 if (-not $CacheDir) { $CacheDir = Join-Path $PSScriptRoot '..' 'lsl-hw-cache' }
+# -BaseUrl wins, then the environment override, then upstream.
+if (-not $BaseUrl) { $BaseUrl = $env:LSL_LHW_BASE_URL }
+if (-not $BaseUrl) { $BaseUrl = 'https://linux-hardware.org/' }
+if (-not $BaseUrl.EndsWith('/')) { $BaseUrl += '/' }
 $CacheDir = Resolve-Path $CacheDir -ErrorAction SilentlyContinue
 if (-not $CacheDir) { New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null }
 $CacheDir = Resolve-Path $CacheDir
 
 Write-Host "Reading IDs from: $IdFile"
 Write-Host "Writing cache to : $CacheDir"
+Write-Host "Fetching from    : $BaseUrl"
 
 $ids = @()
 foreach ($line in (Get-Content $IdFile)) {
@@ -91,7 +101,7 @@ foreach ($id in $ids) {
             Start-Sleep -Seconds ($DelaySec - $elapsed.TotalSeconds)
         }
     }
-    $url = "https://linux-hardware.org/?id=$id"
+    $url = "${BaseUrl}?id=$id"
     $status = 'RATELIMITED'
     $html = ''
     for ($attempt = 1; $attempt -le 4; $attempt++) {

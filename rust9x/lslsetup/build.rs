@@ -6,6 +6,7 @@
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 fn find_between<'a>(s: &'a str, start: &str, end: &str) -> Option<&'a str> {
     let i = s.find(start)? + start.len();
@@ -55,6 +56,27 @@ fn parse_page(html: &str) -> (String, String, String, Vec<String>) {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
+
+    // ---- Git revision, for the build stamp (WHYFAIL16) ----------------------
+    // The version alone answers "what is this?"; the revision answers "what
+    // changed since the last stick?" (v0.1.0-112-g6cccb91 is far more useful
+    // than 0.1.0 for that). Best effort: a source tree without git, or a build
+    // in an environment without it, still has to succeed, so a failure here is
+    // NOT a build error - src/version.rs treats the empty value as "unknown" and
+    // omits the stamp line rather than printing a placeholder.
+    {
+        let rev = Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .current_dir(&manifest)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
+        println!("cargo:rustc-env=LSL_GIT_REV={}", rev);
+    }
 
     // ---- Embedded z0 firstboot layer freshness (WHYFAIL10) -----------------
     // src/lslfiles.rs embeds assets/filesystem.z0.squashfs with include_bytes!,

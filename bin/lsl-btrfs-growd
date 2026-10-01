@@ -67,11 +67,11 @@ try_grow() {
         [ -n "$lower" ] && fs_mp="$lower"
     fi
 
-    # PRIMARY (online): make the live loop device pick up the new file size with
-    # losetup -c. No unmount needed, so this works even while /home is busy.
-    if [ -n "$loop_dev" ] && [ -b "$loop_dev" ]; then
-        losetup -c "$loop_dev" 2>/dev/null || true
-    fi
+    # PRIMARY (online): make every loop device attached to this image pick up the
+    # new file size, so the following resize sees a larger device. This is the
+    # shared helper (bin/lsl-common.sh): it refreshes ALL attached loops, not
+    # just the first, and surfaces losetup errors that used to be discarded.
+    lsl_refresh_image_loops "$img"
 
     # Grow the btrfs filesystem to fill the (now larger) device. This is the step
     # that actually changes the usable space on a busy mount. Target the fs
@@ -84,17 +84,28 @@ try_grow() {
     # ignore losetup -c; if so we try a re-loop, but only when the filesystem can
     # be unmounted - otherwise leave a clear "reboot needed" note (online growth
     # of a busy loop-backed FS is fundamentally limited).
-    if [ -n "$loop_dev" ] && [ -b "$loop_dev" ] && command -v blockdev >/dev/null 2>&1; then
+    #
+    # This check runs whenever a loop device is known, and does not require
+    # blockdev: without it the mismatch used to go unreported entirely and the
+    # cycle ended in a bare `df -h` with no warning at all.
+    if [ -n "$loop_dev" ] && [ -b "$loop_dev" ]; then
         new_size="$(stat -c %s "$img" 2>/dev/null || echo 0)"
         loop_size="$(blockdev --getsize64 "$loop_dev" 2>/dev/null || echo 0)"
-        if [ "$loop_size" != "$new_size" ] && [ "$loop_size" -gt 0 ] 2>/dev/null; then
+        if [ -z "$loop_size" ] || [ "$loop_size" = 0 ]; then
+            # blockdev unavailable or refused: cannot compare, but still tell the
+            # user the online apply is unconfirmed rather than staying silent.
+            echo "lsl-btrfs-growd: could not read the loop device size; online growth of ${label} is unconfirmed." >&2
+        elif [ "$loop_size" != "$new_size" ]; then
             echo "lsl-btrfs-growd: loop device did not pick up new size ($loop_size != $new_size); re-looping ${img}." >&2
             if mountpoint -q "$mp" 2>/dev/null && umount "$mp" 2>/dev/null; then
                 losetup -d "$loop_dev" 2>/dev/null || true
                 loop_dev="$(losetup -f --show "$img" 2>/dev/null || true)"
                 if [ -n "$loop_dev" ]; then
-                    mount -o loop,compress=zstd:3,relatime "$img" "$mp" 2>/dev/null || true
-                    btrfs filesystem resize max "$mp" 2>/dev/null || true
+                    # Mount the device we just created rather than `-o loop` on
+                    # the file: the latter can attach a SECOND loop device and
+                    # strand the first.
+                    mount "$loop_dev" "$fs_mp" 2>/dev/null || true
+                    btrfs filesystem resize max "$fs_mp" 2>/dev/null || true
                 fi
             else
                 echo "lsl-btrfs-growd: cannot remount busy ${label}; a reboot is required to grow it." >&2

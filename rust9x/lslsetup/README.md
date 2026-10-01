@@ -106,6 +106,13 @@ Everything the PS script does is implemented:
   with no explanation.
 - `--dry-run`: the full detection report, plus a capability summary
 - `--probe-os`: capability self-test (OS/UEFI/RAM/volumes/netsh/winhttp/PnP)
+- `--version`: the crate version and git revision, then exit 0 (shares
+  `--help`'s print-and-exit path). The same values are stamped onto the stick as
+  `lsl-build.txt` (version, build time, revision) and `/cdrom/VERSION`, which
+  `bin/lsl-diag.sh` reads on a failed boot. The version falls back to the
+  compiled-in `CARGO_PKG_VERSION` when the bundle has no `VERSION` file — the
+  default nofmt path never does, and it used to stamp a blank line instead
+  (WHYFAIL16).
 
 ## Compiled-in LKDDb cache + sortable hardware page
 
@@ -118,6 +125,10 @@ Everything the PS script does is implemented:
   that column (Support sorts in rating order A < C < D < U) and toggles
   asc/desc with ▲/▼ arrows. Note: nwg's ListView defaults to `NO_HEADER` —
   `set_headers_enabled(true)` is required.
+- The LKDDb base URL is overridable with the `LSL_LHW_BASE_URL` environment
+  variable, for when upstream rate-limits (HTTP 429). The cache file format is
+  unchanged, so a mirrored cache drops straight in; the 10 s crawl-delay still
+  applies.
 
 ## Elevation
 
@@ -211,6 +222,7 @@ Same options as install.ps1's parameter block, as long flags:
 
 ```
 lslsetup.exe --help
+lslsetup.exe --version                      # version + git revision, then exit
 lslsetup.exe --dry-run                       # detection report, writes nothing
 lslsetup.exe --probe-os                      # capability self-test
 lslsetup.exe --iso-path C:\ISO\zorin-18.1.iso

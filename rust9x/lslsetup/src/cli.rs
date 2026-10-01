@@ -164,6 +164,7 @@ Options:
   --sfs-hdd-cache             Copy the squashfs to the HDD cache
   --reclaim-win-swap          Reclaim the Windows swapfile
   --fast-startup-off          Turn off Fast Startup/hibernate (powercfg /h off)
+  --version                   Print the version and git revision, then exit
   --help                     This text
 ";
 
@@ -231,6 +232,10 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--reclaim-win-swap" => o.reclaim_win_swap = true,
             "--fast-startup-off" => o.fast_startup_off = true,
             "--help" | "-h" => return Err(USAGE.to_string()),
+            // Same "print and exit 0" path as --help: main.rs only treats a
+            // message starting with "unknown option" as an error. WHYFAIL16 -
+            // the exe could not be asked what version it was at all.
+            "--version" | "-V" => return Err(crate::version::version_line()),
             other => return Err(format!("unknown option: {}\n\n{}", other, USAGE)),
         }
     }

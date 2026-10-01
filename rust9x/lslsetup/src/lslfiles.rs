@@ -334,16 +334,45 @@ pub fn install_lsl_files(vol_letter: &str, bundle_dir: &str) -> Result<(), Strin
         }
     }
     // Stamp the build for traceability (captured by lsl-diag.sh on failure).
-    let build_ver = std::fs::read_to_string(format!("{}\\VERSION", bundle_dir))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    //
+    // WHYFAIL16: this used to read <bundle>\VERSION and unwrap_or_default() to the
+    // empty string when that read failed. The default (nofmt) path has no bundle at
+    // all, so EVERY stick got a blank version line and lsl-diag.sh - whose job is
+    // "which build is failing?" - printed an empty section, silently. Falling back to
+    // the compiled-in version cannot be empty and needs no staged file, and the
+    // missing file is now reported rather than swallowed.
+    let build_ver = match std::fs::read_to_string(format!("{}\\VERSION", bundle_dir)) {
+        Ok(s) => {
+            let t = s.trim().to_string();
+            if t.is_empty() {
+                out::warn("bundle VERSION file is empty; using the compiled-in version.");
+            }
+            crate::version::resolve_version(Some(&t))
+        }
+        Err(_) => {
+            out::warn(&format!(
+                "no VERSION in the bundle dir ({}); using the compiled-in version.",
+                bundle_dir
+            ));
+            crate::version::resolve_version(None)
+        }
+    };
     let stamp = format!(
-        "{}\nBuilt: {}\n",
+        "{}\nBuilt: {}\n{}\n",
         build_ver,
-        chrono_compat_utc()
+        chrono_compat_utc(),
+        crate::version::git_rev_line()
     );
     let _ = std::fs::write(format!("{}lsl-build.txt", root), stamp);
     copied.push("lsl-build.txt".into());
+
+    // The stick needs its own VERSION for bin/lsl-diag.sh, which reads BOTH
+    // /cdrom/lsl-build.txt and /cdrom/VERSION. It was never staged, so that second
+    // read was a guaranteed "no such file" on every stick. Write the SAME resolved
+    // value the stamp carries so the two can never disagree. Content is the bare
+    // version: lsl-diag.sh cats this file directly.
+    let _ = std::fs::write(format!("{}VERSION", root), format!("{}\n", build_ver));
+    copied.push("VERSION".into());
 
     // casper-md5check.service (stock Mint/Ubuntu live) verifies /cdrom against
     // /cdrom/md5sum.txt. A stock ISO ships that file; this stick does not - its

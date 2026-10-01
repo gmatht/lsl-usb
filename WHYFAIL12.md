@@ -159,7 +159,8 @@ boot would fall back to.
 
 ```bash
 # bin/uproot — write_append_layer()
-mksquashfs /tmp/squashfs/upper "$layer" -comp zstd -Xcompression-level 22 \
+mksquashfs /tmp/squashfs/upper "$layer" -comp zstd \
+    -Xcompression-level "$LSL_SQUASHFS_COMPRESSION_LEVEL" \
     -wildcards -e "var/lib/flatpak/*" "var/cache/apt/archives/*" "var/lib/apt/lists/*"
 
 # bin/uproot — the merge path

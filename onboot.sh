@@ -100,22 +100,12 @@ lsl_ensure_nix_daemon() {
 # Replace the # BEGIN lsl-usb fstab ... # END lsl-usb fstab block in /etc/fstab so
 # installers, disk tools, and "mount -a" see stable UUID/path lines for /cdrom,
 # Windows drive letters, persist, and (HDD mode) loop-backed /home and cache.
-# Refresh every loop device currently attached to $1 so the kernel sees the
-# grown file size. No-op when unattached. Never fails the caller.
-# Background: the kernel caches loop capacity at attach time; extending the
-# backing file leaves attached loops stale, and a later `btrfs resize max`
-# then silently no-ops (exit 0, no growth). Tested: partprobe does NOT fix
-# this (it only re-reads partition tables); `losetup -c` does.
-lsl_refresh_image_loops() {
-    local img="$1" devs dev
-    command -v losetup >/dev/null 2>&1 || return 0
-    devs="$(losetup -j "$(readlink -f "$img" 2>/dev/null || printf '%s' "$img")" 2>/dev/null | cut -d: -f1)"
-    [ -n "$devs" ] || return 0
-    for dev in $devs; do
-        [ -b "$dev" ] || continue
-        losetup -c "$dev" 2>/dev/null || true
-    done
-}
+# lsl_refresh_image_loops is the shared implementation (see bin/lsl-common.sh);
+# it refreshes every loop attached to a grown image so the kernel sees the new
+# file size. Background: the kernel caches loop capacity at attach time;
+# extending the backing file leaves attached loops stale, and a later
+# `btrfs resize max` then silently no-ops (exit 0, no growth). Tested: partprobe
+# does NOT fix this (it only re-reads partition tables); `losetup -c` does.
 
 lsl_grow_btrfs_image() {
     # Grow a btrfs image file to $2 MiB if it is currently smaller. Done while the

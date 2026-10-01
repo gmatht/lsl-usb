@@ -31,6 +31,13 @@ repeatedly: reasoning from a specification instead of running it.
 > libzstd whose real range is 1–19 (+`--ultra` to 22). Reading only the help would
 > have said "22 is a bug"; testing said "22 works and is pointless".
 > — `FINDINGS-COMPRESSION.md`
+>
+> *Resolved in 2026-10-01: the tree now uses one constant,
+> `LSL_SQUASHFS_COMPRESSION_LEVEL` (default 15 — the knee of the measured
+> ratio/time curve), and no call passes 22. Note the rule outlives its example:
+> the same "read the spec, then measure it" move decided the level, and the
+> measurement that is still missing — decompression cost per level — points the
+> opposite way.*
 
 > **"Requires N GB" and "allocates N GB" are different claims — test the second.**
 > dm-clone's destination must be ≥ the source (63 GB). A sparse tmpfs file is 64 GB

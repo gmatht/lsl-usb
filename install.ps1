@@ -947,6 +947,24 @@ function Install-HivexTools {
 $script:lhwDelaySec = 10
 $script:lhwLastRequest = $null
 
+# Base URL for LKDDb device pages. Upstream rate-limits hard (HTTP 429 after a
+# few rapid requests; robots.txt Crawl-delay: 10s), which makes both the bundled
+# cache build and this live rating fragile. Override with the LSL_LHW_BASE_URL
+# environment variable to fetch from a mirror instead - only the URL changes,
+# the cache file format (lsl-lhw-<type>-<vid>-<did>.html) and the parser are
+# identical, so a mirrored cache drops straight in. The crawl-delay below still
+# applies: a mirror changes WHERE pages come from, not how politely we fetch.
+if ($env:LSL_LHW_BASE_URL) { $script:LhwBaseUrl = $env:LSL_LHW_BASE_URL }
+else { $script:LhwBaseUrl = 'https://linux-hardware.org/' }
+if (-not $script:LhwBaseUrl.EndsWith('/')) { $script:LhwBaseUrl += '/' }
+
+function Get-LhwIdUrl {
+    # Device page URL for an id like 'pci:10ec-c821', honouring the mirror
+    # override above.
+    param([string]$Id)
+    return "$($script:LhwBaseUrl)?id=$Id"
+}
+
 function Get-LhwPage {
     # Fetch a linux-hardware.org page with a hard timeout. The site rate-limits
     # aggressively (429), so a hung request must not stall the whole report.
@@ -999,7 +1017,7 @@ function Get-LhwDevicePage {
             Start-Sleep -Seconds ($script:lhwDelaySec - $elapsed.TotalSeconds)
         }
     }
-    $html = Get-LhwPage -Url "https://linux-hardware.org/?id=$Id"
+    $html = Get-LhwPage -Url (Get-LhwIdUrl -Id $Id)
     $script:lhwLastRequest = Get-Date
     if ($html) {
         try { Set-Content -Path $userCache -Value $html } catch { }
@@ -2733,7 +2751,7 @@ try {
                     # emoji glyphs black).
                     $item.SubItems.Add([string]::Format("{0}{1}{2}", [char]0xD83C, [char]0xDF10, [char]0xFE0E)) | Out-Null
                     $item.SubItems[1].Tag = $r.Rating
-                    $item.Tag = "https://linux-hardware.org/?id=$($d.Kind.ToLowerInvariant()):$($d.Vendor.ToLowerInvariant())-$($d.Device.ToLowerInvariant())"
+                    $item.Tag = Get-LhwIdUrl -Id "$($d.Kind.ToLowerInvariant()):$($d.Vendor.ToLowerInvariant())-$($d.Device.ToLowerInvariant())"
                     $lvHw.Items.Add($item) | Out-Null
                     if ($lvHw.ListViewItemSorter -ne $null) { $lvHw.Sort() }
                 }

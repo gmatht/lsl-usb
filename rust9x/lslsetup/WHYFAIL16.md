@@ -89,6 +89,8 @@ legitimately empty value.
 
 ## 4. What is in effect
 
+*As found, before the fix in §5:*
+
 | | value | source |
 |---|---|---|
 | repo `VERSION` | `0.1.0` | `VERSION` |
@@ -96,38 +98,56 @@ legitimately empty value.
 | git | `v0.1.0-112-g6cccb91` | 112 commits past the `v0.1.0` tag |
 | **on a stick** | **blank** | `lsl-build.txt` line 1; `/cdrom/VERSION` absent |
 
-There is also **no `--version` flag** on `lslsetup` (`cli.rs` has none), so the exe
-cannot be asked either.
+There was also **no `--version` flag** on `lslsetup` (`cli.rs` had none), so the
+exe could not be asked either.
 
-## 5. Fix (not implemented)
+*After the fix:* the crate is `0.1.1`, `lslsetup --version` prints
+`lslsetup 0.1.1 (5c48480)`, and a stick carries a non-empty version in **both**
+`lsl-build.txt` (with the revision) and `/cdrom/VERSION`.
 
-Three changes, smallest first:
+## 5. Fix — APPLIED 2026-10-01
+
+All four changes below are in the tree; `src/version.rs` is new and holds the
+resolver plus its unit tests.
 
 1. **Fall back to the compiled-in version.** `env!("CARGO_PKG_VERSION")` is always
-   available and is already `0.1.0` — it needs no file, works in the nofmt path,
-   and cannot be empty. This alone fixes the blank line.
+   available and is already `0.1.1` — it needs no file, works in the nofmt path,
+   and cannot be empty. This alone fixes the blank line. **Done** —
+   `version::resolve_version()`, exercised by
+   `missing_bundle_version_falls_back_to_the_compiled_in_version`.
 2. **Write `VERSION` to the stick root**, so `/cdrom/VERSION` exists for
-   `lsl-diag.sh:75` and for a user who looks. It is 7 bytes.
-3. **Make the missing-file case visible.** Log it rather than silently defaulting:
-   an empty version is a fact worth a line in the log, precisely because the file
-   exists to be read during a failure.
+   `lsl-diag.sh:75` and for a user who looks. It is 7 bytes. **Done** —
+   `install_lsl_files` writes the same resolved value the stamp carries, so the
+   two can never disagree.
+3. **Make the missing-file case visible.** Logged rather than silently
+   defaulted: an empty version is a fact worth a line in the log, precisely
+   because the file exists to be read during a failure. **Done** — `out::warn`
+   on both the missing and the present-but-empty case.
+4. **`--version`** on the CLI, cheap, and it makes the exe self-describing without
+   a stick. **Done** — `--version`/`-V`, sharing `--help`'s print-and-exit path.
 
-Optionally add `--version` to the CLI, which is cheap and makes the exe
-self-describing without a stick.
+Also done, from §5's "worth deciding at the same time": the stamp now carries the
+**git revision** (`build.rs` emits `LSL_GIT_REV` from `git rev-parse --short
+HEAD`, best effort — a tree without git still builds, and the stamp line is then
+omitted rather than filled with a placeholder). `v0.1.0-112-g6cccb91` answers
+"what changed since this stick was made?" in a way `0.1.0` cannot.
 
-Worth deciding at the same time: whether the stamp should also carry the **git
-revision**. `v0.1.0-112-g6cccb91` is far more informative than `0.1.0` for the
-"what changed since this stick was made?" question, and `build.rs` could embed it
-the way the z0 manifest already pins content hashes.
+The `VERSION` file itself stays the bare version, because `lsl-diag.sh` cats it
+directly and does not want the extra lines.
 
-**Nothing above is in effect.** No code was changed; this document is the finding.
+Verified: `lslsetup --version` prints `lslsetup 0.1.1 (5c48480)` and exits 0;
+`cargo test` passes 116 tests including the four new `version::tests`.
 
 ## 6. Not verified
 
-- Whether a *bundle* build (the Rufus flow) currently produces a correct stamp. The
-  code path allows it — `build.sh:145` puts `VERSION` in the bundle — but no bundle
-  was built here to confirm, and the nofmt path (the default, and the one on the
-  stick) cannot.
+- Whether a *bundle* build (the Rufus flow) produces a correct stamp. The code
+  path allows it — `build.sh:145` puts `VERSION` in the bundle, and the resolver
+  prefers it when present — but no bundle was built here to confirm. The nofmt
+  path (the default, and the one on the stick) is the one now covered by tests.
+- Whether a stick actually boots and shows the new files: no live-boot test was
+  run. The write is covered by the same `install_lsl_files` call that already
+  stages `lsl-build.txt` and `md5sum.txt`, and `lsl-diag.sh` is unchanged, so the
+  read side is unchanged too.
 - Whether anything else consumes `lsl-build.txt`. Grepped: only `lsl-diag.sh:48,75`.
 
 ## The rule worth keeping

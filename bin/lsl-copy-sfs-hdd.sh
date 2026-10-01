@@ -127,7 +127,7 @@ build_merged_layer() {
         rm -rf "$mnt"
         return 1
     fi
-    if ! mksquashfs "$acc" "$out" -comp zstd -Xcompression-level 22 \
+    if ! mksquashfs "$acc" "$out" -comp zstd -Xcompression-level "$LSL_SQUASHFS_COMPRESSION_LEVEL" \
         -wildcards -e "var/cache/apt/archives/*" "var/lib/apt/lists/*" \
                    "var/lib/flatpak/*" >/dev/null 2>&1; then
         echo "  FAILED to build merged layer $out" >&2

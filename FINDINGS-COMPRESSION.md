@@ -1,16 +1,19 @@
 # FINDINGS — Compression settings in lsl-usb
 
-**Status:** measurements only, plus what they imply. No code changed. Every number
-below was produced on this stick (Mint 22.3, mksquashfs 4.6.1, libzstd from the
-distro) and the command used is quoted beside it.
+**Status:** measurements, plus what they imply — and now **applied** (see §5).
+Every number below was produced on this stick (Mint 22.3, mksquashfs 4.6.1,
+libzstd from the distro) and the command used is quoted beside it.
 
-**Why this exists:** the tree has **six `mksquashfs` call sites with three
-different settings**, one of which passes a value the tool's own help says is out
-of range. That is worth writing down before anyone tunes it.
+**Why this exists:** the tree had **several `mksquashfs` call sites with three
+different settings**, one of which passed a value the tool's own help says is out
+of range. That was worth writing down before anyone tuned it. All of them now
+read one shared constant, `LSL_SQUASHFS_COMPRESSION_LEVEL` in `bin/lsl-common.sh`.
 
 ---
 
-## 1. What is configured today
+## 1. What was configured (before the change)
+
+Recorded as-found; §5 has the current state.
 
 | site | setting | role |
 |---|---|---|
@@ -18,9 +21,14 @@ of range. That is worth writing down before anyone tunes it.
 | `bin/uproot:678` (merge layer) | `-comp zstd -Xcompression-level 22` | same |
 | `bin/lsl-copy-sfs-hdd.sh:130` | `-comp zstd -Xcompression-level 22` | HDD mirror; boot-critical |
 | `bin/lsl-win-backup.sh:264,285` | `-comp zstd -Xcompression-level 22` | streamed Windows backup |
+| `install.sh:55,60` | `-comp zstd -Xcompression-level 22` | merge + append on live-session install |
+| `install.sh:12` | `-comp zstd` (**no level**) | `home.sfs` seed |
 | `bin/lsl-flush-home.sh:68` | `-comp zstd -b 512K` (**no level**) | home snapshot at shutdown |
 | `bin/lsl-mount-home.sh:153` | `-comp zstd` (**no level, no `-b`**) | first-boot `home.sfs` seed |
 | `misc/build-z0.sh:72` | `-comp zstd` (**no level**) | 12 KB stub, build-time |
+
+`install.sh` was **not in the original four-site table**; it also passed 22. That
+undercount is why §5 says seven sites, not four.
 
 Everything else in the tree is **btrfs** (`compress=zstd:3`), which is a different
 mechanism entirely and is not touched here:
@@ -111,19 +119,52 @@ payload suggested. A 6 % smaller layer is ~44 MB on a 739 MB append, in exchange
 for tens of seconds of CPU on the machine doing the append — which is the user's
 laptop, during first boot, on battery, while a progress dialog is on screen.
 
-## 5. What this implies (not implemented)
+## 5. What this implies — APPLIED, at level 15 (not the 9 recommended below)
 
-1. **`-Xcompression-level 22` should become 9** at the four call sites that use 22.
-   It is outside the documented range, buys nothing over 15–19, and costs the most
-   time of any setting in the tree. If a *deliberate* choice of "maximum" is
-   wanted, 19 is the honest ceiling — but see (2).
-2. **The default (no `-Xcompression-level`) is 9 per the help text.** The three
-   sites that omit it are already at the level the four others should use. That is
-   the argument for standardising on **9**: it is the documented default, it is
-   what the omitted-setting sites already do, and the measurable gain above it is
-   ~6 % for a large time cost.
-3. **Standardise, so the settings are reviewable.** Six sites, three settings, no
-   shared constant. Whatever value is chosen should live in one place.
+**Status: applied 2026-10-01.** Every `mksquashfs` call in the tree now takes
+`-Xcompression-level "$LSL_SQUASHFS_COMPRESSION_LEVEL"`, a single constant defined
+in `bin/lsl-common.sh` (overridable via the environment).
+
+> **The level is 15, deliberately, and this document recommended 9. Do not
+> "correct" it back.** The argument for 9 below (it is the documented default, and
+> the gain above it is only ~6 %) is sound but incomplete: it weighs the gain
+> against *write* time alone, and the measured table in §4 says 15 takes **89 % of
+> the available saving (5.7 of 6.4 points) for 6× the write time, where 19 needs
+> 14×**. 15 is the knee of the ratio/time curve. It also stays inside libzstd's
+> *regular* level range — levels ≥20 are `--ultra`, which mksquashfs' `1..9` help
+> text never mentions — so it relies on no undocumented behaviour.
+>
+> The original analysis stands on every other point, and §6's warning is the one
+> still worth acting on: **boot-time decompression was never measured and favours
+> lower levels.** Every layer is read on every boot. If boot time matters more
+> than layer size, lower the constant — it is one line in `bin/lsl-common.sh`.
+
+What was applied:
+
+1. **`-Xcompression-level 22` is gone from the tree.** It was outside the
+   documented range, it bought nothing over 19, and it did not finish inside the
+   measurement window on real content (§4). Replaced with the shared constant.
+2. **Seven call sites changed, not the four listed in §1** — the table above
+   undercounts. `install.sh:55,60` also passed 22 and are now covered.
+   `install.sh` does not source `lsl-common.sh`, so a guarded source line was
+   added for it. The level was also added to `install.sh:12` (`home.sfs`), which
+   previously relied on the tool default.
+3. **One constant, one place.** `LSL_SQUASHFS_COMPRESSION_LEVEL` in
+   `bin/lsl-common.sh`. Seven sites, one setting, reviewable.
+4. **Left alone deliberately:** `-b 512K` at `lsl-flush-home.sh:68` (block size
+   is a separate decision, §5.4 below), `bin/lsl-mount-home.sh:153`,
+   and the two 12 KB build-time stubs (`build.sh:136`, `misc/build-z0.sh:72`).
+   Note `btrfs` `compress=zstd:3` mounts are a different mechanism entirely and
+   are untouched.
+
+The original reasoning, kept because it explains why 22 was wrong at all:
+
+1. ~~**`-Xcompression-level 22` should become 9**~~ — superseded by 15 above.
+   If a *deliberate* choice of "maximum" is wanted, 19 is the honest ceiling.
+2. **The default (no `-Xcompression-level`) is 9 per the help text.** This is why
+   9 is a defensible floor, and why the three sites that omitted the flag were
+   not themselves broken.
+3. **Standardise, so the settings are reviewable.** Done — see above.
 4. **`-b 512K` at `lsl-flush-home.sh:68` is a separate decision.** Block size
    affects compression ratio little on typical data and increases memory use
    during decompression; worth measuring on `home.sfs` specifically before
@@ -152,14 +193,18 @@ Stated plainly, because the table above could be mistaken for a full picture:
 
 ## 7. The honest summary
 
-The tree asks for level 22 in the four places that matter most, while the tool
-documents 1–9 and the three places that do not specify a level already get 9.
-Measured, 22 buys **nothing** over 19 and 19 buys **~6 %** over 9 on real content
-for a large time cost — and none of that accounts for boot-time decompression,
-which is likely the real constraint. **The defensible change is to use the
-documented default (9) everywhere and to measure decompression before going
-higher.** That is a smaller change than the numbers in §3 first suggest, because
-§3's headline saving shrinks by half when measured on real data.
+As found, the tree asked for level 22 in the places that matter most, while the
+tool documents 1–9 and the sites that specify no level already got 9. Measured,
+22 buys **nothing** over 19 and 19 buys **~6 %** over 9 on real content for a
+large time cost — and none of that accounts for boot-time decompression, which is
+likely the real constraint.
+
+**What was actually applied is 15**, not the 9 this summary originally argued for:
+15 takes 89 % of the available saving for 6× the write time rather than 19's 14×,
+and it stays inside libzstd's regular range. The argument for 9 remains a
+reasonable floor on write-time grounds alone. The measurement that would settle
+it either way — decompression cost per level on a real boot — **is still missing**
+and is the thing to take next.
 
 ---
 

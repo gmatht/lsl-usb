@@ -116,23 +116,68 @@ OPEN 2026-10-01: PERSISTENCE PANE (design only) - DESIGN-PERSISTENCE-PANE.md.
       capability. This also makes it QEMU-testable without Windows.
   Blocks: lslsetup does NOT partition today (zero sfdisk/IOCTL_DISK_SET_*).
 
-OPEN 2026-10-01: COMPRESSION (findings only) - FINDINGS-COMPRESSION.md.
-  Four mksquashfs sites pass -Xcompression-level 22 (help documents 1..9;
-  22 IS honoured, passed to libzstd). Measured on real layer content: 9->19
-  saves ~6%, 19->22 saves nothing. Unmeasured: boot-time DECOMPRESSION cost,
-  which likely argues for LOWER levels. Recommend 9 everywhere from one
-  shared constant. Not applied.
+DONE 2026-10-01: COMPRESSION - FINDINGS-COMPRESSION.md, applied.
+  Every mksquashfs call now takes -Xcompression-level "$LSL_SQUASHFS_COMPRESSION_LEVEL",
+  ONE constant in bin/lsl-common.sh (default 15). 22 is gone: it was past
+  libzstd's regular range (>=20 is --ultra), past mksquashfs' documented 1..9,
+  bought nothing over 19, and did not finish in the measurement window on real
+  content. Level 15 = the knee of the measured curve (5.7% smaller than 9 for 6x
+  write time; 19 needs 14x for the last 0.7 points) - a deliberate DEVIATION from
+  FINDINGS' own recommended 9, recorded in the doc so nobody "fixes" it back.
+  SEVEN sites changed, not the four FINDINGS listed: install.sh:55,60 also passed
+  22 and install.sh did not source lsl-common.sh (guarded source added);
+  install.sh:12 (home.sfs) gained the level it had been defaulting.
+  Regenerated assets/toolkit_sources.sha256 (build.rs fails on drift).
+
+  STILL OPEN, and it is the measurement that decides the level:
+  boot-time DECOMPRESSION cost per level was never measured and points the OTHER
+  way - every layer is decompressed on every boot, so it favours LOWER levels.
+  If boot time matters more than layer size, lower the constant (one line).
+
+DONE 2026-10-01: WHYFAIL16 build stamp. The version no longer depends on a
+  staged <bundle>\VERSION that the default (nofmt) path does not have:
+  env!("CARGO_PKG_VERSION") is the fallback, the missing file is now LOGGED
+  instead of unwrap_or_default()-ed to "", /cdrom/VERSION is written (lsl-diag.sh
+  read it and it was never there), the stamp carries the git revision, and
+  `lslsetup --version` exists. New src/version.rs with the resolver split out so
+  the WHYFAIL16 regression is unit-tested (4 tests).
+
+DONE 2026-10-01 (code half): linux-hardware.org mirror is PARAMETERISED.
+  LSL_LHW_BASE_URL is honoured by install.ps1, lslsetup.exe (hardware.rs) and
+  tools/build-hw-cache.ps1 (-BaseUrl), so only the URL changes to point at a
+  mirror; the cache format (lsl-lhw-<type>-<vid>-<did>.html) is identical so a
+  mirrored cache drops straight in, and the 10s crawl-delay still applies.
+
+DONE 2026-10-01: btrfs-growd loop growth - docs/BTRFS-GROWD.md s3 + s3b.
+  The mechanism works; what was broken was WHICH loop got refreshed. Only the
+  FIRST attached loop device was (findmnt | head -1), so a stale loop from a
+  crashed boot kept the old size cached while the file grew every 60s. Now
+  lsl_refresh_image_loops is ONE shared implementation in bin/lsl-common.sh used
+  by both onboot.sh and the daemon, and it refreshes every attached loop. Also:
+  losetup -c stderr is surfaced instead of discarded (a silently-ignoring kernel
+  left no trace and `btrfs resize max` then exits 0 with no growth); the size
+  verification is no longer triple-gated behind blockdev, so the mismatch is
+  always reported; and the re-loop recovery no longer re-mounts with `-o loop`
+  (which could attach a SECOND device and strand the first) nor resizes $mp
+  instead of $fs_mp. tests/btrfs-growd.tests.sh now calls the real helper rather
+  than re-implementing it, and asserts the loop size matches the grown file.
+  Kept: boot-time unmounted growth is still the reliable path, and the
+  sparse-overprovision redesign stays deferred pending live verification.
+
+  STILL OPEN: no loop-device name is recorded in /run/lsl-usb.state at mount
+  time. Recording it would remove the discovery heuristics entirely - the
+  natural next step if this recurs.
 
 debug Nix
 debug Steam
 
-btrfs-growd: at present growing the file doesn't seem to grow the loop-device, can we fix?
-
 linux-hardware.org mirror: upstream rate-limits hard (HTTP 429 after a few
-rapid requests; robots.txt Crawl-delay: 10s), which makes both the bundled
-cache build (tools/build-hw-cache.ps1) and the live rating fragile. Stand up a
-local mirror of the LKDDb device pages (e.g. on www.easyp.net) and point both
-the build script and Get-LhwPage (install.ps1) at it. Refresh on a cron so the
-bundle ships a complete, always-fresh cache with zero dependence on the
-upstream rate limiter. Cache file format is identical (lsl-lhw-<type>-<vid>-<did>.html),
-so only the base URL changes. See the TODO comment in tools/build-hw-cache.ps1.
+  rapid requests; robots.txt Crawl-delay: 10s), which makes both the bundled
+  cache build (tools/build-hw-cache.ps1) and the live rating fragile. The CODE
+  half is done - LSL_LHW_BASE_URL is honoured by install.ps1, lslsetup.exe and
+  build-hw-cache.ps1 (-BaseUrl); the cache file format is identical
+  (lsl-lhw-<type>-<vid>-<did>.html), so only the base URL changed.
+  REMAINING, and it is not a code change: stand up the mirror host itself
+  (e.g. on www.easyp.net) and refresh it on a cron, so the bundle can ship a
+  complete, always-fresh cache with zero dependence on the upstream rate
+  limiter. That is infrastructure outside this repo.

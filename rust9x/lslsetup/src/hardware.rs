@@ -566,6 +566,33 @@ fn embedded_lookup(id: &str) -> Option<(&'static str, &'static str, &'static str
 // robots.txt Crawl-delay politeness state.
 const LHW_DELAY_SECS: u64 = 10;
 
+/// Default linux-hardware.org base URL.
+pub const LHW_BASE_URL_DEFAULT: &str = "https://linux-hardware.org/";
+
+/// Base URL for LKDDb device pages, overridable with the `LSL_LHW_BASE_URL`
+/// environment variable.
+///
+/// Upstream rate-limits hard (HTTP 429 after a few rapid requests) and its
+/// robots.txt asks for a 10 s Crawl-delay, which makes both the bundled cache
+/// build and the live rating fragile. A mirror of the device pages fixes that,
+/// and the only code change a mirror needs is this URL - the cache file format
+/// (`lsl-lhw-<type>-<vid>-<did>.html`) and the parser are unchanged, so a
+/// mirrored cache drops straight in.
+///
+/// The override changes WHERE pages are fetched from, not how politely: the
+/// crawl-delay above still applies.
+pub fn lhw_base_url() -> String {
+    let b = crate::sys::env_var("LSL_LHW_BASE_URL")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| LHW_BASE_URL_DEFAULT.to_string());
+    if b.ends_with('/') {
+        b
+    } else {
+        format!("{}/", b)
+    }
+}
+
 struct LhwState {
     last: Option<Instant>,
 }
@@ -602,7 +629,7 @@ fn lhw_fetch_page(id: &str, bundle_dir: &str) -> String {
             }
         }
     }
-    let url = format!("https://linux-hardware.org/?id={}", id);
+    let url = format!("{}?id={}", lhw_base_url(), id);
     let html = match crate::net::get(&url, "lsl-usb/1.0") {
         Ok(r) if r.status == 200 => String::from_utf8_lossy(&r.body).into_owned(),
         _ => {
@@ -671,11 +698,19 @@ pub struct Rating {
 
 pub fn lhw_url(d: &Device) -> String {
     format!(
-        "https://linux-hardware.org/?id={}:{}-{}",
+        "{}?id={}:{}-{}",
+        lhw_base_url(),
         d.kind.to_lowercase(),
         d.vendor.to_lowercase(),
         d.device.to_lowercase()
     )
+}
+
+/// Page URL for a raw device id (`pci:8086-1234`), honouring the base-URL
+/// override. The GUI builds its "link" column from ids rather than from
+/// `Device`, so it needs this too.
+pub fn lhw_id_url(id: &str) -> String {
+    format!("{}?id={}", lhw_base_url(), id)
 }
 
 /// Fast path: curated table + embedded cache + on-disk cache, NO network.

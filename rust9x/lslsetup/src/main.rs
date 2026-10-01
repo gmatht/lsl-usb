@@ -26,6 +26,7 @@ mod rufus;
 mod sys;
 mod telemetry;
 mod usbcheck;
+mod version;
 mod wifi;
 
 use sys::out;

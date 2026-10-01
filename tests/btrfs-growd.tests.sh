@@ -52,12 +52,13 @@ size_of() {
 sz0="$(size_of "$MP")"
 echo "size before grow: ${sz0:-unknown} bytes"
 
-# --- replicate bin/lsl-btrfs-growd try_grow PRIMARY (online) path exactly ---
+# --- drive the REAL shared helper the daemon uses (not a hand-rolled copy) ---
+# shellcheck source=../bin/lsl-common.sh
+. "$(dirname "$0")/../bin/lsl-common.sh"
+
 truncate -s +256M "$IMG"                      # 1. grow backing file
 loop_dev="$(findmnt -n -o SOURCE "$MP" 2>/dev/null | grep -E '^/dev/loop' | head -1)"
-if [ -n "$loop_dev" ] && [ -b "$loop_dev" ]; then
-  losetup -c "$loop_dev" 2>/dev/null || true   # 2. online re-read size
-fi
+lsl_refresh_image_loops "$IMG"                # 2. online re-read size (all loops)
 btrfs filesystem resize max "$MP" 2>/dev/null || bad "btrfs filesystem resize max failed"
 # --- end replication ---
 
@@ -74,6 +75,19 @@ if [ -n "$loop_dev" ]; then
   ok "findmnt discovered loop device backing /home: $loop_dev"
 else
   bad "findmnt did not find a /dev/loop device (daemon's PRIMARY path would miss it)"
+fi
+
+# The loop device must actually reflect the grown FILE size. Asserting only that
+# btrfs grew would still pass on a kernel that ignored losetup -c, which is the
+# silent failure this mechanism exists to detect.
+if [ -n "$loop_dev" ]; then
+  want="$(stat -c %s "$IMG" 2>/dev/null || echo 0)"
+  got="$(blockdev --getsize64 "$loop_dev" 2>/dev/null || echo 0)"
+  if [ -n "$got" ] && [ "$got" = "$want" ]; then
+    ok "loop device picked up the grown file size ($got bytes)"
+  else
+    bad "loop device size ($got) != grown file size ($want) - losetup -c was not applied"
+  fi
 fi
 
 echo "RESULT: $pass passed, $fail failed"

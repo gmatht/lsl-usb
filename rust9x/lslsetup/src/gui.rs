@@ -830,7 +830,7 @@ fn spawn_hw_rating(tx: mpsc::Sender<HwMsg>, bundle_dir: String) {
                     rating,
                     name: name.into(),
                     id: id.into(),
-                    url: format!("https://linux-hardware.org/?id={}", id),
+                    url: crate::hardware::lhw_id_url(id),
                 });
             }
             let _ = tx.send(HwMsg::Done { a: 2, c: 1, d: 1, u: 0 });
@@ -4571,7 +4571,7 @@ pub fn run_gui(
                             // the URL must keep its scheme (ShellExecute
                             // treats a bare domain as a relative path and
                             // fails with ERROR_FILE_NOT_FOUND)
-                            let url = if url.is_empty() { String::new() } else { format!("https://linux-hardware.org/?id={}", url.split("id=").nth(1).unwrap_or("")) };
+                            let url = if url.is_empty() { String::new() } else { crate::hardware::lhw_id_url(url.split("id=").nth(1).unwrap_or("")) };
                             let row = HwRow { class, rating, support, name, id, url: url.clone() };
                             hw_rows.borrow_mut().push(row.clone());
                             // Plain-ASCII "link" text (Win95's ANSI listview
@@ -4584,7 +4584,7 @@ pub fn run_gui(
                             );
                         }
                         HwMsg::UpdateRow { id, support, rating, name, url } => {
-                            let url = if url.is_empty() { String::new() } else { format!("https://linux-hardware.org/?id={}", url.split("id=").nth(1).unwrap_or("")) };
+                            let url = if url.is_empty() { String::new() } else { crate::hardware::lhw_id_url(url.split("id=").nth(1).unwrap_or("")) };
                             let link = if url.is_empty() { String::new() } else { "link".to_string() };
                             let mut rows = hw_rows.borrow_mut();
                             for (i, row) in rows.iter_mut().enumerate() {

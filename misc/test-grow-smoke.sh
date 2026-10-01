@@ -1,7 +1,11 @@
 #!/bin/bash
 # Smoke test for lsl_grow_btrfs_image + lsl_refresh_image_loops.
 # Usage: test-grow-smoke.sh /path/to/funcs.sh
-#   where funcs.sh holds the REAL functions extracted from onboot.sh.
+#   where funcs.sh holds the REAL functions extracted from the tree. They now
+#   live in two files, so build funcs.sh from both:
+#     sed -n '/^lsl_refresh_image_loops()/,/^}/p'          bin/lsl-common.sh
+#     sed -n '/^lsl_grow_btrfs_image()/,/^}/p'             onboot.sh
+#   > funcs.sh
 # Grows a live-attached loopback image (the stale-loop scenario partprobe
 # cannot fix) and checks the filesystem actually grows. Not shipped in z0.
 set -u

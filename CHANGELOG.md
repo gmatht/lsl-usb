@@ -2,6 +2,58 @@
 
 All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+Four open proposals closed. `FINDINGS-COMPRESSION.md`, `TODO.md` and
+`docs/BTRFS-GROWD.md` carry the full reasoning for each.
+
+### Fixed
+
+- **Every build trace was blank (WHYFAIL16).** The build stamp read its version
+  from `<bundle>\VERSION` and `unwrap_or_default()`-ed a failed read to the empty
+  string — but the default (nofmt) path has no bundle at all, so *every* stick
+  got a blank version line and `bin/lsl-diag.sh`, whose job is "which build is
+  failing?", printed an empty section, silently. The compiled-in
+  `CARGO_PKG_VERSION` is now the fallback (it cannot be empty and needs no staged
+  file), the missing file is **logged** rather than swallowed, `/cdrom/VERSION` is
+  written (the diagnostic read it; nothing ever created it), the stamp carries the
+  git revision, and `lslsetup --version` exists so the exe is self-describing.
+
+- **btrfs online growth missed the loop device.** The backing file grew but the
+  loop device did not, because `lsl-btrfs-growd` refreshed only the *first*
+  attached loop (`findmnt … | head -1`) — a stale loop from a crashed boot keeps
+  the old size cached, so growth silently missed while the file grew every 60 s.
+  `lsl_refresh_image_loops` is now one shared implementation in
+  `bin/lsl-common.sh` (used by both `onboot.sh` and the daemon) that refreshes
+  *every* attached loop and surfaces `losetup -c` errors instead of discarding
+  them. The size verification is no longer gated behind `blockdev` — when it did
+  not run, the cycle ended with no warning at all — and the re-loop recovery no
+  longer re-mounts with `-o loop` (which could attach a second device and strand
+  the first) nor resizes `/home` where an overlay may be stacked.
+
+### Changed
+
+- **Squashfs compression: one constant at level 15.** The tree passed
+  `-Xcompression-level 22` at seven call sites — past libzstd's regular range
+  (≥20 is `--ultra`), past `mksquashfs`' own documented `1..9`, buying nothing
+  over 19, and not finishing inside the measurement window on real content. All
+  of them now read `LSL_SQUASHFS_COMPRESSION_LEVEL` from `bin/lsl-common.sh`
+  (default **15**): 5.7 % smaller than level 9 for 6× the write time, where 19
+  needs 14× for the last 0.7 points. Note this deliberately overrules
+  `FINDINGS-COMPRESSION.md`'s own recommendation of 9, which weighted write time
+  alone; **boot-time decompression was never measured and favours lower levels**,
+  so the constant is overridable and that measurement is still the open question.
+  `install.sh` gained a guarded source of `lsl-common.sh` and now sets the level
+  on `home.sfs` too, which had been relying on the tool default.
+
+- **The LKDDb base URL is overridable.** `LSL_LHW_BASE_URL` (and `-BaseUrl` on
+  `tools/build-hw-cache.ps1`) points `install.ps1`, `lslsetup.exe` and the cache
+  builder at a mirror of the linux-hardware.org device pages, whose HTTP 429 rate
+  limiting makes both the bundled cache and the live rating fragile. The cache file
+  format is unchanged, so a mirrored cache drops straight in, and the 10 s
+  crawl-delay still applies. Standing up the mirror host itself remains open — it
+  is infrastructure outside this repo.
+
 ## [0.1.1] - first successful lslsetup.exe firstboot
 
 First release verified end-to-end on real hardware: `lslsetup.exe` wrote a stick

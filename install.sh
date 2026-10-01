@@ -5,11 +5,15 @@
 mount /cdrom -o remount,rw
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+# Shared constants (currently the mksquashfs zstd level). Sourced for definitions
+# only - lsl-common.sh has no side effects at source time.
+# shellcheck source=bin/lsl-common.sh
+[ -f "$REPO_ROOT/bin/lsl-common.sh" ] && . "$REPO_ROOT/bin/lsl-common.sh"
 "$REPO_ROOT/bin/config.sh" --sync-only
 
 #cp ./lsl /cdrom/bin/lsl
 
-cd /home/ && mksquashfs . /cdrom/home.sfs -comp zstd
+cd /home/ && mksquashfs . /cdrom/home.sfs -comp zstd -Xcompression-level "$LSL_SQUASHFS_COMPRESSION_LEVEL"
 
 mkdir -p /tmp/squashfs/upper/ /tmp/squashfs/work/ /tmp/squashfs/root/
 mount -t overlay overlay -o upperdir=/tmp/squashfs/upper/,lowerdir=/rofs,workdir=/tmp/squashfs/work/ /tmp/squashfs/root/
@@ -52,12 +56,12 @@ fi
 ts="$(date +%Y%m%d%H%M%S)"
 if [ "${LSL_INSTALL_MERGE:-0}" = "1" ]; then
     #Create new filesystem.squashfs and move old one to filesystem_<date>.squashfs
-    mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem_new.squashfs -comp zstd -Xcompression-level 22
+    mksquashfs /tmp/squashfs/root/ /cdrom/casper/filesystem_new.squashfs -comp zstd -Xcompression-level "$LSL_SQUASHFS_COMPRESSION_LEVEL"
     mv /cdrom/casper/filesystem.squashfs /cdrom/casper/filesystem_orig.squashfs
     mv /cdrom/casper/filesystem_new.squashfs /cdrom/casper/filesystem.squashfs
 else
     #Append a layer from the overlay upperdir (only the changes).
-    mksquashfs /tmp/squashfs/upper/ /cdrom/casper/filesystem_z${ts}.squashfs -comp zstd -Xcompression-level 22
+    mksquashfs /tmp/squashfs/upper/ /cdrom/casper/filesystem_z${ts}.squashfs -comp zstd -Xcompression-level "$LSL_SQUASHFS_COMPRESSION_LEVEL"
     #Save a companion copy of the config script next to the layer (same basename as .squashfs).
     cp "$REPO_ROOT/bin/squashfs_config.sh" /cdrom/casper/filesystem_z${ts}.sh
 fi

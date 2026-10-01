@@ -235,6 +235,37 @@ lsl_effective_home_is_hdd() {
     if [ -n "$m" ]; then [ "$m" = hdd ]; else ! lsl_is_usb_mode; fi
 }
 
+# Refresh EVERY loop device currently attached to the image $1 so the kernel
+# picks up a grown file size. No-op when nothing is attached. Never fails the
+# caller.
+#
+# The kernel caches a loop device's capacity at attach time: extending the
+# backing file leaves attached loops stale, and a later `btrfs filesystem resize
+# max` then silently no-ops (exit 0, no growth). Tested: partprobe does NOT fix
+# this (it only re-reads partition tables); `losetup -c` does.
+#
+# Iterates all attached loops, not just the first: a stale loop left over from a
+# crashed boot keeps the old size cached, and refreshing only one device misses
+# it. readlink first, because a symlinked backing path is exactly what makes a
+# bare `losetup -j` match nothing.
+#
+# A kernel that silently ignores `losetup -c` leaves no exit-status clue, so
+# stderr is surfaced rather than discarded - otherwise the failure only shows up
+# much later as "the filesystem did not grow".
+lsl_refresh_image_loops() {
+    local img="$1" devs dev err
+    command -v losetup >/dev/null 2>&1 || return 0
+    devs="$(losetup -j "$(readlink -f "$img" 2>/dev/null || printf '%s' "$img")" 2>/dev/null | cut -d: -f1)"
+    [ -n "$devs" ] || return 0
+    for dev in $devs; do
+        [ -b "$dev" ] || continue
+        if ! err="$(losetup -c "$dev" 2>&1)"; then
+            echo "lsl: losetup -c $dev failed: ${err:-no output}" >&2
+        fi
+    done
+    return 0
+}
+
 # Install the staged hivex .debs from /cdrom/pkgs when hivexregedit is absent.
 # mount_all.sh needs it to map Windows drive letters; on a stock first boot it is
 # not in the base image, and the same firstboot run installs it ~23 minutes later,
@@ -339,6 +370,18 @@ lsl_fat32_max_bytes() {
     # as a conservative, always-safe ceiling for pre-write size checks.
     echo 4294901760
 }
+
+# zstd level for every mksquashfs call in the tree. 15 is the knee of the
+# measured ratio/time curve on real layer content: -5.7% size versus level 9 for
+# 6x the write time, where 19 reaches -6.4% only for 14x. The tree previously
+# passed 22, which buys nothing over 19, did not finish inside the measurement
+# window, and is past libzstd's regular range (>=20 is --ultra) as well as past
+# mksquashfs' own documented 1..9. See FINDINGS-COMPRESSION.md.
+#
+# Boot-time DECOMPRESSION was never measured and favours lower levels - every
+# layer is read back on every boot. Lower this if boot time matters more than
+# layer size.
+LSL_SQUASHFS_COMPRESSION_LEVEL="${LSL_SQUASHFS_COMPRESSION_LEVEL:-15}"
 
 LSL_HOME_LOWER="${LSL_HOME_LOWER:-/run/lsl-home-lower}"
 LSL_HOME_UPPER="${LSL_HOME_UPPER:-/run/lsl-home-overlay/upper}"

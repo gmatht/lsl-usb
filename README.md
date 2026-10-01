@@ -224,6 +224,21 @@ the bundle can ship a complete, always-fresh cache with no dependence on the
 - `LSL_SFS_HDD_CACHE` (default: `0`)
   - Set to `1` (by the installer wizard or `lsl-copy-sfs-hdd.sh --use`) so
     `lsl-precache.sh` warms the page cache from the HDD copy of the layers.
+- `LSL_SQUASHFS_COMPRESSION_LEVEL` (default: `15`)
+  - zstd level for every `mksquashfs` call. One constant, defined in
+    `bin/lsl-common.sh`, so the setting is reviewable in one place. **15** is the
+    knee of the measured ratio/time curve (≈5.7 % smaller than level 9 for 6×
+    the write time, where 19 needs 14×) and stays inside libzstd's regular
+    range. Boot-time *decompression* was never measured and favours lower levels
+    — lower this if boot time matters more to you than layer size. See
+    [`FINDINGS-COMPRESSION.md`](FINDINGS-COMPRESSION.md).
+- `LSL_LHW_BASE_URL` (default: `https://linux-hardware.org/`)
+  - Base URL for LKDDb device pages, honoured by `install.ps1`, `lslsetup.exe`
+    and `tools/build-hw-cache.ps1` (`-BaseUrl`). Point it at a mirror of the
+    device pages to escape upstream's HTTP 429 rate limiting; the cache file
+    format (`lsl-lhw-<type>-<vid>-<did>.html`) is unchanged, so a mirrored cache
+    drops straight in. The 10 s crawl-delay still applies — a mirror changes
+    *where* pages come from, not how politely we fetch.
 
 ## Persistence model
 
@@ -286,10 +301,16 @@ Mode is selected from resolved `LSL_DATA_DIR`:
   Boot they will not load unless a MOK is enrolled (or Secure Boot is off). Plan
   accordingly (see the Secure Boot section above).
 - **Online btrfs growth is kernel‑limited.** `lsl-btrfs-growd` grows the backing
-  file and refreshes the loop device, but some kernels silently ignore
-  `losetup -c` while `/home` (or the cache) is busy; the new space then only
-  applies after a reboot (or an unmount). The daemon logs this to
-  `<LSL_DATA_DIR>/lsl-btrfs-grow.log` rather than failing silently.
+  file and refreshes **every** loop device attached to it (a stale loop from a
+  crashed boot keeps the old size cached, and refreshing only the first device
+  misses it), resizes the filesystem where the *loop device* is mounted rather
+  than at `/home` (which can be an overlay stacked on top, where the resize is a
+  silent no-op), and reports a `losetup -c` failure instead of discarding it. If
+  the kernel still silently ignores `losetup -c` while `/home` (or the cache) is
+  busy, the new space only applies after a reboot or an unmount — the daemon says
+  so on stderr and logs it to `<LSL_DATA_DIR>/lsl-btrfs-grow.log` rather than
+  failing silently. Boot-time growth of the *unmounted* image remains the
+  reliable path. See [`docs/BTRFS-GROWD.md`](docs/BTRFS-GROWD.md).
 - **`lsl-toram.sh` removes the USB.** After the pivot, persistence writes
   (uphome / uproot / lsl-home-flushd) are unavailable until the stick is
   re‑inserted; a concurrent persistence write is now refused for safety.
@@ -564,7 +585,9 @@ fix, and — importantly — what is *not* yet in effect on a booting stick.
   version is read from `<bundle>\VERSION`, which the default (nofmt) path has no
   bundle for, and `unwrap_or_default()` turns the missing file into an empty
   string — so `lsl-diag.sh`, whose job is "which build is failing?", prints an
-  empty section on every stick.
+  empty section on every stick. **Fixed**: compiled-in version fallback, the
+  missing file logged instead of swallowed, `/cdrom/VERSION` written, the git
+  revision in the stamp, and `lslsetup --version`.
 - [`FRAGILE_HOME.md`](FRAGILE_HOME.md) — companion to WHYFAIL9: the three ways
   lsl-usb answers "is `/home` persistent?", all 8 call sites and the risk each
   carries, and the rules for changing persistence code safely.
@@ -588,6 +611,8 @@ place rather than quietly rewriting.
   reboot (all of snapd's state is on the RAM overlay), why the layer approach dies
   at the 4 GiB FAT32 cap, and the three workable options. Copies the flatpak
   precedent's *principle* even though flatpak's mechanism cannot transfer.
-- [`FINDINGS-COMPRESSION.md`](FINDINGS-COMPRESSION.md) — the six `mksquashfs`
-  call sites, why `-Xcompression-level 22` is outside the documented range, and
-  what 9 vs 19 actually buys on real layer content.
+- [`FINDINGS-COMPRESSION.md`](FINDINGS-COMPRESSION.md) — the `mksquashfs`
+  call sites, why `-Xcompression-level 22` was outside the documented range and
+  bought nothing, and what 9 vs 15 vs 19 actually costs on real layer content.
+  **Applied**: every call now reads one constant,
+  `LSL_SQUASHFS_COMPRESSION_LEVEL` (default `15`) in `bin/lsl-common.sh`.
