@@ -395,6 +395,54 @@ And `uproot` does not need `/cow` either: it mounts its *own* overlay at
 visible path, and packs that. The confusion is easy to fall into because both
 uppers are called "the upper" and only one of them is addressable.
 
+### How to list what the boot has actually changed
+
+There is a tool for this: **`bin/lsl-upper-changes`**.
+
+```
+$ lsl-upper-changes -q
+lsl-upper-changes
+  watermark      : 2026-09-30 19:34:16 (newest layer: filesystem_z20260930192536.squashfs)
+  modified files : 478
+  modified dirs  : 222
+  apparent size  : 15449405 bytes (~14 MB)
+```
+
+The naive approaches all fail, which is why it exists:
+
+| approach | why it fails |
+|---|---|
+| `ls /cow/upper` | `/cow` does not exist in this namespace (§8 above) |
+| overlayfs xattrs | would be exact, but this overlay is mounted **`nouserxattr`** — `getfattr -n trusted.overlay.origin` returns *No such attribute* even on a known copy-up |
+| `find / -newer <anyfile>` | works, but **the watermark decides whether the answer is right** |
+
+**The watermark is the whole trick.** The lower stack is several layers, each with
+its own build mtime:
+
+```
+filesystem.squashfs                2026-09-25 18:19:14
+filesystem_z0_firstboot.squashfs   2026-09-30 18:57:32
+filesystem_z2026...192536.squashfs 2026-09-30 19:34:16   <- NEWEST
+```
+
+A file copied up by this boot is newer than **every** layer. Using an *older*
+layer's date counts that layer's own files as "modified", because they are
+genuinely newer than the base — but they came from the lower stack:
+
+```
+watermark = filesystem.squashfs     -> 1547 files   WRONG (3x too many)
+watermark = newest append layer     ->  500 files   right
+```
+
+The tool derives the watermark itself (`--watermark` prints its reasoning) and
+filters runtime churn (`/proc`, `/sys`, `/run`, `dpkg` backups, caches, logs) by
+default; `--all` includes it.
+
+**What it is not:** mtime is a heuristic, not provenance. A file copied up and
+then `touch -d`'d backwards is missed; a copy-up that was later deleted (a
+whiteout) leaves nothing to stat; and `-xdev` means separate mounts (`/home`,
+`/mnt/c`, `/var/cache`) are not covered — they have their own modification story.
+
 ### Summary
 
 | | casper's root overlay | uproot's config overlay |

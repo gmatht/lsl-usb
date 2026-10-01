@@ -1,0 +1,158 @@
+#!/bin/bash
+# lsl-upper-changes - list the files this boot has written to the root overlay.
+#
+# WHY THIS EXISTS
+# ---------------
+# `uproot` packs the root overlay's upper into an appended layer, and every
+# debugging session eventually asks "what has this boot actually changed?".
+# The intuitive answers are all wrong on a live casper system:
+#
+#   * `ls /cow/upper`           -> /cow does not exist. It was a tmpfs in the
+#                                  INITRAMFS mount namespace, and casper pivoted
+#                                  away from it; the name never existed in the
+#                                  live namespace. See WHYFAIL12 §8.
+#   * overlayfs xattrs          -> would be exact, but this overlay is mounted
+#                                  `nouserxattr`, so trusted.overlay.origin is
+#                                  not present. (Checked: getfattr returns
+#                                  "No such attribute" on a known copy-up.)
+#   * `find / -newer <somefile>` -> works, but the CHOICE OF WATERMARK decides
+#                                  whether the answer is right. See below.
+#
+# THE WATERMARK IS THE WHOLE TRICK
+# --------------------------------
+# The lower stack is several layers, and each has its own build mtime. A file
+# copied up by THIS boot is newer than every layer. A file that came from any
+# layer is older than that layer's mtime.
+#
+# So the correct watermark is the NEWEST layer's mtime, not the oldest:
+#
+#   watermark = filesystem.squashfs     (2026-09-25) -> 1547 files   WRONG
+#   watermark = newest append layer     (2026-09-30) ->  500 files   right
+#
+# Using an older layer's date counts that layer's own files as "modified",
+# because they are genuinely newer than the base - but they came from the lower
+# stack, not from this boot.
+#
+# WHAT IT DOES NOT DO
+# -------------------
+# mtime is a heuristic, and this is not a provenance tool:
+#   * a file copied up and then `touch -d`'d backwards is missed;
+#   * directories are only reported as a count (their mtimes change whenever a
+#     child does, which is noise rather than information);
+#   * it cannot see a copy-up that was then deleted (a whiteout), because there
+#     is nothing left to stat;
+#   * mounts under / are skipped by -xdev (`/home`, `/var/cache`, `/mnt/c` are
+#     separate filesystems and have their own modification story).
+#
+# Usage:
+#   lsl-upper-changes                 # summary + the file list
+#   lsl-upper-changes -q              # summary only
+#   lsl-upper-changes --watermark     # print the watermark it would use
+#   lsl-upper-changes --all           # do not filter runtime directories
+#
+# Exit: 0 always (this is a report, not a check).
+
+set -u
+
+QUIET=0
+SHOW_WM=0
+ALL=0
+for a in "$@"; do
+    case "$a" in
+        -q|--quiet)     QUIET=1 ;;
+        --watermark)    SHOW_WM=1 ;;
+        --all)          ALL=1 ;;
+        -h|--help)      sed -n '2,45p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *) echo "lsl-upper-changes: unknown option '$a' (try --help)" >&2; exit 2 ;;
+    esac
+done
+
+# --- find the newest layer ---------------------------------------------------
+# CASPER_DIR is the directory holding the stacked *.squashfs layers. On a normal
+# boot that is /cdrom/casper; ISO-scan boots can differ, so allow an override.
+CASPER_DIR="${LSL_CASPER_DIR:-/cdrom/casper}"
+
+if [ ! -d "$CASPER_DIR" ]; then
+    echo "lsl-upper-changes: no $CASPER_DIR - cannot determine the layer stack." >&2
+    echo "  Set LSL_CASPER_DIR to the directory holding the *.squashfs layers." >&2
+    exit 0
+fi
+
+# Newest layer by mtime. `ls -t` needs a real match; guard the empty case.
+newest=""
+for f in "$CASPER_DIR"/filesystem*.squashfs; do
+    [ -e "$f" ] || continue
+    if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then
+        newest="$f"
+    fi
+done
+
+if [ -z "$newest" ]; then
+    echo "lsl-upper-changes: no filesystem*.squashfs under $CASPER_DIR." >&2
+    exit 0
+fi
+
+# --- the watermark -----------------------------------------------------------
+# `stat -c %y` -> "2026-09-30 19:34:16.000000000 +0000"; find's -newermt wants
+# something it can parse, and the trailing nanoseconds are fine to keep.
+WM="$(stat -c %y "$newest" | cut -d. -f1)"
+
+if [ "$SHOW_WM" = "1" ]; then
+    echo "watermark : $WM"
+    echo "from      : $newest"
+    echo "layers    :"
+    for f in "$CASPER_DIR"/filesystem*.squashfs; do
+        [ -e "$f" ] || continue
+        printf '  %-52s %s\n' "$(basename "$f")" "$(stat -c %y "$f" | cut -d. -f1)"
+    done
+    exit 0
+fi
+
+# --- collect -----------------------------------------------------------------
+# -xdev: stay on the overlay (separate mounts - /home, /mnt/c, /var/cache - are
+#        different filesystems with their own stories).
+# -newermt: newer than the newest layer.
+# Excluded by default: kernel/runtime filesystems, and directories that churn as
+# a side effect of simply running (dpkg's backup files, caches, logs, /run).
+FILTER='^/(proc|sys|dev|run|tmp|mnt|media|cdrom|rofs|boot)/|^/(var/lib/dpkg/.*\.(dpkg-[a-z]+|save)|var/cache|var/log|var/tmp)/'
+
+tmp="$(mktemp)" || exit 1
+if [ "$ALL" = "1" ]; then
+    find / -xdev -newermt "$WM" -type f 2>/dev/null > "$tmp"
+else
+    find / -xdev -newermt "$WM" -type f 2>/dev/null \
+        | grep -vE "$FILTER" > "$tmp"
+fi
+
+n_files=$(wc -l < "$tmp")
+n_dirs=$(find / -xdev -newermt "$WM" -type d 2>/dev/null \
+        | grep -vE "$FILTER" | wc -l)
+
+echo "lsl-upper-changes"
+echo "  watermark      : $WM (newest layer: $(basename "$newest"))"
+echo "  modified files : $n_files"
+echo "  modified dirs  : $n_dirs   (noisy - a dir's mtime tracks its children)"
+[ "$ALL" = "0" ] && echo "  (runtime dirs filtered; --all to include them)"
+
+if [ "$QUIET" = "0" ] && [ "$n_files" -gt 0 ]; then
+    echo
+    echo "  --- files ---"
+    sed 's/^/  /' "$tmp"
+fi
+
+# A rough size, because "what would this cost in an appended layer?" is the
+# question right after "what changed?". NUL-delimited so filenames with spaces
+# or newlines do not split into extra arguments (the first attempt used word
+# splitting and reported 16 KB for 478 files).
+echo
+# -sbc, not -sb: without -c, `du -b --files0-from` prints ONE LINE PER FILE, so
+# `tail -1` returns the last FILE rather than a total. The first attempt at this
+# reported 548 bytes (the last file, /snap/README) for 43 MB of content.
+total=$(tr '\n' '\0' < "$tmp" | du -sbc --files0-from=- 2>/dev/null | tail -1 | cut -f1)
+if [ -n "${total:-}" ]; then
+    printf '  apparent size  : %s bytes (~%s MB)\n' "$total" "$((total / 1024 / 1024))"
+    echo "                   (apparent, not on-disk - the layer compresses)"
+fi
+
+rm -f "$tmp"
+exit 0
