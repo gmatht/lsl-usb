@@ -63,9 +63,15 @@ pre_shutdown_cleanup() {
         # shellcheck source=/dev/null
         . /cdrom/bin/lsl-common.sh
         lsl_load_config
-        if ! lsl_is_usb_mode; then
-            if mountpoint -q /home/mint/.cache 2>/dev/null; then
-                run_privileged umount /home/mint/.cache || true
+        # Only HDD mode stacks the extra btrfs bind mounts; a usb/ram/fallback
+        # /home has none. Branch on the effective mode (not a fresh resolve), so
+        # this cannot unmount binds that were never made.
+        if lsl_effective_home_is_hdd; then
+            # Resolve the desktop user; never assume "mint" (an Ubuntu stick
+            # has /home/ubuntu - see lsl_desktop_user / WHYFAIL13).
+            _du="$(lsl_desktop_user)"
+            if [ -n "$_du" ] && mountpoint -q "/home/$_du/.cache" 2>/dev/null; then
+                run_privileged umount "/home/$_du/.cache" || true
             fi
             if mountpoint -q /var/cache 2>/dev/null; then
                 run_privileged umount /var/cache || true
@@ -114,6 +120,10 @@ elif command -v dialog >/dev/null 2>&1; then
 elif command -v whiptail >/dev/null 2>&1; then
     GUI_TOOL="whiptail"
 fi
+
+# "Load to RAM" runs this on the stick; overridable so the option is testable
+# off-stick (same LSL_* override convention as lsl-ramclone-progress.sh).
+TORAM_BIN="${LSL_TORAM_BIN:-/cdrom/bin/lsl-toram.sh}"
 
 show_error() {
     local message="$1"
@@ -175,9 +185,17 @@ confirm_and_run() {
         # shellcheck source=/dev/null
         . /cdrom/bin/lsl-common.sh
         lsl_load_config
-        if ! lsl_is_usb_mode; then
-            save_msg="Syncing btrfs home and cache…"
-        fi
+        # Say only what this boot can actually do. A fresh resolve promised a
+        # btrfs sync that never happened on a usb-fallback boot (see
+        # FRAGILE_HOME.md); branch on the effective mode instead. The default
+        # (usb, or no state file on a pre-fix stick) is the stick wording.
+        _ehm="$(lsl_effective_home_mode)"
+        case "$_ehm" in
+            hdd)          save_msg="Syncing btrfs home and cache…" ;;
+            usb-fallback) save_msg="Cannot save home: this boot mounted a temporary overlay (the data dir was not persistent)." ;;
+            ram)          save_msg="/home is RAM-only; nothing to save." ;;
+            "")           if ! lsl_is_usb_mode; then save_msg="Syncing btrfs home and cache…"; fi ;;
+        esac
     fi
 
     if command -v uphome >/dev/null 2>&1; then
@@ -371,17 +389,37 @@ main() {
             save_mode="nosave"
             power_mode="shutdown"
             ;;
-        "Load to RAM + remove USB"|"7")
+        "Load to RAM + remove USB"*|"7")
             # Copy the session to RAM and pivot, so the USB can be removed.
-            if [ -x /cdrom/bin/lsl-toram.sh ]; then
-                if run_privileged /cdrom/bin/lsl-toram.sh; then
+            # zenity --radiolist returns the option TEXT, so the pattern must
+            # carry the "(persistence to USB stops)" suffix - a bare
+            # "Load to RAM + remove USB" sent this option into the catch-all
+            # `*) exit 0`, a completely silent no-op.
+            if [ -x "$TORAM_BIN" ]; then
+                toram_rc=0
+                if [ "$GUI_TOOL" = "zenity" ]; then
+                    # lsl-toram.sh --progress prints "PCT # text" on stdout and
+                    # its human log on stderr. No --auto-close: the script ends
+                    # the bar by finishing (EOF), and zenity reads an
+                    # --auto-close pipe only once (WHYFAIL8).
+                    (
+                        run_privileged "$TORAM_BIN" --progress 2>/tmp/lsl-toram.log
+                    ) | zenity --progress --no-cancel --width=480 \
+                        --title="lsl-usb — Load to RAM" \
+                        --text="Copying the session into RAM…" 2>/dev/null
+                    toram_rc="${PIPESTATUS[0]}"
+                else
+                    run_privileged "$TORAM_BIN" || toram_rc=$?
+                fi
+
+                if [ "$toram_rc" -eq 0 ]; then
                     if [ "$GUI_TOOL" = "zenity" ]; then
                         zenity --info --title="lsl-usb" --text="Session is now running from RAM. You can remove the USB stick." 2>/dev/null || true
                     else
                         echo "Session is now running from RAM. You can remove the USB stick."
                     fi
                 else
-                    show_error "lsl-toram failed - the USB is still required."
+                    show_error "lsl-toram failed - the USB is still required.\n\nDetails:\n$(tail -n 20 /tmp/lsl-toram.log 2>/dev/null)"
                 fi
             else
                 show_error "lsl-toram.sh not found on /cdrom."

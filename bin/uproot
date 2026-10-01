@@ -164,118 +164,115 @@ prompt_choice() {
     esac
 }
 
-# Rewrite layerfs-path in every boot config so the NEXT boot stacks `new`.
-# casper walks dot-suffixes UPWARD from the layer named on the kernel
-# cmdline, so the appended layer only goes live if the configs point at
-# IT (walking down through z0 to the base). Mirrors what the installer
-# writes: /cdrom/menu.lst (grub4dos BIOS), /cdrom/EFI/BOOT/grub.cfg
-# (signed GRUB2 UEFI) and the \efi\grub\menu.lst mirror
-# (grub4dos-for-UEFI).
+# Historically rewrote `layerfs-path=` in every boot config so the next boot
+# would stack the newly appended layer. No longer needed: casper globs
+# *.squashfs and stacks whatever it finds, so a new layer goes live by
+# EXISTING - its filename alone decides that it sorts above every older one.
+#
+# Kept as a no-op shim because bin/uproot is also called from firstboot,
+# which is mid-upgrade on some sticks: an old caller passing a layer path
+# must not fail with "command not found".
+#
+# One thing still worth doing here: strips a stale `layerfs-path=` out of the
+# boot configs. A stick written by an older installer still carries one, and
+# with the flattened naming it would point at a file that no longer exists -
+# casper would panic with "File system layers are missing" on the next boot.
 repoint_layerfs_refs() {
-    local new="$1" f found=0
+    local new="$1" f found=0 stripped=0
     for f in /cdrom/menu.lst /cdrom/EFI/BOOT/grub.cfg /cdrom/efi/grub/menu.lst; do
         [ -f "$f" ] || continue
         if grep -q "layerfs-path=" "$f" 2>/dev/null; then
-            sed -i "s|layerfs-path=[^ ]*|layerfs-path=${new}|g" "$f" 2>/dev/null
             found=1
+            sed -i "s|[[:space:]]*layerfs-path=[^ ]*||g" "$f" 2>/dev/null && stripped=1
         fi
     done
-    if [ "$found" -eq 1 ]; then
-        echo "Boot configs updated: layerfs-path now stacks ${new##*/}"
-        log "layerfs-path repointed to ${new}"
-    else
-        echo "WARNING: no boot config with layerfs-path found; the new layer will NOT stack on the next boot." >&2
-        log "WARNING: no layerfs-path boot refs found to update."
+    if [ "$found" -eq 1 ] && [ "$stripped" -eq 1 ]; then
+        echo "Boot configs: removed stale layerfs-path (casper globs layers now)."
+        log "removed stale layerfs-path from boot configs"
+    elif [ "$found" -eq 1 ]; then
+        echo "WARNING: layerfs-path= still present in a boot config and could not be stripped." >&2
+        log "WARNING: could not strip layerfs-path from boot configs."
     fi
 }
 
-# Return the layer file currently named on the kernel cmdline (layerfs-path=).
-# Boot configs live on the stick, so honour STICK_DIR rather than assuming
-# /cdrom: comparing a /cdrom path against STICK_DIR-relative files silently
-# failed to match and let the prune delete the layer the cmdline names (a
-# bricked boot). A boot config named with a leading /cdrom/ is also matched
-# against $stick so both spellings resolve to the same file.
-active_layer_path() {
-    local stick="${STICK_DIR:-/cdrom}" f line
-    for f in "$stick/menu.lst" "$stick/EFI/BOOT/grub.cfg" "$stick/efi/grub/menu.lst"; do
-        [ -f "$f" ] || continue
-        line="$(grep -o 'layerfs-path=[^ ]*' "$f" 2>/dev/null | head -n1)"
-        [ -n "$line" ] || continue
-        line="${line#layerfs-path=}"
-        # Normalise a /cdrom/... reference onto $stick.
-        case "$line" in
-            /cdrom/*) line="$stick/${line#/cdrom/}" ;;
-        esac
-        printf '%s\n' "$line"
-        return 0
+# Print the lexically-greatest appended layer on the stick, i.e. the newest
+# one casper will stack last. This is the same comparison casper performs
+# (it globs *.squashfs and sorts), so "greatest" and "topmost" are the same
+# thing. Returns 1 when no append exists.
+#
+# GLOB TRAP: an append is filesystem_z<14-digit-ts>. The stub is
+# filesystem_z0_firstboot.squashfs, which ALSO matches filesystem_z[0-9]* - it
+# would sort as "z0..." and could be selected or deleted as if it were an
+# append. The glob below pins the timestamp width, which excludes it.
+latest_append_layer() {
+    local stick="${1:-${STICK_DIR:-/cdrom}}" f best="" b
+    for f in "$stick"/casper/filesystem_z[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*.squashfs; do
+        [ -e "$f" ] || continue
+        b="$(basename "$f")"
+        if [ -z "$best" ] || [[ "$b" > "${best##*/}" ]]; then
+            best="$f"
+        fi
     done
-    return 1
+    [ -n "$best" ] || return 1
+    printf '%s\n' "$best"
 }
 
 # Delete superseded appended layers.
 #
-# Casper stacks by walking dot-suffixes UPWARD from the ONE layer named on the
-# kernel cmdline, so only that file (and files whose names are dot-extensions of
-# it) are ever read. Every other filesystem.z0.<ts>.squashfs is dead weight: on
-# this stick five SUCCESSFUL firstboots left 5x761MB (3.6 GB), of which four
-# were completely inert because menu.lst named only the newest. Nothing had
-# failed, so the retry-path cleanup below never ran.
+# casper globs $LIVE_MEDIA_PATH/*.squashfs and stacks the matches in lexical
+# order, so EVERY filesystem_z<ts>.squashfs on the stick is read, newest last.
+# There is no "active" layer: nothing is orphaned by naming. The only layers
+# worth reaping are the older APPENDS, which are dead weight once a newer
+# append has been written (they only shadow each other in a fixed order).
+#
+# This replaces the old dot-chain design, where casper read only the chain
+# named by `layerfs-path=` and four of five 761 MB appends sat inert (see
+# WHYFAIL14). Layer ORDER is now carried by the filenames:
+#
+#   filesystem.squashfs                 base (distro image)      sorts 1st
+#   filesystem_z0_firstboot.squashfs    firstboot stub           sorts 2nd
+#   filesystem_z<ts>.squashfs           appends, newest last     sorts after
 #
 # Safety:
-#   - $1 is the layer just written and named in the boot configs: never removed.
-#   - The base names filesystem.z0.squashfs / filesystem_z0_firstboot.squashfs
-#     are never touched.
-#   - A file is only removed if it is NOT the layer we just wrote, NOT the layer
-#     the cmdline names, and NOT a dot-extension of that named layer (i.e.
-#     casper cannot reach it from the named entry).
+#   - The layer just written ($1) is never removed.
+#   - The base and the stub are never touched.
+#   - A file is only removed if it is an OLDER append than $1, i.e. its
+#     timestamp sorts strictly before the keeper's. Comparing by name is the
+#     same comparison casper uses, so "older" means exactly "stacked under".
 #   - Removal is best-effort: EBUSY on vfat is expected for a layer still
 #     backing the live overlay, so failure here is reported, never fatal.
 prune_superseded_layers() {
     local keep="${1:-}" stick="${STICK_DIR:-/cdrom}" l base n=0 freed=0 a keepbase
-    local active; active="$(active_layer_path 2>/dev/null || true)"
-    # Prefer the layer we just wrote+repointed to; fall back to the cmdline ref.
-    [ -n "$keep" ] || keep="$active"
+    # Prefer the layer we just wrote; nothing else can define "newer".
+    [ -n "$keep" ] || keep="$(latest_append_layer "$stick")"
 
     # FAIL SAFE: this function deletes layers, and a mistake here bricks the
     # next boot. Refuse to act unless we positively know which layer must
-    # survive. Earlier revision deleted on negation (remove everything that
-    # didn't match a keeper) and, when active_layer_path failed to resolve (it
-    # assumed /cdrom while STICK_DIR was elsewhere), it removed the very layer
-    # the cmdline named. Never guess.
+    # survive. An earlier revision of the dot-chain prune deleted by negation
+    # and removed the very layer the boot config named. Never guess.
     if [ -z "$keep" ] || [ ! -f "$keep" ]; then
-        log "Prune skipped: could not determine the active layer (no keep candidate)."
+        log "Prune skipped: no appended layer found to keep."
         return 0
     fi
-    # The keeper must be inside the stick we are pruning.
     case "$keep" in
         "$stick"/*) ;;
         *) log "Prune skipped: keeper $keep is outside $stick."; return 0 ;;
     esac
     keepbase="$(basename "$keep")"
-    # And the boot config must actually name a layer, or we cannot reason about
-    # the chain at all.
-    if [ -z "$active" ]; then
-        log "Prune skipped: no layerfs-path reference found in the boot configs."
-        return 0
-    fi
+    # The keeper must actually be an append we manage, or the lexical
+    # comparison below would be meaningless.
+    case "$keepbase" in
+        filesystem_z[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) ;;
+        *) log "Prune skipped: keeper $keepbase is not an appended layer."; return 0 ;;
+    esac
 
-    for l in "$stick"/casper/filesystem.z0.[0-9]*.squashfs; do
+    for l in "$stick"/casper/filesystem_z[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*.squashfs; do
         [ -e "$l" ] || continue
         base="$(basename "$l")"
-        case "$base" in
-            filesystem.z0.squashfs|filesystem_z0_firstboot.squashfs) continue ;;
-        esac
-        # Keep the layer we just wrote (and repointed the boot config at).
-        [ "$base" = "$keepbase" ] && continue
-        # Keep whatever the cmdline names, by basename (path spelling may vary).
-        [ -n "$active" ] && [ "$base" = "$(basename "$active")" ] && continue
-        # Keep dot-extensions of the named layer: casper walks dot-suffixes
-        # upward, so filesystem.z0.<ts>.<ts2> is an ancestor of the entry and
-        # IS read. (${x%.squashfs} on an empty $active would match everything,
-        # so this is inside the [ -n "$active" ] guard.)
-        [ -n "$active" ] && case "${base%.squashfs}" in
-            "$(basename "${active%.squashfs}")".*) continue ;;
-        esac
+        # Reap only layers that sort BELOW the keeper: casper stacks those
+        # first, so the keeper already overrides every file they contain.
+        # Anything sorting above the keeper is newer and must survive.
+        [[ "$base" < "$keepbase" ]] || continue
         a="$(stat -c '%s' "$l" 2>/dev/null || echo 0)"
         if rm -f "$l" "${l%.squashfs}.sh" 2>/dev/null; then
             n=$((n + 1)); freed=$((freed + a))
@@ -290,23 +287,22 @@ prune_superseded_layers() {
 }
 
 write_append_layer() {
-    local ts layer meta need sz prev stem
+    local ts layer meta need sz
     ts="$(date +%Y%m%d%H%M%S)"
-    # casper stacks layers by stripping dot-suffixes UPWARD from the layer
-    # named on the kernel cmdline (layerfs-path=...). A dot-SIBLING name
-    # (filesystem.z0.<ts>) is never stacked - it is not an ancestor of
-    # anything the cmdline names (the Sep 16-21 layers sat inert, 5x761MB,
-    # for exactly this reason). The new layer must EXTEND the current
-    # newest chain name so the walk reaches it through z0 down to the base
-    # (an underscore stem like filesystem_z<ts> has NO dot-parents, so
-    # casper would boot the layer ALONE - no /sbin/init - initramfs drop).
-    stem="filesystem.z0"
-    prev="$(ls -1 /cdrom/casper/filesystem.z0.*.squashfs 2>/dev/null | sort | tail -n1)"
-    if [ -n "$prev" ]; then
-        stem="$(basename "${prev%.squashfs}")"
-    fi
-    layer="/cdrom/casper/${stem}.${ts}.squashfs"
-    meta="/cdrom/casper/${stem}.${ts}.sh"
+    # casper globs *.squashfs and stacks the matches lexically, greatest on
+    # top. The new layer therefore only has to SORT ABOVE every layer already
+    # on the stick, which a fixed-width zero-padded timestamp guarantees:
+    #
+    #   filesystem.squashfs               base            ("." = 0x2E)
+    #   filesystem_z0_firstboot.squashfs  stub            ("_" = 0x5F)
+    #   filesystem_z<ts>.squashfs         this append     ("2" > "0")
+    #
+    # No stem to inherit, no chain to extend, no boot config to rewrite - the
+    # filename alone places it. This replaces the old dot-chain naming, where
+    # the layer only went live if a boot config named it (five 761 MB appends
+    # sat inert because none did). See WHYFAIL14.
+    layer="/cdrom/casper/filesystem_z${ts}.squashfs"
+    meta="/cdrom/casper/filesystem_z${ts}.sh"
     # Free-space guard: avoid a cryptic mksquashfs failure on a full FAT partition.
     sz="$(du -sm /tmp/squashfs/upper 2>/dev/null | awk '{print $1}')"; sz="${sz:-0}"
     need="$(( sz + 64 ))"
@@ -352,10 +348,9 @@ write_append_layer() {
         echo "No squashfs_config.sh path recorded; skipping ${meta##*/}"
     fi
     repoint_layerfs_refs "$layer"
-    # Reap layers the repoint just orphaned. Before this, every successful
-    # firstboot appended a fresh layer and left the previous ones inert on the
-    # FAT partition (5x761MB = 3.6 GB here) because nothing pruned the chain on
-    # the success path - only on retries, which never happened.
+    # Reap the appends this new layer supersedes. Every older filesystem_z<ts>
+    # is stacked BELOW the new one, which overrides all of its files, so they
+    # are dead weight (a stick once held 5x761MB = 3.6 GB of them).
     prune_superseded_layers "$layer"
     echo "Layer written. Reboot to have casper include it."
 }
@@ -726,15 +721,18 @@ case "$choice" in
         fi
         echo "filesystem.squashfs updated successfully!"
         log "filesystem.squashfs updated successfully (merged)."
-        # The merged base now contains everything the dotted chain held.
-        # Point the boot configs back at plain z0: a stale dotted layer
-        # stacked OVER the merged base would shadow its newer files.
-        repoint_layerfs_refs /cdrom/casper/filesystem.z0.squashfs
-        # Best-effort removal of the now-redundant chain layers. Files
-        # whose loop devices still back the LIVE overlay may refuse to
-        # unlink (EBUSY on vfat) - those are inert now and can be deleted
-        # after the next reboot.
-        rm -f /cdrom/casper/filesystem.z0.*.squashfs /cdrom/casper/filesystem.z0.*.sh 2>/dev/null || true
+        # The merged base now contains everything the appended layers held, and
+        # it sorts FIRST, so every append is now redundant and must go: left
+        # in place they would stack on top and shadow the merged base's newer
+        # files with their older copies.
+        repoint_layerfs_refs /cdrom/casper/filesystem.squashfs
+        # Best-effort removal of the now-redundant layers. Files whose loop
+        # devices still back the LIVE overlay may refuse to unlink (EBUSY on
+        # vfat) - those are inert now and can be deleted after the next reboot.
+        rm -f /cdrom/casper/filesystem_z[0-9]*.squashfs /cdrom/casper/filesystem_z[0-9]*.sh 2>/dev/null || true
+        # The stub layers lsl-firstboot.service; a merged base already contains
+        # it, but keeping the stub is harmless (it is a near-empty layer) and
+        # avoids a stick that loses firstboot if the merge is later reverted.
         ;;
     skip)
         echo "Skipping persistence."

@@ -26,9 +26,39 @@ getent() { return 1; }
 ls() { printf 'zorin\n'; }
 assert '[ "$(lsl_desktop_user)" = zorin ]' 'lsl_desktop_user: /home fallback -> zorin'
 
-# # --- fallback: nothing -> mint ---------------------------------------------
+# # --- fallback: nothing -> EMPTY (never invent a username) -------------------
+# This used to assert "mint". Returning a hardcoded development-distro name
+# turned "there is no desktop user in this context" (uproot's chroot) into
+# "write to /home/mint", silently losing every $HOME install - the terminal pin
+# included (WHYFAIL13). Callers must be able to tell "no user" and skip.
 ls() { return 1; }
-assert '[ "$(lsl_desktop_user)" = mint ]' 'lsl_desktop_user: final fallback -> mint'
+assert '[ -z "$(lsl_desktop_user)" ]' 'lsl_desktop_user: no user found -> empty (does not guess)'
+
+# # --- lsl_desktop_user_for_session: loginctl wins when present ---------------
+# The host-side resolver used by lsl-firstboot.sh's $HOME installer. Inside
+# uproot's chroot loginctl cannot reach the host /run, so it must degrade to the
+# same heuristics (and to empty) rather than inventing a name.
+loginctl() {
+    case "$*" in
+        *"list-sessions"*) printf '3 1000 ubuntu seat0\n' ;;
+        *"Type"*) printf 'x11\n' ;;
+        *"Name"*) printf 'ubuntu\n' ;;
+        *) return 1 ;;
+    esac
+}
+assert '[ "$(lsl_desktop_user_for_session)" = ubuntu ]' 'lsl_desktop_user_for_session: loginctl graphical session -> ubuntu'
+# A root-only session must not be adopted as the desktop user.
+loginctl() {
+    case "$*" in
+        *"list-sessions"*) printf '3 0 root seat0\n' ;;
+        *"Type"*) printf 'x11\n' ;;
+        *"Name"*) printf 'root\n' ;;
+        *) return 1 ;;
+    esac
+}
+getent() { echo "mint:x:1000:1000::/home/mint:/bin/bash"; }
+assert '[ "$(lsl_desktop_user_for_session)" = mint ]' 'lsl_desktop_user_for_session: root session skipped -> uid 1000 fallback'
+unset -f loginctl
 # Restore the real commands: these mocks are plain shell functions, so they
 # leaked into every later test (the layer-prune cases below call ls/wc and got
 # the stub's "zorin"). Unset at the end of each block that stubs a coreutils
@@ -42,6 +72,113 @@ LSL_DATA_DIR=/persist
 assert 'lsl_is_usb_mode' 'lsl_is_usb_mode: /persist -> usb'
 LSL_DATA_DIR=/mnt/c/Users/lsl-usb
 assert '! lsl_is_usb_mode' 'lsl_is_usb_mode: /mnt/c/Users/lsl-usb -> hdd'
+
+# # --- lsl_effective_home_mode ------------------------------------------------
+# The mode /home was ACTUALLY mounted with, from the state file. This is what
+# persistence writers must branch on. Regression for the 2026-09-28 first-boot
+# data loss: a fallback tmpfs overlay recorded LSL_MODE=usb, so uphome's fresh
+# lsl_is_usb_mode resolve said "hdd", ran a no-op btrfs sync, exited 0, and the
+# first-boot home was lost on reboot (see FRAGILE_HOME.md).
+EHM_TMP="$(mktemp -d)"
+mkdir -p "$EHM_TMP/run"
+# lsl_state_file() returns a fixed /run path; override it for the test.
+eval "$(sed -n '/^lsl_state_file()/,/^}/p' bin/lsl-common.sh | sed "s|echo /run/lsl-usb.state|echo $EHM_TMP/run/lsl-usb.state|")"
+
+# Each LSL_MODE value survives the round trip verbatim.
+for m in ram usb usb-fallback hdd; do
+    printf 'LSL_HOME_LOWER=/run/lsl-home-lower\nLSL_MODE=%s\n' "$m" \
+        > "$EHM_TMP/run/lsl-usb.state"
+    assert '[ "$(lsl_effective_home_mode)" = '"$m"' ]' "lsl_effective_home_mode: LSL_MODE=$m round-trips"
+done
+
+# The real fallback state file (all four keys) is read correctly - the CRLF /
+# key-order shape lsl-mount-home.sh actually writes.
+printf 'LSL_HOME_LOWER=/run/lsl-home-lower\nLSL_HOME_UPPER=/run/lsl-home-overlay/upper\nLSL_HOME_WORK=/run/lsl-home-overlay/work\nLSL_MODE=usb-fallback\n' \
+    > "$EHM_TMP/run/lsl-usb.state"
+assert '[ "$(lsl_effective_home_mode)" = usb-fallback ]' \
+       'lsl_effective_home_mode: real fallback state file -> usb-fallback'
+
+# A CRLF state file (written onto FAT) must not leak \r into the mode.
+printf 'LSL_MODE=usb-fallback\r\n' > "$EHM_TMP/run/lsl-usb.state"
+assert '[ "$(lsl_effective_home_mode)" = usb-fallback ]' \
+       'lsl_effective_home_mode: CRLF state file trims CR'
+
+# The LAST LSL_MODE wins if the file ever carries more than one.
+printf 'LSL_MODE=usb\nLSL_MODE=usb-fallback\n' > "$EHM_TMP/run/lsl-usb.state"
+assert '[ "$(lsl_effective_home_mode)" = usb-fallback ]' \
+       'lsl_effective_home_mode: last LSL_MODE wins'
+
+# No state file: fall back to the live mount type. /home is not tmpfs here, so
+# the answer must be empty (unknown), NOT a fabricated "usb"/"hdd".
+rm -f "$EHM_TMP/run/lsl-usb.state"
+findmnt() { echo "overlay"; }
+assert '[ -z "$(lsl_effective_home_mode)" ]' \
+       'lsl_effective_home_mode: no state file + overlay /home -> empty'
+findmnt() { echo "tmpfs"; }
+assert '[ "$(lsl_effective_home_mode)" = ram ]' \
+       'lsl_effective_home_mode: no state file + tmpfs /home -> ram'
+unset -f findmnt
+rm -rf "$EHM_TMP"
+
+# A legacy stick (pre-fix lsl-mount-home.sh) writing plain LSL_MODE=usb must
+# still read as usb and still flush - the new value must not break old sticks.
+EHM_TMP="$(mktemp -d)"; mkdir -p "$EHM_TMP/run"
+eval "$(sed -n '/^lsl_state_file()/,/^}/p' bin/lsl-common.sh | sed "s|echo /run/lsl-usb.state|echo $EHM_TMP/run/lsl-usb.state|")"
+printf 'LSL_MODE=usb\n' > "$EHM_TMP/run/lsl-usb.state"
+assert '[ "$(lsl_effective_home_mode)" = usb ]' 'legacy stick: LSL_MODE=usb still reads as usb'
+rm -rf "$EHM_TMP"
+
+# # --- lsl_effective_home_is_usb / _is_hdd ------------------------------------
+# The predicates the daemons and the shutdown UI branch on. Only "usb" is a real
+# stick overlay; only "hdd" has loop-backed btrfs images. ram and usb-fallback
+# are neither (a fallback overlay must NOT be treated as a stick).
+EHM_TMP="$(mktemp -d)"; mkdir -p "$EHM_TMP/run"
+eval "$(sed -n '/^lsl_state_file()/,/^}/p' bin/lsl-common.sh | sed "s|echo /run/lsl-usb.state|echo $EHM_TMP/run/lsl-usb.state|")"
+for m in ram usb usb-fallback hdd; do
+    printf 'LSL_MODE=%s\n' "$m" > "$EHM_TMP/run/lsl-usb.state"
+    case "$m" in
+        usb) assert 'lsl_effective_home_is_usb && ! lsl_effective_home_is_hdd' 'is_usb/is_hdd: LSL_MODE=usb -> usb only' ;;
+        hdd) assert 'lsl_effective_home_is_hdd && ! lsl_effective_home_is_usb' 'is_usb/is_hdd: LSL_MODE=hdd -> hdd only' ;;
+        *)   assert '! lsl_effective_home_is_usb && ! lsl_effective_home_is_hdd' "is_usb/is_hdd: LSL_MODE=$m -> neither" ;;
+    esac
+done
+# No state file: fall back to the old prediction driven by LSL_DATA_DIR.
+rm -f "$EHM_TMP/run/lsl-usb.state"
+LSL_DATA_DIR=/cdrom
+assert 'lsl_effective_home_is_usb && ! lsl_effective_home_is_hdd' 'is_usb/is_hdd: no state file + /cdrom -> usb'
+LSL_DATA_DIR=/mnt/c/Users/lsl-usb
+assert 'lsl_effective_home_is_hdd && ! lsl_effective_home_is_usb' 'is_usb/is_hdd: no state file + /mnt/c -> hdd'
+rm -rf "$EHM_TMP"
+
+# # --- lsl_ensure_hivex_tools -------------------------------------------------
+# Installs the staged .debs from $LSL_CDROM/pkgs when hivexregedit is missing, so
+# mount_all.sh can map /mnt/c BEFORE /home mounts (no first-boot fallback).
+HX_TMP="$(mktemp -d)"; mkdir -p "$HX_TMP/bin" "$HX_TMP/pkgs"
+LSL_CDROM="$HX_TMP"
+# (a) hivexregedit already on PATH -> ok, no dpkg needed.
+: > "$HX_TMP/bin/hivexregedit"; chmod +x "$HX_TMP/bin/hivexregedit"
+PATH="$HX_TMP/bin:$PATH"; hash -r
+assert 'lsl_ensure_hivex_tools' 'ensure_hivex_tools: present -> ok'
+# (b) absent and nothing staged -> fail (no false success).
+# PATH must not leave the REAL hivexregedit reachable: this stick has it
+# installed (/usr/bin/hivexregedit, from the WHYFAIL9/10 staged .debs), so a
+# plain "prepend a stub dir" leaves `command -v hivexregedit` succeeding and the
+# function correctly returning 0 - failing this assertion for the wrong reason.
+# Shadow every PATH entry with an empty dir so absence is actually tested.
+rm -f "$HX_TMP/bin/hivexregedit"; hash -r
+mkdir -p "$HX_TMP/empty"
+_old_path="$PATH"
+PATH="$HX_TMP/empty"   # nothing on PATH at all -> hivexregedit truly absent
+assert '! lsl_ensure_hivex_tools' 'ensure_hivex_tools: absent + no pkgs -> fail'
+PATH="$_old_path"; hash -r
+# (c) absent but a staged .deb whose install drops the binary -> ok.
+: > "$HX_TMP/pkgs/libhivex-bin.deb"
+dpkg() { : > "$HX_TMP/bin/hivexregedit"; chmod +x "$HX_TMP/bin/hivexregedit"; }
+assert 'lsl_ensure_hivex_tools' 'ensure_hivex_tools: staged .deb installs -> ok'
+unset -f dpkg
+PATH="${PATH#"$HX_TMP/bin:"}"; hash -r
+unset LSL_CDROM   # later tests expect the default /cdrom stick path
+rm -rf "$HX_TMP"
 
 # # --- lsl_data_dir_is_persistent ---------------------------------------------
 # Mock findmnt to report a given filesystem type for the data dir's mountpoint.
@@ -68,6 +205,35 @@ LSL_TEST_FST=ntfs3;   assert 'lsl_data_dir_is_persistent' 'ntfs3 data dir persis
 LSL_TEST_FST=tmpfs;   assert '! lsl_data_dir_is_persistent' 'tmpfs data dir not persistent'
 LSL_TEST_FST=;        assert '! lsl_data_dir_is_persistent' 'empty fstype not persistent'
 LSL_TEST_FST=vfat;    assert 'lsl_data_dir_is_persistent' 'vfat (USB) data dir persistent'
+unset -f findmnt
+
+# --- lsl_data_dir_is_writable (the ro-landing race) ---------------------------
+# The boot journal showed /mnt/c landing READ-ONLY (ntfs-3g) at 03:42:37 while
+# the rw mount succeeded a second later. Persistence alone accepted the ro
+# landing, so the btrfs home was declared unwritable and /home fell back to a
+# throwaway tmpfs overlay. These cases pin the rw requirement.
+# Mock findmnt to answer per-column: $1 is the OPTIONS/column selector.
+findmnt() {
+    case "$*" in
+        *-o\ TARGET*)   echo "${LSL_TEST_MP:-}" ;;
+        *-o\ FSTYPE*)   echo "${LSL_TEST_FST2:-}" ;;
+        *-o\ OPTIONS*)  echo "${LSL_TEST_OPTS:-}" ;;
+        *)              echo "" ;;
+    esac
+}
+LSL_DATA_DIR=/mnt/c/Users/lsl-usb
+LSL_TEST_MP=/mnt/c; LSL_TEST_FST2=ntfs3
+LSL_TEST_OPTS='rw,relatime,uid=0,gid=0,iocharset=utf8'
+assert 'lsl_data_dir_is_writable' 'ntfs3 mounted rw -> writable'
+LSL_TEST_OPTS='ro,relatime,uid=0,gid=0,iocharset=utf8'
+assert '! lsl_data_dir_is_writable' 'ntfs3 mounted ro -> NOT writable (the race)'
+LSL_TEST_OPTS='rw,relatime'
+LSL_TEST_FST2=vfat
+assert 'lsl_data_dir_is_writable' 'vfat mounted rw -> writable'
+LSL_TEST_FST2=tmpfs
+assert '! lsl_data_dir_is_writable' 'tmpfs is never writable-for-persistence'
+LSL_TEST_FST2=ntfs3; LSL_TEST_OPTS=''
+assert '! lsl_data_dir_is_writable' 'unknown options -> not writable (no rw proof)'
 unset -f findmnt
 
 # --- lsl_cdrom_is_vfat / lsl_fat32_max_bytes --------------------------------
@@ -203,17 +369,24 @@ assert '[ "$R_SHADOW" -eq 0 ]' 'lsl_env_file: /cdrom/lsl-usb.env preferred over 
 
 rm -rf "$ENV_TMP"
 
-# --- layer prune: fail-safe deletion of superseded squashfs layers -----------
+# --- layer prune: reap superseded appended squashfs layers -------------------
 # Regression for the bug where 5 SUCCESSFUL firstboots left 5x761MB (3.6 GB) of
 # layers, 4 inert because menu.lst named only the newest: cleanup ran only on the
-# retry path, which never fired. Equally important is that the prune must never
-# delete the layer the boot config names - an early revision of it did exactly
-# that (it compared a hardcoded /cdrom path against STICK_DIR-relative files,
-# failed to match, and removed the layer the cmdline pointed at).
+# retry path, which never fired.
+#
+# Layer prune: casper globs *.squashfs and stacks the matches lexically, so
+# layer ORDER comes from the filenames and there is no "named" layer any more.
+# filesystem.squashfs (base) < filesystem_z0_firstboot.squashfs (stub) <
+# filesystem_z<ts>.squashfs (appends, newest last). An older append is
+# therefore pure dead weight once a newer one exists.
+#
+# The load-bearing invariants are that the BASE and the STUB are never touched
+# (the stub carries lsl-firstboot.service) and that the newest append survives.
 LAYER_TMP="$(mktemp -d)"
 mkdir -p "$LAYER_TMP/casper"
-mk_layer() { dd if=/dev/zero of="$LAYER_TMP/casper/filesystem.z0.$1.squashfs" bs=1k count=1 2>/dev/null; }
-set_names() { printf 'kernel /vmlinuz layerfs-path=%s\n' "$1" > "$LAYER_TMP/menu.lst"; }
+mk_layer() { dd if=/dev/zero of="$LAYER_TMP/casper/filesystem_z$1.squashfs" bs=1k count=1 2>/dev/null; }
+mk_base() { dd if=/dev/zero of="$LAYER_TMP/casper/filesystem.squashfs" bs=1k count=1 2>/dev/null; }
+mk_stub() { dd if=/dev/zero of="$LAYER_TMP/casper/filesystem_z0_firstboot.squashfs" bs=1k count=1 2>/dev/null; }
 
 # Drive the firstboot helper (it is a script, so extract the one function).
 run_prune() {
@@ -222,40 +395,48 @@ run_prune() {
       echo 'lsl_firstboot_prune_orphan_layers'; } > "$LAYER_TMP/drive.sh"
     bash "$LAYER_TMP/drive.sh" >/dev/null 2>&1 || true
 }
-count_layers() { ls "$LAYER_TMP"/casper/filesystem.z0.*.squashfs 2>/dev/null | wc -l | tr -d ' '; }
+count_layers() { ls "$LAYER_TMP"/casper/filesystem_z[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*.squashfs 2>/dev/null | wc -l | tr -d ' '; }
 
-# 1. Superseded layers are reaped; the named one survives.
+# 1. Superseded appends are reaped; the newest survives. Base and stub are
+#    untouched.
+mk_base; mk_stub
 mk_layer 20260916164712; mk_layer 20260919045856; mk_layer 20260921085616
-set_names /cdrom/casper/filesystem.z0.20260921085616.squashfs
 run_prune
-assert '[ "$(count_layers)" = 1 ]' 'layer prune: superseded layers removed'
-assert '[ -f "$LAYER_TMP/casper/filesystem.z0.20260921085616.squashfs" ]' \
-       'layer prune: the layer named by the boot config survives'
+assert '[ "$(count_layers)" = 1 ]' 'layer prune: superseded appends removed'
+assert '[ -f "$LAYER_TMP/casper/filesystem_z20260921085616.squashfs" ]' \
+       'layer prune: the newest append survives'
+assert '[ -f "$LAYER_TMP/casper/filesystem.squashfs" ]' \
+       'layer prune: the base layer is never reaped'
+assert '[ -f "$LAYER_TMP/casper/filesystem_z0_firstboot.squashfs" ]' \
+       'layer prune: the firstboot stub is never reaped (glob must not match z0_)'
 
-# 2. No boot config -> delete nothing (fail safe).
-rm -f "$LAYER_TMP/menu.lst"
-mk_layer 20260916164712
+# 2. No appends at all -> the stub must survive (this is the glob trap: a
+#    filesystem_z[0-9]* glob would match filesystem_z0_firstboot and delete it).
+rm -f "$LAYER_TMP"/casper/filesystem_z[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*.squashfs
+mk_base; mk_stub
 run_prune
-assert '[ "$(count_layers)" = 2 ]' 'layer prune: no boot config -> deletes nothing'
+assert '[ -f "$LAYER_TMP/casper/filesystem_z0_firstboot.squashfs" ]' \
+       'layer prune: stub alone is never deleted'
+assert '[ -f "$LAYER_TMP/casper/filesystem.squashfs" ]' \
+       'layer prune: base alone is never deleted'
 
-# 3. Boot config names a layer that does not exist -> delete nothing.
-set_names /cdrom/casper/filesystem.z0.doesnotexist.squashfs
+# 3. A single append is the keeper; nothing to reap.
+mk_layer 20260930120000
 run_prune
-assert '[ "$(count_layers)" = 2 ]' 'layer prune: unresolvable named layer -> deletes nothing'
+assert '[ "$(count_layers)" = 1 ]' 'layer prune: a lone append survives'
+assert '[ -f "$LAYER_TMP/casper/filesystem_z20260930120000.squashfs" ]' \
+       'layer prune: the lone append is still present'
 
-# 4. A dot-extension of the named layer is an ancestor casper reads: keep it.
-rm -f "$LAYER_TMP"/casper/filesystem.z0.*.squashfs
-mk_layer 20260921085616
-mk_layer 20260921085616.20260922000000
-mk_layer 20260916164712
-set_names /cdrom/casper/filesystem.z0.20260921085616.squashfs
+# 4. Many appends -> exactly one survives (the newest), and it is the newest
+#    by NAME, which is the same order casper stacks by.
+rm -f "$LAYER_TMP"/casper/filesystem_z[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*.squashfs
+mk_base; mk_stub
+mk_layer 20260928025844; mk_layer 20260928025844.20260928142919 2>/dev/null
+mk_layer 20260929035510; mk_layer 20260930121931; mk_layer 20260916164712
 run_prune
-assert '[ -f "$LAYER_TMP/casper/filesystem.z0.20260921085616.squashfs" ]' \
-       'layer prune: keeps the named layer'
-assert '[ -f "$LAYER_TMP/casper/filesystem.z0.20260921085616.20260922000000.squashfs" ]' \
-       'layer prune: keeps dot-extensions (casper ancestors) of the named layer'
-assert '[ ! -f "$LAYER_TMP/casper/filesystem.z0.20260916164712.squashfs" ]' \
-       'layer prune: still removes an unrelated older layer'
+assert '[ "$(count_layers)" = 1 ]' 'layer prune: 4 appends collapse to the newest'
+assert '[ -f "$LAYER_TMP/casper/filesystem_z20260930121931.squashfs" ]' \
+       'layer prune: the newest append by name is the keeper'
 rm -rf "$LAYER_TMP"
 
 # --- lsl_ensure_user_home: rebuild a missing user home ----------------------

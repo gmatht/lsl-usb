@@ -20,13 +20,31 @@ LSL_DESKTOP_USER="$(lsl_desktop_user)"
 CDROM="${LSL_CDROM:-/cdrom}"
 CFG_ROOT="${LSL_CONFIG_ROOT:-}"
 
+# --- do the $HOME-targeted installs have a real user to target? -------------
+# config.sh is invoked twice: from squashfs_config.sh INSIDE uproot's chroot (a
+# real `chroot`, so no uid 1000, no /home entries, no desktop user at all), and
+# from onboot.sh on the HOST. In the chroot every $HOME path is a dead end, and
+# silently writing to a guessed /home/mint is what lost the terminal pin
+# (WHYFAIL13). The pin/kitty/desktop-shortcut installers below are therefore
+# gated on LSL_HOME_INSTALL=1, which is exactly "we resolved a real user".
+#
+# A chroot caller may still legitimately want the system-wide half (systemd
+# units, /usr/local/bin), so this gates only the home writes - not the script.
+LSL_HOME_INSTALL=0
+if [[ -n "$LSL_DESKTOP_USER" ]] && [[ -d "${CFG_ROOT}/home/$LSL_DESKTOP_USER" ]]; then
+    LSL_HOME_INSTALL=1
+else
+    echo "config.sh: no desktop user resolvable (user='${LSL_DESKTOP_USER:-<none>}' home='${CFG_ROOT}/home/${LSL_DESKTOP_USER:-?}'); skipping \$HOME installs (terminal pin, kitty config, desktop shortcuts)" >&2
+fi
+
 SYNC=1
 SYSTEMD=1
 SKIP_AUTOSTART_WARN=0
 AUTOSTART_WARN_ONLY=0
+HOME_ONLY=0
 
 usage() {
-    echo "Usage: $0 [--sync-only | --systemd-only | --from-onboot | --install-autostart-warning-only]" >&2
+    echo "Usage: $0 [--sync-only | --systemd-only | --from-onboot | --install-autostart-warning-only | --install-home-only]" >&2
     exit 1
 }
 
@@ -62,6 +80,10 @@ while [[ $# -gt 0 ]]; do
         --systemd-only) SYNC=0 ;;
         --from-onboot) SYNC=0; SKIP_AUTOSTART_WARN=1 ;;
         --install-autostart-warning-only) SYNC=0; SYSTEMD=0; AUTOSTART_WARN_ONLY=1 ;;
+        # Host-side $HOME installs only (see install_desktop_home_files in
+        # lsl-firstboot.sh). Used because those installers cannot work inside
+        # uproot's chroot - there is no desktop user there (WHYFAIL13).
+        --install-home-only) SYNC=0; SYSTEMD=0; HOME_ONLY=1 ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1" >&2; usage ;;
     esac
@@ -95,6 +117,14 @@ sync_cdrom() {
     if [[ -f "$REPO_ROOT/misc/.wezterm.lua" ]]; then
         cp_to_cdrom "$REPO_ROOT/misc/.wezterm.lua" "$CDROM/misc/.wezterm.lua"
     fi
+    # kitty.conf must also reach the stick: install_lsl_kitty_conf reads it from
+    # $REPO_ROOT/misc/ at install time, so on a boot where config.sh runs from
+    # the stick (the normal layout, REPO_ROOT == /cdrom) an unsynced misc/ means
+    # the kitty config is silently skipped. It only ever logged this at debug
+    # level, which is how it went unnoticed.
+    if [[ -f "$REPO_ROOT/misc/kitty.conf" ]]; then
+        cp_to_cdrom "$REPO_ROOT/misc/kitty.conf" "$CDROM/misc/kitty.conf"
+    fi
     shopt -s nullglob
     cp_to_cdrom "$REPO_ROOT/systemd/"*.service "$CDROM/systemd/"
     shopt -u nullglob
@@ -115,6 +145,10 @@ sync_cdrom() {
 }
 
 install_desktop_shortcuts() {
+    if [[ "${LSL_HOME_INSTALL:-0}" != "1" ]]; then
+        return 0
+    fi
+
     # $1 = force: install even when this invocation is not syncing the repo
     # (see install_desktop_shortcuts_from_onboot). Default 0 keeps the
     # historical behavior for --systemd-only / --sync-only scratch runs.
@@ -189,17 +223,17 @@ EOF
     if [[ -n "$lsl_tui_entry" ]]; then
         printf '%s\n' "$lsl_tui_entry" >/home/$LSL_DESKTOP_USER/Desktop/lsl-tui.desktop
         chmod +x /home/$LSL_DESKTOP_USER/Desktop/lsl-tui.desktop
-        chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/lsl-tui.desktop
+        chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/lsl-tui.desktop 2>/dev/null || true
     fi
     if [[ -n "$lsl_gui_entry" ]]; then
         printf '%s\n' "$lsl_gui_entry" >/home/$LSL_DESKTOP_USER/Desktop/lsl-gui.desktop
         chmod +x /home/$LSL_DESKTOP_USER/Desktop/lsl-gui.desktop
-        chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/lsl-gui.desktop
+        chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/lsl-gui.desktop 2>/dev/null || true
     fi
     if [[ -n "$lsl_shutdown_entry" ]]; then
         printf '%s\n' "$lsl_shutdown_entry" >/home/$LSL_DESKTOP_USER/Desktop/lsl-shutdown.desktop
         chmod +x /home/$LSL_DESKTOP_USER/Desktop/lsl-shutdown.desktop
-        chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/lsl-shutdown.desktop
+        chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/lsl-shutdown.desktop 2>/dev/null || true
     fi
 
     if command -v brave-browser >/dev/null 2>&1 || command -v brave-browser-stable >/dev/null 2>&1; then
@@ -215,7 +249,7 @@ Terminal=false
 Categories=Network;WebBrowser;
 EOF
         chmod +x /home/$LSL_DESKTOP_USER/Desktop/brave-browser.desktop
-        chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/brave-browser.desktop
+        chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER /home/$LSL_DESKTOP_USER/Desktop/brave-browser.desktop 2>/dev/null || true
     fi
 }
 
@@ -245,6 +279,10 @@ install_desktop_shortcuts_from_onboot() {
 
 # Runs even when SYNC=0 (--from-onboot) so login warning is installed after /home exists.
 install_lsl_autostart_warning() {
+    if [[ "${LSL_HOME_INSTALL:-0}" != "1" ]]; then
+        return 0
+    fi
+
     local mint_home
     if [[ -n "$CFG_ROOT" ]]; then
         mint_home="${CFG_ROOT}/home/$LSL_DESKTOP_USER"
@@ -268,11 +306,15 @@ NoDisplay=true
 X-GNOME-Autostart-enabled=true
 EOF
     chmod +x "$mint_home/.config/autostart/lsl-home-readonly-warning.desktop"
-    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config/autostart/lsl-home-readonly-warning.desktop"
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config/autostart/lsl-home-readonly-warning.desktop" 2>/dev/null || true
 }
 
 
 install_lsl_kitty_conf() {
+    if [[ "${LSL_HOME_INSTALL:-0}" != "1" ]]; then
+        return 0
+    fi
+
     # Ship a Windows-Terminal-like kitty config so the default terminal matches
     # what users expect from Windows. Installed into the desktop user's config.
     local mint_home kitty_dir
@@ -300,6 +342,10 @@ install_lsl_kitty_conf() {
 }
 
 install_lsl_terminal_autostart() {
+    if [[ "${LSL_HOME_INSTALL:-0}" != "1" ]]; then
+        return 0
+    fi
+
     # The desktop/panel is expected to look like Windows Terminal out of the box:
     # a terminal pinned to the panel. Pinning is done by bin/lsl-pin-favorites
     # (which now prefers kitty, because kitty is what the base image actually
@@ -335,20 +381,24 @@ NoDisplay=true
 X-GNOME-Autostart-enabled=true
 EOF
     chmod +x "$mint_home/.config/autostart/lsl-terminal-pin.desktop"
-    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config/autostart/lsl-terminal-pin.desktop"
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config/autostart/lsl-terminal-pin.desktop" 2>/dev/null || true
 }
 
 install_lsl_pin_favorites_autostart() {
+    if [[ "${LSL_HOME_INSTALL:-0}" != "1" ]]; then
+        return 0
+    fi
+
     local mint_home
     if [[ -n "$CFG_ROOT" ]]; then
         mint_home="${CFG_ROOT}/home/$LSL_DESKTOP_USER"
     else
         mint_home="/home/$LSL_DESKTOP_USER"
     fi
-    if [[ ! -d "$mint_home" ]]; then
+    if [[ -z "$LSL_DESKTOP_USER" || ! -d "$mint_home" ]]; then
         return 0
     fi
-    mkdir -p "$mint_home/.config/autostart"
+    mkdir -p "$mint_home/.config/autostart" || return 0
     chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config" "$mint_home/.config/autostart" 2>/dev/null || true
 
     cat <<'EOF' >"$mint_home/.config/autostart/lsl-pin-favorites.desktop"
@@ -362,7 +412,7 @@ NoDisplay=true
 X-GNOME-Autostart-enabled=true
 EOF
     chmod +x "$mint_home/.config/autostart/lsl-pin-favorites.desktop"
-    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config/autostart/lsl-pin-favorites.desktop"
+    chown $LSL_DESKTOP_USER:$LSL_DESKTOP_USER "$mint_home/.config/autostart/lsl-pin-favorites.desktop" 2>/dev/null || true
 }
 
 ensure_cdrom_path_in_bashrc() {
@@ -428,6 +478,18 @@ install_systemd_units() {
 
 if [[ "$AUTOSTART_WARN_ONLY" -eq 1 ]]; then
     install_lsl_autostart_warning
+    exit 0
+fi
+
+# --install-home-only: the host-side half. Only the $HOME-targeted installers
+# run; the repo sync and the system-wide systemd units were already handled by
+# the chroot-side call (or onboot). Exits without touching SYNC/SYSTEMD.
+if [[ "$HOME_ONLY" -eq 1 ]]; then
+    install_desktop_shortcuts
+    install_lsl_autostart_warning
+    install_lsl_terminal_autostart
+    install_lsl_pin_favorites_autostart
+    install_lsl_kitty_conf
     exit 0
 fi
 

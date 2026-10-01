@@ -231,6 +231,14 @@ $script:mockPaths = @('G:/casper/filesystem.squashfs')
 $script:mockReadHost = '1'
 $chosen = Select-ExistingUsb -Label ''
 Assert-True ($chosen -and $chosen.DriveLetter -eq 'G') 'Select-ExistingUsb picks the chosen volume'
+# Single drive: plain Enter (empty answer) defaults to the only USB found.
+$script:mockReadHost = ''
+$only = Select-ExistingUsb -Label ''
+Assert-True ($only -and $only.DriveLetter -eq 'G') 'Select-ExistingUsb defaults to the only drive on Enter'
+# ...but 0 still routes to a fresh Rufus write (null).
+$script:mockReadHost = '0'
+$fresh = Select-ExistingUsb -Label ''
+Assert-True ($null -eq $fresh) 'Select-ExistingUsb: 0 still means write fresh via Rufus'
 
 # Select-ExistingIso: Everything present -> prompt -> pick
 function global:Find-EverythingIsos { return ,@('D:\iso\a.iso', 'D:\iso\b.iso') }
@@ -484,6 +492,40 @@ Assert-True ($script:mockPaths -contains 'G:/drivers/rtl8814au.tar.gz') 'tarball
 Remove-Item function:global:Get-CimInstance -ErrorAction SilentlyContinue
 Remove-Item function:New-Item -ErrorAction SilentlyContinue   # NB: 'function:global:New-Item' does NOT remove a global function
 Remove-Item function:global:Download -ErrorAction SilentlyContinue
+
+# Install-HivexTools: stages the three hivex .debs to <USB>:\pkgs\ so the guest
+# can install hivexregedit before /home mounts (WHYFAIL9 / FRAGILE_HOME.md).
+Write-Host '== hivex tooling staging =='
+$hivexIndex = @'
+Package: libhivex0
+Version: 1.3.23-1build7
+Filename: pool/universe/h/hivex/libhivex0_1.3.23-1build7_amd64.deb
+
+Package: libhivex-bin
+Version: 1.3.23-1build7
+Filename: pool/universe/h/hivex/libhivex-bin_1.3.23-1build7_amd64.deb
+
+Package: libwin-hivex-perl
+Version: 1.3.23-1build7
+Filename: pool/universe/h/hivex/libwin-hivex-perl_1.3.23-1build7_amd64.deb
+'@
+$hivexCache = Join-Path $env:TEMP 'lsl-apt-noble-updates-universe-Packages.gz'
+New-FakePackagesGz -Path $hivexCache -Content $hivexIndex
+function global:New-Item { param([string]$ItemType, [switch]$Force, [string]$Path) }
+function global:Download {
+    param([string]$Url, [string]$Destination)
+    $script:mockPaths += $Destination
+}
+$script:mockPaths = @()
+$vol5 = [pscustomobject]@{ DriveLetter = 'G' }
+$hrep = Install-HivexTools -Vol $vol5
+Assert-True ($hrep.Count -eq 3) 'Install-HivexTools returns three report lines'
+Assert-True (($hrep | Where-Object { $_ -match '^STAGE libwin-hivex-perl' }).Count -eq 1) 'hivexregedit package (libwin-hivex-perl) staged'
+Assert-True ($script:mockPaths -contains 'G:/pkgs/libhivex-bin_1.3.23-1build7_amd64.deb') 'libhivex-bin .deb staged to <USB>:\pkgs\'
+Assert-True ($script:mockPaths -contains 'G:/pkgs/libwin-hivex-perl_1.3.23-1build7_amd64.deb') 'libwin-hivex-perl .deb staged to <USB>:\pkgs\'
+Remove-Item function:New-Item -ErrorAction SilentlyContinue
+Remove-Item function:global:Download -ErrorAction SilentlyContinue
+Remove-Item $hivexCache -Force -ErrorAction SilentlyContinue
 
 # --- 14. Linux compatibility rating (linux-hardware.org LKDDb) ---
 Write-Host '== Linux compatibility rating =='

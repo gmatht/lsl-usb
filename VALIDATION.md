@@ -12,34 +12,57 @@ first real validation pass. Do it in order; each step is a prerequisite for the 
 - **First boot needs network for `apt`.** Prefer **wired Ethernet**; some wireless
   cards need firmware absent from the base image. For fully-offline first boots,
   drop `.deb` packages into `<USB>:/firmware/` before booting (installed by
-  `squashfs_config.sh` before apt). If there is no network, first boot retries on
+  `squashfs_config.sh` before apt). The installer also stages the hivex `.debs`
+  in `<USB>:/pkgs/` (see below). If there is no network, first boot retries on
   the next boot (it does not silently proceed to a base image).
 
 ## 0. Automated pre-checks (run before burning time on real hardware)
 
 These catch the two biggest unknowns without a physical boot:
 
-- [ ] **Casper layer glob** — VERIFIED against `linuxmint-22.3-cinnamon-64bit.iso`:
-      its initrd's `main/scripts/casper` globs `filesystem*.squashfs` (any suffix,
-      line 91/142/647) and stacks them lexically with the **lexically-greatest
-      file as the top layer**. Order is `filesystem.squashfs` (base) <
-      `filesystem_z0_firstboot.squashfs` < `filesystem_z<timestamp>.squashfs`
-      (appended layer, top), so the first-boot packages and unit appear on the
-      second boot. `bash tests/casper-layer-check.sh` passes with the default glob.
+- [ ] **Casper layer order** — VERIFIED against `linuxmint-22.3-cinnamon-64bit.iso`:
+      its initrd's `main/scripts/casper` globs `*.squashfs` and stacks the
+      matches lexically with the **lexically-greatest file as the top layer**.
+      Layer order is therefore carried entirely by the filenames:
+
+      | rank | name | role |
+      |---|---|---|
+      | 1 | `filesystem.squashfs` | base (distro image) |
+      | 2 | `filesystem_z0_firstboot.squashfs` | first-boot stub |
+      | 3+ | `filesystem_z<timestamp>.squashfs` | appended layers, newest last |
+
+      (`'_'` 0x5F > `'.'` 0x2E puts every `filesystem_z*` above the base;
+      `'2'` > `'0'` puts the appends above the stub; the fixed-width timestamp
+      makes lexical order equal chronological order.)
+
+      **No `layerfs-path=` is passed on the kernel cmdline.** That flag selects
+      casper's other branch, which walks dot-suffixes upward from one named
+      file and `panic`s if a walked layer is missing — the scheme this project
+      used until 2026-09-30 (see WHYFAIL14). Only `initramfs/lsl_hdd_mirror.sh`
+      still sets it, to point at a single pre-merged layer on the internal disk.
+
+      `bash tests/casper-layer-check.sh` asserts the names and the sort order.
       To re-verify on a different image:
       ```bash
       unmkinitramfs /cdrom/casper/initrd /tmp/ir && \
-        grep -nE '\*\.squashfs' /tmp/ir/main/scripts/casper
+        grep -nE '\*\.squashfs|LAYERFS_PATH' /tmp/ir/main/scripts/casper
       Casper_GLOB='<the glob you found>' bash tests/casper-layer-check.sh
       ```
+      Note the real glob is `*.squashfs`, NOT `filesystem*.squashfs`: any other
+      `.squashfs` in the layer directory becomes an overlay layer.
 - [ ] **`bash tests/mount_all.tests.sh`** passes (GPT/MBR drive-letter GUID
       resolution; the partition GUID must match `PARTUUID`).
 - [ ] **`bash tests/lsl-common.tests.sh`** and **`build.sh`** pass locally.
-- [ ] If `hivex-tools` / `btrfs-progs` are NOT in the base Mint live image,
-      the first boot cannot mount `/mnt/c` or create `home.btrfs`; `onboot.sh`
-      now falls back to a temporary tmpfs `/home` and warns, but HDD persistence
-      only becomes real on the second boot. Verify both tools are present in the
-      image you wrote (`which hivexget btrfs`; `apt-cache policy ...`).
+- [ ] **hivex-tools / btrfs-progs on the base image.** If `hivex-tools` is NOT in
+      the base Mint live image, `mount_all.sh` cannot map `/mnt/c`, so the first
+      boot's `/home` falls back to a temporary tmpfs overlay. The installer now
+      stages `libhivex0`/`libhivex-bin`/`libwin-hivex-perl` `.debs` to
+      `<USB>:/pkgs/`, and `lsl_ensure_hivex_tools` installs them offline before
+      `/home` mounts (`onboot.sh` / `lsl-mount-home.sh`), so this should no longer
+      trigger. To verify: confirm `<USB>:/pkgs/` has the three `.debs`, and on the
+      first boot check `/run/lsl-usb.state` says `LSL_MODE=hdd` (not
+      `usb-fallback`) and that `/mnt/c` is mounted. If `/run/lsl-usb.mount-missing-hivex`
+      exists, the early install failed (see `lsl-firstboot.home-failed` on the stick).
 - [ ] **Rufus DD mode** — with Rufus, write in "DD Image" mode (not "ISO" mode)
       so the stick boots like a real ISO; some UEFIs reject Rufus' "ISO" hybrid
       partition table. **Secure Boot**: Mint ships a Microsoft-signed shim, so the
@@ -180,6 +203,13 @@ re-sign the DKMS modules (or accept no wifi until SB is off).
       final unmount, and `lsl-diag.sh toram-pre` is captured beforehand).
       After the swap, uphome/uproot/lsl-home-flushd are unavailable until the USB
       is re-inserted.
+- [ ] Boot to RAM (`ramclone`): on the `(Boot to RAM, no persistence)` entry,
+      `dmsetup status clone` shows the clone device and `lsl-ramclone-status`
+      reports a rising percent; the autostart dialog shows the copy progress and,
+      at 100%, a **Detach USB** button. Clicking it powers off the stick and
+      reports "It is now safe to remove your stick."; pulling it keeps the
+      session alive. Repeat on the persistent `(Boot to RAM)` entry, and confirm
+      a normal (non-RAM) boot shows no dialog.
 
 ## 4. Performance
 

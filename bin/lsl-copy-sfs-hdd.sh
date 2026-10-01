@@ -52,25 +52,25 @@ human() {
 }
 
 # Emit one source sfs path per line (only files that exist on the USB).
+# Order matters: the merge below overlays them in exactly this sequence, so
+# the base must come first and the newest append last. Alphabetical order is
+# that order (see WHYFAIL14), but it is spelled out explicitly here so a new
+# name cannot silently change which layer wins.
 source_layers() {
     local f
-    for f in "$CDROM/casper/filesystem_z0_firstboot.squashfs" \
-             "$CDROM/casper/filesystem.squashfs" \
-             "$CDROM/casper/filesystem_"*.squashfs \
+    for f in "$CDROM/casper/filesystem.squashfs" \
+             "$CDROM/casper/filesystem_z0_firstboot.squashfs" \
+             "$CDROM"/casper/filesystem_z[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*.squashfs \
              "$CDROM/home"*.sfs; do
         [ -f "$f" ] && printf '%s\n' "$f"
     done
 }
 
-# Map a USB layer basename to the name it gets in the HDD mirror. casper's
-# multi-layer LAYERFS_PATH chain expects filesystem.z0.squashfs stacked over
-# filesystem.squashfs, so the firstboot layer is renamed on copy.
-dest_name() {
-    case "$1" in
-        filesystem_z0_firstboot.squashfs) printf 'filesystem.z0.squashfs' ;;
-        *) printf '%s' "$1" ;;
-    esac
-}
+# The single layer the initrd hook points LAYERFS_PATH at. With the dot-chain
+# gone, a flat name has NO dot-parents, so casper's LAYERFS_PATH walk resolves
+# exactly this one file - it must therefore be self-contained (a real rootfs
+# with /sbin/init), not a delta over the USB's base layer. Hence the pre-merge.
+MERGED_NAME="filesystem_zmerged.squashfs"
 
 layer_size() { stat -c %s "$1" 2>/dev/null || echo 0; }
 
@@ -94,36 +94,71 @@ env_set() {
     echo "Set LSL_SFS_HDD_CACHE=$val in $ENV_FILE"
 }
 
-copy_one() {
-    local src="$1" base dest sz sha
-    base="$(basename "$src")"
-    dest="$DEST/$(dest_name "$base")"
-    sz="$(layer_size "$src")"
-    echo "  copying $base -> $(basename "$dest") ($(human "$sz")) ..."
-    cp -a "$src" "$dest" 2>/dev/null || cp "$src" "$dest" || { echo "  FAILED to copy $base" >&2; return 1; }
-    if [ "$(layer_size "$dest")" != "$sz" ]; then
-        echo "  ERROR: size mismatch after copy of $base" >&2; return 1
+# Overlay every source layer into one self-contained squashfs at $STAGE_DIR.
+# Layer order comes from source_layers(): base first, newest append last, so
+# the newest content wins - the same precedence casper's lexical stack gives.
+# Exclusions mirror uproot's append (never bake apt caches or flatpak's
+# content-addressed store).
+build_merged_layer() {
+    local out="$1"; shift
+    local mnt="/tmp/lsl-merge.$$" f n=0
+    mkdir -p "$mnt" || return 1
+    # Build an overlay dir by applying each layer in order. unsquashfs cannot
+    # write over an existing tree, so unpack each layer to its own dir and
+    # copy it in with later layers overwriting earlier files.
+    local acc="$mnt/acc"
+    mkdir -p "$acc"
+    for f in "$@"; do
+        local one="$mnt/l.$n"
+        mkdir -p "$one"
+        if ! unsquashfs -f -d "$one" "$f" >/dev/null 2>&1; then
+            echo "  FAILED to unpack $f" >&2
+            rm -rf "$mnt"
+            return 1
+        fi
+        # Later layers must win: copy over, do not merge-only.
+        cp -a "$one/." "$acc/" 2>/dev/null
+        rm -rf "$one"
+        n=$((n + 1))
+    done
+    # A rootfs without /sbin/init would drop the boot to an initramfs shell.
+    if [ ! -e "$acc/sbin/init" ]; then
+        echo "  ERROR: merged tree has no /sbin/init; refusing to publish it." >&2
+        rm -rf "$mnt"
+        return 1
     fi
-    sha="$(sha256sum "$src" | awk '{print $1}')"
-    printf '%s=%s sha256:%s\n' "$(basename "$dest")" "$sz" "$sha" >> "$MANIFEST"
-    echo "  copied $base -> $(basename "$dest")"
+    if ! mksquashfs "$acc" "$out" -comp zstd -Xcompression-level 22 \
+        -wildcards -e "var/cache/apt/archives/*" "var/lib/apt/lists/*" \
+                   "var/lib/flatpak/*" >/dev/null 2>&1; then
+        echo "  FAILED to build merged layer $out" >&2
+        rm -f "$out"
+        rm -rf "$mnt"
+        return 1
+    fi
+    rm -rf "$mnt"
+    return 0
 }
 
 do_offer() {
     local files; files="$(source_layers)"
     [ -n "$files" ] || { echo "No squashfs layers found on $CDROM." >&2; exit 1; }
     mkdir -p "$DEST" 2>/dev/null || { echo "error: cannot create $DEST" >&2; exit 1; }
-    echo "Linux squashfs layers found on the USB ($CDROM):"
+    echo "Linux squashfs layers found on the USB ($CDROM), in stack order:"
     local total=0 f sz
     while IFS= read -r f; do
         sz="$(layer_size "$f")"; total=$(( total + sz ))
-        local st="missing"
-        [ -f "$DEST/$(basename "$f")" ] && st="present"
-        echo "  $(basename "$f")  $(human "$sz")  [HDD copy: $st]"
+        echo "  $(basename "$f")  $(human "$sz")"
     done <<< "$files"
-    echo "Total to copy: $(human "$total") -> $DEST"
+    echo "Total: $(human "$total"). These are overlaid (in this order) into a single"
+    echo "self-contained layer $MERGED_NAME at $DEST - casper boots that one file."
+    echo "Current mirror:"
+    if [ -f "$DEST/$MERGED_NAME" ]; then
+        echo "  $MERGED_NAME  $(human "$(layer_size "$DEST/$MERGED_NAME")")  [present]"
+    else
+        echo "  $MERGED_NAME  -  [missing]"
+    fi
     local ans
-    read -r -p "Copy all layers to the HDD now? [y/N] " ans
+    read -r -p "Build the merged layer on the HDD now? [y/N] " ans
     case "${ans:-}" in
         y|Y|yes|YES) do_yes ;;
         *) echo "Aborted. Nothing copied." ;;
@@ -131,43 +166,55 @@ do_offer() {
 }
 
 do_yes() {
-    local files; files="$(source_layers)"
-    [ -n "$files" ] || { echo "No squashfs layers found on $CDROM." >&2; exit 1; }
+    local files; files="$(source_layers | tr '\n' ' ')"
+    [ -n "${files// /}" ] || { echo "No squashfs layers found on $CDROM." >&2; exit 1; }
     mkdir -p "$DEST" 2>/dev/null || { echo "error: cannot create $DEST" >&2; exit 1; }
+    # Build the merged layer FIRST. If it cannot be built there is no point
+    # copying anything: without it the mirror cannot boot.
+    local tmp="$DEST/.$MERGED_NAME.part"
+    rm -f "$tmp"
+    echo "Building merged layer $MERGED_NAME from $(echo "$files" | wc -w) layer(s) ..."
+    if ! build_merged_layer "$tmp" $files; then
+        echo "ERROR: could not build the merged layer; mirror not updated." >&2
+        exit 1
+    fi
     : > "$MANIFEST" 2>/dev/null || true
     {
         echo "# LSL squashfs layers copied to HDD for faster boot"
         echo "SourceUSB=$CDROM"
         echo "Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } >> "$MANIFEST"
-    local f
-    while IFS= read -r f; do
-        copy_one "$f" || true
-    done <<< "$files"
+    # Publish atomically: casper must never see a half-written layer.
+    mv -f "$tmp" "$DEST/$MERGED_NAME" || { echo "ERROR: could not publish merged layer." >&2; exit 1; }
+    local sz sha
+    sz="$(layer_size "$DEST/$MERGED_NAME")"
+    sha="$(sha256sum "$DEST/$MERGED_NAME" | awk '{print $1}')"
+    printf '%s=%s sha256:%s\n' "$MERGED_NAME" "$sz" "$sha" >> "$MANIFEST"
+    echo "Merged layer ready: $DEST/$MERGED_NAME ($(human "$sz"))"
+    # Drop stale per-layer copies from a pre-merge mirror so the hook cannot
+    # pick an old layout.
+    rm -f "$DEST/filesystem.squashfs" "$DEST/filesystem_z0_firstboot.squashfs" \
+          "$DEST"/filesystem_z[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*.squashfs \
+          "$DEST/home"*.sfs 2>/dev/null || true
     env_set 1
     echo "Done. On next boot the initrd will auto-detect this mirror and use it;"
     echo "lsl-precache.sh also warms the page cache from it."
 }
 
 do_status() {
-    local files; files="$(source_layers)"
-    echo "Layer status (USB $CDROM vs HDD $DEST):"
-    if [ -z "$files" ]; then echo "  no layers on USB."; fi
-    local f sz_us sz_hd d
+    echo "Mirror status (USB $CDROM -> HDD $DEST):"
+    local d="$DEST/$MERGED_NAME"
+    if [ -f "$d" ]; then
+        echo "  $MERGED_NAME: present ($(human "$(layer_size "$d")"))"
+        echo "  (built $(date -u -r "$d" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown))"
+    else
+        echo "  $MERGED_NAME: MISSING - run --yes to build it"
+    fi
+    echo "  source layers on USB:"
+    local f
     while IFS= read -r f; do
-        sz_us="$(layer_size "$f")"
-        d="$DEST/$(dest_name "$(basename "$f")")"
-        if [ ! -f "$d" ]; then
-            echo "  $(basename "$f"): MISSING on HDD ($(human "$sz_us") on USB)"
-        else
-            sz_hd="$(layer_size "$d")"
-            if [ "$sz_hd" = "$sz_us" ]; then
-                echo "  $(basename "$f"): OK ($(human "$sz_hd"), current)"
-            else
-                echo "  $(basename "$f"): STALE (HDD $(human "$sz_hd") != USB $(human "$sz_us")) - re-run --yes"
-            fi
-        fi
-    done <<< "$files"
+        echo "    $(basename "$f")  $(human "$(layer_size "$f")")"
+    done < <(source_layers)
     local flag=""
     [ -f "$ENV_FILE" ] && flag="$(grep -E '^LSL_SFS_HDD_CACHE=' "$ENV_FILE" | tail -1 | cut -d= -f2)"
     echo "LSL_SFS_HDD_CACHE=$flag (in $ENV_FILE)"

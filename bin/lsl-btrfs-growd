@@ -8,9 +8,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 lsl_load_config
 
-if lsl_is_usb_mode; then
-    exit 0
-fi
+# Only HDD mode has home.btrfs/cache.btrfs to grow. Branch on the mode /home was
+# actually mounted with (recorded by lsl-mount-home.sh), not a fresh prediction:
+# a usb-fallback boot has an overlay and no image, so it must exit like USB/ram.
+lsl_effective_home_is_hdd || exit 0
 
 MIN_PCT="${LSL_BTRFS_MIN_FREE_PCT:-10}"
 CHUNK_MIB="${LSL_BTRFS_GROW_CHUNK_MIB:-1024}"
@@ -128,7 +129,9 @@ try_grow() {
 
 while true; do
     lsl_load_config
-    if lsl_is_usb_mode; then
+    # Effective mode, not the live resolve: the prediction can flip under this
+    # loop (e.g. /mnt/c mounts mid-first-boot) while the recorded mode cannot.
+    if ! lsl_effective_home_is_hdd; then
         exit 0
     fi
     try_grow /home "$(lsl_home_btrfs_path)" home

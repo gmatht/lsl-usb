@@ -9,10 +9,26 @@ fi
 
 mountpoint -q /cdrom 2>/dev/null || exit 0
 
-# Live-session desktop user (mint on Mint, zorin on Zorin, ...).
-LSL_DESKTOP_USER="$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)"
-[ -n "$LSL_DESKTOP_USER" ] || LSL_DESKTOP_USER="$(ls -1 /home 2>/dev/null | head -n1 || true)"
-[ -n "$LSL_DESKTOP_USER" ] || LSL_DESKTOP_USER="mint"
+# Live-session desktop user (mint on Mint, zorin on Zorin, ubuntu on Ubuntu, ...).
+# Resolve it, never invent one: a guessed "mint" on an Ubuntu stick would write
+# wifi history under /home/mint, which does not exist (WHYFAIL13/
+# lsl_desktop_user). Prefer the shared resolver so there is ONE definition.
+if [ -f /cdrom/bin/lsl-common.sh ]; then
+    # shellcheck source=/dev/null
+    . /cdrom/bin/lsl-common.sh
+    LSL_DESKTOP_USER="$(lsl_desktop_user)"
+fi
+if [ -z "${LSL_DESKTOP_USER:-}" ]; then
+    LSL_DESKTOP_USER="$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)"
+fi
+if [ -z "${LSL_DESKTOP_USER:-}" ]; then
+    LSL_DESKTOP_USER="$(ls -1 /home 2>/dev/null | head -n1 || true)"
+fi
+# No desktop user resolvable: skip rather than write into a guessed home.
+if [ -z "${LSL_DESKTOP_USER:-}" ]; then
+    echo "persist-wifi: no desktop user resolvable; skipping" >&2
+    exit 0
+fi
 STATE_DIR="/home/$LSL_DESKTOP_USER/.local/state/lsl"
 STATE_WIFI_FILE="${STATE_DIR}/wifi.history.sh"
 CDROM_WIFI_FILE="/cdrom/wifi.sh"

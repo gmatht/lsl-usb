@@ -413,6 +413,96 @@ pub fn install_driver_packages(vol_letter: &str, skip_download: bool) -> Vec<Str
 }
 
 // ---------------------------------------------------------------------------
+// Staged tooling packages (<USB>:\pkgs) - offline boot-critical .debs.
+//
+// WHY THIS EXISTS (WHYFAIL9 / WHYFAIL10)
+// --------------------------------------
+// mount_all.sh maps Windows drive letters by reading the MountedDevices
+// registry key with hivexget/hivexregedit. Those tools are NOT in the live
+// image, and on a stock first boot the same firstboot run installs them only
+// ~23 minutes AFTER /home has already been mounted. Without them mount_all.sh
+// cannot map /mnt/c, the data dir is not persistent, and /home falls back to a
+// transient tmpfs overlay - so that boot's home is lost. The Linux side
+// (lsl_ensure_hivex_tools) installs the .debs staged HERE, BEFORE /home
+// mounts, which removes the trigger with no network.
+//
+// The three packages are self-contained against the 24.04 base image: their
+// only deps are libc6, libreadline8t64, libxml2 and perl, all present.
+// ---------------------------------------------------------------------------
+
+/// hivex packages to stage, in install order (libhivex0 before its dependants).
+/// (package, suite, component) - all in noble/universe.
+const STAGED_PKGS: &[(&str, &str, &str)] = &[
+    ("libhivex0", "noble", "universe"),
+    ("libhivex-bin", "noble", "universe"),
+    ("libwin-hivex-perl", "noble", "universe"),
+];
+
+/// Install-StagedPackages: download the boot-critical tooling .debs to
+/// <USB>:\pkgs\ and write lsl-pkgs.txt. Returns the report lines.
+///
+/// Best-effort: a package that cannot be resolved or downloaded is reported and
+/// skipped, never fatal - the stick still boots, it just loses the offline
+/// hivex path (and therefore /home persistence on a drive-letter-mapped boot).
+pub fn install_staged_packages(vol_letter: &str, skip_download: bool) -> Vec<String> {
+    let root = format!("{}:\\", vol_letter);
+    let pkg_dir = format!("{}pkgs", root);
+    let mut report = Vec::new();
+    let mut staged = 0usize;
+
+    for (pkg, suite, component) in STAGED_PKGS {
+        let Some(url) = ubuntu_package_url(pkg, suite, component) else {
+            report.push(format!(
+                "SKIP  {}: could not resolve a download URL (no network / index unavailable)",
+                pkg
+            ));
+            continue;
+        };
+        let fname = url.rsplit('/').next().unwrap_or(pkg).to_string();
+        if skip_download {
+            report.push(format!("STAGE {}: {} (download skipped)", pkg, fname));
+            continue;
+        }
+        crate::sys::create_dir_all(&pkg_dir);
+        let dest = format!("{}\\{}", pkg_dir, fname);
+        match crate::net::download_to_file(&url, &dest, crate::net::user_agent(), &mut |_| {}) {
+            Ok(n) if n > 0 => {
+                report.push(format!(
+                    "STAGE {}: {} ({:.1} KB)",
+                    pkg,
+                    fname,
+                    n as f64 / 1024.0
+                ));
+                staged += 1;
+            }
+            Ok(_) => {
+                crate::sys::delete_file(&dest);
+                report.push(format!("FAIL  {}: empty download", pkg));
+            }
+            Err(e) => {
+                crate::sys::delete_file(&dest);
+                report.push(format!("FAIL  {}: {}", pkg, e));
+            }
+        }
+    }
+
+    if staged == 0 {
+        report.push(
+            "WARNING: no hivex packages staged - a boot whose Windows drives need \
+             drive-letter mapping will fall back to a transient /home."
+                .into(),
+        );
+    } else {
+        report.push(format!(
+            "Staged {} hivex package(s) to {} - the Linux side installs them before /home mounts.",
+            staged, pkg_dir
+        ));
+    }
+    let _ = std::fs::write(format!("{}lsl-pkgs.txt", root), report.join("\r\n"));
+    report
+}
+
+// ---------------------------------------------------------------------------
 // linux-hardware.org LKDDb rating (Get-LinuxCompatRating).
 // ---------------------------------------------------------------------------
 

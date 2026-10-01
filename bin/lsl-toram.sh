@@ -15,11 +15,45 @@
 #  - Processes holding open files keep writing to the pre-copy descriptors;
 #    restart long-lived apps after the swap for full consistency.
 #
-# Usage: sudo bin/lsl-toram.sh
+# Usage: sudo bin/lsl-toram.sh [--progress]
+#   --progress  emit zenity "PCT # text" lines on stdout (human status moves to
+#               stderr) so a caller can show a progress bar; used by
+#               lsl-shutdown-gui. Without it the output is unchanged.
 #   LSL_TORAM_TEST=1  stop after the RAM copy (no pivot) - dry run.
 set -euo pipefail
 
-[ -e /run/lsl-toram.done ] && { echo "Session is already running from RAM."; exit 0; }
+PROGRESS=0
+for _arg in "$@"; do
+    case "$_arg" in
+        --progress) PROGRESS=1 ;;
+        -h|--help)
+            echo "Usage: $0 [--progress]" >&2
+            echo "  --progress  emit 'PCT # text' progress lines on stdout." >&2
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $_arg" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# Human-facing status: stdout normally, stderr under --progress so the only
+# thing a caller sees on stdout is the machine-readable progress protocol.
+say() {
+    if [ "$PROGRESS" = 1 ]; then printf '%s\n' "$*" >&2; else printf '%s\n' "$*"; fi
+}
+# One zenity "PCT # text" line (no-op unless --progress).
+progress() {
+    [ "$PROGRESS" = 1 ] || return 0
+    printf '%s # %s\n' "$1" "$2"
+}
+
+if [ -e /run/lsl-toram.done ]; then
+    say "Session is already running from RAM."
+    progress 100 "Session is already running from RAM."
+    exit 0
+fi
 mountpoint -q /cdrom || { echo "/cdrom is not mounted; this does not look like a live session." >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || { echo "Please run as root." >&2; exit 1; }
 
@@ -51,13 +85,13 @@ TAR_EXCLUDES=(--exclude=./proc --exclude=./sys --exclude=./dev --exclude=./run -
               --exclude=./mnt --exclude=./media --exclude=./cdrom \
               --exclude=./lsl-toram-root --exclude=./lsl-toram-old)
 
-echo "Measuring the running root..."
+say "Measuring the running root..."
 root_mb="$(du -sm "${DU_EXCLUDES[@]}" / 2>/dev/null | awk '{print $1}')"
 root_mb="${root_mb:-0}"
 # headroom: extra 50% (cow growth, cache working set)
 need_mb=$(( root_mb * 15 / 10 + 512 ))
 free_mb="$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)"
-echo "Root to copy: ~${root_mb} MB  |  RAM needed: ~${need_mb} MB  |  free: ${free_mb} MB"
+say "Root to copy: ~${root_mb} MB  |  RAM needed: ~${need_mb} MB  |  free: ${free_mb} MB"
 if [ "$need_mb" -gt "$free_mb" ]; then
     echo "ERROR: not enough free RAM (need ~${need_mb} MB)." >&2
     exit 1
@@ -65,7 +99,7 @@ fi
 
 # Stop all LSL persistence helpers; left running they hold files in the old
 # root and prevent it from being unmounted (so the USB could not be removed).
-systemctl stop lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service 2>/dev/null || true
+systemctl stop lsl-home-flushd.service lsl-btrfs-growd.service lsl-precache.service >/dev/null 2>&1 || true
 
 # Detach the persistence loop devices (home/cache btrfs) so the old root can be
 # fully unmounted after the pivot. Source the helpers to resolve the image paths.
@@ -85,8 +119,39 @@ mkdir -p "$NEW" "$OLD"
 mount -t tmpfs -o "size=${need_mb}M" tmpfs "$NEW"
 mount -t tmpfs -o size=64M tmpfs "$OLD"
 
-echo "Copying the live root into RAM (${root_mb} MB)..."
+# The destination tmpfs starts empty and grows to about the root size, so df's
+# used blocks are a good real-time proxy for the tar copy. Poll them in the
+# background; under --progress this poller is the only writer on stdout.
+copy_total_kb=$(( root_mb * 1024 ))
+[ "$copy_total_kb" -gt 0 ] || copy_total_kb=1
+copy_poller=""
+if [ "$PROGRESS" = 1 ]; then
+    (
+        last=-1
+        while :; do
+            used_kb="$(df -k "$NEW" 2>/dev/null | awk 'NR==2 {print $3; exit}')" || used_kb=0
+            case "$used_kb" in ''|*[!0-9]*) used_kb=0 ;; esac
+            pct=$(( used_kb * 100 / copy_total_kb ))
+            [ "$pct" -lt 1 ] && pct=1
+            [ "$pct" -gt 99 ] && pct=99
+            if [ "$pct" -ne "$last" ]; then
+                printf '%s # Copying the session into RAM… (%s%%)\n' "$pct" "$pct"
+                last="$pct"
+            fi
+            sleep 1
+        done
+    ) &
+    copy_poller=$!
+fi
+
+say "Copying the live root into RAM (${root_mb} MB)..."
 tar -C / -cf - "${TAR_EXCLUDES[@]}" . | tar -C "$NEW" -xf -
+
+if [ -n "$copy_poller" ]; then
+    kill "$copy_poller" 2>/dev/null || true
+    wait "$copy_poller" 2>/dev/null || true
+fi
+progress 99 "Copy complete - switching the session to RAM…"
 
 # Carry the runtime mounts into the new root before the swap.
 for d in proc sys dev run; do
@@ -97,19 +162,20 @@ done
 sync
 
 if [ "${LSL_TORAM_TEST:-0}" = "1" ]; then
-    echo "TEST MODE: root copied to $NEW; swap skipped."
-    du -sh "$NEW" 2>/dev/null | sed 's/^/Copied: /'
+    say "TEST MODE: root copied to $NEW; swap skipped."
+    say "Copied: $(du -sh "$NEW" 2>/dev/null | awk '{print $1}')"
+    progress 100 "Copy complete (test mode)."
     exit 0
 fi
 
-echo "Switching the session root to RAM..."
+say "Switching the session root to RAM..."
 # Best-effort snapshot in case the pivot wedges the session (the USB is still
 # mounted here, so the tarball survives a hard reset).
 if [ -x /cdrom/bin/lsl-diag.sh ]; then
     bash /cdrom/bin/lsl-diag.sh toram-pre >/dev/null 2>&1 || true
 fi
-echo "NOTE: after the swap, persistence writes (uphome / lsl-home-flushd /"
-echo "      uproot / persist-wifi) are unavailable until the USB is re-inserted."
+say "NOTE: after the swap, persistence writes (uphome / lsl-home-flushd /"
+say "      uproot / persist-wifi) are unavailable until the USB is re-inserted."
 mount --make-rprivate /
 cd "$NEW"
 pivot_root . "$OLD"
@@ -130,7 +196,9 @@ done
 
 touch /run/lsl-toram.done
 if mountpoint -q /cdrom 2>/dev/null; then
-    echo "WARNING: /cdrom is still mounted (lazy unmount pending); wait a moment before removing the USB."
+    say "WARNING: /cdrom is still mounted (lazy unmount pending); wait a moment before removing the USB."
+    progress 100 "Done - the USB is still finishing its detach."
 else
-    echo "Done. The USB stick can now be removed."
+    say "Done. The USB stick can now be removed."
+    progress 100 "Done. The USB stick can now be removed."
 fi

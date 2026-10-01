@@ -30,7 +30,11 @@ HOME_SFS="$(lsl_home_sfs_path)"
 
 # HDD mode's data dir lives on a Windows volume (/mnt/c/...); mount the drives
 # here (idempotent) so this unit can run before onboot.sh does its own mount.
+# Install any staged hivex .debs first: mount_all.sh needs hivexregedit, the
+# base image lacks it, and this early install is what stops a stock first boot
+# from falling back to a tmpfs overlay (WHYFAIL9 / FRAGILE_HOME.md).
 if [ -r /cdrom/bin/mount_all.sh ]; then
+    lsl_ensure_hivex_tools || true
     bash /cdrom/bin/mount_all.sh 2>/dev/null || true
 fi
 
@@ -75,15 +79,34 @@ if ! lsl_is_usb_mode && ! command -v mkfs.btrfs >/dev/null 2>&1; then
     echo "lsl: using a temporary tmpfs-overlay /home instead (changes lost on reboot)." >&2
     LSL_FALLBACK_USB_HOME=1
 fi
-if ! lsl_is_usb_mode && ! lsl_data_dir_is_persistent; then
-    echo "lsl: HDD data dir $DATA_DIR not on a persistent volume yet; retrying drive mount..." >&2
+if ! lsl_is_usb_mode && ! lsl_data_dir_is_writable; then
+    echo "lsl: HDD data dir $DATA_DIR not yet writable; retrying drive mount..." >&2
     bash /cdrom/bin/mount_all.sh 2>/dev/null || true
     DATA_DIR="$(lsl_resolve_data_dir)"
     mkdir -p "$DATA_DIR" 2>/dev/null || true
-    if lsl_data_dir_is_persistent; then
-        echo "lsl: data dir now on a persistent volume: $DATA_DIR" >&2
+    # Wait for a WRITABLE mount, not merely a persistent one. The ntfs3 rw
+    # refusal ("Can't mount, would change RO state") clears about a second
+    # later, and the boot journal shows mount_all landing the volume READ-ONLY
+    # first; accepting that ro landing declared usb-fallback and threw the
+    # whole session's /home away, even though the rw mount succeeded moments
+    # later. Bounded so a genuinely unwritable store still falls back honestly.
+    _lsl_rw_waits="${LSL_RW_WAIT_STEPS:-15}"
+    _lsl_rw_delay="${LSL_RW_WAIT_DELAY:-1}"
+    _lsl_rw_i=0
+    while [ "$_lsl_rw_i" -lt "$_lsl_rw_waits" ] && ! lsl_data_dir_is_writable; do
+        sleep "$_lsl_rw_delay"
+        _lsl_rw_i=$((_lsl_rw_i + 1))
+        # Re-drive the mount every few tries: the journal replay that unblocks
+        # the rw mount needs the volume to be retried, not just waited on.
+        if [ $((_lsl_rw_i % 3)) -eq 0 ]; then
+            bash /cdrom/bin/mount_all.sh 2>/dev/null || true
+        fi
+        DATA_DIR="$(lsl_resolve_data_dir)"
+    done
+    if lsl_data_dir_is_writable; then
+        echo "lsl: data dir now writable on a persistent volume: $DATA_DIR" >&2
     else
-        echo "lsl: WARNING: data dir still not persistent; using a temporary tmpfs-overlay /home for this boot (changes lost on reboot)." >&2
+        echo "lsl: WARNING: data dir still not writable after ${_lsl_rw_waits} tries; using a temporary tmpfs-overlay /home for this boot (changes lost on reboot)." >&2
         LSL_FALLBACK_USB_HOME=1
     fi
 fi
@@ -155,11 +178,18 @@ elif lsl_is_usb_mode || [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
     # image adopted from another distro, or one created before the user
     # existed); autologin dies without it, so guarantee it like the RAM branch.
     lsl_ensure_user_home /home
+    # A fallback tmpfs overlay (HDD data dir not persistent yet) records its own
+    # mode so downstream consumers can tell it apart from a real USB stick: both
+    # have a RAM upper layer, but only the fallback is a transient accident.
+    _lsl_state_mode=usb
+    if [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
+        _lsl_state_mode=usb-fallback
+    fi
     {
         echo "LSL_HOME_LOWER=$LSL_HOME_LOWER"
         echo "LSL_HOME_UPPER=$LSL_HOME_UPPER"
         echo "LSL_HOME_WORK=$LSL_HOME_WORK"
-        echo "LSL_MODE=usb"
+        echo "LSL_MODE=$_lsl_state_mode"
     } > /run/lsl-usb.state
 else
     HOME_IMG="$(lsl_home_btrfs_path)"

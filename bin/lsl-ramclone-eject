@@ -28,10 +28,20 @@ done
 RAMCLONE_DIR="/run/ramclone"
 [ -f "$RAMCLONE_DIR/status" ] || { echo "ramclone not active" >&2; exit 2; }
 
-# Check hydration status.
+# Check hydration status. dm-clone's STATUSTYPE_INFO puts the hydrated/total
+# region pair in field 7 (`0 <len> clone <metablocksize> <used>/<total>
+# <regionsize> <hydrated>/<total> <hydrating> ...`), not in fields 4/5.
 status_line=$(dmsetup status clone 2>/dev/null)
 [ -n "$status_line" ] || { echo "error querying dm-clone status" >&2; exit 3; }
-read -r _start _end _type hyd total _rest <<< "$status_line"
+set -- $status_line
+[ "${3:-}" = "clone" ] || { echo "error parsing dm-clone status" >&2; exit 3; }
+hydtot="${7:-}"
+case "$hydtot" in
+    */*) hyd="${hydtot%%/*}"; total="${hydtot##*/}" ;;
+    *) echo "error parsing dm-clone status" >&2; exit 3 ;;
+esac
+case "$hyd" in ''|*[!0-9]*) echo "error parsing dm-clone status" >&2; exit 3 ;; esac
+case "$total" in ''|*[!0-9]*) echo "error parsing dm-clone status" >&2; exit 3 ;; esac
 if [ "$hyd" -ne "$total" ] 2>/dev/null; then
     echo "Hydration not complete ($hyd / $total regions). Use lsl-ramclone-status to monitor." >&2
     exit 1

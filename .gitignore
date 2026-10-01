@@ -35,3 +35,11 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Windows `> $null` redirect artefacts (a literal file named "$null" gets
+# created when a command is run from a shell that does not understand $null,
+# e.g. cmd.exe running a bash-style redirect). Never source, never commit.
+$null
+
+# Local agent-tool state (commandcode). Per-machine, not project content.
+.commandcode/

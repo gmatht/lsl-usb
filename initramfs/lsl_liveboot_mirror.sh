@@ -10,12 +10,16 @@
 # devices and - for each - calls is_live_path(): it just globs
 # "${mountpoint}/${LIVE_MEDIA_PATH}/*.squashfs". The default LIVE_MEDIA_PATH is
 # "live", so a stock ISO keeps "live/filesystem.squashfs". Our mirror is laid out
-# as "sfs/filesystem.squashfs" (+ "sfs/filesystem.z0.squashfs" for the first-boot
-# layer) carrying a beacon header in "sfs/manifest.txt". If we verify a mirror we
-# simply `export LIVE_MEDIA_PATH=sfs`; live-boot's OWN scanner then finds
-# "sfs/*.squashfs" on the internal disk and assembles the root from it. No
-# LAYERFS_PATH / patching of live-boot internals required, and the same mirror
-# layout works for casper (see lsl_hdd_mirror.sh).
+# as "sfs/filesystem.squashfs" (+ "sfs/filesystem_z0_firstboot.squashfs" for the
+# first-boot layer) carrying a beacon header in "sfs/manifest.txt". If we verify
+# a mirror we simply `export LIVE_MEDIA_PATH=sfs`; live-boot's OWN scanner then
+# finds "sfs/*.squashfs" on the internal disk and assembles the root from it, in
+# lexical order - which the filenames encode (base < stub < appends, see
+# WHYFAIL14). No LAYERFS_PATH / patching of live-boot internals required.
+#
+# NOTE: unlike casper, live-boot can root off an arbitrary mount because its own
+# scanner walks block devices, so the mirror keeps the layers SEPARATE here. The
+# casper hook needs a single merged layer instead (LAYERFS_PATH names one file).
 #
 # Timing: /usr/bin/live-boot sources all 9990-* helpers (incl. 0001-init-vars,
 # which sets LIVE_MEDIA_PATH=live) at parse time - BEFORE scripts/live-premount

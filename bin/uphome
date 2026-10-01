@@ -8,13 +8,33 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 lsl_load_config
 
+# Decide from the mode /home was ACTUALLY mounted with (recorded by
+# lsl-mount-home.sh), not from a fresh data-dir resolve. On the first boot the
+# data dir can start out non-persistent (hivex-tools missing -> /mnt/c not
+# mounted), so /home is a tmpfs overlay; by the time firstboot finishes, /mnt/c
+# is mounted and lsl_is_usb_mode flips to "hdd". Trusting that re-resolve made
+# this script take the HDD branch, no-op the btrfs sync, and drop the whole
+# first-boot home on reboot.
+_ehm="$(lsl_effective_home_mode)"
+
 # Boot-to-RAM "(no persistence)": /home is a tmpfs - nothing to persist.
-if [ "$(findmnt -n -o FSTYPE --target /home 2>/dev/null || true)" = "tmpfs" ]; then
+if [ "$_ehm" = "ram" ] || [ "$(findmnt -n -o FSTYPE --target /home 2>/dev/null || true)" = "tmpfs" ]; then
     echo "uphome: /home is RAM (Boot to RAM, no persistence); nothing to persist."
     exit 0
 fi
 
-if lsl_is_usb_mode; then
+# Fallback tmpfs overlay (HDD data dir was not persistent when /home was
+# mounted). It has the same layout as a real USB-mode overlay but is a transient
+# accident, so say so loudly rather than silently "succeeding" with a no-op sync.
+if [ "$_ehm" = "usb-fallback" ]; then
+    echo "uphome: /home is a FALLBACK tmpfs overlay (HDD data dir was not persistent" >&2
+    echo "        when /home was mounted); its contents WILL BE LOST on reboot." >&2
+    echo "        Free space on the data dir / mount it, then reboot and rebuild" >&2
+    echo "        the layer on a boot where /home mounts persistently." >&2
+    exit 1
+fi
+
+if [ "$_ehm" = "usb" ] || { [ -z "$_ehm" ] && lsl_is_usb_mode; }; then
     echo "USB mode: flushing merged /home to the stick's per-distro home image…"
     exec "$SCRIPT_DIR/lsl-flush-home.sh"
 fi

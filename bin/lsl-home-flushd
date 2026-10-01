@@ -8,9 +8,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 lsl_load_config
 
-if ! lsl_is_usb_mode; then
-    exit 0
-fi
+# Only a REAL USB-stick overlay is flushable. Branch on the mode /home was
+# actually mounted with (recorded by lsl-mount-home.sh), not a fresh prediction:
+# a usb-fallback tmpfs overlay is refused by lsl-flush-home.sh anyway, so stop
+# watching instead of relying on that later refusal.
+lsl_effective_home_is_usb || exit 0
 
 UPPER="${LSL_HOME_UPPER:-/run/lsl-home-overlay/upper}"
 IDLE_SEC="${LSL_HOME_IDLE_SEC:-300}"
@@ -44,7 +46,7 @@ while sleep 30; do
     if ! mountpoint -q /home 2>/dev/null; then
         continue
     fi
-    if ! lsl_is_usb_mode; then
+    if ! lsl_effective_home_is_usb; then
         exit 0
     fi
 

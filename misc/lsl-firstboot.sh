@@ -353,11 +353,9 @@ flush_dialog_telemetry() {
 # open; only the next boot's casper glob is affected.)
 lsl_firstboot_drop_prior_appended_layers() {
     local stick="${STICK_DIR:-/cdrom}" l n=0
-    for l in "$stick"/casper/filesystem.z0.[0-9]*.squashfs "$stick"/casper/filesystem_z[0-9][0-9][0-9][0-9]*.squashfs; do
+    # 14-digit timestamp width: excludes the stub filesystem_z0_firstboot.
+    for l in "$stick"/casper/filesystem_z[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*.squashfs; do
         [ -e "$l" ] || continue
-        case "$(basename "$l")" in
-            filesystem.z0.squashfs|filesystem_z0_firstboot.squashfs) continue ;;
-        esac
         rm -f "$l" "${l%.squashfs}.sh" 2>/dev/null || true
         n=$((n + 1))
     done
@@ -367,7 +365,7 @@ lsl_firstboot_drop_prior_appended_layers() {
 # Remove any appended layer that fails to list (partial/corrupt from an
 # interrupted mksquashfs) so we never boot a broken layer.
 lsl_firstboot_cleanup_partial_layers() {
-    for l in ${STICK_DIR:-/cdrom}/casper/filesystem.z0.[0-9]*.squashfs ${STICK_DIR:-/cdrom}/casper/filesystem_z[0-9][0-9][0-9][0-9]*.squashfs; do
+    for l in ${STICK_DIR:-/cdrom}/casper/filesystem_z[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*.squashfs; do
         [ -e "$l" ] || continue
         if ! unsquashfs -l "$l" >/dev/null 2>&1; then
             echo "Removing corrupt/partial layer: $l" >&2
@@ -693,10 +691,39 @@ install_flatpaks_fat() {
 # waiting, so this is the sole STATUS writer. It tails the firstboot log for
 # LSL_STEP n/m + LSL_TASK markers (emitted by uproot / squashfs_config.sh)
 # and mksquashfs percentages. Never fails the service.
+#
+# Fine-grained "packages" progress. STEP SEMANTICS (deliberate, 2026-09-30):
+# squashfs_config.sh emits only ONE LSL_STEP marker per step, so folding that
+# marker straight into `pct` pinned the dialog at a single value for the whole
+# ~470-package apt run (step 4/9 -> pct=44, the notorious "stuck at 44%") -
+# the bar looked frozen for minutes. LSL_STEP therefore NO LONGER drives pct.
+# Instead the `packages` task is one continuous 0..100 ramp driven by apt's
+# OWN stdout, which already flows into this same log:
+#   download:  "Need to get N MB" sets the scale; every "Get:.." line counts
+#              up                                             -> pct  2..60
+#   unpack:    "Unpacking"/"Setting up" lines count up (apt emits ~2 per
+#              package: unpack + configure)                   -> pct 60..95
+#   the short tail (nvim AppImage / extra AppImages / CLI tools, i.e. the
+#              LSL_STEP values >= 5) creeps 95..99 so the bar never stalls.
+# The detail text shows package counts (n/m) using apt's own plan line
+# "N upgraded, M newly installed", falling back to file counts if absent.
+# LSL_STEP is now used ONLY for the detail text ("Step n/m label"), and the
+# value is floored so a step whose packages are already installed (no Get
+# lines at all) still shows sane progress instead of snapping back.
+# Everything stays best-effort: one malformed log line must never abort the
+# loop or leave the dialog stale.
 # $1 is uproot's pid: tail --pid exits by itself when uproot finishes, so
 # this monitor (pipe included) can never outlive the install it follows -
 # no kill needed, and no orphaned tail can wedge a test runner's capture.
 monitor_uproot_progress() {
+    # Continuous pct across the whole `packages` task, plus apt-run counters.
+    # _pkg_pct is a high-water mark: progress must never move backwards.
+    # _pkg_total is apt's announced package count for this run ("N upgraded,
+    # M newly installed"), used for the "n/m" in the detail text and as the
+    # install-phase scale.
+    local _pkg_pct=0 _pkg_total_get=0 _pkg_seen_get=0 _pkg_seen_setup=0 _pkg_total=0
+    # Set once per monitor run; the tail loop body runs in a subshell so these
+    # are simply its locals - no need to export anything.
     tail --pid="$1" -n 0 -F "$LOG" 2>/dev/null | while IFS= read -r line; do
         case "$line" in
             *"LSL_TASK layer"*)
@@ -704,6 +731,9 @@ monitor_uproot_progress() {
                 task_begin layer "Packing USB layer…" 2>/dev/null || true
                 ;;
             *"LSL_STEP "*)
+                # Detail only - see the header comment. Steps >= 5 are the
+                # short tail, so park them in the 95..99 creep band; earlier
+                # steps just keep the current pct (the floor) and refresh text.
                 _rest="${line##*LSL_STEP }"
                 _frac="${_rest%% *}"
                 _label="${_rest#* }"
@@ -712,7 +742,82 @@ monitor_uproot_progress() {
                 case "$_n$_m" in ''|*[!0-9]*) continue ;; esac
                 [ "$_m" -gt 0 ] 2>/dev/null || continue
                 [ "$LSL_TASK" = "packages" ] || task_begin packages "$_label" 2>/dev/null || true
-                task_progress $((_n * 100 / _m)) "$_label" 2>/dev/null || true
+                # New apt invocation: reset the per-run counters; the
+                # "Need to get"/"N upgraded, M newly installed" lines below
+                # re-arm the scales.
+                _pkg_total_get=0; _pkg_seen_get=0; _pkg_seen_setup=0; _pkg_total=0
+                if [ "$_n" -ge 5 ] 2>/dev/null; then
+                    _p=$((95 + (_n - 5) * 4 / (_m - 4)))
+                    [ "$_p" -gt 99 ] && _p=99
+                    [ "$_p" -gt "$_pkg_pct" ] && _pkg_pct="$_p"
+                fi
+                task_progress "$_pkg_pct" "$_label" 2>/dev/null || true
+                ;;
+            *" upgraded, "*" newly installed"*)
+                # apt's own plan line, e.g.
+                #   "155 upgraded, 312 newly installed, 0 to remove and ..."
+                # -> exact package count for this run (matches the number of
+                # "Setting up" lines), used to show a true n/m.
+                _u="${line%% upgraded, *}"
+                _rest="${line#* upgraded, }"
+                _new="${_rest%% newly installed*}"
+                case "$_u" in ''|*[!0-9]*) _u=0 ;; esac
+                case "$_new" in ''|*[!0-9]*) _new=0 ;; esac
+                _pkg_total=$((_u + _new))
+                ;;
+            "Need to get "*)
+                # "Need to get 346 MB of archives." -> the download scale.
+                _num="${line#Need to get }"; _num="${_num%% *}"
+                case "$_num" in ''|*[!0-9]*) _num=0 ;; esac
+                _pkg_total_get="$_num"; _pkg_seen_get=0
+                ;;
+            "Get:"[0-9]*)
+                # Only meaningful during the package fetch (a total is known);
+                # the small repo-metadata Get lines from `apt update` precede
+                # any Need-to-get and are correctly ignored.
+                [ "$LSL_TASK" = "packages" ] || continue
+                [ "$_pkg_total_get" -gt 0 ] 2>/dev/null || continue
+                _pkg_seen_get=$((_pkg_seen_get + 1))
+                [ "$_pkg_seen_get" -gt "$_pkg_total_get" ] && _pkg_seen_get="$_pkg_total_get"
+                # Start at 2, not 0, so the label never shows a bare 0% while
+                # clearly working; cap the download band at 60.
+                _p=$((2 + _pkg_seen_get * 58 / _pkg_total_get))
+                [ "$_p" -gt 60 ] && _p=60
+                [ "$_p" -gt "$_pkg_pct" ] && _pkg_pct="$_p"
+                # Prefer the announced package count (apt fetches one archive
+                # per package, so Get lines == packages); "Need to get" is a
+                # SIZE in MB and must never be shown as a file count.
+                if [ "$_pkg_total" -gt 0 ] 2>/dev/null; then
+                    _seen="$_pkg_seen_get"
+                    [ "$_seen" -gt "$_pkg_total" ] && _seen="$_pkg_total"
+                    task_progress "$_pkg_pct" "Downloading packages ($_seen/$_pkg_total)…" 2>/dev/null || true
+                else
+                    task_progress "$_pkg_pct" "Downloading packages ($_pkg_seen_get files, ${_pkg_total_get} MB)…" 2>/dev/null || true
+                fi
+                ;;
+            "Unpacking "*|"Setting up "*|"Preparing to unpack "*)
+                [ "$LSL_TASK" = "packages" ] || continue
+                _pkg_seen_setup=$((_pkg_seen_setup + 1))
+                # 60..95. Prefer apt's announced package count; fall back to
+                # twice the download count, and +1 avoids a division by zero.
+                # apt emits Unpacking + Setting up per package, so a package is
+                # "done" at its Setting up line - count those, not every line.
+                case "$line" in
+                    "Setting up "*) _pkg_done=$((_pkg_seen_setup / 2 + 1)) ;;
+                    *)              _pkg_done=$((_pkg_seen_setup / 2)) ;;
+                esac
+                if [ "$_pkg_total" -gt 0 ] 2>/dev/null; then
+                    _p=$((60 + _pkg_seen_setup * 35 / (_pkg_total * 2)))
+                    [ "$_p" -gt 95 ] && _p=95
+                    [ "$_p" -gt "$_pkg_pct" ] && _pkg_pct="$_p"
+                    [ "$_pkg_done" -gt "$_pkg_total" ] && _pkg_done="$_pkg_total"
+                    task_progress "$_pkg_pct" "Installing packages ($_pkg_done/$_pkg_total)…" 2>/dev/null || true
+                elif [ "$_pkg_total_get" -gt 0 ] 2>/dev/null; then
+                    _p=$((60 + _pkg_seen_setup * 35 / (_pkg_total_get * 2 + 1)))
+                    [ "$_p" -gt 95 ] && _p=95
+                    [ "$_p" -gt "$_pkg_pct" ] && _pkg_pct="$_p"
+                    task_progress "$_pkg_pct" "Installing packages ($_pkg_seen_setup lines)…" 2>/dev/null || true
+                fi
                 ;;
             *%*)
                 case "$line" in
@@ -836,53 +941,99 @@ rm -f "$ATTEMPT_FILE" 2>/dev/null || true
 rm -f "$FAILED_MARKER" "$FAILED_REASON" "$NET_FAIL_FILE" 2>/dev/null || true
 rm -f /run/lsl-firstboot.no-network 2>/dev/null || true
 
-# Reap layers earlier SUCCESSFUL firstboots orphaned. uproot already prunes as
+# Reap APPENDED layers that a newer append already supersedes. uproot prunes as
 # part of writing a layer; this is the belt-and-braces pass for a boot that
-# reaches the finale. The retry-path cleanup (lsl_firstboot_drop_prior_appended
-# _layers) only fires while the stamp is missing, so on a stick where every
-# attempt succeeded nothing ever pruned: this one had 5x761MB (3.6 GB) of
-# layers, 4 of them inert because menu.lst named only the newest.
+# reaches the finale. This one had 5x761MB (3.6 GB) of layers because the old
+# dot-chain naming only went live when a boot config named it, and nothing
+# pruned on the success path (the retry-path cleanup only fires while the stamp
+# is missing).
 #
-# Same fail-safe rules as uproot's prune_superseded_layers: delete nothing
-# unless we positively resolve the layer the boot config names, and never
-# remove that layer, its dot-progenitors, or the base layers.
+# Under the flattened naming casper globs *.squashfs and stacks every match
+# lexically, so the newest append already overrides every older one: the older
+# ones are superseded dead weight. The base and the firstboot stub are never
+# touched. GLOB TRAP: filesystem_z[0-9]* also matches
+# filesystem_z0_firstboot.squashfs, so the timestamp width is pinned below.
 lsl_firstboot_prune_orphan_layers() {
-    local stick="${STICK_DIR:-/cdrom}" active b l n=0
-    # `|| true`: with `set -euo pipefail` a missing menu.lst (or no match)
-    # makes grep exit 1/2 and would abort the whole firstboot with no log.
-    active="$(grep -o 'layerfs-path=[^ ]*' "$stick/menu.lst" 2>/dev/null | head -n1 || true)"
-    active="${active#layerfs-path=}"
-    case "$active" in /cdrom/*) active="$stick/${active#/cdrom/}" ;; esac
-    if [ -z "$active" ] || [ ! -f "$active" ]; then
-        log "Layer prune skipped: boot config names no resolvable layer."
+    local stick="${STICK_DIR:-/cdrom}" b l n=0 keeper=""
+    keeper="$(ls -1 "$stick"/casper/filesystem_z[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*.squashfs 2>/dev/null | sort | tail -n1 || true)"
+    if [ -z "$keeper" ]; then
+        log "Layer prune skipped: no appended layer found."
         return 0
     fi
-    for l in "$stick"/casper/filesystem.z0.[0-9]*.squashfs; do
+    for l in "$stick"/casper/filesystem_z[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*.squashfs; do
         [ -e "$l" ] || continue
         b="$(basename "$l")"
-        case "$b" in
-            filesystem.z0.squashfs|filesystem_z0_firstboot.squashfs) continue ;;
-        esac
-        [ "$b" = "$(basename "$active")" ] && continue
-        case "${b%.squashfs}" in
-            "$(basename "${active%.squashfs}")".*) continue ;;
-        esac
+        # Keep the newest; reap only what sorts below it (so it is stacked
+        # under the keeper, whose content already wins).
+        [[ "$b" < "$(basename "$keeper")" ]] || continue
         if rm -f "$l" "${l%.squashfs}.sh" 2>/dev/null; then
-            n=$((n + 1)); log "Pruned orphaned layer: $b"
+            n=$((n + 1)); log "Pruned superseded layer: $b"
         fi
     done
     # if/then, not `[ ... ] && log`: under `set -e` the && form returns 1 when
     # n=0 and would abort the run.
     if [ "$n" -gt 0 ]; then
-        log "Pruned $n orphaned layer(s) left by earlier successful firstboots."
+        log "Pruned $n superseded layer(s) left by earlier successful firstboots."
     fi
     return 0
 }
 lsl_firstboot_prune_orphan_layers
 
+# --- install the desktop user's $HOME files (HOST context) ------------------
+# config.sh's $HOME-targeted installers (terminal pin, kitty.conf, desktop
+# shortcuts) are SKIPPED inside uproot's chroot: the chroot has no uid 1000 and
+# an empty /home, so there is no user to write for and the old code fell back to
+# a hardcoded "mint" that does not exist here (WHYFAIL13 - the panel never got
+# its terminal icon). Run them HERE instead: this script is root on the HOST,
+# so loginctl resolves the real session user and /home is the live one.
+#
+# Best-effort throughout: a missing session or unwritable home must not fail
+# firstboot (the setup itself is already complete at this point).
+install_desktop_home_files() {
+    local user="" home cfg
+    # Resolve the session user here rather than relying on lsl-common.sh being
+    # sourced: this script is deliberately self-contained (it is the only thing
+    # on the z0 layer besides a unit file), and the helper is a few lines.
+    if command -v loginctl >/dev/null 2>&1; then
+        local s dtype
+        for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+            dtype="$(loginctl show-session -p Type --value "$s" 2>/dev/null || true)"
+            case "$dtype" in x11|wayland) ;; *) continue ;; esac
+            user="$(loginctl show-session -p Name --value "$s" 2>/dev/null || true)"
+            [ -n "$user" ] && [ "$user" != root ] || { user=""; continue; }
+            break
+        done
+    fi
+    [ -n "$user" ] || user="$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)"
+    [ -n "$user" ] || user="$(ls -1 /home 2>/dev/null | head -n1 || true)"
+    if [ -z "$user" ]; then
+        log "WARNING: no desktop user resolvable on the host; skipping \$HOME installs (terminal pin, kitty config, desktop shortcuts)."
+        return 0
+    fi
+    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+    [ -n "$home" ] && [ -d "$home" ] || {
+        log "WARNING: $user has no /home directory; skipping \$HOME installs."
+        return 0
+    }
+    cfg="${STICK_DIR:-/cdrom}/bin/config.sh"
+    [ -r "$cfg" ] || { log "No config.sh on the stick; skipping \$HOME installs."; return 0; }
+    # --install-home-only: the system-wide half (systemd units, repo sync)
+    # already ran in the chroot / on onboot, and re-running it here would
+    # duplicate work. LSL_DESKTOP_USER is passed explicitly so config.sh does
+    # not re-derive it from a possibly-stale context.
+    log "Installing desktop user files for $user ($home)..."
+    LSL_DESKTOP_USER="$user" LSL_CONFIG_ROOT= LSL_CDROM="${STICK_DIR:-/cdrom}" \
+        bash "$cfg" --install-home-only >>"$LOG" 2>&1 \
+        || log "WARNING: \$HOME installs exited non-zero (terminal pin may be missing); see $LOG."
+    return 0
+}
+
 task_done packages
 task_done layer
 flush_home_final
+# After flush_home_final: /home has been persisted (or flagged), so anything
+# written here lands in a home that will actually survive the reboot.
+install_desktop_home_files
 if [ "${LSL_HOME_FAILED:-0}" = "1" ]; then
     # Keep the failure in front of the operator: the reboot-approval dialog is the
     # last thing they see, and rebooting is exactly what loses this boot's /home.

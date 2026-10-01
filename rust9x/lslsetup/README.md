@@ -231,7 +231,7 @@ Exit codes: 0 success, 1 fatal error, 2 user cancel.
 
 ## Testing
 
-- `cargo +rust9x test --target i686-rust9x-windows-msvc` (10 unit tests,
+- `cargo +rust9x test --target i686-rust9x-windows-msvc` (unit tests,
   incl. the nofmt MBR/menu.lst logic and asset-hash pins)
 - `tests/qemu-boot-test.sh` (Linux, needs qemu-system-i386 + grub-mkrescue +
   xorriso + sfdisk + mkfs.vfat, run as root): builds a disk image replicating

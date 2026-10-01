@@ -18,6 +18,16 @@ if ls /cdrom/firmware/*.deb >/dev/null 2>&1; then
     dpkg -i /cdrom/firmware/*.deb >/dev/null 2>&1 || true
     apt-get install -f -y >/dev/null 2>&1 || true
 fi
+# Staged tooling the installer drops in /cdrom/pkgs/ (hivex: libhivex0,
+# libhivex-bin, libwin-hivex-perl). Install it early so the chroot has
+# hivexregedit before the big apt step: it is the tool mount_all.sh needs to map
+# /mnt/c, and its absence is what made a stock first boot fall back to a tmpfs
+# /home (WHYFAIL9 / FRAGILE_HOME.md). The apt list below is the network fallback.
+if ls /cdrom/pkgs/*.deb >/dev/null 2>&1; then
+    echo "Installing staged tooling from /cdrom/pkgs ..."
+    dpkg -i /cdrom/pkgs/*.deb >/dev/null 2>&1 || true
+    apt-get install -f -y >/dev/null 2>&1 || true
+fi
 # Staged network drivers: the Windows installer drops these in /cdrom/drivers/
 # for chipsets that need out-of-tree drivers on the 24.04 base (RTL8821CE,
 # RTL8723DE, RTL88x2BU, RTL8812AU, RTL8814AU, RTL8188EU, RTL8723BU, Broadcom

@@ -361,6 +361,7 @@ Recommendation: **>= 4 GB RAM for first boot**.
 - `build.sh`: builds the Windows installer bundle (`dist/lsl-usb-win.zip`) - a ~4 KB `filesystem_z0_firstboot.squashfs` layer (systemd unit + scripts only, no distro binaries) plus the FAT-side file set. Runs three gates before packaging: the `install.ps1` test suite (pwsh), `shellcheck -S error` on all shell scripts, and a bundle preflight (layer contents, unit `ExecStart` paths, zip entries).
 - `misc/lsl-firstboot.sh` + `misc/lsl-firstboot.service`: run once on the first boot of a Windows-installed USB - waits for network, runs `uproot --auto-append` (installs `/cdrom/bin/squashfs_config.sh` packages in a chroot overlay and persists a new layer), stamps `/cdrom/casper/lsl-firstboot.done`, then reboots. The recipe also removes Mint's `nosnap.pref` pin and installs `snapd` by default (disable with `LSL_SNAP_SUPPORT=0`) so snaps - including any `.snap` files the Windows installer preloads to `<USB>\snaps\` - can be installed.
 - `misc/lsl-firstboot-progress.sh` + `.desktop`: user-session zenity progress dialog fed by `/run/lsl-firstboot-status` while the first-boot setup runs (the desktop is not blocked; the work is `nice`d/`ionice`d).
+- `misc/lsl-ramclone-progress.sh` + `.desktop`, `initramfs/live-ramclone`, `bin/lsl-ramclone-status`, `bin/lsl-ramclone-eject`: Boot to RAM. The `ramclone` boot entry copies the live root into RAM via dm-clone (base squashfs as origin, RAM as destination) while the other casper chain layers are RAM-backed into tmpfs, so the session keeps running after the stick is pulled. The user-session dialog shows the hydration progress and, once complete, offers a **Detach USB** button that ejects the stick and reports it is safe to remove. No-op unless the boot cmdline contains `ramclone`.
 - `onboot.sh` + `systemd/onboot.service`: runtime setup on every boot (runs after
   `lsl-home.service`).
 - `bin/lsl-mount-home.sh` + `systemd/lsl-home.service`: mount `/home` (RAM-only,
@@ -444,15 +445,21 @@ wear, copy those layers to the internal HDD:
 exactly one read-only (NTFS via the initrd's `ntfs-3g`, else native), and looks for
 a `*/sfs/manifest.txt` carrying the LSL beacon. If every recorded layer is present
 with the expected size (+ sha256 when recorded) it redirects the live root to that
-mirror. Two hook implementations share the same scan/verify/mirror layout:
+mirror. Three hook implementations share the same scan/verify/mirror layout:
 
 - **casper (Mint/Ubuntu):** `initramfs/lsl_hdd_mirror.sh` is a casper-premount
-  hook that sets casper's `LAYERFS_PATH` to the multi-layer entry
-  (`filesystem.z0.squashfs`, which casper stacks over `filesystem.squashfs`).
+  hook that sets casper's `LAYERFS_PATH` to the merged mirror layer
+  (`sfs/filesystem_zmerged.squashfs`). `LAYERFS_PATH` is used here because it is
+  the only casper input that accepts a layer path on a device other than
+  `/cdrom` - the default glob branch is always rooted at `/cdrom`, so it cannot
+  reach an internal disk. `bin/lsl-copy-sfs-hdd.sh` builds that layer by
+  overlaying the USB's base + first-boot stub + appends into one self-contained
+  squashfs (and refuses to publish it unless it contains `/sbin/init`).
 - **live-boot (Debian):** `initramfs/lsl_liveboot_mirror.sh` is a live-premount
   hook that exports `LIVE_MEDIA_PATH=sfs`, so live-boot's *own* `find_livefs`
   scanner discovers `sfs/*.squashfs` on the internal disk and assembles the root
-  from it. No patching of live-boot internals is required.
+  from it. No patching of live-boot internals is required. Unlike casper,
+  live-boot keeps the layers **separate** and stacks them by name order.
 - **antiX (32-bit x86):** `initramfs/lsl_antix_mirror.sh` is sourced by antiX's
   monolithic live-init just before `find_linuxfs_file`; it exports
   `SQFILE_FILE=sfs/filesystem.squashfs` and `FROM_BOOT=hd,usb` so antiX's own
@@ -461,13 +468,14 @@ mirror. Two hook implementations share the same scan/verify/mirror layout:
   `sfs/` mirror layout - antiX honours `SQFILE_FILE` pointing anywhere, so no
   duplicate `linuxfs` copy is needed.
 
-In both cases `/cdrom` (bin/, onboot.sh, lsl-usb.env) stays on the USB, the hook
+In every case `/cdrom` (bin/, onboot.sh, lsl-usb.env) stays on the USB, the hook
 never panics and never changes the root, and if anything is missing or fails
-verification it does nothing - casper/live-boot simply fall back to the USB
-(which just boots a little slower). The **same mirror layout** (`sfs/filesystem.squashfs`
-+ `sfs/filesystem.z0.squashfs` + `sfs/manifest.txt`) serves both frameworks, and a
-cmdline flag `lsl_no_hdd_mirror` disables the hook entirely. The hook is
-POSIX-`sh` and architecture-agnostic. The casper and live-boot variants run
+verification it does nothing - the live system simply falls back to the USB
+(which just boots a little slower). The **same mirror layout**
+(`sfs/filesystem.squashfs` + `sfs/manifest.txt`, plus `sfs/filesystem_zmerged.squashfs`
+for casper) serves all three frameworks, and a cmdline flag `lsl_no_hdd_mirror`
+disables the hook entirely. The hook is POSIX-`sh` and architecture-agnostic.
+The casper and live-boot variants run
 unchanged on a 32-bit (i386) Debian live image; the antiX variant is itself a
 32-bit live-init fork and is validated under `qemu-system-i386`. (antiX ships a
 *different* live-init fork that uses `linuxfs` and its own `sq=`/`from=` levers
@@ -510,3 +518,51 @@ push; a `v*` tag triggers a release with `dist/lsl-usb-win.zip` attached.
 ## Status / roadmap
 
 See [`TODO.md`](TODO.md) for current experiments and next tasks.
+
+### Post-mortems
+
+When something fails on a live boot, the write-up lands in a numbered
+`WHYFAIL<n>.md`: what the operator saw, the evidence chain, the root cause, the
+fix, and — importantly — what is *not* yet in effect on a booting stick.
+
+> **Note:** there are **two** WHYFAIL series. This repo root holds
+> `WHYFAIL5/6/7/9/11/12`; [`rust9x/lslsetup/`](rust9x/lslsetup/) holds
+> `WHYFAIL13/14/15/16`. Numbers 1–4, 8 and 10 exist in neither — treat the numbering
+> as a shared sequence split across two directories, not as a gap in coverage.
+>
+> **[`RULES.md`](RULES.md) collects every "rule worth keeping"** from all of them
+> (plus the design notes) into one place, with an index of the gaps above.
+
+- [`WHYFAIL7.md`](WHYFAIL7.md) — persistent `/home` not mounted (CRLF in
+  `lsl-usb.env`), plus orphaned squashfs layers never reaped on the success path.
+- [`WHYFAIL9.md`](WHYFAIL9.md) — first-boot `/home` changes dropped: the
+  fallback tmpfs overlay recorded itself as `LSL_MODE=usb` and `uphome` trusted a
+  re-resolved prediction over that record.
+- [`WHYFAIL11.md`](WHYFAIL11.md) — `/home` still transient after the WHYFAIL9 fix.
+- [`WHYFAIL12.md`](WHYFAIL12.md) — machine identity lives in the overlay upper
+  (netplan Wi-Fi profile with a cleartext PSK, `hostname`, `lightdm.conf`,
+  `machine-id`). Harmless today because that upper is RAM and `uproot` packs a
+  different one; becomes live the moment persistence is added — and every
+  persistent live USB has the same problem.
+- [`FRAGILE_HOME.md`](FRAGILE_HOME.md) — companion to WHYFAIL9: the three ways
+  lsl-usb answers "is `/home` persistent?", all 8 call sites and the risk each
+  carries, and the rules for changing persistence code safely.
+
+### Design notes and findings
+
+Forward-looking documents. Where one supersedes earlier reasoning, it says so in
+place rather than quietly rewriting.
+
+- [`DESIGN-F2FS-PERSISTENCE.md`](DESIGN-F2FS-PERSISTENCE.md) — persisting `/home`
+  on an F2FS partition: provisioning, the identity scrub in a `casper-premount`
+  hook, the per-boot regenerators, open questions and a verification plan.
+- [`DESIGN-PERSISTENCE-PANE.md`](DESIGN-PERSISTENCE-PANE.md) — the wizard page
+  that would drive it: backend, space slider, cache-on-tmpfs, the `eatmydata`
+  speed option, and how the space is actually obtained (no destructive control).
+- [`DESIGN-BOOT-TO-RAM-VARIANTS.md`](DESIGN-BOOT-TO-RAM-VARIANTS.md) — Boot-to-RAM
+  variants and every block-layer option for them (dm-clone, dm-cache, a user-mode
+  NBD device), with what was **measured** versus what was merely read. §11
+  supersedes §1-10 where they disagree.
+- [`FINDINGS-COMPRESSION.md`](FINDINGS-COMPRESSION.md) — the six `mksquashfs`
+  call sites, why `-Xcompression-level 22` is outside the documented range, and
+  what 9 vs 19 actually buys on real layer content.

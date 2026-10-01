@@ -543,7 +543,7 @@ fn run() {
                             check_done = true;
                         } else {
                             ui.set_stage_status(ST::UsbCheck as usize, &crate::locale::tr("skipped"));
-                            ui.set_stage_progress(ST::UsbCheck as usize, 1, 1);
+                            ui.set_stage_skipped(ST::UsbCheck as usize);
                             ui.pump();
                         }
                         crate::telemetry::write_probe(&t.letter, "pending");
@@ -624,7 +624,7 @@ fn run() {
                                 }
                                 crate::boot::BootChoice::None => {
                                     ui.set_stage_status(ST::BootSetup as usize, &crate::locale::tr("no reboot"));
-                                    ui.set_stage_progress(ST::BootSetup as usize, 1, 1);
+                                    ui.set_stage_skipped(ST::BootSetup as usize);
                                     ui.pump();
                                     break (choice, String::new(), String::new());
                                 }
@@ -1060,6 +1060,22 @@ fn run() {
         lslfiles::install_rust_tools(&vol.letter, &arch);
     } else {
         out::info("Skipping Rust tools (tick the page-3 checkbox or pass --preload-rust-tools to add fd/bat/zoxide to <USB>:\\bin).");
+    }
+
+    // Boot-critical tooling: hivexget/hivexregedit are needed by mount_all.sh to
+    // map Windows drive letters, and the live image does not ship them. Staging
+    // the .debs here is what stops a first boot from falling back to a transient
+    // tmpfs /home (WHYFAIL9 / WHYFAIL10). NOT gated on preload_drivers - a NIC
+    // driver is a convenience, this is the difference between a persistent and a
+    // volatile /home.
+    if opts.pkgs {
+        out::step("Staging boot-critical tooling (hivex) to <USB>:\\pkgs...");
+        let report = hardware::install_staged_packages(&vol.letter, false);
+        for l in &report {
+            out::info(&format!("  {}", l));
+        }
+    } else {
+        out::info("Skipping boot-critical hivex staging (--no-pkgs): a drive-letter-mapped boot may use a transient /home.");
     }
 
     if preload_drivers {
@@ -1640,11 +1656,27 @@ fn gui_tail_in_dialog(
     } else {
         out::info("Skipping Rust tools (unchecked).");
         ui.set_stage_status(ST::RustTools as usize, &crate::locale::tr("skipped"));
-        ui.set_stage_progress(ST::RustTools as usize, 1, 1);
+        ui.set_stage_skipped(ST::RustTools as usize);
         ui.pump();
     }
 
     ui.set_active_stage(ST::Drivers as usize);
+    // Stage the boot-critical hivex .debs unconditionally (NOT gated on the
+    // drivers checkbox): without them mount_all.sh cannot map /mnt/c and /home
+    // is transient (WHYFAIL9 / WHYFAIL10). Shares the Drivers stage.
+    if opts.pkgs {
+        ui.set_stage_status(ST::Drivers as usize, &crate::locale::tr("staging tooling..."));
+        ui.set_status(&crate::locale::tr("Staging boot-critical tooling (hivex)..."));
+        out::step("Staging boot-critical tooling (hivex) to <USB>:\\pkgs...");
+        ui.set_stage_progress(ST::Drivers as usize, 0, 1);
+        ui.pump();
+        let report = hardware::install_staged_packages(vol_letter, false);
+        for l in &report {
+            out::info(&format!("  {}", l));
+        }
+    } else {
+        out::warn("Skipping boot-critical hivex staging (--no-pkgs): a drive-letter-mapped boot may use a transient /home.");
+    }
     if g.drivers || opts.drivers {
         ui.set_stage_status(ST::Drivers as usize, &crate::locale::tr("preloading..."));
         ui.set_status(&crate::locale::tr("Preloading network drivers..."));
@@ -1674,7 +1706,7 @@ fn gui_tail_in_dialog(
     } else {
         out::info("Skipping network driver preload (unchecked).");
         ui.set_stage_status(ST::Drivers as usize, &crate::locale::tr("skipped"));
-        ui.set_stage_progress(ST::Drivers as usize, 1, 1);
+        ui.set_stage_skipped(ST::Drivers as usize);
         ui.pump();
     }
 
@@ -1705,7 +1737,7 @@ fn gui_tail_in_dialog(
     } else {
         out::info("Skipping squashfs-to-HDD copy (unchecked).");
         ui.set_stage_status(ST::HddCopy as usize, &crate::locale::tr("skipped"));
-        ui.set_stage_progress(ST::HddCopy as usize, 1, 1);
+        ui.set_stage_skipped(ST::HddCopy as usize);
         ui.pump();
     }
 
@@ -1833,10 +1865,17 @@ fn fatal_gui(msg: &str, ui: &gui::WorkingUi) -> bool {
     // explanation. The user reads why (download/Rufus/launch failure) before
     // closing the page, which then exits with an error code - or goes Back
     // to pick another method (e.g. Rufus after a nofmt refusal).
+    //
+    // "Close" on the FAILED page now leaves the dialog UP (show_final returns
+    // false with the window alive, stage bars and all) instead of tearing it
+    // down, so the reason stays readable and copyable. We must therefore not
+    // exit just because the page was dismissed: pump until the user really
+    // closes the window, then exit with the error code.
     out::err(msg);
     if ui.show_final("lslsetup - failed", &format!("{}\r\n\r\nSee the console for the full log.", msg), false) {
         return true;
     }
+    ui.wait_until_closed();
     std::process::exit(1);
 }
 

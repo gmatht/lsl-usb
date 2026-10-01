@@ -85,11 +85,41 @@ lsl_desktop_user() {
     # The live-session desktop user (mint on Mint, zorin on Zorin, ubuntu on
     # Ubuntu, ...). UID 1000 is the standard first desktop user on
     # Ubuntu-family live systems; fall back to the first /home entry.
+    #
+    # NEVER invent a username. This used to end with `[ -n "$u" ] || u="mint"`,
+    # which turned "there is no desktop user in this context" into "write to
+    # /home/mint". That is exactly what happened when config.sh ran INSIDE
+    # uproot's chroot (WHYFAIL13): the chroot has no uid 1000 and an empty
+    # /home, so the fallback fired, every $HOME-targeted install silently
+    # targeted a nonexistent user, and the terminal pin was never written. An
+    # empty result is the honest answer - callers must skip (and say so) rather
+    # than write into a guessed home.
     local u=""
     u="$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)"
     [ -n "$u" ] || u="$(ls -1 /home 2>/dev/null | head -n1 || true)"
-    [ -n "$u" ] || u="mint"
     printf '%s\n' "$u"
+}
+
+# The desktop user, but consulted in the HOST context: loginctl first (the
+# authoritative "who is actually logged into a graphical session"), then the
+# uid-1000 / /home heuristics. This is the resolver for anything that must
+# write into a real user's $HOME from a root script - and it works from a
+# chroot-side caller too only if loginctl can reach the host's /run, which it
+# normally cannot; hence lsl-firstboot.sh (host, as root) is the intended user.
+# Prints nothing when no desktop user can be found.
+lsl_desktop_user_for_session() {
+    local s u dtype
+    if command -v loginctl >/dev/null 2>&1; then
+        for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+            dtype="$(loginctl show-session -p Type --value "$s" 2>/dev/null || true)"
+            case "$dtype" in x11|wayland) ;; *) continue ;; esac
+            u="$(loginctl show-session -p Name --value "$s" 2>/dev/null || true)"
+            [ -n "$u" ] && [ "$u" != root ] || continue
+            printf '%s\n' "$u"
+            return 0
+        done
+    fi
+    lsl_desktop_user
 }
 
 # Ensure the desktop user's home exists under HOME_ROOT, seeded from skel when
@@ -155,6 +185,72 @@ lsl_is_usb_mode() {
     esac
 }
 
+# The mode that /home was ACTUALLY mounted with this boot, read from the state
+# file lsl-mount-home.sh wrote. This is authoritative and must be preferred over
+# a fresh lsl_is_usb_mode resolve by anything that persists /home.
+#
+# Why: when the HDD data dir is not on a persistent volume yet (first boot,
+# before hivex-tools mount /mnt/c), lsl-mount-home.sh falls back to a tmpfs
+# overlay and records LSL_MODE=usb. Later in that same boot the data dir can
+# resolve as persistent again (the mounts catch up), so lsl_is_usb_mode returns
+# false while /home is in fact a tmpfs-overlay whose upper layer is RAM. uphome
+# then took the HDD branch, ran a no-op btrfs sync, and the first-boot home
+# changes were lost on reboot.
+#
+# Prints one of: ram | usb | usb-fallback | hdd | (empty when unknown).
+lsl_effective_home_mode() {
+    local f mode
+    f="$(lsl_state_file)"
+    if [ -r "$f" ]; then
+        # tr -d '\r': the state file is written under /run on the live system,
+        # but a stick-restored copy can carry CRLF (same class of bug as the
+        # CRLF env file that once broke mode detection - see lsl_load_config).
+        mode="$(sed -n 's/^LSL_MODE=//p' "$f" 2>/dev/null | tr -d '\r' | tail -n1)"
+    fi
+    # Fall back to the live mount when there is no state file: a /home that is
+    # literally tmpfs can only be the RAM-only ("no persistence") branch.
+    if [ -z "${mode:-}" ]; then
+        if [ "$(findmnt -n -o FSTYPE --target /home 2>/dev/null || true)" = "tmpfs" ]; then
+            mode=ram
+        fi
+    fi
+    printf '%s\n' "${mode:-}"
+}
+
+# True when /home is a REAL USB-stick overlay (persistable to home.sfs). A
+# usb-fallback tmpfs overlay has the same layout but its upper layer is RAM, so
+# it is NOT a stick. With no state file, fall back to the old prediction so
+# pre-fix sticks keep working.
+lsl_effective_home_is_usb() {
+    local m
+    m="$(lsl_effective_home_mode)"
+    if [ -n "$m" ]; then [ "$m" = usb ]; else lsl_is_usb_mode; fi
+}
+
+# True when /home is a loop-backed btrfs on the data dir (HDD mode) - the only
+# mode with home.btrfs/cache.btrfs to grow or sync. ram/usb/usb-fallback are not.
+lsl_effective_home_is_hdd() {
+    local m
+    m="$(lsl_effective_home_mode)"
+    if [ -n "$m" ]; then [ "$m" = hdd ]; else ! lsl_is_usb_mode; fi
+}
+
+# Install the staged hivex .debs from /cdrom/pkgs when hivexregedit is absent.
+# mount_all.sh needs it to map Windows drive letters; on a stock first boot it is
+# not in the base image, and the same firstboot run installs it ~23 minutes later,
+# so /mnt/c never mounts in time and /home falls back to a tmpfs overlay (the
+# WHYFAIL9 data loss). Installing the pre-staged .debs HERE, before /home mounts,
+# removes that trigger with no network. Best-effort: returns 0 when hivexregedit
+# is (or becomes) available, 1 otherwise - never callers' failure.
+lsl_ensure_hivex_tools() {
+    command -v hivexregedit >/dev/null 2>&1 && return 0
+    local d="${LSL_CDROM:-/cdrom}/pkgs"
+    ls "$d"/*.deb >/dev/null 2>&1 || return 1
+    echo "lsl: hivexregedit missing; installing staged .debs from $d ..." >&2
+    dpkg -i "$d"/*.deb >/dev/null 2>&1 || true
+    command -v hivexregedit >/dev/null 2>&1
+}
+
 lsl_data_dir_is_persistent() {
     # True when the resolved LSL_DATA_DIR sits on a persistent volume (a real
     # disk / loop / USB partition), not the live overlay/tmpfs root. Used by
@@ -169,6 +265,39 @@ lsl_data_dir_is_persistent() {
     case "$fst" in
         overlay|aufs|tmpfs|ramfs|"") return 1 ;;
         *) return 0 ;;
+    esac
+}
+
+lsl_data_dir_is_writable() {
+    # True when the data dir is persistent AND currently mounted read-write.
+    #
+    # Why this is separate from lsl_data_dir_is_persistent: the btrfs home
+    # image needs a writable volume, and a READ-ONLY ntfs mount satisfies the
+    # persistence check while being useless for writing it. On boot the data
+    # dir routinely lands `ro` first - the kernel refuses the rw mount with
+    # "Can't mount, would change RO state" and onboot's rw attempt succeeds
+    # about a second later. Branching on persistence alone accepted that ro
+    # landing and declared usb-fallback, losing the whole session's /home.
+    #
+    # Deliberately does NOT mutate the mount: remounting rw on a volume the
+    # kernel considers dirty is how NTFS gets corrupted. It only reports, so
+    # the caller can keep retrying and still fall back honestly.
+    local d mp opts
+    lsl_data_dir_is_persistent || return 1
+    d="$(lsl_resolve_data_dir 2>/dev/null || true)"
+    [ -n "$d" ] || return 1
+    mp="$(findmnt -n -o TARGET -T "$d" 2>/dev/null || true)"
+    [ -n "$mp" ] || return 1
+    # Ask findmnt about the mount point, not the data dir: -T on the data dir
+    # can resolve to a different (parent) mount than the one we validated.
+    opts="$(findmnt -n -o OPTIONS --target "$mp" 2>/dev/null || true)"
+    [ -n "$opts" ] || return 1
+    # Options are comma-separated; "ro" appears only on a read-only mount,
+    # and rw mounts list "rw" explicitly.
+    case ",$opts," in
+        *,ro,*) return 1 ;;
+        *,rw,*) return 0 ;;
+        *) return 1 ;;
     esac
 }
 

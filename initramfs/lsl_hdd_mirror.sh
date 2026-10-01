@@ -6,12 +6,18 @@
 # root FROM that mirror instead of /cdrom (the USB). The internal disk is faster,
 # so boot is quicker and USB wear drops.
 #
-# How: casper's layer discovery reads LAYERFS_PATH (an absolute dir holding the
-# layers). We scan local block devices, mount each read-only, look for a mirror
-# "sfs/manifest.txt" carrying our beacon header, and - if every recorded layer
-# exists with the expected size (+ sha256, when recorded) - point LAYERFS_PATH
-# at the multi-layer entry (filesystem.z0.squashfs, which casper stacks over
-# filesystem.squashfs). /cdrom (bin/, onboot.sh, lsl-usb.env) stays on the USB.
+# How: the Linux-side builder OVERLAYS every USB layer (base, firstboot stub,
+# appends) into ONE self-contained squashfs, filesystem_zmerged.squashfs, and
+# records it in sfs/manifest.txt. We scan local block devices, mount each
+# read-only, look for that manifest, verify the merged layer's size (+ sha256
+# when recorded), and - only if it verifies - point LAYERFS_PATH at that single
+# file. /cdrom (bin/, onboot.sh, lsl-usb.env) stays on the USB.
+#
+# Why ONE merged layer and not a stack: casper resolves LAYERFS_PATH by
+# stripping dot-suffixes upward, so a dot-free name resolves to exactly that
+# one file. Since the dot-chain was removed (alphabetical stacking everywhere
+# else, see WHYFAIL14), there is no chain left to walk and the layer has to
+# carry a complete rootfs itself.
 #
 # Safety: this script NEVER panics and NEVER changes the root. If anything is
 # missing, unreadable, or fails verification, it simply does nothing and casper
@@ -44,6 +50,7 @@ fi
 BEACON="LSL squashfs layers copied to HDD for faster boot"
 LSLL_MNT="/mnt/lsl-mirror-scan"
 ADOPT=""
+MERGED="filesystem_zmerged.squashfs"
 
 # Echo the "sfs" dir that holds a verified LSL mirror manifest, else nothing.
 # Avoids head|grep pipelines (fragile under busybox ash in the initramfs); uses
@@ -73,8 +80,8 @@ lsl_verify() {
             [ "$got" = "$want" ] || return 1
         fi
     done < "$man/manifest.txt"
-    # casper's multi-layer chain needs the z0 entry point.
-    [ -f "$man/filesystem.z0.squashfs" ] || return 1
+    # casper boots exactly one file here, so that file must be the merged one.
+    [ -f "$man/$MERGED" ] || return 1
     return 0
 }
 
@@ -89,9 +96,9 @@ for dev in $(find /dev -type b 2>/dev/null); do
         sfs=$(lsl_find_sfs "$mnt")
         if [ -n "$sfs" ] && lsl_verify "$sfs"; then
             # Keep this volume mounted: casper loop-mounts the layer file through it.
-            ADOPT="$sfs/filesystem.z0.squashfs"
+            ADOPT="$sfs/$MERGED"
             export LAYERFS_PATH="$ADOPT"
-            echo "LSL: adopting HDD mirror layers from $sfs (LAYERFS_PATH=$LAYERFS_PATH)" >&2
+            echo "LSL: adopting HDD mirror layer from $sfs (LAYERFS_PATH=$LAYERFS_PATH)" >&2
             lsl_dbg "ADOPTED $ADOPT from $sfs"
             return 0 2>/dev/null || exit 0
         fi

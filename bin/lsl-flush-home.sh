@@ -23,6 +23,18 @@ if ! lsl_is_usb_mode; then
     exit 1
 fi
 
+# Only a real USB-mode overlay may be squashed to home.sfs. A fallback tmpfs
+# overlay (HDD data dir not persistent at mount time) has the same layout but
+# was mounted transiently and by design must not be written to the stick's
+# per-distro home image: doing so overwrites a good image with a near-empty
+# one. See lsl_effective_home_mode in lsl-common.sh.
+_ehm="$(lsl_effective_home_mode)"
+if [ "$_ehm" = "usb-fallback" ]; then
+    echo "lsl-flush-home.sh: /home is a FALLBACK tmpfs overlay; refusing to overwrite" >&2
+    echo "  $HOME_SFS with it. Reboot with the data dir mounted and retry." >&2
+    exit 1
+fi
+
 if ! mountpoint -q /home 2>/dev/null; then
     echo "lsl-flush-home.sh: /home is not mounted." >&2
     exit 1

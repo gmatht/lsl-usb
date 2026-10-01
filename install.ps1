@@ -568,6 +568,15 @@ function Select-ExistingUsb {
         Write-Info $desc
     }
     Write-Info 'Reusing skips the ISO download and the Rufus re-write; the lsl-usb files are dropped in place.'
+
+    # Single drive: make it the default (plain Enter accepts it). 0 still writes
+    # fresh via Rufus, so the fresh path stays reachable.
+    if ($found.Count -eq 1) {
+        $ans = Read-Host 'Press Enter to install onto the only USB found, or 0 to write fresh via Rufus'
+        if ($ans -eq '0') { return $null }
+        return $found[0]
+    }
+
     $ans = Read-Host "Choose a USB [1..$($found.Count)] to install lsl-usb onto now, or 0 to write fresh via Rufus"
     $n = 0
     if ([int]::TryParse($ans, [ref]$n) -and $n -ge 1 -and $n -le $found.Count) {
@@ -883,6 +892,39 @@ function Install-DriverPackages {
         }
     }
     try { $report | Set-Content -Encoding ascii -Path (Join-Path $root 'lsl-drivers.txt') } catch { }
+    return ,$report
+}
+
+function Install-HivexTools {
+    # Stage the hivex .debs to <USB>:\pkgs\ so the guest can install them BEFORE
+    # /home mounts. mount_all.sh needs hivexregedit to map the Windows drive
+    # letters, but the base image lacks hivex-tools and the same firstboot run is
+    # what would otherwise install it (~23 min later) - so /mnt/c never mounts in
+    # time and /home falls back to a tmpfs overlay, losing that boot's /home
+    # (WHYFAIL9 / FRAGILE_HOME.md). libhivex-bin ships hivexget/hivexsh;
+    # libwin-hivex-perl ships hivexregedit; libhivex0 is the shared library both
+    # need. Non-fatal: an unresolved package just logs a SKIP, so non-Ubuntu
+    # images (where the suite differs) still install without these.
+    param($Vol)
+    $root = "$($Vol.DriveLetter):\"
+    $pkgDir = Join-Path $root 'pkgs'
+    $report = @()
+    New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
+    foreach ($p in @('libhivex0', 'libhivex-bin', 'libwin-hivex-perl')) {
+        $url = Get-UbuntuPackageUrl -Package $p -Suite 'noble-updates' -Component 'universe'
+        if (-not $url) { $url = Get-UbuntuPackageUrl -Package $p -Suite 'noble' -Component 'universe' }
+        if (-not $url) { $report += "SKIP  ${p}: could not resolve download URL"; continue }
+        $dest = Join-Path $pkgDir ([System.IO.Path]::GetFileName($url))
+        try {
+            Download $url $dest
+            if (-not (Test-Path $dest) -or (Get-Item $dest).Length -eq 0) { throw 'empty download' }
+            $kb = [math]::Round((Get-Item $dest).Length / 1KB, 0)
+            $report += "STAGE ${p}: $([System.IO.Path]::GetFileName($url)) ($kb KB)"
+        } catch {
+            Remove-Item $dest -Force -ErrorAction SilentlyContinue
+            $report += "FAIL  ${p}: $($_.Exception.Message)"
+        }
+    }
     return ,$report
 }
 
@@ -2115,6 +2157,8 @@ try {
             }
         })
         $reusePanel.Controls.Add($rb)
+        # Single drive: select it by default so the user can just proceed.
+        if ($existingUsbs.Count -eq 1) { $rb.Checked = $true }
         $ry += 24
     }
     $ui.IsoReady = $true
@@ -2441,7 +2485,9 @@ try {
         $targetRadios += $rb
         $ty += 24
     }
-    if ($targetRadios.Count -gt 0) { $targetRadios[0].Checked = $true }
+    # Single drive: select it by default. With several, leave the choice to
+    # the user rather than guessing which stick to copy onto.
+    if ($targetRadios.Count -eq 1) { $targetRadios[0].Checked = $true }
 
     $lblInstallSummary = New-Object System.Windows.Forms.Label
     $lblInstallSummary.Location = New-Object System.Drawing.Point(10, 420)
@@ -3099,6 +3145,9 @@ Assert-UsbCapacity -Vol $vol -IsoSizeBytes $isoSize
 
 WriteStep 'Dropping lsl-usb files onto the USB...'
 Install-LslFiles -Vol $vol -BundleDir $BundleDir
+WriteStep 'Staging hivex tooling for first boot (<USB>:\pkgs)...'
+$hivexReport = Install-HivexTools -Vol $vol
+$hivexReport | ForEach-Object { Write-Info "  $_" }
 if ($PreloadRustTools) {
     WriteStep 'Preloading 32-bit Rust CLI tools (fd/bat/zoxide) onto the USB...'
     Install-RustTools -Vol $vol

@@ -214,6 +214,22 @@ const UEFI_TT: &str = "UEFI boot needs a FAT32 stick plus a BOOTX64.EFI loader (
 /// Tooltip while the write method is not the built-in installer.
 const METHOD_TT: &str = "Used by the built-in installer only - pick Built-in non-destructive above to configure BIOS/UEFI boot.";
 
+/// True when an ISO-page radio kind is one of the three mutually-exclusive
+/// "main source" rows: 0=Download Fresh, 1=local ISO, 2=existing USB.
+///
+/// The three live in SEPARATE WS_GROUPs (each section's first radio carries
+/// WS_GROUP), so Win32 only auto-unchecks siblings WITHIN the clicked
+/// section. Selecting one therefore leaves another section's pre-checked row
+/// still Checked - with a local Mint ISO present, that row is pre-checked at
+/// build time, so clicking "use the existing USB" used to leave BOTH checked.
+/// The harvest then broke the tie in favour of the ISO and silently dropped
+/// the user's choice, and the run fell through to the ordinary ISO install,
+/// which demands its own target pick. An explicit click now clears the other
+/// source rows, so the last explicit click wins.
+fn is_iso_source_kind(kind: u8) -> bool {
+    kind <= 2
+}
+
 /// Drive letter of the checked kind-4 target radio ("" when none).
 fn checked_target_letter(items: &PageItems) -> String {
     for it in items.borrow().iter() {
@@ -2021,12 +2037,21 @@ impl WorkingUi {
     }
 
     fn set_bar_units(&self, h: usize, done: u64, total: u64) {
+        let (max, pos) = bar_units(done, total);
+        self.set_bar_units_raw(h, max, pos);
+    }
+
+    /// Drive a bar with explicit (max, pos) already in control units.
+    fn set_bar_units_raw(&self, h: usize, max: i32, pos: i32) {
         const PBM_SETRANGE32: u32 = 1030;
         const PBM_SETPOS: u32 = 1026;
         if h == 0 || !is_window(h) {
             return;
         }
-        let (max, pos) = bar_units(done, total);
+        // A full range of 100 is the control's indeterminate value and always
+        // paints 100%, so never hand it a max of exactly 100.
+        let max = if max == 100 { 1000 } else { max };
+        let pos = pos.min(max).max(0);
         use winapi::um::winuser::SendMessageW;
         unsafe {
             SendMessageW(h as _, PBM_SETRANGE32, 0, max as isize);
@@ -2068,9 +2093,11 @@ impl WorkingUi {
     }
 
     /// Mark stage `idx` complete (bar to 100%, label with check).
+    /// Uses bar_units_done() - NOT (1,1) - so the bar is unambiguously full.
     pub fn set_stage_done(&self, idx: usize) {
         if let (Some(&b), Some(&name)) = (self.stage_bars.get(idx), WORK_STAGES.get(idx)) {
-            self.set_bar_units(b, 1, 1);
+            let (max, pos) = bar_units_done();
+            self.set_bar_units_raw(b, max, pos);
             repaint(b);
             if let Some(&h) = self.stage_labels.get(idx) {
                 set_wnd_text(
@@ -2079,6 +2106,18 @@ impl WorkingUi {
                 );
                 repaint(h);
             }
+        }
+        self.pump();
+    }
+
+    /// Mark stage `idx` SKIPPED (unchecked option): the work did not run, so
+    /// the bar is emptied and the label says skipped. Deliberately NOT
+    /// set_stage_done: painting a full bar for something that never ran is
+    /// the same false "100%" the progress-scaling fix removes.
+    pub fn set_stage_skipped(&self, idx: usize) {
+        if let Some(&b) = self.stage_bars.get(idx) {
+            self.set_bar_units_raw(b, 1000, 0);
+            repaint(b);
         }
         self.pump();
     }
@@ -2142,6 +2181,19 @@ impl WorkingUi {
                 UnregisterHotKey(self.main as winapi::shared::windef::HWND, INSTALL_HOTKEY_ID);
                 DestroyWindow(self.main as winapi::shared::windef::HWND)
             };
+        }
+    }
+
+    /// Pump the message loop until the wizard window is really gone.
+    ///
+    /// Used after the FAILED page: "Close" now leaves the dialog up (so the
+    /// failure reason stays on screen), which means the caller must wait for
+    /// the user's own window close instead of exiting behind a live dialog.
+    /// Returns immediately once the window is destroyed.
+    pub fn wait_until_closed(&self) {
+        while is_window(self.main) {
+            self.pump();
+            std::thread::sleep(std::time::Duration::from_millis(60));
         }
     }
 
@@ -2305,11 +2357,19 @@ impl WorkingUi {
             self.repaint_window();
             return true;
         }
-        // FAILED page Close: destroy the window (user gives up).
         // FINISHED page: the caller decides when to close
         // (ask_boot_choice follows for nofmt; skip/rufus callers close).
+        //
+        // FAILED page Close deliberately does NOT destroy the window any
+        // more: the failure reason is the one thing the user must be able to
+        // read (and copy) after a run that did not work, and a destroyed
+        // dialog loses it. Close instead hides the failure page and leaves
+        // the window (and the stage bars, which keep their real state) on
+        // screen; the real close is the window's own [X].
         if !ok {
-            self.close();
+            self.hide_summary();
+            self.show_stages();
+            self.repaint_window();
         }
         false
     }
@@ -2513,10 +2573,55 @@ impl WorkingUi {
 /// PBM_SETRANGE32/PBM_SETPOS take 32-bit ints, so a ~3 GB byte total wraps
 /// negative and the bar reads complete at ~1%. Pure so the scaling is
 /// unit-testable - the live control is unreachable headless.
+///
+/// The (0, 100) range is RESERVED by Windows: a comctl32 progress bar given
+/// `max == 100` renders 100% full regardless of the position it is set to
+/// (100 is the control's indeterminate/marquee value). A total that rounds
+/// under 100 MB must therefore be SCALED off that value rather than clamped
+/// to it, or every sub-100 MB bar reads 100% from its first chunk. The
+/// scale factor is per-case (below) and applies to both ends equally, so
+/// the ratio - and therefore the rendered fill - is preserved exactly.
+///
+/// A position is also clamped to `max - 1`: a bar for an operation that is
+/// still RUNNING must never render as complete. Only set_stage_done() fills
+/// a bar, via bar_units_done(). (0,0) means "unknown" and stays (1,0).
 pub(crate) fn bar_units(done: u64, total: u64) -> (i32, i32) {
-    let max = ((total / sys::MB).max(1)).min(i32::MAX as u64) as i32;
-    let pos = (done / sys::MB).min(total / sys::MB).min(max as u64) as i32;
-    (max, pos)
+    if total == 0 {
+        return (1, 0);
+    }
+    // Work in megabytes, then pick a scale that keeps `max` off the
+    // reserved 100 value and inside i32 without ever rounding the ratio
+    // away. Scale BOTH ends by the same factor.
+    let mb_total = (total / sys::MB).max(1);
+    let mb_done = done / sys::MB;
+    // 1x when the MB figure is usable as-is; 10x when it lands exactly on
+    // 100 (the reserved always-full range); 100x when it is under 100 and
+    // needs the extra resolution to stay off the reserved value. The
+    // `mb_total == 1` case (a sub-megabyte total) would scale to exactly
+    // 100 as well, so it takes the 1000 range directly.
+    let scale: u64 = if mb_total == 1 {
+        1000
+    } else if mb_total == 100 {
+        10
+    } else if mb_total < 100 {
+        100
+    } else {
+        1
+    };
+    let max_u = mb_total * scale;
+    let max = max_u.min(i32::MAX as u64) as i32;
+    // Never let a RUNNING bar reach its max: clamp to max - 1 (except for
+    // the degenerate max == 1 case, which stays empty at position 0).
+    let cap = if max_u > 1 { max_u - 1 } else { 0 };
+    let pos = (mb_done * scale).min(cap).min(max as u64) as i32;
+    (max, pos.max(0))
+}
+
+/// Range (max, pos) that reads as genuinely complete. Kept separate from
+/// bar_units so a live transfer's own position can never be mistaken for a
+/// finished stage - set_stage_done() is the only caller.
+pub(crate) fn bar_units_done() -> (i32, i32) {
+    (1000, 1000)
 }
 
 impl crate::nofmt::WriteUi for WorkingUi {
@@ -3043,6 +3148,14 @@ pub fn run_gui(
     // there, and a 64-bit live USB would not boot. Unknown-arch ISOs are
     // left alone (treated as compatible).
     let cpu64 = is_64bit_capable();
+    // Whether the Mint "main" radio below will actually be pre-checked. The
+    // existing-USB section (further down the page) consults this so the page
+    // never shows two "main" choices selected at once: they are separate
+    // WS_GROUPs, so neither unchecks the other.
+    let mint_iso_prechecked = have_mint
+        .as_deref()
+        .map(|m| cpu64 || iso_arch_64(m) != Some(true))
+        .unwrap_or(false);
     if found_isos.is_empty() {
         add_plain("(none found)", &mut y);
     }
@@ -3137,7 +3250,20 @@ pub fn run_gui(
         v
     };
     for (n, u) in existing_usbs.iter().enumerate() {
-        add_radio(&format!("{}:  {}  ({:.1} GB)", u.letter, u.label, u.size_gb()), false, 2, n == 0, &mut y);
+        // Pre-check a lone existing USB so the user can just proceed (same
+        // default as install.ps1 and choose_target) - but NOT when the
+        // recommended Mint ISO is already pre-selected as "main" below/above.
+        // These sections are separate WS_GROUPs, so checking both would show
+        // two main choices at once and the harvest would silently drop one.
+        // With several USBs, leave the choice open: reuse is a real decision.
+        let only = existing_usbs.len() == 1 && !mint_iso_prechecked;
+        add_radio(
+            &format!("{}:  {}  ({:.1} GB)", u.letter, u.label, u.size_gb()),
+            only,
+            2,
+            n == 0,
+            &mut y,
+        );
     }
     if existing_usbs.is_empty() {
         add_plain("(none found)", &mut y);
@@ -4368,6 +4494,52 @@ pub fn run_gui(
                             }
                         }
                     }
+                    // The three "main source" sections (Download Fresh = kind 0,
+                    // Local ISO = kind 1, existing USB = kind 2) are SEPARATE
+                    // WS_GROUPs, so Win32 only auto-unchecks siblings WITHIN the
+                    // clicked section: checking one leaves the other sections'
+                    // pre-checked radio still Checked. With a local Mint ISO
+                    // present that is exactly the reported case - the ISO
+                    // "main" is pre-checked at build time, the user then clicks
+                    // "D: Lexar" to reuse, and BOTH are Checked. The harvest
+                    // then resolved the tie in favour of the ISO
+                    // (see harvest_gui_result), silently discarding the reuse
+                    // click, and the flow fell through to the normal ISO install
+                    // which demands its own target pick ("No target USB was
+                    // selected on the INSTALL page"). The radio must do what it
+                    // looks like it does, so an explicit click on any source
+                    // row clears every other source row: last explicit click wins.
+                    if let Some((k, _)) = clicked {
+                        if is_iso_source_kind(k) {
+                            let clicked_hwnd = iso_items
+                                .borrow()
+                                .iter()
+                                .find_map(|it| match &it.ctl {
+                                    PageCtl::Radio(rb, kk) if *kk == k => {
+                                        if rb.check_state() != nwg::RadioButtonState::Checked {
+                                            return None;
+                                        }
+                                        rb.handle.hwnd().map(|h| h as usize)
+                                    }
+                                    _ => None,
+                                });
+                            for it in iso_items.borrow().iter() {
+                                if let PageCtl::Radio(rb, kk) = &it.ctl {
+                                    if !is_iso_source_kind(*kk) {
+                                        continue; // not a source row
+                                    }
+                                    if rb.handle.hwnd().map(|h| h as usize) == clicked_hwnd
+                                    {
+                                        continue; // the one just clicked
+                                    }
+                                    rb.set_check_state(nwg::RadioButtonState::Unchecked);
+                                }
+                            }
+                            glog(&format!(
+                                "iso source click kind={k}: cleared the other source sections"
+                            ));
+                        }
+                    }
                     if let Some((0, text)) = clicked {
                         glog(&format!("distro radio clicked: {text}"));
                         if let Some((_, (_n, url))) = distro_urls
@@ -4705,6 +4877,18 @@ fn harvest_gui_result(
     }
     chosen_iso = chosen_iso.filter(|s| !s.is_empty() && s != "[None found]");
     reuse_usb = reuse_usb.filter(|s| !s.is_empty());
+
+    // Exactly one "main" source. The three sections (local ISO, existing USB,
+    // fresh download) are separate WS_GROUPs, so Win32 does NOT clear one when
+    // another is picked - and the build-time pre-checks can leave two Checked at
+    // once (the recommended Mint ISO AND a single existing USB). The harvest
+    // then used USB precedence and silently DROPPED the ISO the user had also
+    // selected. The ISO is the richer choice (a real ISO path is what every
+    // later stage consumes), so when both are selected keep the ISO and drop
+    // the reuse.
+    if let (Some(_), Some(_)) = (&chosen_iso, &reuse_usb) {
+        reuse_usb = None;
+    }
 
     // Extra multiboot ISOs (page-1 kind-3 checkboxes): loopback-only
     // entries, no firstboot. The selected primary is excluded here (the
@@ -5155,6 +5339,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn iso_source_kinds_are_exactly_the_three_main_sections() {
+        // 0=Download Fresh, 1=local ISO, 2=existing USB are the mutually
+        // exclusive "main source" rows. Anything else on the ISO page (there
+        // is nothing else today, but the kind space is shared with the other
+        // pages' tags) must NOT be swept by the click handler - unchecking a
+        // non-source row would silently drop an unrelated selection.
+        for k in [0u8, 1, 2] {
+            assert!(is_iso_source_kind(k), "kind {k} must be a source row");
+        }
+        for k in [3u8, 4, 5, 9, 11] {
+            assert!(!is_iso_source_kind(k), "kind {k} must not be a source row");
+        }
+    }
+
+    #[test]
+    fn iso_source_click_clears_only_the_other_source_rows() {
+        // Reproduces the reported "reuse still asks me to choose a USB" bug
+        // as a pure model of the sweep, since the real controls need a window:
+        // a local Mint ISO's "main" radio is pre-checked (separate WS_GROUP
+        // from the reuse section, so Win32 leaves it Checked), the user clicks
+        // reuse, and the harvest then dropped the reuse in favour of the ISO.
+        // Model: [iso, iso, reuse] with the first row already Checked.
+        let mut rows = vec![(1u8, true), (1u8, false), (2u8, false)];
+        // the user clicks the existing-USB row
+        let clicked_kind = 2u8;
+        let clicked_idx = rows
+            .iter()
+            .position(|(k, c)| *k == clicked_kind && !*c)
+            .expect("reuse row present");
+        rows[clicked_idx].1 = true;
+        // the sweep
+        for i in 0..rows.len() {
+            if rows[i].0 == clicked_kind && i == clicked_idx {
+                continue;
+            }
+            if is_iso_source_kind(rows[i].0) {
+                rows[i].1 = false;
+            }
+        }
+        // exactly one source row survives, and it is the one clicked
+        let checked: Vec<u8> = rows.iter().filter(|(_, c)| *c).map(|(k, _)| *k).collect();
+        assert_eq!(checked, vec![2u8], "only the clicked source stays checked");
+    }
+
+    #[test]
+    fn iso_source_click_leaves_a_second_reuse_row_unchecked() {
+        // Two sticks: the build only pre-checks the FIRST row of a section and
+        // never pre-checks when several exist. Clicking the second must not be
+        // mistaken for "a source row is checked" and clear the first, which
+        // would leave reuse pointing at a different drive than the one shown.
+        let mut rows = vec![(2u8, false), (2u8, false)];
+        let clicked_idx = 1usize;
+        rows[clicked_idx].1 = true;
+        for i in 0..rows.len() {
+            if rows[i].0 == 2 && i == clicked_idx {
+                continue;
+            }
+            if is_iso_source_kind(rows[i].0) {
+                rows[i].1 = false;
+            }
+        }
+        let checked: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, c))| *c)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(checked, vec![clicked_idx], "the clicked stick stays picked");
+    }
+
+    #[test]
     fn bottom_bands_never_overlap() {
         // the "Downloading ..." label band touches neither the scrollable
         // pages above nor the button row below, at any client height -
@@ -5307,10 +5562,44 @@ mod tests {
         assert_eq!(max, (total / sys::MB) as i32);
         assert_eq!(pos, (31_000_000u64 / sys::MB) as i32);
         assert!(pos < max, "1% must not read complete");
-        // degenerate + complete cases stay sane
         assert_eq!(bar_units(0, 0), (1, 0));
-        let (max2, pos2) = bar_units(total, total);
-        assert_eq!((max2, pos2), (max, max));
+    }
+
+    #[test]
+    fn running_bar_never_reads_complete() {
+        // A bar for an operation that is still RUNNING must never be
+        // positioned at its max, at any size. Two traps are covered: a
+        // `max` of exactly 100 (the comctl32 progress bar reserves that
+        // range as its always-full indeterminate value, so the bar paints
+        // full at any position), and totals that round to a small MB
+        // figure. Regression: a sub-100 MB copy used to render a 100%
+        // bar from its first chunk while the work had barely started.
+        for (done, total) in [
+            (0u64, 30 * sys::MB),
+            (30 * sys::MB, 30 * sys::MB),
+            (99 * sys::MB, 100 * sys::MB),
+            (100 * sys::MB, 100 * sys::MB),
+            (3_100_000_000u64, 3_100_000_000u64),
+            (0, 1),
+            (1, 1),
+            (1, 200),
+            (0, 99),
+            (0, 101),
+            (0, 2 * sys::MB),
+            (99, 100),
+        ] {
+            let (max, pos) = bar_units(done, total);
+            assert!(max > 0, "max must be positive for {}/{}", done, total);
+            assert!(pos < max, "bar read complete while running: {}/{}", done, total);
+            assert_ne!(max, 100, "max == 100 is the control's always-full range");
+        }
+        // Resolution is preserved, not collapsed: both ends scale together.
+        assert_eq!(bar_units(15 * sys::MB, 30 * sys::MB), (3000, 1500));
+        assert_eq!(bar_units(50 * sys::MB, 100 * sys::MB), (1000, 500));
+        // The explicit done path is the only bar that reads complete.
+        assert_eq!(bar_units_done(), (1000, 1000));
+        let (m, p) = bar_units_done();
+        assert_eq!(p, m);
     }
 
     #[test]

@@ -478,14 +478,56 @@ def main():
         return True
 
     def finish_ui(text_done):
+        # The stamp means "root-side setup returned", NOT "everything worked".
+        # lsl-firstboot.sh writes the stamp before it blocks in
+        # schedule_reboot_on_approval(), and it also stamps on the failure and
+        # no-uproot paths (and with LSL_HOME_FAILED=1 when this boot's /home
+        # will be lost). Blanket "Done — 100%" here painted a full green bar
+        # over a phase that literally starts with "failed -" and over a done
+        # list that does not cover every task (observed 2026-09-29: the `stick`
+        # task never completed, phase='failed - setup complete but /home not
+        # persisted', and the dialog still showed 100%). Report what the status
+        # file actually says: 100% only for a clean, complete firstboot.
+        data = read_status(status_file)
+        tasks = parse_tasks(data)
+        done = parse_done(data)
+        phase = (data.get("phase", "") or "").strip()
+        labels = {tid: label for tid, label in tasks}
+        clean = not phase.lower().startswith("failed") and all(
+            tid in done for tid, _ in tasks
+        )
         for tid, (sym, txt, _h) in rows.items():
-            label = next((l for t, l in parse_tasks(read_status(status_file)) if t == tid), tid)
-            sym.set_markup('<span fgcolor="#2e7d32">✔</span>')
-            txt.set_markup('<span fgcolor="#555555">%s</span>' % GLib.markup_escape_text(label))
-        overall.set_fraction(1.0)
-        overall.set_text("Done — 100%")
-        current_bar.set_fraction(1.0)
-        detail.set_text(text_done)
+            label = labels.get(tid, tid)
+            if tid in done:
+                sym.set_markup('<span fgcolor="#2e7d32">✔</span>')
+                txt.set_markup('<span fgcolor="#555555">%s</span>' % GLib.markup_escape_text(label))
+            else:
+                # Not completed (or never reached): keep it visibly pending
+                # instead of stamping a tick over it.
+                sym.set_markup('<span fgcolor="#c62828">✖</span>')
+                txt.set_markup(
+                    '<span fgcolor="#c62828">%s (not completed)</span>'
+                    % GLib.markup_escape_text(label)
+                )
+        if clean:
+            overall.set_fraction(1.0)
+            overall.set_text("Done — 100%")
+            current_bar.set_fraction(1.0)
+            detail.set_text(text_done)
+        else:
+            # Finished, but with a problem. Do NOT claim 100%: hold the bar at
+            # the last real value (never above 99) and let the detail line carry
+            # the failure, which is the one thing the operator must not miss
+            # before rebooting.
+            fail_text = (data.get("detail", "") or "").strip() or phase or text_done
+            overall.set_fraction(0.99)
+            overall.set_text("Finished with problems — see below")
+            current_bar.set_fraction(0.0)
+            detail.set_text(fail_text[:320])
+        dialog_log(
+            "gtk fallback: finish_ui clean=%s phase=%s done=%s"
+            % (clean, phase or "(none)", data.get("done", "") or "(none)")
+        )
 
     def on_destroy(_w=None):
         dialog_log(

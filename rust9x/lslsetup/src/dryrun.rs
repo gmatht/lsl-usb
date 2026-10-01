@@ -73,7 +73,7 @@ pub fn show_dry_run_report(opts: &crate::cli::Opts) {
         out::info("Would copy grldr, extract the kernel + base squashfs out of the source ISO (the ISO file itself is never copied),");
         out::info("write the direct-kernel menu.lst entries,");
         out::info("drop the first-boot toolkit (bin/uproot et al.), extract the base squashfs,");
-        out::info("and write the embedded z0 firstboot layer to casper\\filesystem.z0.squashfs,");
+        out::info("and write the embedded z0 firstboot layer to casper\\filesystem_z0_firstboot.squashfs,");
         out::info("offering first to delete h2testw leftovers (*.h2w) when space runs short,");
         if uefi_src != Some("vendored signed shim+GRUB2") {
             out::info("mirror the entries to efi\\grub\\menu.lst for grub4dos-for-UEFI,");
@@ -194,6 +194,18 @@ pub fn show_dry_run_report(opts: &crate::cli::Opts) {
         }
     } else {
         out::warn("netsh absent on this Windows version - wifi.sh cannot be generated.");
+    }
+
+    // ---- boot-critical tooling ----
+    if opts.pkgs {
+        out::step("Boot-critical tooling (would be staged to <USB>:\\pkgs\\)");
+        for pkg in ["libhivex0", "libhivex-bin", "libwin-hivex-perl"] {
+            out::info(&format!("  {}", pkg));
+        }
+        out::info("  hivexget/hivexregedit let mount_all.sh map Windows drive letters, so");
+        out::info("  /home mounts persistently instead of a transient tmpfs overlay.");
+    } else {
+        out::step("Boot-critical tooling (skipped: --no-pkgs)");
     }
 
     // ---- network drivers ----

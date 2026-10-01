@@ -8,3 +8,7 @@ No format install by default?
 
 Support F2FS?
 Support repartition?
+
+(initranfs/0 stdin: invalid argument
+File system layers are missing:\n '/cdrom/casper/filesystem/z0.20260928025844.20260928142919.squasfs' doesn't exist,\n '/cdrom/casper/file
+system.z0.20260928025844.squashfs' doen't exist.)

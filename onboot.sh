@@ -299,6 +299,10 @@ fi
 
 modprobe ntfs3 2>/dev/null || true
 mkdir -p /mnt/c /mnt/d
+# Install staged hivex .debs before mount_all.sh: it needs hivexregedit to map
+# the Windows drive letters, the base image lacks it, and the same firstboot run
+# would otherwise install it only after /mnt/c is needed (WHYFAIL9).
+lsl_ensure_hivex_tools || true
 bash /cdrom/bin/mount_all.sh
 
 if [ -r /cdrom/bin/wsl-boot-setup ]; then
@@ -337,6 +341,11 @@ lsl_is_usb_mode && _lsl_mode_want="usb"
 echo "lsl: env=${LSL_ENV_FILE:-<none>} data_dir=$DATA_DIR mode=$_lsl_mode_want LSL_DATA_DIR=${LSL_DATA_DIR:-<unset>}"
 if [ "$_lsl_mode_want" = "hdd" ] && ! lsl_data_dir_is_persistent; then
     echo "lsl: WARNING: data dir $DATA_DIR is not on a persistent volume" >&2
+elif [ "$_lsl_mode_want" = "hdd" ] && ! lsl_data_dir_is_writable; then
+    # Persistent but read-only: onboot.sh runs AFTER lsl-home.service, so by
+    # now the rw mount should have landed. If it still has not, the home image
+    # cannot be written and whatever is on /home will not persist.
+    echo "lsl: WARNING: data dir $DATA_DIR is persistent but not writable; home images cannot be written" >&2
 fi
 
 # Command log: USB → /persist or tmpfs; HDD → on home.btrfs (not NTFS data dir; not /cdrom).
@@ -398,8 +407,13 @@ lsl_merge_fstab || true
 lsl_ensure_nix_daemon || true
 
 # After /home is mounted (config.sh --from-onboot runs earlier, before home setup).
+# --install-home-only (not just the warning): onboot runs on the HOST with the
+# real /home mounted, so this is the context that CAN resolve the desktop user -
+# unlike the chroot-side call in squashfs_config.sh, which finds no user at all
+# (WHYFAIL13). Running it every boot also self-heals existing sticks whose pin
+# was never installed, without waiting for a fresh first boot. Idempotent.
 if [ -r /cdrom/bin/config.sh ]; then
-    bash /cdrom/bin/config.sh --install-autostart-warning-only || true
+    bash /cdrom/bin/config.sh --install-home-only || true
 fi
 
 # Optional: overlay-writable view of Windows Steam libraries so Linux Steam can

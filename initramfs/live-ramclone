@@ -2,10 +2,16 @@
 # live-ramclone - casper-premount hook for Boot to RAM via dm-clone.
 #
 # When the kernel cmdline contains 'ramclone', this hook:
-#   1) extracts dm-clone modules from the mounted squashfs
+#   1) extracts dm-clone modules from the base squashfs
 #   2) loads dm-clone (and brd, or falls back to tmpfs+loop)
-#   3) creates a dm-clone device with the squashfs as origin and RAM as dest
-#   4) overrides get_backing_device so casper mounts /dev/mapper/clone
+#   3) creates ONE dm-clone device: origin = the big base squashfs on the USB,
+#      dest = RAM - so the live root is usable immediately and hydrates in the
+#      background
+#   4) copies every OTHER layer of casper's dotted chain (the tiny z0 firstboot
+#      layer, any appended filesystem.z0.<ts> layer) into tmpfs and loops it
+#      from RAM, so no squashfs on the USB stays open
+#   5) overrides get_backing_device so casper mounts our RAM-backed devices -
+#      casper calls it once PER LAYER (see setup_overlay's layerfs-path walk)
 #
 # The hook is SOURCED by casper's run_scripts (via ORDER file), so exports
 # and function overrides propagate into casper's shell.
@@ -14,20 +20,69 @@ set +e
 grep -qw ramclone /proc/cmdline 2>/dev/null || return 0 2>/dev/null || exit 0
 
 # Idempotent: if clone already exists, nothing to do.
-[ -e /dev/mapper/clone ] && return 0 2>/dev/null || exit 0
+# NOTE: must be an `if`, not `[ ... ] && return 0 || exit 0` - in the latter the
+# `|| exit 0` fires whenever the condition is FALSE (the normal case here) and,
+# because run_scripts SOURCES this hook, that would exit casper's shell.
+if [ -e /dev/mapper/clone ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # Skip if HDD mirror is active (already on fast local disk).
-[ -n "${LAYERFS_PATH}" ] && return 0 2>/dev/null || exit 0
+if [ -n "${LAYERFS_PATH}" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
-# Find the squashfs file on the live medium.
-SQFS=""
-for cand in /cdrom/casper/filesystem.squashfs \
-            /cdrom/casper/filesystem.z0.squashfs; do
-    [ -f "$cand" ] && { SQFS="$cand"; break; }
+RAMDIR=/run/ramclone
+mkdir -p "$RAMDIR" 2>/dev/null
+: > "$RAMDIR/backdev" 2>/dev/null
+
+# --- casper's layer set (base first) ---------------------------------------
+# Two ways casper can pick its layers, and this hook must agree with whichever
+# applies on THIS boot:
+#
+#   1. LAYERFS_PATH / layerfs-path= set -> casper walks dot-suffixes upward
+#      from that one name, mounting every member of the chain. Only the HDD
+#      mirror hook sets this now (it points at a single pre-merged layer), and
+#      this hook has already returned above in that case.
+#   2. Otherwise -> casper globs *.squashfs and stacks them lexically. That is
+#      the normal boot: every layer on the stick is RAM-backed, and only the
+#      BASE is dm-cloned (the appended layers are small).
+_lsl_lfp=""
+for _lsl_a in $(cat /proc/cmdline 2>/dev/null); do
+    case "$_lsl_a" in
+        layerfs-path=*) _lsl_lfp="${_lsl_a#layerfs-path=}" ;;
+    esac
 done
-[ -n "$SQFS" ] || return 0 2>/dev/null || exit 0
+_lsl_chain=""
+if [ -n "$_lsl_lfp" ]; then
+    _lsl_ext="${_lsl_lfp##*.}"
+    _lsl_rest="${_lsl_lfp%.*}"
+    _lsl_dir="${_lsl_rest%/*}"
+    _lsl_name="${_lsl_rest##*/}"
+    _lsl_n=0
+    while :; do
+        _lsl_chain="${_lsl_dir}/${_lsl_name}.${_lsl_ext} ${_lsl_chain}"
+        _lsl_parent="${_lsl_name%.*}"
+        [ "$_lsl_parent" = "$_lsl_name" ] && break
+        _lsl_name="$_lsl_parent"
+        _lsl_n=$((_lsl_n + 1))
+        [ "$_lsl_n" -gt 8 ] && break
+    done
+else
+    # Alphabetical order == stack order (base, stub, then appends).
+    for _lsl_c in $(ls -1 /cdrom/casper/*.squashfs 2>/dev/null | sort); do
+        [ -f "$_lsl_c" ] || continue
+        _lsl_chain="${_lsl_chain} ${_lsl_c}"
+    done
+fi
+# Trim the leading space the glob branch may have introduced.
+_lsl_chain="${_lsl_chain# }"
+[ -n "$_lsl_chain" ] || return 0 2>/dev/null || exit 0
 
-BYTES=$(stat -c %s "$SQFS" 2>/dev/null || echo "")
+BASE="${_lsl_chain%% *}"
+[ -f "$BASE" ] || return 0 2>/dev/null || exit 0
+
+BYTES=$(stat -c %s "$BASE" 2>/dev/null || echo "")
 [ -n "$BYTES" ] || return 0 2>/dev/null || exit 0
 SECT=$((BYTES / 512))
 [ $((BYTES % 512)) -eq 0 ] || return 0 2>/dev/null || exit 0
@@ -39,9 +94,9 @@ for d in /lib/modules/*/; do
 done
 [ -n "$KVER" ] || return 0 2>/dev/null || exit 0
 
-# Mount squashfs temporarily to copy dm-clone modules into the initramfs.
+# Mount the base squashfs temporarily to copy dm-clone modules into the initramfs.
 mkdir -p /mnt/sqfs
-mount -t squashfs -o ro "$SQFS" /mnt/sqfs 2>/dev/null || return 0 2>/dev/null || exit 0
+mount -t squashfs -o ro "$BASE" /mnt/sqfs 2>/dev/null || return 0 2>/dev/null || exit 0
 
 MOD_SRC="/mnt/sqfs/lib/modules/$KVER/kernel/drivers/md"
 MOD_DST="/lib/modules/$KVER/kernel/drivers/md"
@@ -65,59 +120,95 @@ rm -f "/lib/modules/$KVER/modules.dep.bin" 2>/dev/null || true
 # Load dm-clone.
 modprobe dm_clone 2>/dev/null || return 0 2>/dev/null || exit 0
 
-# Create RAM destination device.
+# Create RAM destination device (must be >= the base squashfs size).
 DEST_DEV=""
 if modprobe brd rd_nr=1 rd_size=$((BYTES / 1024)) 2>/dev/null; then
     DEST_DEV="/dev/ram0"
 else
     # Fallback: sparse file on tmpfs + loop device.
-    mkdir -p /run/ramclone
-    dd if=/dev/zero of=/run/ramclone/dest bs=1M count=$((BYTES / 1024 / 1024 + 1)) 2>/dev/null
-    DEST_DEV=$(losetup -f --show /run/ramclone/dest 2>/dev/null)
+    dd if=/dev/zero of="$RAMDIR/dest" bs=1M count=$((BYTES / 1024 / 1024 + 1)) 2>/dev/null
+    DEST_DEV=$(losetup -f --show "$RAMDIR/dest" 2>/dev/null)
 fi
 [ -b "$DEST_DEV" ] || return 0 2>/dev/null || exit 0
 
 # Metadata bitmap device (tmpfs file + loop).
-META_BYTES=$((8 * 1024 * 1024))
-mkdir -p /run/ramclone
-dd if=/dev/zero of=/run/ramclone/meta bs=1M count=8 2>/dev/null
-META_DEV=$(losetup -f --show /run/ramclone/meta 2>/dev/null)
+dd if=/dev/zero of="$RAMDIR/meta" bs=1M count=8 2>/dev/null
+META_DEV=$(losetup -f --show "$RAMDIR/meta" 2>/dev/null)
 [ -b "$META_DEV" ] || { losetup -d "$DEST_DEV" 2>/dev/null; return 0 2>/dev/null || exit 0; }
 
-# Origin: read-only loop over the squashfs file.
-ORIGIN_DEV=$(losetup -f --show --read-only "$SQFS" 2>/dev/null)
+# Origin: read-only loop over the base squashfs file.
+ORIGIN_DEV=$(losetup -f --show --read-only "$BASE" 2>/dev/null)
 [ -b "$ORIGIN_DEV" ] || {
     losetup -d "$META_DEV" 2>/dev/null
     losetup -d "$DEST_DEV" 2>/dev/null
     return 0 2>/dev/null || exit 0
 }
 
-# Create dm-clone device.
-dmsetup create clone --table "0 $SECT clone $META_DEV $DEST_DEV $ORIGIN_DEV" 2>/dev/null || {
+# dm-clone's constructor is `clone <meta> <dest> <source> <region size>`; the
+# region size is MANDATORY (the kernel rejects argc < 4) and must be a power of
+# two in [8, 2^21] sectors and a multiple of the device logical block size.
+# 1 MiB = 2048 sectors. Omitting it used to make dmsetup create fail silently,
+# so Boot to RAM never actually copied anything.
+REGION=2048
+dmsetup create clone --table "0 $SECT clone $META_DEV $DEST_DEV $ORIGIN_DEV $REGION" 2>/dev/null || {
     losetup -d "$ORIGIN_DEV" 2>/dev/null
     losetup -d "$META_DEV" 2>/dev/null
     losetup -d "$DEST_DEV" 2>/dev/null
     return 0 2>/dev/null || exit 0
 }
 
-# Record state for runtime scripts.
-mkdir -p /run/ramclone
-echo "$SQFS"   > /run/ramclone/sqfs
-echo "$ORIGIN_DEV" > /run/ramclone/origin_loop
-echo "$META_DEV"  > /run/ramclone/meta_loop
-echo "$DEST_DEV" > /run/ramclone/dest_dev
-echo "active"  > /run/ramclone/status
-touch /run/ramclone/ready
+# Record state for the runtime scripts.
+mkdir -p "$RAMDIR"
+echo "$BASE"        > "$RAMDIR/sqfs"
+echo "$ORIGIN_DEV"  > "$RAMDIR/origin_loop"
+echo "$META_DEV"    > "$RAMDIR/meta_loop"
+echo "$DEST_DEV"    > "$RAMDIR/dest_dev"
+echo "$SECT"        > "$RAMDIR/sectors"
 
-# Override get_backing_device so casper mounts the clone device instead
-# of setting up a loop over the squashfs file.
+# The base layer is served by the dm-clone device.
+echo "${BASE##*/} /dev/mapper/clone" >> "$RAMDIR/backdev"
+
+# RAM-back every OTHER chain layer (z0 / appended) so no USB file stays open
+# after the stick is pulled. `/run` is a tmpfs that survives switch_root.
+LSL_ALL_RAM=1
+for _lsl_img in $_lsl_chain; do
+    [ "$_lsl_img" = "$BASE" ] && continue
+    _lsl_bn="${_lsl_img##*/}"
+    if [ ! -f "$_lsl_img" ]; then
+        LSL_ALL_RAM=0
+        continue
+    fi
+    if cp "$_lsl_img" "$RAMDIR/$_lsl_bn" 2>/dev/null; then
+        _lsl_ld=$(losetup -f --show --read-only "$RAMDIR/$_lsl_bn" 2>/dev/null)
+        if [ -b "$_lsl_ld" ]; then
+            echo "$_lsl_bn $_lsl_ld" >> "$RAMDIR/backdev"
+            continue
+        fi
+    fi
+    LSL_ALL_RAM=0
+done
+if [ "$LSL_ALL_RAM" = "1" ]; then
+    : > "$RAMDIR/all_ram"
+else
+    rm -f "$RAMDIR/all_ram" 2>/dev/null
+fi
+
+# Override get_backing_device so casper mounts the RAM-backed devices instead
+# of looping the squashfs files on the USB. Called once per layer.
 get_backing_device() {
     case "$1" in
-        */filesystem.squashfs|*/filesystem.z0.squashfs)
-            echo "/dev/mapper/clone"
-            return 0
-            ;;
         *.squashfs|*.ext2)
+            _bd_bn="${1##*/}"
+            _bd_dev=""
+            if [ -f "$RAMDIR/backdev" ]; then
+                while read -r _bd_n _bd_d; do
+                    [ "$_bd_n" = "$_bd_bn" ] && { _bd_dev="$_bd_d"; break; }
+                done < "$RAMDIR/backdev"
+            fi
+            if [ -n "$_bd_dev" ]; then
+                echo "$_bd_dev"
+                return 0
+            fi
             dev="$(/sbin/losetup -f --show --read-only "$1" 2>/dev/null)"
             if [ -n "$dev" ]; then
                 echo "$dev"
@@ -137,11 +228,16 @@ get_backing_device() {
     esac
 }
 
+# Status files last (this is what the runtime dialog keys off).
+echo "active" > "$RAMDIR/status"
+touch "$RAMDIR/ready"
+
 # Log to console.
 {
     echo "ramclone: dm-clone active"
-    echo "ramclone: sqfs=$SQFS origin=$ORIGIN_DEV dest=$DEST_DEV"
-    echo "ramclone: hydration running in background"
+    echo "ramclone: base=$BASE origin=$ORIGIN_DEV dest=$DEST_DEV"
+    echo "ramclone: chain=$_lsl_chain"
+    echo "ramclone: hydration running in background (all_ram=$LSL_ALL_RAM)"
 } > /dev/console 2>/dev/null
 
 return 0 2>/dev/null || exit 0

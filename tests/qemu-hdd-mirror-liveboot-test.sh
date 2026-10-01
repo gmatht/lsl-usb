@@ -102,8 +102,12 @@ mkdir -p "$HMNT/sfs"
 echo "  base root squashfs -> mirror/sfs/filesystem.squashfs"
 cp "$WORK/base-root.squashfs" "$HMNT/sfs/filesystem.squashfs"
 if [ -f "$DIST/filesystem_z0_firstboot.squashfs" ]; then
-    echo "  z0 firstboot layer -> mirror/sfs/filesystem.z0.squashfs"
-    cp "$DIST/filesystem_z0_firstboot.squashfs" "$HMNT/sfs/filesystem.z0.squashfs"
+    # live-boot (Debian) scans block devices and globs $LIVE_MEDIA_PATH/*.squashfs
+    # itself, so it keeps the SEPARATE layers rather than a merged one - unlike
+    # casper, whose LAYERFS_PATH can only name a single file. Order still comes
+    # from the names: base < stub < appends (see WHYFAIL14).
+    echo "  z0 firstboot layer -> mirror/sfs/filesystem_z0_firstboot.squashfs"
+    cp "$DIST/filesystem_z0_firstboot.squashfs" "$HMNT/sfs/filesystem_z0_firstboot.squashfs"
 fi
 echo "  writing manifest ..."
 {

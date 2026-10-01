@@ -7,11 +7,21 @@ WSL_REPORT="${WSL_REPORT:-/tmp/wsl}"
 # overridable for testing.
 VHDX_CONF="${LSL_WSL_VHDX_CONF:-/cdrom/lsl-wsl-vhdx.conf}"
 
-# Live-session desktop user (mint on Mint, zorin on Zorin, ...) - used for the
-# /media/<user>/ auto-mount path.
-LSL_DESKTOP_USER="$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)"
-[ -n "$LSL_DESKTOP_USER" ] || LSL_DESKTOP_USER="$(ls -1 /home 2>/dev/null | head -n1 || true)"
-[ -n "$LSL_DESKTOP_USER" ] || LSL_DESKTOP_USER="mint"
+# Live-session desktop user (mint on Mint, zorin on Zorin, ubuntu on Ubuntu, ...)
+# - used for the /media/<user>/ auto-mount path. Resolve it, never invent one:
+# a guessed "mint" on an Ubuntu stick points at a home that does not exist
+# (see lsl_desktop_user in lsl-common.sh / WHYFAIL13).
+if [ -f /cdrom/bin/lsl-common.sh ]; then
+    # shellcheck source=/dev/null
+    . /cdrom/bin/lsl-common.sh
+    LSL_DESKTOP_USER="$(lsl_desktop_user)"
+fi
+if [ -z "${LSL_DESKTOP_USER:-}" ]; then
+    LSL_DESKTOP_USER="$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)"
+fi
+if [ -z "${LSL_DESKTOP_USER:-}" ]; then
+    LSL_DESKTOP_USER="$(ls -1 /home 2>/dev/null | head -n1 || true)"
+fi
 
 # Clear existing report (no-op command: a bare redirect trips SC2188).
 : > "$WSL_REPORT"

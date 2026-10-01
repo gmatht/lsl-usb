@@ -11,6 +11,17 @@ firstboots had left 5×761 MB of squashfs layers on the stick (3.6 GB), four of
 them inert**, because nothing pruned the layer chain on the success path. That
 is WHYFAIL7 §2.
 
+> **Follow-up: see `WHYFAIL9.md`.** WHYFAIL7 fixed *why the fallback was entered*
+> (CRLF in the env file) but not *what the fallback recorded*: it still wrote
+> `LSL_MODE=usb`, and `uphome` still trusted a re-resolved `lsl_is_usb_mode`
+> instead of that record. On 2026-09-28 the same symptom recurred on a stock
+> first boot with **no misconfiguration at all** — the fallback triggers because
+> `mount_all.sh` needs `hivexregedit`, which the same firstboot run installs
+> 23 minutes later. `uphome` then ran a no-op btrfs sync on a tmpfs overlay and
+> exited 0, so firstboot logged `Final home flush OK` and the home was lost.
+> `WHYFAIL9.md` closes that half; `FRAGILE_HOME.md` inventories every remaining
+> caller of the mode detection.
+
 This file documents what was wrong, what was changed, and — importantly — what
 is **not** yet in effect on a booting stick.
 

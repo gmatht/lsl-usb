@@ -1,6 +1,6 @@
 [package]
 name = "lslsetup"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 # Full reimplementation of lsl-usb's install.ps1 as a native Windows
@@ -14,7 +14,7 @@ winapi = { version = "0.3", features = [
     "combaseapi", "consoleapi", "errhandlingapi", "fileapi", "handleapi", "ioapiset", "libloaderapi", "minwinbase", "namedpipeapi", "memoryapi",
     "objbase", "objidl", "processenv", "processthreadsapi", "shellapi",
     "shobjidl", "shobjidl_core", "synchapi", "sysinfoapi", "winbase", "wincon", "winerror", "winioctl",
-    "softpub", "winnt", "winreg", "winuser", "wintrust", "impl-default",
+    "softpub", "wingdi", "winnt", "winreg", "winuser", "wintrust", "impl-default",
 ] }
 sha2 = "0.10"
 flate2 = "1"

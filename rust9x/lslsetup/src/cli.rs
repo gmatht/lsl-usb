@@ -40,6 +40,7 @@ pub struct Opts {
     pub wifi_networks: Vec<String>,
     pub efu: bool,              // write the Everything EFU index (default on)
     pub drivers: bool,          // stage network drivers (default on)
+    pub pkgs: bool,             // stage boot-critical hivex .debs (default on)
     pub sfs_hdd: bool,          // copy squashfs to the HDD cache
     pub reclaim_win_swap: bool, // reclaim the Windows swapfile
     pub fast_startup_off: bool, // powercfg /h off (WHYFAIL6 §5)
@@ -95,6 +96,7 @@ impl Default for Opts {
             wifi_networks: Vec::new(),
             efu: true,
             drivers: true,
+            pkgs: true,
             sfs_hdd: false,
             reclaim_win_swap: false,
             fast_startup_off: false,
@@ -157,6 +159,8 @@ Options:
   --wifi-network <name>       Copy only this wifi profile (repeatable)
   --no-efu                    Do not write the Everything EFU index
   --no-drivers                Do not stage out-of-tree network drivers
+  --no-pkgs                   Do not stage the boot-critical hivex .debs
+                             (without them /home is not persistent)
   --sfs-hdd-cache             Copy the squashfs to the HDD cache
   --reclaim-win-swap          Reclaim the Windows swapfile
   --fast-startup-off          Turn off Fast Startup/hibernate (powercfg /h off)
@@ -222,6 +226,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--wifi-network" => o.wifi_networks.push(next()?),
             "--no-efu" => o.efu = false,
             "--no-drivers" => o.drivers = false,
+            "--no-pkgs" => o.pkgs = false,
             "--sfs-hdd-cache" => o.sfs_hdd = true,
             "--reclaim-win-swap" => o.reclaim_win_swap = true,
             "--fast-startup-off" => o.fast_startup_off = true,
@@ -249,6 +254,7 @@ mod tests {
             "--wifi-network", "Office",
             "--no-efu",
             "--no-drivers",
+            "--no-pkgs",
             "--sfs-hdd-cache",
             "--reclaim-win-swap",
             "--fast-startup-off",
@@ -262,6 +268,7 @@ mod tests {
         assert_eq!(o.wifi_networks, vec!["Home".to_string(), "Office".to_string()]);
         assert!(!o.efu);
         assert!(!o.drivers);
+        assert!(!o.pkgs);
         assert!(o.sfs_hdd);
         assert!(o.reclaim_win_swap);
         assert!(o.fast_startup_off);
@@ -275,6 +282,7 @@ mod tests {
         assert!(o.wifi);
         assert!(o.efu);
         assert!(o.drivers);
+        assert!(o.pkgs);
         assert!(!o.sfs_hdd);
         assert!(!o.reclaim_win_swap);
         assert!(!o.fast_startup_off);

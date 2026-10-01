@@ -123,24 +123,38 @@ mkfs.ntfs -f -q "$HP" >/dev/null || { losetup -d "$LOOP2"; skip "mkfs.ntfs faile
 HMNT="$WORK/hdd"; mkdir -p "$HMNT"
 ntfs-3g "$HP" "$HMNT" 2>/dev/null || mount -t ntfs-3g "$HP" "$HMNT" 2>/dev/null || { losetup -d "$LOOP2"; skip "could not mount NTFS to populate"; }
 mkdir -p "$HMNT/sfs"
-# Mirror base = the SAME release as the boot kernel (stashed above); the z0
-# firstboot layer is renamed to filesystem.z0.squashfs. home.sfs is optional.
+# The mirror is ONE self-contained layer (the hook's LAYERFS_PATH resolves a
+# dot-free name to exactly that file, and it refuses anything else). Build it
+# by overlaying base + stub exactly as bin/lsl-copy-sfs-hdd.sh does, so this
+# harness exercises the real layout.
 SRC_ROOT="$WORK/base-root.squashfs"
 SRC_Z0="$DIST/filesystem_z0_firstboot.squashfs"
-echo "  copying base root squashfs -> mirror ..."
-cp "$SRC_ROOT" "$HMNT/sfs/filesystem.squashfs"
-echo "  copying z0 firstboot layer -> mirror/filesystem.z0.squashfs ..."
-cp "$SRC_Z0"  "$HMNT/sfs/filesystem.z0.squashfs"
+MERGED="filesystem_zmerged.squashfs"
+echo "  building merged mirror layer -> $MERGED ..."
+ACC="$WORK/acc"; rm -rf "$ACC"; mkdir -p "$ACC"
+i=0
+for src in "$SRC_ROOT" "$SRC_Z0"; do
+    [ -f "$src" ] || { losetup -d "$LOOP2"; skip "missing merge input $src"; }
+    one="$WORK/m.$i"; mkdir -p "$one"
+    unsquashfs -f -d "$one" "$src" >/dev/null 2>&1 || { losetup -d "$LOOP2"; skip "unsquashfs failed on $src"; }
+    cp -a "$one/." "$ACC/" 2>/dev/null
+    rm -rf "$one"
+    i=$((i + 1))
+done
+[ -e "$ACC/sbin/init" ] || { losetup -d "$LOOP2"; skip "merged tree has no /sbin/init"; }
+mksquashfs "$ACC" "$WORK/$MERGED" -comp zstd >/dev/null 2>&1 \
+    || { losetup -d "$LOOP2"; skip "mksquashfs failed for the merged mirror layer"; }
+rm -rf "$ACC"
+cp "$WORK/$MERGED" "$HMNT/sfs/$MERGED"
 echo "  writing manifest ..."
 {
     echo "# LSL squashfs layers copied to HDD for faster boot"
     echo "SourceUSB=/cdrom"
     echo "Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    for n in filesystem.squashfs filesystem.z0.squashfs; do
-        sz=$(stat -c %s "$HMNT/sfs/$n")
-        sh=$(sha256sum "$HMNT/sfs/$n" | awk '{print $1}')
-        echo "$n=$sz sha256:$sh"
-    done
+    n="$MERGED"
+    sz=$(stat -c %s "$HMNT/sfs/$n")
+    sh=$(sha256sum "$HMNT/sfs/$n" | awk '{print $1}')
+    echo "$n=$sz sha256:$sh"
 } > "$HMNT/sfs/manifest.txt"
 cat "$HMNT/sfs/manifest.txt"
 umount "$HMNT"; losetup -d "$LOOP2"; sync

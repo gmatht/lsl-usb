@@ -2,11 +2,23 @@
 # add-steam-libraries - Automatically add mounted Steam libraries to Steam configuration
 
 STEAM_USER="${STEAM_USER:-}"
+if [ -z "$STEAM_USER" ] && [ -f /cdrom/bin/lsl-common.sh ]; then
+    # shellcheck source=/dev/null
+    . /cdrom/bin/lsl-common.sh
+    STEAM_USER="$(lsl_desktop_user)"
+fi
 if [ -z "$STEAM_USER" ]; then
     STEAM_USER="$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)"
 fi
-[ -n "$STEAM_USER" ] || STEAM_USER="$(ls -1 /home 2>/dev/null | head -n1 || true)"
-[ -n "$STEAM_USER" ] || STEAM_USER="mint"
+if [ -z "$STEAM_USER" ]; then
+    STEAM_USER="$(ls -1 /home 2>/dev/null | head -n1 || true)"
+fi
+# Never invent a user (a guessed "mint" on an Ubuntu stick targets a home that
+# does not exist - see lsl_desktop_user / WHYFAIL13).
+if [ -z "$STEAM_USER" ]; then
+    echo "add-steam-libraries: no desktop user resolvable; skipping" >&2
+    exit 0
+fi
 STEAM_HOME="/home/$STEAM_USER"
 STEAM_CONFIG_DIR="$STEAM_HOME/.steam/steam"
 STEAM_CONFIG_DIR_ALT="$STEAM_HOME/.local/share/Steam"

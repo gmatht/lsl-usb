@@ -1,15 +1,14 @@
 #!/bin/bash
 # tests/casper-layer-check.sh - verify the squashfs layer filenames lsl-usb
-# produces are actually matched by the casper initramfs glob on the target live
-# image. This is the single biggest unknown before a real-hardware boot: casper
-# stacks /cdrom/casper/filesystem*.squashfs in lexical order, but different
-# Mint/Ubuntu releases use different globs (older ones require a fixed 4-char
-# suffix, e.g. filesystem[0-9a-z][0-9a-z][0-9a-z][0-9a-z].squashfs). If our
-# filesystem_z*.squashfs names don't match, the appended layer (and the
-# lsl-firstboot unit) will NOT appear on the second boot.
+# produces are matched by the casper initramfs glob on the target live image,
+# AND that they sort into the right STACK order. casper globs the layer
+# directory and stacks the matches lexically with the greatest on top, so the
+# filenames themselves are the only thing expressing layer order (see
+# WHYFAIL14). If our names don't match the glob, or don't sort base < stub <
+# appends, the first-boot unit or the appended packages will not appear.
 #
 # How to find the real glob on the built USB / ISO:
-#   unmkinitramfs /cdrom/casper/initrd . && grep -nE 'filesystem.*squashfs' ./main/scripts/casper
+#   unmkinitramfs /cdrom/casper/initrd . && grep -nE '\*\.squashfs' ./main/scripts/casper
 # Then run: Casper_GLOB='...' bash tests/casper-layer-check.sh
 #
 # Run: bash tests/casper-layer-check.sh
@@ -18,14 +17,16 @@ PASS=0; FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
 
-# Default: permissive modern casper glob. Override once you've inspected the
-# target initrd (older casper uses the fixed 4-char-suffix glob).
-GLOB="${Casper_GLOB:-filesystem*.squashfs}"
+# Default: casper's real glob is *.squashfs (ANY file, not just filesystem*).
+# Override once you've inspected the target initrd.
+GLOB="${Casper_GLOB:-*.squashfs}"
 echo "Checking layer names against casper glob: $GLOB"
-echo "(Override with Casper_GLOB='...' if your Mint initrd uses a fixed-width suffix.)"
+echo "(Override with Casper_GLOB='...' if your Mint initrd uses something narrower.)"
 
-# The names lsl-usb produces: base + firstboot layer + a sample appended layer.
-layers=( filesystem.squashfs filesystem_z0_firstboot.squashfs filesystem_z20250827000000.squashfs )
+# The names lsl-usb produces, in the order they must STACK.
+BASE_NAME="filesystem.squashfs"
+STUB_NAME="filesystem_z0_firstboot.squashfs"
+layers=( "$BASE_NAME" "$STUB_NAME" filesystem_z20250827000000.squashfs )
 
 for n in "${layers[@]}"; do
     # case patterns are glob-matched, so $GLOB is treated as a casper-style glob.
@@ -36,13 +37,32 @@ for n in "${layers[@]}"; do
     esac
 done
 
-# The appended layer must sort AFTER the firstboot layer (newest wins).
+# Layer ORDER is the load-bearing invariant now that layerfs-path= is gone:
+# casper sorts the glob matches, so a name that sorts into the wrong slot
+# silently shadows (or is shadowed by) the wrong layer. Compare the sorted
+# result against the ORDER WE REQUIRE (base, stub, appends) - not against
+# another sort, which would assert nothing.
 appended=filesystem_z20250827000000.squashfs
-firstboot=filesystem_z0_firstboot.squashfs
-if [[ "$appended" > "$firstboot" ]]; then
-    pass "appended layer sorts after firstboot layer"
+actual_order="$(printf '%s\n' "${layers[@]}" | sort | tr '\n' ' ')"
+required_order="$BASE_NAME $STUB_NAME $appended "
+if [ "$actual_order" = "$required_order" ]; then
+    pass "stack order is base < stub < appended (computed by sort, as casper does)"
 else
-    fail "appended layer does NOT sort after firstboot layer"
+    fail "stack order WRONG - casper would stack these in the wrong order"
+    echo "      required: $required_order"
+    echo "      actual  : $actual_order"
+fi
+
+# The appended layer must sort ABOVE the stub, and the stub above the base.
+if [[ "$appended" > "$STUB_NAME" ]]; then
+    pass "appended layer sorts above the firstboot stub (newest wins)"
+else
+    fail "appended layer sorts BELOW the stub - it would be shadowed"
+fi
+if [[ "$STUB_NAME" > "$BASE_NAME" ]]; then
+    pass "stub sorts above the base image"
+else
+    fail "stub sorts BELOW the base image - the stub would never be read"
 fi
 
 echo ""

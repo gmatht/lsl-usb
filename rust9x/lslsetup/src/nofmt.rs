@@ -605,6 +605,54 @@ pub fn menu_entry(title: &str, iso_rel: &str, big_iso: bool) -> String {
     )
 }
 
+/// The live-session username a distro's own ISO passes on its kernel
+/// cmdline (`username=`/`hostname=`), or None when it does not pass one.
+///
+/// WHY THIS EXISTS (2026-10-01): casper's built-in live identity is
+/// USERNAME="ubuntu" / HOST="ubuntu" (see /etc/casper.conf in the casper
+/// source), so a distro that does NOT override it on the cmdline boots as
+/// `ubuntu` with $HOME=/home/ubuntu - whatever it calls itself on the boot
+/// splash and in .disk/info. Linux Mint passes `username=mint hostname=mint`
+/// from 21.3 onward (before 21.3 it passed nothing and booted as `ubuntu`;
+/// see linuxmint discussion #289). LSL generates the cmdline itself instead
+/// of using the ISO's GRUB, so without this the Mint logo appears and every
+/// $HOME install targets a nonexistent /home/mint while the session actually
+/// runs as /home/ubuntu - the "why is the user ubuntu?" confusion.
+///
+/// Only distros whose live user is KNOWN are listed. Returning None keeps
+/// casper's default, which is the honest answer when we cannot confirm it -
+/// never guess a name (the same rule as lsl_desktop_user in lsl-common.sh).
+pub fn live_session_username(iso_name_or_info: &str) -> Option<&'static str> {
+    let s = iso_name_or_info.to_ascii_lowercase();
+    // Mint 21.3+: username=mint hostname=mint (linuxmint discussion #289).
+    if s.contains("linuxmint") || s.contains("linux mint") || s.contains("mint-") {
+        return Some("mint");
+    }
+    // Ubuntu and its official flavours do not override casper, so they boot
+    // with casper's own default identity - which IS "ubuntu". Naming it
+    // explicitly makes the entry reproduce the ISO's own GRUB exactly.
+    if s.contains("ubuntu") || s.contains("lubuntu") || s.contains("xubuntu") ||
+        s.contains("kubuntu")
+    {
+        return Some("ubuntu");
+    }
+    // Everything else (Zorin, antiX, Debian, ...): UNVERIFIED. Return None so
+    // casper decides, rather than guessing a name that may not exist. Zorin in
+    // particular is NOT confirmed to pass username=/hostname=, and its live
+    // user has not been verified to be "zorin" - do not add it by assumption.
+    None
+}
+
+/// Extra kernel parameters naming the live session user/host, or "" when the
+/// distro is not known to override casper's default (see
+/// `live_session_username`). Mint's own GRUB passes exactly these.
+pub fn live_session_kernel_params(iso_name_or_info: &str) -> String {
+    match live_session_username(iso_name_or_info) {
+        Some(u) => format!(" username={u} hostname={u}"),
+        None => String::new(),
+    }
+}
+
 /// Kernel/initrd filenames probed under casper/ (first hit wins).
 const CASPER_KERNEL_CANDIDATES: &[&str] = &["casper/vmlinuz", "casper/vmlinuz.efi"];
 /// Base squashfs probed under casper/ (first hit wins). Extracted next to
@@ -623,19 +671,33 @@ const CASPER_INITRD_CANDIDATES: &[&str] = &[
 /// build on BIOS INT 13h CD emulation), this uses only `find`/`kernel`/
 /// `initrd`/`boot` — commands grub4dos-for-UEFI implements — so it boots
 /// on BOTH firmwares. File-less main: casper finds the extracted base by
-/// device scan and stacks z0 beside it (no iso-scan, no loopback).
+/// device scan and globs every layer in /casper (no iso-scan, no loopback).
 /// All paths are grub4dos-style (`/_ISO/...`, forward slashes).
 /// Direct-kernel entry (BIOS + UEFI grub4dos): boots the kernel extracted
-/// next to the ISO stem with the base+z0 stack on the FAT partition.
+/// next to the ISO stem with the layer stack on the FAT partition.
 /// File-less main: no ISO file on the stick, so no iso-scan and no
 /// loopback - casper's device scan finds /casper/filesystem.squashfs and
-/// layerfs-path stacks the z0 beside it (/cdrom IS the stick here, not an
-/// ISO loop, so the layer path points at /cdrom, not /isodevice).
+/// globs the rest. Layer ORDER is alphabetical, which the filenames encode:
+/// filesystem.squashfs (base) < filesystem_z0_firstboot.squashfs (stub) <
+/// filesystem_z<ts>.squashfs (appends, newest last). No layerfs-path= is
+/// passed, so casper takes its default *.squashfs glob branch.
 pub fn menu_entry_direct(title: &str, kern_rel: &str, init_rel: &str) -> String {
+    menu_entry_direct_user(title, kern_rel, init_rel, "")
+}
+
+/// `menu_entry_direct` with extra kernel parameters appended before the
+/// standard ones - used to pass the live-session `username=`/`hostname=`
+/// that the distro's own GRUB passes (see `live_session_username`).
+pub fn menu_entry_direct_user(
+    title: &str,
+    kern_rel: &str,
+    init_rel: &str,
+    user_params: &str,
+) -> String {
     format!(
         "\ntitle {title}\n\
          find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
-         kernel {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs rootdelay=15 quiet splash\n\
+         kernel {kern_rel} boot=casper{user_params} rootdelay=15 quiet splash\n\
          initrd {init_rel}\n\
          boot\n"
     )
@@ -643,10 +705,20 @@ pub fn menu_entry_direct(title: &str, kern_rel: &str, init_rel: &str) -> String 
 
 /// Same as menu_entry_direct but adds the ramclone kernel flag.
 pub fn menu_entry_direct_ramclone(title: &str, kern_rel: &str, init_rel: &str) -> String {
+    menu_entry_direct_ramclone_user(title, kern_rel, init_rel, "")
+}
+
+/// `menu_entry_direct_ramclone` with the live-session user parameters.
+pub fn menu_entry_direct_ramclone_user(
+    title: &str,
+    kern_rel: &str,
+    init_rel: &str,
+    user_params: &str,
+) -> String {
     format!(
         "\ntitle {title}\n\
          find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
-         kernel {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone rootdelay=15 quiet splash\n\
+         kernel {kern_rel} boot=casper ramclone{user_params} rootdelay=15 quiet splash\n\
          initrd {init_rel} /casper/initrd.ramclone.gz\n\
          boot\n"
     )
@@ -658,10 +730,20 @@ pub fn menu_entry_direct_ramclone(title: &str, kern_rel: &str, init_rel: &str) -
 /// initrd's ORDER must re-run the base's own casper-premount scripts - simply
 /// overwriting ORDER with the hook name would silently disable them.
 pub fn menu_entry_direct_hddmirror(title: &str, kern_rel: &str, init_rel: &str) -> String {
+    menu_entry_direct_hddmirror_user(title, kern_rel, init_rel, "")
+}
+
+/// `menu_entry_direct_hddmirror` with the live-session user parameters.
+pub fn menu_entry_direct_hddmirror_user(
+    title: &str,
+    kern_rel: &str,
+    init_rel: &str,
+    user_params: &str,
+) -> String {
     format!(
         "\ntitle {title}\n\
          find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
-         kernel {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs rootdelay=15 quiet splash\n\
+         kernel {kern_rel} boot=casper{user_params} rootdelay=15 quiet splash\n\
          initrd {init_rel} /casper/initrd.hddmirror.gz\n\
          boot\n"
     )
@@ -675,7 +757,7 @@ pub fn default_menu() -> String {
      # The main entry boots the extracted kernel directly (no ISO file), e.g.:\n\
      # title Ubuntu direct\n\
      # find --set-root --ignore-floppies --ignore-cd /_ISO/ubuntu/vmlinuz\n\
-     # kernel /_ISO/ubuntu/vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs quiet splash\n\
+     # kernel /_ISO/ubuntu/vmlinuz boot=casper rootdelay=15 quiet splash\n\
      # initrd /_ISO/ubuntu/initrd\n"
         .to_string()
 }
@@ -1412,6 +1494,113 @@ pub fn backup_volume_contents(letter: &str, ui: Option<&dyn WriteUi>) -> Result<
         if skipped > 0 { format!(", {} skipped", skipped) } else { String::new() }, dest));
     Ok(dest)
 }
+
+/// Captions the backup-offer box gives its two decision buttons.
+const BACKUP_BTN_FIRST: &str = "Backup";
+const BACKUP_BTN_YOLO: &str = "YOLO";
+
+/// Uninstalls the WH_CBT relabel hook once the message box has returned.
+struct RelabelHook(winapi::shared::windef::HHOOK);
+
+impl Drop for RelabelHook {
+    fn drop(&mut self) {
+        unsafe { winapi::um::winuser::UnhookWindowsHookEx(self.0) };
+    }
+}
+
+/// Install a thread-local WH_CBT hook that rewrites the backup-offer message
+/// box's Yes/No captions ("Backup" / "YOLO") as the box activates. A
+/// MessageBox's captions are OS-localized and not settable through the API, so
+/// renaming just those two buttons without changing the box any other way
+/// means rewriting them while it is on screen. Returns None if the hook cannot
+/// be installed (the box then keeps Yes/No).
+fn relabel_hook() -> Option<RelabelHook> {
+    use winapi::um::processthreadsapi::GetCurrentThreadId;
+    use winapi::um::winuser::{SetWindowsHookExW, WH_CBT};
+    let h = unsafe {
+        SetWindowsHookExW(WH_CBT, Some(relabel_box_hook), std::ptr::null_mut(), GetCurrentThreadId())
+    };
+    if h.is_null() {
+        out::warn("backup relabel hook could not be installed; the box keeps Yes/No.");
+        None
+    } else {
+        Some(RelabelHook(h))
+    }
+}
+
+/// On activation of the backup-offer box (the only dialog up with Yes + No +
+/// Cancel), rename its Yes/No buttons. Nothing else about the box is touched.
+unsafe extern "system" fn relabel_box_hook(code: i32, wparam: usize, lparam: isize) -> isize {
+    use winapi::um::winuser::{CallNextHookEx, GetClassNameW, GetDlgItem, HCBT_ACTIVATE};
+    const IDCANCEL: i32 = 2;
+    const IDYES: i32 = 6;
+    const IDNO: i32 = 7;
+    if code == HCBT_ACTIVATE as i32 {
+        let hwnd = wparam as winapi::shared::windef::HWND;
+        unsafe {
+            // Identify our box: a dialog (class "#32770") with all three buttons.
+            // Leave room for the terminating null: GetClassNameW copies at most
+            // cchClassName - 1 characters, so a 6-element buffer truncates
+            // "#32770" to "#3277" and the class test would never match.
+            let mut cls = [0u16; 8];
+            let n = GetClassNameW(hwnd, cls.as_mut_ptr(), cls.len() as i32);
+            let is_dialog = n == 6 && cls[..6] == [0x23, 0x33, 0x32, 0x37, 0x37, 0x30];
+            if is_dialog {
+                let yes = GetDlgItem(hwnd, IDYES);
+                let no = GetDlgItem(hwnd, IDNO);
+                if !yes.is_null() && !no.is_null() && !GetDlgItem(hwnd, IDCANCEL).is_null() {
+                    relabel_button(hwnd, yes, BACKUP_BTN_FIRST);
+                    relabel_button(hwnd, no, BACKUP_BTN_YOLO);
+                }
+            }
+        }
+    }
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+/// Rename one message-box button. The box sized the button for its default
+/// caption, so a longer one is widened to fit - extending LEFT, which keeps
+/// the button's right edge and the single-row layout exactly as they were.
+fn relabel_button(dlg: winapi::shared::windef::HWND, btn: winapi::shared::windef::HWND, text: &str) {
+    use winapi::shared::windef::{HGDIOBJ, POINT, RECT, SIZE};
+    use winapi::um::wingdi::{GetTextExtentPoint32W, SelectObject};
+    use winapi::um::winuser::{
+        GetClientRect, GetDC, GetWindowRect, MoveWindow, ReleaseDC, ScreenToClient, SendMessageW,
+        SetWindowTextW, WM_GETFONT,
+    };
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        SetWindowTextW(btn, wide.as_ptr());
+        // How wide does the caption need to be, in the button's own font?
+        let mut need = 0i32;
+        let dc = GetDC(btn);
+        if !dc.is_null() {
+            let font = SendMessageW(btn, WM_GETFONT, 0, 0) as HGDIOBJ;
+            let old = if font.is_null() { std::ptr::null_mut() } else { SelectObject(dc, font) };
+            let mut sz: SIZE = std::mem::zeroed();
+            GetTextExtentPoint32W(dc, wide.as_ptr(), wide.len() as i32 - 1, &mut sz);
+            need = sz.cx + 20; // the button's horizontal text margin
+            if !old.is_null() {
+                SelectObject(dc, old);
+            }
+            ReleaseDC(btn, dc);
+        }
+        let mut r: RECT = std::mem::zeroed();
+        GetWindowRect(btn, &mut r);
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        if need <= w {
+            return;
+        }
+        let mut pt = POINT { x: r.left, y: r.top };
+        ScreenToClient(dlg, &mut pt);
+        let right = pt.x + w;
+        let mut cr: RECT = std::mem::zeroed();
+        GetClientRect(dlg, &mut cr);
+        let x = (right - need).max(cr.left + 8);
+        MoveWindow(btn, x, pt.y, right - x, h, 1);
+    }
+}
+
 /// Content gate for NeedsContentCheck targets. Returns true = proceed.
 /// Console: typed BACKUP / YES (repo convention). GUI: Yes/No/Cancel
 /// (Yes = backup + continue when an offer fits).
@@ -1450,11 +1639,15 @@ pub fn confirm_fixed_volume(snap: &ContentSnapshot, reason: &str, ui: Option<&dy
             use winapi::um::winuser::{MB_ICONQUESTION, MB_ICONWARNING, MB_YESNOCANCEL, MB_YESNO, MessageBoxW};
             let text = format!("{}: {}\n\n{}\n\n{}\n\n{}", snap.letter, reason, describe_snapshot(snap),
                 content_warning(snap).unwrap_or_else(|| "The install keeps existing files.".into()),
-                if offer_backup { "Yes = back up the contents and continue\nNo = continue WITHOUT backup\nCancel = abort" }
+                if offer_backup { "Backup = back up the contents and continue\nYOLO = continue WITHOUT backup\nCancel = abort" }
                 else { "Yes = use this drive anyway (back up by hand first - too big to auto-back)\nNo/Cancel = abort" });
             let (wt, ww) = (sys::wide(&text), sys::wide("lslsetup - use this drive?"));
             let flags = if offer_backup { MB_YESNOCANCEL } else { MB_YESNO } | if snap.red_flags.is_empty() { MB_ICONQUESTION } else { MB_ICONWARNING };
+            // The backup offer's Yes/No are renamed to "Backup" / "YOLO"
+            // while the box is up; the box itself is otherwise unchanged.
+            let _hook = if offer_backup { relabel_hook() } else { None };
             let r = unsafe { MessageBoxW(std::ptr::null_mut(), wt.as_ptr(), ww.as_ptr(), flags) };
+            drop(_hook);
             const IDYES: i32 = 6;
             const IDNO: i32 = 7;
             if r == IDYES {
@@ -1908,10 +2101,22 @@ fn write_menu_entries(
             ));
         }
     };
+    // Reproduce the distro's OWN GRUB kernel cmdline for the live user.
+    // casper defaults to USERNAME/HOST "ubuntu" (/etc/casper.conf), and Mint
+    // only boots as "mint" because its GRUB passes username=/hostname=. Our
+    // entries are generated, not the ISO's, so without this a Mint stick boots
+    // with the Mint splash but a /home/ubuntu session (2026-10-01).
+    let user_params = live_session_kernel_params(iso_name);
+    if !user_params.is_empty() {
+        out::info(&format!(
+            "menu.lst live-session identity:{}",
+            user_params
+        ));
+    }
     let dentry = if hddmirror {
-        menu_entry_direct_hddmirror(&dtitle, &kern_rel, &init_rel)
+        menu_entry_direct_hddmirror_user(&dtitle, &kern_rel, &init_rel, &user_params)
     } else {
-        menu_entry_direct(&dtitle, &kern_rel, &init_rel)
+        menu_entry_direct_user(&dtitle, &kern_rel, &init_rel, &user_params)
     };
     let (m, added) = refresh_menu_entry(&menu, &dtitle, &dentry);
     menu = m;
@@ -1995,7 +2200,7 @@ fn ramclone_menu_entry(title: &str, kern_rel: &str, initrd: &str, extra: &str) -
     format!(
         "\ntitle {title}\n\
          find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
-         kernel {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone{extra} rootdelay=15 quiet splash\n\
+         kernel {kern_rel} boot=casper ramclone{extra} rootdelay=15 quiet splash\n\
          initrd {initrd}\n\
          boot\n"
     )
@@ -2006,7 +2211,7 @@ fn ramclone_grub_entry(title: &str, kern_rel: &str, initrd: &str, extra: &str) -
     format!(
         "menuentry \"{title}\" {{\n\
          \x20   search --no-floppy --set=root --file {kern_rel}\n\
-         \x20   linux {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone{extra} rootdelay=15 quiet splash\n\
+         \x20   linux {kern_rel} boot=casper ramclone{extra} rootdelay=15 quiet splash\n\
          \x20   initrd {initrd}\n\
          }}\n"
     )
@@ -2027,16 +2232,23 @@ pub fn add_ramclone_boot_entries(
     init_rel: &str,
     uefi: bool,
     hddmirror: bool,
+    iso_name: &str,
 ) -> Result<(), String> {
     let base = title.trim_end_matches(" (direct kernel)");
+    // Same live-session identity the direct entry passes - the RAM variants
+    // must not boot as a different user than the plain entry.
+    let user_params = live_session_kernel_params(iso_name);
     let initrd_line = if hddmirror {
         format!("{} /casper/initrd.hddmirror.gz /casper/initrd.ramclone.gz", init_rel)
     } else {
         format!("{} /casper/initrd.ramclone.gz", init_rel)
     };
     let variants = [
-        (format!("{base} (Boot to RAM)"), ""),
-        (format!("{base} (Boot to RAM, no persistence)"), " lsl_home=tmpfs"),
+        (format!("{base} (Boot to RAM)"), user_params.clone()),
+        (
+            format!("{base} (Boot to RAM, no persistence)"),
+            format!("{} lsl_home=tmpfs", user_params),
+        ),
     ];
     // BIOS menu (grub4dos)
     let menu_path = format!("{}menu.lst", root);
@@ -2237,7 +2449,7 @@ pub fn write_extra_iso_entries(
                 Err(_) => ("set timeout=5\n".to_string(), false),
             };
             let (cfg, added) =
-                upsert_grub_entry(&existing, &title, &uefi_cfg_loopback(&title, iso_rel));
+                upsert_grub_entry(&existing, &title, &uefi_cfg_loopback_user(&title, iso_rel, &live_session_kernel_params(iso_name)));
             if added {
                 std::fs::write(&cfg_path, cfg)
                     .map_err(|e| format!("write grub.cfg: {}", e))?;
@@ -2306,8 +2518,12 @@ fn write_efi_bootdir(
     title: &str,
     kern_rel: &str,
     init_rel: &str,
+    iso_name: &str,
 ) -> Result<(), String> {
     let bootdir = format!("{}EFI\\BOOT", root);
+    // The signed-chain GRUB2 entry must carry the same live-session identity
+    // as the grub4dos menu (see live_session_username).
+    let user_params = live_session_kernel_params(iso_name);
     sys::create_dir_all(&bootdir);
     std::fs::write(format!("{}\\BOOTX64.EFI", bootdir), bootx64)
         .map_err(|e| format!("write BOOTX64.EFI: {}", e))?;
@@ -2321,12 +2537,22 @@ fn write_efi_bootdir(
     match std::fs::read_to_string(&cfg_path) {
         Err(_) => {
             // Fresh file: header + the file-less direct entry.
-            std::fs::write(&cfg_path, format!("set timeout=5\n{}", uefi_cfg_direct(title, kern_rel, init_rel)))
-                .map_err(|e| format!("write grub.cfg: {}", e))?;
+            std::fs::write(
+                &cfg_path,
+                format!(
+                    "set timeout=5\n{}",
+                    uefi_cfg_direct_user(title, kern_rel, init_rel, &user_params)
+                ),
+            )
+            .map_err(|e| format!("write grub.cfg: {}", e))?;
             out::info(&format!("Created grub.cfg entry '{}'.", title));
         }
         Ok(existing) => {
-            let (cfg, added) = upsert_grub_entry(&existing, title, &uefi_cfg_direct(title, kern_rel, init_rel));
+            let (cfg, added) = upsert_grub_entry(
+                &existing,
+                title,
+                &uefi_cfg_direct_user(title, kern_rel, init_rel, &user_params),
+            );
             if added {
                 std::fs::write(&cfg_path, cfg).map_err(|e| format!("write grub.cfg: {}", e))?;
                 out::info(&format!("Updated grub.cfg entry '{}' (multiboot-safe upsert).", title));
@@ -2348,26 +2574,27 @@ fn install_uefi_resolved(
     title: &str,
     kern_rel: &str,
     init_rel: &str,
+    iso_name: &str,
     uefi_bootx64: &str,
     loader: UefiLoader,
 ) -> Result<bool, String> {
     match resolve_uefi(loader, uefi_bootx64) {
         ResolvedUefi::Signed => {
             let (shim, grub, mm) = bundled_signed().expect("resolve said Signed but the chain is gone");
-            write_efi_bootdir(root, shim, Some((grub, mm)), title, kern_rel, init_rel)?;
+            write_efi_bootdir(root, shim, Some((grub, mm)), title, kern_rel, init_rel, iso_name)?;
             out::info("UEFI: signed shim -> GRUB2 chain installed (Secure Boot ON works too).");
             Ok(true)
         }
         ResolvedUefi::Grub4dos => {
             let bytes = bundled_uefi().expect("resolve said Grub4dos but nothing is bundled");
-            write_efi_bootdir(root, bytes, None, title, kern_rel, init_rel)?;
+            write_efi_bootdir(root, bytes, None, title, kern_rel, init_rel, iso_name)?;
             out::info("UEFI: grub4dos-for-UEFI BOOTX64.EFI installed (Secure Boot must be OFF).");
             Ok(true)
         }
         ResolvedUefi::Custom => {
             let bytes =
                 std::fs::read(uefi_bootx64).map_err(|e| format!("read {}: {}", uefi_bootx64, e))?;
-            write_efi_bootdir(root, &bytes, None, title, kern_rel, init_rel)?;
+            write_efi_bootdir(root, &bytes, None, title, kern_rel, init_rel, iso_name)?;
             out::info(&format!(
                 "UEFI: BOOTX64.EFI (--uefi-bootx64 {}) + grub.cfg installed.",
                 uefi_bootx64
@@ -2479,11 +2706,11 @@ fn install_files(
     // install_uefi_resolved creates - on a fresh stick the read would fail and
     // the "Boot to RAM" grub.cfg entry would be silently dropped (the entry
     // showed on BIOS/grub4dos but never under the signed-GRUB2 UEFI chain).
-    let uefi_ok = install_uefi_resolved(&root, &title, &kern_rel, &init_rel, uefi_bootx64, uefi_loader)?;
+    let uefi_ok = install_uefi_resolved(&root, &title, &kern_rel, &init_rel, &iso_name, uefi_bootx64, uefi_loader)?;
     if ramclone {
         if let Err(e) = crate::lslfiles::install_ramclone_initrd(&t.letter, bundle_dir) {
             out::warn(&format!("ramclone initrd not created ({}); Boot to RAM entry skipped.", e));
-        } else if let Err(e) = add_ramclone_boot_entries(&root, &title, &kern_rel, &init_rel, uefi_res.mirror_menu(), hddmirror_ok) {
+        } else if let Err(e) = add_ramclone_boot_entries(&root, &title, &kern_rel, &init_rel, uefi_res.mirror_menu(), hddmirror_ok, &iso_name) {
             out::warn(&format!("ramclone boot entries not added ({}).", e));
         }
     }
@@ -3115,14 +3342,14 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     // add_ramclone_boot_entries so that entry's grub.cfg append finds the file
     // (see install_files - otherwise the Boot to RAM entry never shows UEFI).
     if want_uefi {
-        install_uefi_resolved(&root, &title, &kern_rel, &init_rel, uefi_bootx64, uefi_loader)?;
+        install_uefi_resolved(&root, &title, &kern_rel, &init_rel, &iso_name, uefi_bootx64, uefi_loader)?;
     } else {
         out::info("UEFI boot not selected - EFI files skipped.");
     }
     if ramclone {
         if let Err(e) = crate::lslfiles::install_ramclone_initrd(&t.letter, bundle_dir) {
             out::warn(&format!("ramclone initrd not created ({}); Boot to RAM entry skipped.", e));
-        } else if let Err(e) = add_ramclone_boot_entries(&root, &title, &kern_rel, &init_rel, uefi_res.mirror_menu(), hddmirror_ok) {
+        } else if let Err(e) = add_ramclone_boot_entries(&root, &title, &kern_rel, &init_rel, uefi_res.mirror_menu(), hddmirror_ok, &iso_name) {
             out::warn(&format!("ramclone boot entries not added ({}).", e));
         }
     }
@@ -3130,8 +3357,8 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     // First-boot toolkit (bin/uproot et al.): without it the first boot can
     // only stamp trivially. Embedded, LF-normalized, read-back verified.
     crate::lslfiles::install_firstboot_toolkit(&root)?;
-    // z0 firstboot layer (lsl-firstboot.service et al.): the menu's
-    // layerfs-path points at it, so it ships embedded, not hand-staged.
+    // z0 firstboot layer (lsl-firstboot.service et al.): casper's *.squashfs
+    // glob stacks it over the base, so it ships embedded, not hand-staged.
     crate::lslfiles::install_z0_layer(&root)?;
 
     // Extra loopback-only ISOs (no firstboot, no extraction) ride along
@@ -3173,20 +3400,41 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
 /// iso-scan - casper's device scan finds /casper on the stick, and
 /// /cdrom IS the stick here, so the layer path points at /cdrom.
 fn uefi_cfg_direct(title: &str, kern_rel: &str, init_rel: &str) -> String {
+    uefi_cfg_direct_user(title, kern_rel, init_rel, "")
+}
+
+/// `uefi_cfg_direct` carrying the live-session username/hostname that the
+/// distro's own GRUB passes (see `live_session_username`).
+fn uefi_cfg_direct_user(
+    title: &str,
+    kern_rel: &str,
+    init_rel: &str,
+    user_params: &str,
+) -> String {
     format!(
         "menuentry \"{title}\" {{\n\
          \x20   search --no-floppy --set=root --file {kern_rel}\n\
-         \x20   linux {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs rootdelay=15 quiet splash\n\
+         \x20   linux {kern_rel} boot=casper{user_params} rootdelay=15 quiet splash\n\
          \x20   initrd {init_rel}\n\
          }}\n"
     )
 }
 
 fn uefi_cfg_direct_ramclone(title: &str, kern_rel: &str, init_rel: &str) -> String {
+    uefi_cfg_direct_ramclone_user(title, kern_rel, init_rel, "")
+}
+
+/// `uefi_cfg_direct_ramclone` with the live-session user parameters.
+fn uefi_cfg_direct_ramclone_user(
+    title: &str,
+    kern_rel: &str,
+    init_rel: &str,
+    user_params: &str,
+) -> String {
     format!(
         "menuentry \"{title}\" {{\n\
          \x20   search --no-floppy --set=root --file {kern_rel}\n\
-         \x20   linux {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs ramclone rootdelay=15 quiet splash\n\
+         \x20   linux {kern_rel} boot=casper ramclone{user_params} rootdelay=15 quiet splash\n\
          \x20   initrd {init_rel} /casper/initrd.ramclone.gz\n\
          }}\n"
     )
@@ -3194,23 +3442,43 @@ fn uefi_cfg_direct_ramclone(title: &str, kern_rel: &str, init_rel: &str) -> Stri
 
 /// GRUB2 entry with HDD-mirror initrd appended.
 fn uefi_cfg_direct_hddmirror(title: &str, kern_rel: &str, init_rel: &str) -> String {
+    uefi_cfg_direct_hddmirror_user(title, kern_rel, init_rel, "")
+}
+
+/// `uefi_cfg_direct_hddmirror` with the live-session user parameters.
+fn uefi_cfg_direct_hddmirror_user(
+    title: &str,
+    kern_rel: &str,
+    init_rel: &str,
+    user_params: &str,
+) -> String {
     format!(
         "menuentry \"{title}\" {{\n\
          \x20   search --no-floppy --set=root --file {kern_rel}\n\
-         \x20   linux {kern_rel} boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs rootdelay=15 quiet splash\n\
+         \x20   linux {kern_rel} boot=casper{user_params} rootdelay=15 quiet splash\n\
          \x20   initrd {init_rel} /casper/initrd.hddmirror.gz\n\
          }}\n"
     )
 }
 
 /// Loopback GRUB2 entry (extras, which ship as ISO files): the stock
-/// chainload shape - iso-scan target + in-ISO kernel, deliberately no
-/// layerfs-path so a foreign kernel never stacks this stick's z0 (which
-/// would also fire lsl-firstboot.service against the wrong base).
+/// chainload shape - iso-scan target + in-ISO kernel. This stick's own
+/// layers are never stacked: with iso-scan/filename= casper's live-media
+/// root is the ISO loop mount, so its *.squashfs glob resolves inside the
+/// extra's own casper/ directory rather than /cdrom/casper. (It also would
+/// not fire lsl-firstboot.service against the wrong base.)
 /// Non-casper ISOs get no grub.cfg entry at all (their kernel lives
 /// outside casper/).
 fn uefi_cfg_loopback(title: &str, iso_rel: &str) -> String {
-    let params = format!("boot=casper iso-scan/filename={iso_rel} rootdelay=15 quiet splash");
+    uefi_cfg_loopback_user(title, iso_rel, "")
+}
+
+/// `uefi_cfg_loopback` with the extra ISO's live-session user parameters, so
+/// an extra Mint ISO does not boot as casper's default "ubuntu".
+fn uefi_cfg_loopback_user(title: &str, iso_rel: &str, user_params: &str) -> String {
+    let params = format!(
+        "boot=casper{user_params} iso-scan/filename={iso_rel} rootdelay=15 quiet splash"
+    );
     format!(
         "menuentry \"{title}\" {{\n\
          \x20   search --no-floppy --set=root --file {iso_rel}\n\
@@ -3852,6 +4120,55 @@ mod tests {
         assert_eq!(mb_str(sys::GB * 3 + 512), "3072 MB"); // truncates, never rounds up need
     }
 
+    #[test]
+    fn live_session_username_matches_the_distros_own_grub() {
+        // 2026-10-01: casper's built-in live identity is USERNAME/HOST
+        // "ubuntu" (/etc/casper.conf), so a distro that does not override it
+        // on the cmdline boots as `ubuntu` - which is why a Mint stick showed
+        // the Mint logo but a /home/ubuntu session. Mint 21.3+ passes
+        // username=mint hostname=mint (linuxmint discussion #289).
+        assert_eq!(live_session_username("linuxmint-22.3-cinnamon-64bit.iso"), Some("mint"));
+        assert_eq!(live_session_username("Linux Mint 22.3 \"Wilma\" - Release amd64"), Some("mint"));
+        // Ubuntu family: casper's default, named explicitly.
+        assert_eq!(live_session_username("ubuntu-24.04.1-desktop-amd64.iso"), Some("ubuntu"));
+        assert_eq!(live_session_username("lubuntu-24.04-desktop-amd64.iso"), Some("ubuntu"));
+        assert_eq!(live_session_username("xubuntu-24.04-desktop-amd64.iso"), Some("ubuntu"));
+        // Unverified distros must NOT be guessed - an invented name points at
+        // a home that does not exist (the lsl_desktop_user rule).
+        assert_eq!(live_session_username("Zorin-OS-18-Core-64-bit.iso"), None);
+        assert_eq!(live_session_username("antiX-23.2_x64-full.iso"), None);
+        assert_eq!(live_session_username("debian-12.7.0-amd64.iso"), None);
+    }
+
+    #[test]
+    fn live_session_params_are_passed_to_the_kernel_cmdline() {
+        // Mint must get exactly what its own GRUB passes.
+        assert_eq!(
+            live_session_kernel_params("linuxmint-22.3-cinnamon-64bit.iso"),
+            " username=mint hostname=mint"
+        );
+        // An unknown distro adds nothing (casper decides).
+        assert_eq!(live_session_kernel_params("Zorin-OS-18-Core-64bit.iso"), "");
+
+        // ...and it must actually reach every generated entry, both menus and
+        // both initrd variants, or a Mint stick still boots as `ubuntu`.
+        let p = live_session_kernel_params("linuxmint-22.3-cinnamon-64bit.iso");
+        let direct = menu_entry_direct_user("Mint (direct kernel)", "/_ISO/m/vmlinuz", "/_ISO/m/initrd", &p);
+        assert!(direct.contains("boot=casper username=mint hostname=mint rootdelay=15"), "{}", direct);
+        let ram = menu_entry_direct_ramclone_user("Mint (Boot to RAM)", "/_ISO/m/vmlinuz", "/_ISO/m/initrd", &p);
+        assert!(ram.contains("boot=casper ramclone username=mint hostname=mint rootdelay=15"), "{}", ram);
+        let hdd = menu_entry_direct_hddmirror_user("Mint (direct kernel)", "/_ISO/m/vmlinuz", "/_ISO/m/initrd", &p);
+        assert!(hdd.contains("boot=casper username=mint hostname=mint rootdelay=15"), "{}", hdd);
+        let uefi = uefi_cfg_direct_user("Mint (direct kernel)", "/_ISO/m/vmlinuz", "/_ISO/m/initrd", &p);
+        assert!(uefi.contains("boot=casper username=mint hostname=mint rootdelay=15"), "{}", uefi);
+
+        // The plain constructors keep the old, distro-neutral cmdline so an
+        // unknown distro is unaffected.
+        let plain = menu_entry_direct("X (direct kernel)", "/_ISO/x/vmlinuz", "/_ISO/x/initrd");
+        assert!(plain.contains("boot=casper rootdelay=15"), "{}", plain);
+        assert!(!plain.contains("username="), "{}", plain);
+    }
+
     fn valid_mbr() -> [u8; 512] {
         let mut m = [0u8; 512];
         m[446 + 4] = 0x0B; // one FAT32 partition entry
@@ -3930,21 +4247,21 @@ mod tests {
         // The UEFI path: grub4dos-for-UEFI has no INT 13h `(0xff)`
         // emulation, so the direct entry must avoid map/chainloader and
         // boot the extracted kernel with the base+z0 stack. File-less
-        // main: no iso-scan, no loopback - layerfs-path points at /cdrom
-        // (the stick itself), not /isodevice (no ISO loop anymore).
+        // main: no iso-scan, no loopback - casper's own *.squashfs glob
+        // stacks every layer found under /cdrom/casper.
         let e = menu_entry_direct(
             "Mint (direct kernel)",
             "/_ISO/mint/vmlinuz",
             "/_ISO/mint/initrd",
         );
         assert!(e.contains("title Mint (direct kernel)"));
-        assert!(e.contains("kernel /_ISO/mint/vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs rootdelay=15"));
+        assert!(e.contains("kernel /_ISO/mint/vmlinuz boot=casper rootdelay=15"));
         assert!(e.contains("initrd /_ISO/mint/initrd"));
         assert!(e.contains("\nboot\n"));
         assert!(!e.contains("map "), "direct entry must not use map: {}", e);
         assert!(!e.contains("chainloader"), "direct entry must not chainload: {}", e);
         assert!(!e.contains("iso-scan"), "file-less main has no ISO to scan: {}", e);
-        assert!(e.contains("layerfs-path=/cdrom/casper/filesystem.z0.squashfs"), "direct entry must stack z0: {}", e);
+        assert!(!e.contains("layerfs-path"), "direct entry must use casper's glob, not name one layer: {}", e);
         // coexists with an extra's loopback entry (different titles)
         let (m1, a1) = upsert_menu(&default_menu(), "Mint (direct kernel)", &e);
         assert!(a1);
@@ -4027,10 +4344,11 @@ mod tests {
     fn grub_cfg_upsert_is_idempotent_and_multiboot() {
         let a = uefi_cfg_direct("Mint (direct kernel)", "/_ISO/mint/vmlinuz", "/_ISO/mint/initrd");
         let b = uefi_cfg_loopback("Debian (loopback ISO)", "/_ISO/debian.iso");
-        // file-less main stacks z0 at /cdrom with no iso-scan; extras
-        // loopback their own ISO file and must not load the layer.
-        assert!(a.contains("layerfs-path=/cdrom/casper/filesystem.z0.squashfs"));
-        assert!(!a.contains("iso-scan") && !a.contains("loopback loop"));
+        // The main entry is file-less: casper globs /cdrom/casper/*.squashfs and
+        // stacks base < stub < appends alphabetically. The extra loops its
+        // own ISO, so its glob resolves inside the ISO mount instead.
+        assert!(a.contains("boot=casper") && !a.contains("iso-scan") && !a.contains("loopback loop"));
+        assert!(!a.contains("layerfs-path"), "no layer is named; the glob orders them: {}", a);
         assert!(!b.contains("layerfs-path"));
         assert!(b.contains("iso-scan/filename=/_ISO/debian.iso"));
         assert!(b.contains("loopback loop /_ISO/debian.iso"));

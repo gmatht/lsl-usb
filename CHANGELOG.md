@@ -2,9 +2,287 @@
 
 All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.1.1] - first successful lslsetup.exe firstboot
+
+First release verified end-to-end on real hardware: `lslsetup.exe` wrote a stick
+with the non-destructive (nofmt) path, the stick booted, and the first-boot
+install completed.
+
+### Fixed
+
+- **kitty would not start.** `misc/kitty.conf` failed to parse:
+  `tab_powerline_style no` is not one of kitty's `angled`/`round`/`slanted`
+  choices, so kitty aborted configuration with an "Errors parsing configuration"
+  dialog and never became usable. Four further keys were WT-isms with no kitty
+  equivalent and were dropped silently (`padding_left/right/top/bottom`,
+  `font_subpixel_antialias`, `active_tab_title_format`); they are now
+  `window_padding_width`, gone, and `active_tab_title_template`, and the
+  `ctrl+zero` shortcut (kitty spells the key `0`) is `ctrl+0`. Verified against
+  kitty 0.32.2's own config loader: the corrected file parses with zero bad
+  lines. **`lslsetup` also never shipped the file** — `misc/` was not in
+  `FIRSTBOOT_TOOLKIT`, so `config.sh`'s `install_lsl_kitty_conf` skipped it
+  silently and kitty ran unconfigured; `misc\kitty.conf` is now embedded and
+  `misc` is copied in the bundle path too, with a regression test.
+
+- **A Mint stick booted as `ubuntu`.** casper's built-in live identity is
+  `USERNAME="ubuntu"` / `HOST="ubuntu"` (`/etc/casper.conf`), and Linux Mint only
+  boots as `mint` because *its own GRUB* passes `username=mint hostname=mint`
+  (21.3 onward). `lslsetup` generates the cmdline itself and passed neither, so a
+  Mint image showed the Mint splash and then ran a `/home/ubuntu` session. The
+  generated entries now derive the live user from the ISO name (Mint -> `mint`,
+  Ubuntu family -> `ubuntu`, anything unverified -> no parameter rather than a
+  guess) and pass it in every menu and `grub.cfg` entry.
+
+- **Four scripts still invented the username `mint`** — `bin/detect-wsl`,
+  `bin/persist-wifi.sh`, `bin/add-steam-libraries`, and `bin/lsl-shutdown-gui`
+  (which unmounted a literal `/home/mint/.cache`). All now call the shared
+  `lsl_desktop_user` resolver and skip with a message rather than writing to a
+  guessed home.
 
 ### Added
+
+- `RULES.md` — every "rule worth keeping" from the WHYFAIL and design documents,
+  collected in one place (62 source blocks, 49 generalisable rules) with an index
+  of the documentation gaps.
+- `WHYFAIL12.md` — machine identity lives in the overlay upper (a netplan Wi-Fi
+  profile with a cleartext PSK, `hostname`, `lightdm.conf`, `machine-id`). Harmless
+  today because that upper is RAM; becomes live the moment persistence is added,
+  and applies to every persistent live USB, not just this one.
+- `WHYFAIL16.md` — every build trace is blank: the version is read from a file the
+  nofmt path never puts on the stick, and `unwrap_or_default()` hides the failure.
+  So a stick cannot report its own build, which is what `lsl-diag.sh` exists to
+  ask.
+- `FINDINGS-COMPRESSION.md` — the six `mksquashfs` call sites, why
+  `-Xcompression-level 22` is outside the documented range, and what level 9 vs 19
+  actually buys on real layer content (~6 %, for a large time cost).
+- `DESIGN-F2FS-PERSISTENCE.md`, `DESIGN-PERSISTENCE-PANE.md`,
+  `DESIGN-BOOT-TO-RAM-VARIANTS.md` — design notes for persistence on F2FS, the
+  wizard page that would drive it, and every block-layer option for Boot-to-RAM
+  (with what was **measured** marked apart from what was merely read).
+- `rust9x/lslsetup/WHYFAIL13/14/16.md`, `WHYFAIL9/11.md`, `FRAGILE_HOME.md` —
+  previously untracked post-mortems now committed.
+
+### Changed
+
+- `VERSION`, `Cargo.toml` and `Cargo.lock` are all `0.1.1`.
+
+### Notes
+
+- **The repository has two WHYFAIL series**: `WHYFAIL5/6/7/9/11/12` at the root and
+  `WHYFAIL13/14/15/16` under `rust9x/lslsetup/`. Numbers 1-4, 8 and 10 exist in
+  neither; `WHYFAIL8` and `WHYFAIL10` are cited by other documents but were never
+  written. `README.md` now says so.
+- **Nothing in the design notes is implemented.** They are designs, with their
+  unverified claims labelled as such.
+- A stray `$null` file (a Windows redirect artefact) and `.commandcode/` local
+  tool state are now in `.gitignore`.
+
+## [Unreleased]
+
+### Known issues
+- **The Persistence pane has NO destructive control; "Erase this stick" was
+  removed (`DESIGN-PERSISTENCE-PANE.md` §2.6).** The checkbox was introduced to
+  serve repartitioning, and §9.2 then showed the space can be obtained without any
+  destruction (two partitions at format time, or a filesystem-aware shrink on first
+  boot) — so it had no remaining justification. Deleting it removes the pane's only
+  data-losing code path, which no confirmation dialog can equal. Formatting stays
+  where it belongs: the Rufus flow, where **Rufus** asks the user itself. Also
+  dropped with it: the `erase_stick` harvest field, the `--erase-stick` flag and
+  the destructive-path test (replaced by a stronger non-destruction assertion).
+- **HARD CONSTRAINT on the Persistence pane: the `eatmydata` option enables the
+  `eatmydata` utility and nothing else (`DESIGN-PERSISTENCE-PANE.md` §2.8).** It
+  must not be used as a licence or an excuse to install anything the user did not
+  ask for, and must never be wired to partitioning, formatting or any other disk
+  write. Those live behind "Erase this stick" (§2.6), which is the *only* control
+  permitted to destroy data. **Formatting a drive is never funny, and a tick on
+  one destructive checkbox is not consent to a different destructive act.** The
+  package is inert (a 21 KB wrapper + a 35 KB `.so`), so the option is exactly one
+  `LD_PRELOAD` for two install steps; any other observable effect is a defect.
+  **Do not implement malware.**
+- **Persistence-pane design: an `eatmydata` speed option was requested and is
+  now specified (`DESIGN-PERSISTENCE-PANE.md` §2.8).** It wraps the sync-heavy
+  first-boot steps — `dpkg`/`apt` (`bin/squashfs_config.sh:9,96,99`), the
+  `mksquashfs` layer build (`bin/uproot:334`), the layer copy. Default off,
+  because it trades durability: `libeatmydata` makes the sync calls *return
+  success anyway*, so a power loss mid-install leaves a package database the
+  kernel was told was committed. Its manpage CAVEAT applies to us directly —
+  `uproot` chroots into the target image (`uproot:526-553`) and the architecture
+  can differ from the host, so `libeatmydata1` must be installed *inside the
+  chroot* for the target arch, and the option must verify the preload actually
+  took effect or it silently does nothing.
+- **The destructive checkbox was misnamed "EatMyData" and has been renamed
+  "Erase this stick".** `eatmydata` is a real package that *speeds up* writes by
+  disabling fsync; using its name for a checkbox that destroys data inverted its
+  meaning and made the genuine `eatmydata` option (§2.8) unnameable.
+- **The Persistence-pane design cannot use a Windows FAT resize, and the plan
+  has been revised accordingly (`DESIGN-PERSISTENCE-PANE.md` §9).** Windows will
+  not shrink *or* extend a FAT32 volume (Disk Management greys out *Shrink*;
+  `diskpart` returns "the file system does not support it"), so reserving space
+  for an F2FS partition by shrinking the FAT is not implementable. The design now
+  **creates an unformatted partition and has firstboot format it** — and since
+  `lslsetup` already opens `\\.\PhysicalDriveN` and writes raw sectors, that
+  extends existing capability rather than adding a new one. Also recorded: why GPT
+  is refused for BIOS (the grub4dos stage1 needs sectors 1-15, which the GPT
+  header and entries occupy — §9.1), and that the destructive confirmation is a
+  **second checkbox**, not the console `type OK` idiom.
+- **Compression settings are inconsistent and one is out of the documented
+  range (`FINDINGS-COMPRESSION.md`).** Six `mksquashfs` call sites use three
+  different settings; four pass `-Xcompression-level 22` while `mksquashfs -help`
+  documents `1 .. 9`. Measured: 22 is accepted and honoured (not clamped) but
+  buys **nothing** over 19, and 9->19 buys only **~6 %** on real layer content
+  for a large time cost - none of which counts boot-time *decompression*, likely
+  the real constraint. Recommendation (not applied): standardise on the
+  documented default 9, from one shared constant.
+- **Machine identity lives in an overlay upper, and nothing scrubs it
+  (WHYFAIL12).** On a live Mint stick, `/cow/upper` (casper's RAM root overlay)
+  holds `/etc/netplan/90-NM-<uuid>.yaml` pinned to `match: name "wlp0s20f3"`
+  **with the WPA PSK in cleartext**, plus `lightdm.conf`/`casper.conf`/`hostname`
+  pinned to `ubuntu` (greeter loop if the next image uses another name),
+  `machine-id`, `resolv.conf` and a snakeoil TLS pair. Not a live bug today: that
+  upper is RAM and `uproot` packs a different, fresh one, so none of it is baked
+  into a layer. It becomes live the moment persistence is added - and any
+  persistent live USB has this, not just ours (stock casper mounts a `casper-rw`
+  device as `/cow` and uses it as the upper; mkusb/Rufus/pendrivelinux do the
+  same).
+
+  Fix, by mechanism (earlier drafts of WHYFAIL12 got this wrong twice): a *packed*
+  filesystem is filtered at pack time (`mksquashfs -e`); a filesystem that is an
+  *overlay upper* is scrubbed as a plain directory before the overlay mounts. For
+  casper the window is a `casper-premount` hook - which we already own and
+  already use for the HDD mirror (`build.sh:154 repack_initrd`;
+  `lslfiles.rs:1724`). Read from casper's own `scripts/casper`: our hook runs at
+  `:926`, `/cow/upper` is created at `:551-583`, and the root overlay is mounted
+  at `:683` - so the hook is strictly before it. Scrubbing alone unmasks the
+  *lower's* stale copy, so each scrubbed path also needs a per-boot regenerator
+  (`onboot.sh`'s `lsl_merge_fstab` is the pattern). See `WHYFAIL12.md` section 6.
+
+### Changed
+- **Layer stacking is now alphabetical, and the filenames carry the order.**
+  The boot menus no longer pass `layerfs-path=`, so casper takes its default
+  `*.squashfs` glob branch and stacks every layer it finds in lexical order,
+  greatest on top. The names encode that order:
+
+  | rank | name | role |
+  |---|---|---|
+  | 1 | `filesystem.squashfs` | base (distro image) |
+  | 2 | `filesystem_z0_firstboot.squashfs` | first-boot stub |
+  | 3+ | `filesystem_z<ts>.squashfs` | appended layers, newest last |
+
+  `uproot` now appends a flat `filesystem_z<ts>.squashfs` — no inherited dotted
+  stem, no chain to extend, and no boot config to rewrite (a new layer goes live
+  simply by existing). `install_lsl_files` writes only the underscore stub name;
+  the dotted `filesystem.z0.squashfs` twin existed solely to be nameable by
+  `layerfs-path=` and sorted into the wrong slot under a glob. A superseded
+  append is reaped by name (anything sorting below the newest), which also fixes
+  the old `sort | tail -n1` stem selection that picked the wrong link on a
+  multi-link chain. See WHYFAIL14.
+- **HDD mirror is a single pre-merged layer.** `LAYERFS_PATH` is kept for the
+  mirror only - it is the one casper input that can name a layer on a device
+  other than `/cdrom`, so the glob branch cannot replace it. With the dot-walk
+  gone, a dot-free name resolves to exactly one file, so
+  `bin/lsl-copy-sfs-hdd.sh` now overlays base + stub + appends into one
+  `filesystem_zmerged.squashfs` and refuses to publish it unless the merged tree
+  contains `/sbin/init`. `initramfs/lsl_hdd_mirror.sh` verifies that file;
+  `tests/qemu-hdd-mirror-test.sh` builds it the same way. live-boot (Debian) is
+  unaffected and keeps the separate layers.
+
+### Fixed
+- **A Mint stick booted as `ubuntu`: the generated kernel cmdline never named
+  the live-session user.** casper's built-in live identity is
+  `USERNAME="ubuntu"` / `HOST="ubuntu"` (`/etc/casper.conf` in the casper
+  source), so a distro that does not override it on the cmdline boots as
+  `ubuntu` with `$HOME=/home/ubuntu` - whatever logo and `.disk/info` the ISO
+  carries. Linux Mint passes `username=mint hostname=mint` from 21.3 on
+  (before 21.3 it passed nothing and really did boot as `ubuntu`; see
+  linuxmint discussion #289). LSL **generates** the cmdline instead of using
+  the ISO's own GRUB, and passed neither parameter - so a Mint image showed
+  the Mint splash and then a `/home/ubuntu` session, which is also why the
+  WHYFAIL5/9 logs read `user=ubuntu` and `root@ubuntu:`.
+
+  `nofmt.rs` now derives the live user from the ISO name/`.disk/info` and
+  passes `username=`/`hostname=` exactly where the distro's own GRUB does
+  (Mint -> `mint`; the Ubuntu family -> `ubuntu`, which is casper's default
+  named explicitly). Unverified distros (Zorin, antiX, Debian) get **no**
+  parameter rather than a guessed name - the same "never invent a username"
+  rule as `lsl_desktop_user`. Wired through every generated entry: the
+  grub4dos direct/ramclone/hddmirror stanzas, the `efi\grub\menu.lst`
+  mirror, the signed-GRUB2 `grub.cfg` entries, and the extra-ISO loopback
+  entry.
+- **Four scripts still invented the username `mint`.** `lsl_desktop_user`
+  (bin/lsl-common.sh) exists precisely so nothing guesses the live-session
+  user - the live home is `mint` on Mint, `ubuntu` on Ubuntu/its flavours
+  (and casper's default when a distro names none, see the entry above) -
+  and WHYFAIL13 records what the old `|| u="mint"`
+  fallback cost: every `$HOME`-targeted install silently wrote to a home that
+  did not exist. The rule was applied in `lsl-common.sh` but four callers kept
+  their own copy with the guess intact: `bin/detect-wsl` and
+  `bin/persist-wifi.sh` (both resolved the user, then fell back to `mint`),
+  `bin/add-steam-libraries` (same), and `bin/lsl-shutdown-gui`, which
+  unmounted a literal `/home/mint/.cache` on every HDD-mode shutdown. All four
+  now call the shared resolver and skip (with a message) rather than write into
+  a guessed home; the shutdown unmount is a no-op on a non-Mint stick instead
+  of pointing at another user's directory.
+- **kitty would not start: the shipped `misc/kitty.conf` was invalid, and the
+  installer never staged it.** `bin/config.sh`'s `install_lsl_kitty_conf` reads
+  `$REPO_ROOT/misc/kitty.conf` at first boot and silently skips when it is
+  missing, but the non-destructive installer writes `/cdrom` from its embedded
+  `FIRSTBOOT_TOOLKIT` list only - which had no `misc/` entry - so on a
+  nofmt-built stick the config was never copied and kitty ran with its built-in
+  defaults. Worse, the repo's conf could not be loaded even when present:
+  `tab_powerline_style no` is not one of kitty's `angled`/`round`/`slanted`
+  choices, so kitty aborts configuration with an "Errors parsing configuration"
+  dialog and never becomes usable. Four more keys were WT-isms with no kitty
+  equivalent and were dropped silently (`padding_left/right/top/bottom`,
+  `font_subpixel_antialias`, `active_tab_title_format`); they are now
+  `window_padding_width`, gone, and `active_tab_title_template`, and the
+  `ctrl+zero` shortcut (kitty spells the key `0`) is `ctrl+0`. `lslsetup` now
+  embeds `misc\kitty.conf` in `FIRSTBOOT_TOOLKIT` and copies `misc` in the
+  bundle path too, with a regression test asserting the conf is present and
+  free of the fatal/unknown options. Verified against kitty 0.32.2's own config
+  loader: the corrected file parses with zero bad lines; the old one raised
+  `ValueError: The value no is not a valid choice for tab_powerline_style`.
+- **Choosing "use an existing Live USB" still asked for a target USB to install
+  on.** The three "main source" sections on the ISO page (Download Fresh, Local
+  ISO, existing USB) are separate `WS_GROUP`s - each section's first radio
+  carries `WS_GROUP` - so Win32 only auto-unchecks siblings *within* the clicked
+  section. With a matching local Mint ISO present, its "main" radio is
+  pre-checked at build time, so clicking "D: Lexar" left **both** checked. The
+  harvest then broke the tie in favour of the ISO and silently discarded the
+  click, so the run fell through to the ordinary ISO install - which then
+  demanded its own target pick ("No target USB was selected on the INSTALL
+  page") even though the user had just named a stick. The existing build-time
+  guard could not help: it only avoids *pre-checking* reuse, and the conflicting
+  state was created by the click, not by the default. An explicit click on any
+  source row now clears the other source rows, so the last explicit click wins.
+  Three new GUI unit tests cover the kind set, reuse-over-a-pre-checked-ISO, and
+  two sticks.
+- A prune glob of `filesystem_z[0-9]*` also matched
+  `filesystem_z0_firstboot.squashfs` and deleted the first-boot stub, which
+  carries `lsl-firstboot.service`. Every append selection now pins the 14-digit
+  timestamp width, and a regression test asserts the stub survives a prune.
+- `repoint_layerfs_refs` now *strips* a stale `layerfs-path=` from the boot
+  configs instead of repointing it. A stick written by an older installer still
+  carries the flag, and under the flattened naming it named a file that no longer
+  existed - casper would have panicked on the next boot with
+  `File system layers are missing`.
+- `live-ramclone` resolves its layer set by globbing `/cdrom/casper/*.squashfs`
+  in sorted order when `layerfs-path=` is absent, so Boot-to-RAM backs the same
+  layers casper will stack.
+
+### Added
+- `misc/check-stick-drift.sh`: compares the repo's hand-written shell
+  (`bin/`, `misc/`, `onboot.sh`, `install.ps1`) against a mounted stick and
+  reports per-file drift. Most fixes land twice - once in the repo, once by hand
+  in the live `/cdrom` - and each direction fails independently and silently: a
+  repo-only fix leaves the bug on the device that shows it, a stick-only fix gets
+  re-shipped-over by the next `build.sh`/`lslsetup` run. This is the sibling guard
+  for the shell that is *not* embedded in a blob (what `check-z0-freshness.sh`
+  does for the z0 layer). Normalises CRLF before comparing, so a Windows
+  checkout does not read as drift - the same CRLF class that has broken
+  `LSL_DATA_DIR` detection and the bash-log hook. Exits 0 when no stick is
+  mounted, so it stays runnable on the dev box. Verified against a synthetic
+  stick: identical, CRLF-only, missing-file and stale-file cases all classify
+  correctly.
 - `lsl-reclaim-win-swap.sh` (opt-in, `LSL_RECLAIM_WIN_SWAP=1`): after verifying a
   clean Windows shutdown (read-write NTFS and no `hiberfil.sys`), rename Windows's
   `pagefile.sys` and each WSL2 distro's `swapfile.vhdx` to temp files and reuse that
@@ -73,6 +351,20 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
   reclaim is armed while `hiberfil.sys` still exists.
 
 ### Changed
+- **When only one target drive is available, it is now selected by default.**
+  `install.ps1`: the `-NoGui` console prompt (`Select-ExistingUsb`) accepts a
+  plain Enter to install onto the single USB found (`0` still writes fresh via
+  Rufus), the wizard's reuse-an-existing-USB list checks that one radio button,
+  and the non-destructive-copy target picker preselects it. `lslsetup`: the
+  page-1 reuse-an-existing-USB list now pre-checks the sole entry (its console
+  `choose_target` and the INSTALL-page target picker already defaulted the
+  single/first-Ready candidate). With several drives the choice is still left
+  to the user.
+- `lslsetup.exe` backup offer: the fixed-volume prompt's Yes/No buttons now read
+  **Backup First** (back up the contents, then continue) and **YOLO** (continue
+  without backing up). The box itself - message text, layout, Cancel - is
+  unchanged: the two captions are rewritten in place, since a MessageBox cannot
+  be relabeled through the API. The too-big-to-auto-back prompt keeps Yes/No.
 - `install.sh` appends a new squashfs layer by default (`LSL_INSTALL_MERGE=1`
   for the old merge behavior); `find_*.zstd` indexing only when no EFU exists.
 - Dropped WezTerm (third-party repo + autostart) - kitty (in the main repos)
@@ -81,8 +373,170 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
 - `onboot.sh` seeds `home.sfs` on first boot; optional FUSE flatpak mount.
 - `detect-wsl` reads `/cdrom/lsl-wsl-vhdx.conf` (Windows-side VHDX paths).
 - `lsl` reads `find_everything.efu` catalogs alongside `find_*.zstd`.
+- **Home-persistence consumers now branch on the recorded mode, not a fresh
+  prediction.** `lsl-home-flushd` and `lsl-btrfs-growd` (which re-resolved every
+  60s mid-loop) use new `lsl_effective_home_is_usb` / `lsl_effective_home_is_hdd`
+  helpers in `lsl-common.sh`, and `lsl-shutdown-gui` reports the mode `/home` was
+  actually mounted with - so it can no longer promise a btrfs sync that did not
+  happen (or unmount binds that were never made). Behavior-preserving on sticks
+  with no state file, which fall back to `lsl_is_usb_mode`.
 
 ### Fixed
+- **A stick that had been re-imaged a few times stopped booting with `File system
+  layers are missing`: the layer prune deleted the chain it had just built.**
+  `uproot` appends a layer by *extending* the newest dotted name
+  (`filesystem.z0.<ts1>` → `filesystem.z0.<ts1>.<ts2>`), because casper walks
+  dot-suffixes **upward** from the layer named in `layerfs-path=` and every
+  ancestor must exist. The prune that ran immediately afterwards
+  (`uproot:prune_superseded_layers`, plus the firstboot finale's
+  `lsl_firstboot_prune_orphan_layers`) tested the two names the wrong way round
+  and kept only dot-*extensions* of the named layer - the longer siblings, which
+  casper never reads - while reaping the shorter ones it *requires*. So every
+  append after the first destroyed the previous link, and the next boot died with
+  `(initramfs/0 stdin: invalid argument / File system layers are missing`.
+  Observed on a stick whose fourth successful append had left only
+  `filesystem.z0.<ts1>.<ts2>.<ts3>.<ts4>.squashfs` beside `filesystem.z0.squashfs`,
+  with `menu.lst` and `EFI/BOOT/grub.cfg` naming it. Both sites now keep
+  dot-*ancestors* (named name as a prefix of the candidate). The test that should
+  have caught it asserted the inverted direction - it required a *longer* sibling
+  to survive - so it passed green through three firstboots; it is corrected, and a
+  4-deep-chain case pins the exact reported failure. The doomed layers are
+  therefore no longer reclaimed: a chain of N appends keeps N layers by design,
+  since only the named layer's ancestors are readable.
+- **Boot to RAM showed no progress dialog: `lslsetup` wrote its secondary initrds
+  with the wrong cpio `newc` name padding.** The `newc` header is 110 bytes and
+  `110 % 4 == 2`, so the name field must be padded to align `(110 + namesize)`;
+  padding `namesize` alone misplaced every entry after the first by 2 bytes. GNU
+  `cpio` resyncs on the resulting bad magic and still extracts everything, so
+  `cpio -idm` verification looked healthy - but the kernel's initramfs unpacker
+  (`init/initramfs.c unpack_to_rootfs`) does not resync: it stopped after the
+  first member and silently dropped the tail, including
+  `scripts/casper-premount/ORDER`. Without `ORDER`, casper never *sources* the
+  ramclone hook, `/run/ramclone/ready` never appeared, and
+  `lsl-ramclone-progress.sh` exited at its first gate. Fixed in all three sites
+  (`cpio_newc_file`, `parse_cpio_newc`, `split_initrd`) via a `cpio_pad_name`
+  helper; data padding still uses `cpio_pad4`. Pinned by a `kernel_unpack_names`
+  helper that walks an archive by the kernel's rule - no resync - plus 4 tests
+  (`pad_name_aligns_the_110_byte_header`, `archive_survives_the_kernel_unpack_rule`,
+  `old_wrong_padding_is_rejected_by_the_kernel_rule`,
+  `order_survives_injection_the_way_casper_needs_it`), since writer and parsers
+  previously shared the wrong formula and round-tripped consistently against each
+  other while both disagreed with the real format. **104 passed, 0 failed.**
+  The shipped `casper/initrd.{hddmirror,ramclone}.gz` blobs stay corrupt until the
+  build regenerates them.
+- **`usb-fallback` still fired when the data dir was mounted read-only: the
+  persistence check never asked for `OPTIONS`.** The boot journal shows
+  `lsl-home.service` reaching a *read-only* `ntfs-3g` mount at 03:42:37, and the
+  kernel rw mount succeeding (`onboot.sh: Using path: /mnt/c`) about one second
+  later. `lsl_data_dir_is_persistent` only asked `findmnt -o TARGET` and
+  `-o FSTYPE`, never `-o OPTIONS`, so a read-only ntfs mount passed as
+  "persistent" - but the btrfs home image needs `rw`. `lsl-mount-home.sh` branched
+  on that predicate, accepted the `ro` landing, and declared the fallback,
+  discarding the session's `/home` (5.8 MB / 384 entries) into a throwaway tmpfs
+  upper layer. New `lsl_data_dir_is_writable()` requires persistent **and**
+  `rw` in the mount options; `lsl-mount-home.sh` now waits for a writable mount
+  in a bounded loop (re-driving `mount_all.sh` every third try, since the journal
+  replay that unblocks the rw mount needs a retry) before declaring the fallback,
+  which stays honest if the store never becomes writable. It deliberately does
+  not remount rw - that is how NTFS gets corrupted on a dirty volume.
+  `onboot.sh` warns separately for "persistent but not writable". Pinned by 5 new
+  cases in `tests/lsl-common.tests.sh` (**75 passed, 0 failed**).
+- **`/home` was still a RAM overlay on a persistent boot entry, because
+  `mount_all.sh` failed to mount `/mnt/c` and nobody checked** (WHYFAIL11, fourth
+  occurrence of this symptom; see `WHYFAIL11.md`). WHYFAIL9 and WHYFAIL10 are both
+  deployed and working here - the hivex `.debs` are staged by `lslsetup` and
+  installed before `/home` mounts, `LSL_MODE=usb-fallback` is recorded honestly,
+  and `onboot.sh` reads the recorded fact. The remaining defect was the mount
+  itself: the kernel `ntfs3` driver refused the volume (`Can't mount, would change
+  RO state` - Windows Fast Startup/dirty NTFS, the WHYFAIL6 5 class), the
+  read-write branch had a single `mount -t ntfs3` with **no `ntfs-3g` fallback**,
+  and the script never verified the result. WHYFAIL10 had already made the *exit
+  code* graceful, which is exactly why this was invisible: the caller re-checks
+  `lsl_data_dir_is_persistent` against the **live mount table**, not the return
+  value, so a script that returns 0 while leaving `/mnt/c` unmounted still forces
+  the fallback. New `mount_ntfs()` tries `ntfs3` then `ntfs-3g` (present on the
+  image), then the same pair read-only, verifies every rung with `mountpoint -q`,
+  treats an already-mounted target as a no-op success, and fails loudly if `/mnt/c`
+  is genuinely unmountable. `ntfs_is_dirty()` no longer misreads `ntfsfix -n`'s
+  `Refusing to operate on read-write mounted device` as a clean bill of health, the
+  EXIT trap can no longer unmount `/mnt/c` (it was reachable when the volume was
+  already mounted at scan time and `best_mount` was `/mnt/c`), and the script now
+  ends with `mountpoint -q /mnt/c && exit 0 || exit 1` - making WHYFAIL10 5a's
+  documented "exits 0 whenever `/mnt/c` is mounted" contract real for the first
+  time (it previously returned `parse_drive Z`'s status, usually 1).
+  Pinned by 6 new cases in `tests/mount_all.tests.sh` (**9 passed, 0 failed**).
+- **"Load to RAM + remove USB" in `lsl-shutdown-gui` did nothing; it now copies
+  with a real progress bar and a completion notice.** Two defects: (1) the zenity
+  radiolist returns the option *text*, and the case arm matched only the prefix
+  `Load to RAM + remove USB` - the label's `(persistence to USB stops)` suffix sent
+  the selection into the catch-all `*) exit 0`, a completely silent no-op
+  (dialog/whiptail return the tag `7`, so only the Mint/zenity path was broken);
+  (2) even when it ran, `bin/lsl-toram.sh` printed only to stdout, which is
+  discarded under `pkexec`, so there was nothing to watch. `lsl-toram.sh` gained
+  `--progress`, emitting zenity `PCT # text` lines on stdout (real percent from the
+  destination tmpfs's `df` usage during the tar copy; human status moves to stderr),
+  and `lsl-shutdown-gui` pipes that into a `zenity --progress` bar and shows
+  "Session is now running from RAM" on success (or an error dialog with the log tail
+  on failure). The bar follows the WHYFAIL8 rule - no `--auto-close`; the script's
+  exit closes it via EOF. `bin/lsl-toram.sh` is also now embedded in
+  `FIRSTBOOT_TOOLKIT` (it never was, so a nofmt-built stick would only ever have
+  errored "lsl-toram.sh not found"), pinned by a new Rust unit test plus bats tests
+  for the dispatch and the `--progress` protocol.
+- **A first-boot `usb-fallback` `/home` now fails loudly, and the hivex trigger
+  is removed.** When the final flush finds a fallback tmpfs overlay,
+  `misc/lsl-firstboot.sh` logs an ERROR, sets a failed phase/detail in the live
+  progress dialog, writes `/cdrom/casper/lsl-firstboot.home-failed[.reason]` and
+  shows a desktop warning *before* the reboot-approval dialog (new
+  `misc/lsl-firstboot-home-failed.sh`) instead of logging `Final home flush OK`
+  over lost work. To stop the fallback triggering at all, the Windows installer
+  stages `libhivex0`/`libhivex-bin`/`libwin-hivex-perl` `.debs` to
+  `<USB>:\pkgs\`, a new `lsl_ensure_hivex_tools` installs them offline before
+  `/home` mounts (in `onboot.sh` / `lsl-mount-home.sh`), `mount_all.sh` names the
+  missing-`hivexregedit` ordering defect (marker `/run/lsl-usb.mount-missing-hivex`),
+  and `bin/squashfs_config.sh` installs the staged `.debs` early in the chroot.
+- **The first-boot progress dialog flashed for ~1s then vanished while setup kept running for another 23 minutes** (third report of this symptom; see `WHYFAIL8.md` — not yet written). `misc/lsl-firstboot-progress.sh` piped a long-lived writer (`feed_zenity`, which loops until the stamp appears) into `zenity --progress --auto-close`. With `--auto-close`, zenity 3.44 closes the read end of its own stdin after the first couple of lines, so the next `echo` in the writer died of `SIGPIPE` - silently, without reaching the `kill -0` guard. The pipe then hit EOF and zenity exited `0`, which the caller logged as "shown to completion" (`consumer rc=0`); the writer's own `141` was never logged. Measured: with `--auto-close` the writer emitted **1** line, without it **10**; end-to-end the dialog lived ~2s before and 14s+ after. `--auto-close` is removed (the writer already emits `100` to close the window; `--auto-kill` stays for Cancel) and the exit log now records `writer rc=` as well as `consumer rc=` so a SIGPIPE death cannot masquerade as success again. `misc/lsl-ramclone-progress.sh` and `bin/lsl-shutdown-gui` use `--auto-close` too but their feeds are bounded (they finish and emit `100`), so they are unaffected and were deliberately left alone.
+- **The `lsl-progress-gtk.py` fallback wrote nothing to the dialog trace**, so the two earlier post-mortems of the same symptom (2026-09-15/16 and 2026-09-21) could not see that backend at all. It now logs to the same `LSL_DIALOG_LOG`/`LSL_DIALOG_TRACE` targets on every entry and exit path - window shown (mode, `DISPLAY`, stamp/status paths), first render (step, percent, task), and the closing reason (stamp present / parent gone / window closed / stdin EOF) with a tick count and last rendered state. It polls the status file and so cannot take SIGPIPE; this is observability, not a behavioural fix.
+- **`lsl-progress-gtk.py` ignored the `--opt=value` argument form.** `--status-file=`, `--stamp=`, `--title=`, `--text=` and `--poll=` were silently dropped, and `--width=480` consumed the *following* argument as its value, which could swallow a consecutive option. The shell caller uses the space-separated form so nothing was broken in practice; both forms are now accepted.
+- **First-boot `/home` changes could be silently dropped via the fallback
+  tmpfs overlay.** When the HDD data dir is not persistent at mount time (the
+  canonical first boot: `hivexregedit` missing, so `mount_all.sh` leaves `/mnt/c`
+  unmounted), `lsl-mount-home.sh` correctly falls back to a tmpfs-overlay `/home`
+  - but recorded `LSL_MODE=usb`, indistinguishable from a real USB stick. By the
+  time firstboot finished, the drives had mounted, so `uphome`'s fresh
+  `lsl_is_usb_mode` resolve said "hdd" and it took the HDD branch: a no-op
+  `btrfs filesystem sync`, exit 0, first-boot home lost on reboot (it was only
+  ever in `/run`). `lsl-flush-home.sh`, reading the stale `usb`, would
+  additionally have overwritten the stick's per-distro `home.sfs` with the
+  near-empty overlay. Added `lsl_effective_home_mode()` (state file,
+  authoritative, falls back to the live mount type), the fallback now records
+  `LSL_MODE=usb-fallback`, `uphome` branches on the effective mode and fails
+  loudly on `usb-fallback` instead of "succeeding", and `lsl-flush-home.sh`
+  refuses to write a fallback overlay to `home.sfs`.
+- **New docs: `WHYFAIL9.md` and `FRAGILE_HOME.md`.** `WHYFAIL9.md` is the
+  incident write-up (evidence chain, reproduce/verify, what is not yet in
+  effect on a booting stick); `FRAGILE_HOME.md` generalises it into the three
+  ways lsl-usb answers "is /home persistent?", an inventory of all 8 call
+  sites with the risk each carries, and six rules for future changes.
+- **Boot to RAM (`ramclone`) never copied anything and never showed a dialog.**
+  The initramfs hook built the dm-clone table without the mandatory region-size
+  argument, and dm-clone rejects `argc < 4` - so `dmsetup create` failed and the
+  stick silently booted normally from the USB (nothing hydrated, no dialog, and
+  the stick could not actually be removed). It also mapped both the base and the
+  `z0` layer to the single clone device, but casper mounts every layer of the
+  dotted `layerfs-path` chain separately (`setup_overlay`); and
+  `lsl-ramclone-status` / `lsl-ramclone-eject` read the wrong `dmsetup status`
+  fields (the hydrated/total region pair is field 7, `<hydrated>/<total>`, not
+  4/5), so progress was always 0% and completion was never signalled. The hook
+  now passes `2048` (1 MiB) as the region size, RAM-backs every other chain
+  layer (`z0` / appended) into tmpfs so no USB file stays open, and records the
+  layer-to-device map for `get_backing_device`. A new
+  `/etc/xdg/autostart/lsl-ramclone-progress.desktop`
+  (`misc/lsl-ramclone-progress.sh` plus a `lsl-progress-gtk.py --ramclone` mode
+  as the zenity fallback) shows the copy progress on a Boot-to-RAM boot and -
+  once hydration is complete and every layer is RAM-backed - offers a **Detach
+  USB** button that runs the eject and then reports "It is now safe to remove
+  your stick." Normal boots and the `lsl_home=tmpfs` "(no persistence)" entry
+  are otherwise unaffected.
 - Persistent `/home` could hide the live user's home: the home image
   (`home.btrfs` / `home.sfs`) is keyed to `LSL_DATA_DIR`, not to the booted
   distro, so an image seeded by another live user - e.g. an Ubuntu-seeded
