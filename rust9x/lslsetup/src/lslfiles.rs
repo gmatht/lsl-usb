@@ -155,6 +155,11 @@ static FIRSTBOOT_TOOLKIT: &[(&str, &str)] = &[
     // (2026-09-22: it was missing from the stick entirely).
     ("bin\\uphome", include_str!("../../../bin/uphome")),
     ("bin\\lsl-flush-home.sh", include_str!("../../../bin/lsl-flush-home.sh")),
+    // "Load to RAM + remove USB" in lsl-shutdown-gui runs this; the same
+    // reasoning as uphome above applies (2026-09-28: it was never embedded,
+    // so the option could only ever error "lsl-toram.sh not found" on a
+    // nofmt-built stick).
+    ("bin\\lsl-toram.sh", include_str!("../../../bin/lsl-toram.sh")),
     // Desktop + autostart + onboot payload (2026-09-22 post-mortems): the
     // nofmt installer writes /cdrom/bin from this array only, so every
     // script the boot references must be embedded -
@@ -186,6 +191,18 @@ static FIRSTBOOT_TOOLKIT: &[(&str, &str)] = &[
     ("fuse\\fat_linux_meta_fs.py", include_str!("../../../fuse/fat_linux_meta_fs.py")),
     ("fuse\\fusepy\\fuse.py", include_str!("../../../fuse/fusepy/fuse.py")),
     ("onboot.sh", include_str!("../../../onboot.sh")),
+    // misc/kitty.conf: config.sh's install_lsl_kitty_conf reads it from
+    // $REPO_ROOT/misc/ at first-boot and silently skips when it is absent
+    // (there is only a debug-level log). On a nofmt-built stick REPO_ROOT is
+    // /cdrom and misc/ is never staged - the nofmt installer writes /cdrom
+    // from FIRSTBOOT_TOOLKIT only - so without this entry the terminal is
+    // installed (kitty ships in the base image) but never configured, and
+    // kitty launches with its own defaults instead of the Windows-Terminal
+    // look. The file must also PARSE: kitty shows an "Errors parsing
+    // configuration" dialog and never becomes usable when a value is invalid
+    // (e.g. the old `tab_powerline_style no`), which reads as "kitty won't
+    // start".
+    ("misc\\kitty.conf", include_str!("../../../misc/kitty.conf")),
 ];
 
 pub fn install_firstboot_toolkit(root: &str) -> Result<Vec<String>, String> {
@@ -208,22 +225,29 @@ pub fn install_firstboot_toolkit(root: &str) -> Result<Vec<String>, String> {
     Ok(done)
 }
 
-/// Embedded z0 firstboot layer (casper/filesystem.z0.squashfs).
+/// Embedded z0 firstboot layer (casper/filesystem_z0_firstboot.squashfs).
 ///
 /// Built from misc/ by misc/build-z0.sh (mksquashfs, WSL) and committed
 /// beside the other embedded assets; the nofmt installer has no mksquashfs
 /// on Windows, so it ships this blob instead of building it. Rebuild
 /// whenever misc/ changes - the blob carries lsl-firstboot.service, and a
-/// stale blob means a stale firstboot. Content-proven in QEMU (layer
-/// stacks base+z0+appended, firstboot stamps, relayer boots Brave/nvim).
+/// stale blob means a stale firstboot. build.rs re-hashes each packed source
+/// against assets/z0_sources.sha256 (written by build-z0.sh) and fails the
+/// build when misc/ has drifted, so a stale blob can no longer ship
+/// (WHYFAIL10). Content-proven in QEMU (layer stacks base+stub+appended,
+/// firstboot stamps, relayer boots Brave/nvim).
 static Z0_BLOB: &[u8] = include_bytes!("../assets/filesystem.z0.squashfs");
 
 /// Write the embedded z0 layer to casper\ on the stick (always overwrite:
-/// 12 KB, and this guarantees the firstboot service stays fresh). The
-/// menu's layerfs-path points at exactly this file, so a missing/stale z0
-/// is a boot failure, not a warning.
+/// 12 KB, and this guarantees the firstboot service stays fresh). The name
+/// is the underscore form so casper's alphabetical glob stacks it above the
+/// base and below every appended layer; a missing/stale stub is a boot
+/// failure, not a warning.
 pub fn install_z0_layer(root: &str) -> Result<u64, String> {
-    let dest = format!("{}\\casper\\filesystem.z0.squashfs", root.trim_end_matches('\\'));
+    let dest = format!(
+        "{}\\casper\\filesystem_z0_firstboot.squashfs",
+        root.trim_end_matches('\\')
+    );
     if Z0_BLOB.len() < 4096 || Z0_BLOB[0..4] != [0x68, 0x73, 0x71, 0x73] {
         return Err("embedded z0 layer is not a squashfs blob (bad magic/size)".into());
     }
@@ -250,36 +274,41 @@ pub fn install_lsl_files(vol_letter: &str, bundle_dir: &str) -> Result<(), Strin
 
     let mut copied: Vec<String> = Vec::new();
 
-    // 1) the (minimal) root layer - casper stacks it over the base image.
+    // 1) the (minimal) root layer - casper's *.squashfs glob stacks it over
+    // the base image. Layer ORDER is alphabetical, so the stub's name must
+    // sort above "filesystem.squashfs" ("_" 0x5F > "." 0x2E) and below every
+    // appended layer ("filesystem_z<ts>" > "filesystem_z0_firstboot").
     // Legacy bundle path (install.ps1 parity): a build.sh bundle ships
     // filesystem_z0_firstboot.squashfs next to the exe. The nofmt path
-    // already wrote the embedded equivalent (casper/filesystem.z0.squashfs)
-    // before we get here, so don't warn then - and never leave the stick
-    // without a z0 layer: fall back to the embedded blob when the bundle
-    // file is absent.
+    // already wrote the embedded equivalent before we get here, so don't warn
+    // then - and never leave the stick without a stub layer: fall back to the
+    // embedded blob when the bundle file is absent.
+    //
+    // There is deliberately only ONE name now. The dotted twin
+    // (filesystem.z0.squashfs) existed solely so `layerfs-path=` could name
+    // the dot-walk entry point; with no layerfs-path= on the cmdline, a
+    // second copy sorted into the wrong slot and shadowed the appended
+    // layers (see WHYFAIL14).
     let layer = format!("{}\\filesystem_z0_firstboot.squashfs", bundle_dir);
-    let dotted = format!("{}\\filesystem.z0.squashfs", casper);
+    let dest = format!("{}\\filesystem_z0_firstboot.squashfs", casper);
     if path_exists(&layer) {
-        sys::copy_file(&layer, &format!("{}\\filesystem_z0_firstboot.squashfs", casper))
+        sys::copy_file(&layer, &dest)
             .map_err(|e| format!("copy layer: {}", e))?;
         copied.push("filesystem_z0_firstboot.squashfs".into());
-        // Dotted twin for casper's multi-layer dotted-chain walk (the
-        // `layerfs-path=` on direct entries needs exactly this name; 8 KB,
-        // and every existing `_firstboot` reader keeps working untouched).
-        sys::copy_file(&layer, &dotted)
-            .map_err(|e| format!("copy dotted layer: {}", e))?;
-        copied.push("filesystem.z0.squashfs".into());
-    } else if path_exists(&dotted) {
+    } else if path_exists(&dest) {
         out::info("z0 firstboot layer already present on the stick (embedded install); skipping bundle layer copy.");
     } else {
         match install_z0_layer(&root) {
-            Ok(_) => copied.push("filesystem.z0.squashfs (embedded)".into()),
+            Ok(_) => copied.push("filesystem_z0_firstboot.squashfs (embedded)".into()),
             Err(e) => out::warn(&format!("filesystem_z0_firstboot.squashfs not found in bundle and embedded z0 install failed ({}); layer not copied.", e)),
         }
     }
 
-    // 2) the FAT-side lsl scripts (same set as bin/config.sh --sync-only)
-    for d in ["bin", "systemd", "initramfs"] {
+    // 2) the FAT-side lsl scripts (same set as bin/config.sh --sync-only).
+    //    "misc" carries kitty.conf, which bin/config.sh installs into the
+    //    desktop user's ~/.config/kitty at first boot; without it the copy is
+    //    skipped and kitty runs with its built-in defaults.
+    for d in ["bin", "systemd", "initramfs", "misc"] {
         let src = format!("{}\\{}", bundle_dir, d);
         if sys::is_dir(&src) {
             sys::copy_tree(&src, &format!("{}\\{}", root, d))
@@ -509,6 +538,10 @@ where
     let mut copied = 0;
     let mut skipped = 0;
     let mut manifest = vec![
+        // Beacon must match bin/lsl-copy-sfs-hdd.sh and initramfs/lsl_hdd_mirror.sh.
+        // This copy path stages the RAW layers only (Windows has no mksquashfs);
+        // the Linux-side builder overlays them into the merged layer the
+        // initrd hook actually boots.
         "# LSL squashfs layers copied to HDD for faster boot".to_string(),
         format!("SourceUSB={}:", vol_letter),
         format!("Date={}", now_u_string()),
@@ -524,13 +557,12 @@ where
         if !path_exists(&s) {
             continue;
         }
-        // casper's multi-layer LAYERFS_PATH chain stacks filesystem.z0 over
-        // filesystem, so the firstboot layer is renamed on copy.
-        let dname = if base.starts_with("filesystem_z") && base.ends_with("_firstboot.squashfs") {
-            "filesystem.z0.squashfs".to_string()
-        } else {
-            base.clone()
-        };
+        // Mirror files keep their on-stick names - no renaming. The raw
+        // layers are the INPUTS to the pre-merge that bin/lsl-copy-sfs-hdd.sh
+        // runs on the Linux side (Windows has no mksquashfs); that merge
+        // produces the single dot-free layer the initrd hook points
+        // LAYERFS_PATH at. See WHYFAIL14.
+        let dname = base.clone();
         let d = format!("{}\\{}", dest, dname);
         let sz = file_size(&s).unwrap_or(0);
         // Idempotency: skip if already on HDD with matching size.
@@ -1086,8 +1118,9 @@ mod firstboot_toolkit_tests {
         // writes /cdrom/bin from FIRSTBOOT_TOOLKIT only, and uphome (plus
         // lsl-flush-home.sh, which uphome execs in USB mode) was never
         // embedded. Every sibling script the shutdown chain shells out
-        // to must be here.
-        for name in ["bin\\uphome", "bin\\lsl-flush-home.sh"] {
+        // to must be here. 2026-09-28: lsl-toram.sh (the "Load to RAM +
+        // remove USB" option) was missing the same way.
+        for name in ["bin\\uphome", "bin\\lsl-flush-home.sh", "bin\\lsl-toram.sh"] {
             let e = FIRSTBOOT_TOOLKIT.iter().find(|(r, _)| *r == name);
             assert!(e.is_some(), "{} missing from FIRSTBOOT_TOOLKIT", name);
             assert!(
@@ -1123,11 +1156,118 @@ mod firstboot_toolkit_tests {
     }
 
     #[test]
-    fn z0_blob_is_shippable_squashfs() {
-        // Rebuild via misc/build-z0.sh whenever misc/ changes; this blob is
-        // what the nofmt installer drops as casper/filesystem.z0.squashfs.
+    fn toolkit_ships_a_kitty_config_that_parses() {
+        // Regression 2026-10-01: config.sh's install_lsl_kitty_conf reads
+        // $REPO_ROOT/misc/kitty.conf and silently skips when it is absent, so a
+        // nofmt-built stick (which stages /cdrom from FIRSTBOOT_TOOLKIT only)
+        // never configured the terminal at all. Worse, the file that did ship in
+        // the repo could not be loaded: kitty shows "Errors parsing
+        // configuration" and never becomes usable for an invalid choice value
+        // (`tab_powerline_style no` is not one of angled/round/slanted), which
+        // reads to the user as "kitty won't start". The embedded conf must
+        // exist and must not contain the known-fatal/invalid options.
+        let e = FIRSTBOOT_TOOLKIT
+            .iter()
+            .find(|(r, _)| *r == "misc\\kitty.conf")
+            .expect("misc\\kitty.conf missing from FIRSTBOOT_TOOLKIT");
+        let conf = e.1.replace("\r\n", "\n");
+        assert!(!conf.is_empty(), "misc\\kitty.conf embedded empty");
+        assert!(conf.contains("font_family"), "kitty.conf lost its font section");
+        // Fatal: a value kitty rejects aborts configuration entirely.
+        assert!(
+            !conf.contains("tab_powerline_style no"),
+            "tab_powerline_style only accepts angled/round/slanted - 'no' is fatal"
+        );
+        // Unknown keys are silently ignored (non-fatal, but the option does
+        // nothing): these were the WT-isms that had no kitty equivalent.
+        for bad in [
+            "padding_left",
+            "padding_right",
+            "padding_top",
+            "padding_bottom",
+            "font_subpixel_antialias",
+            "active_tab_title_format",
+        ] {
+            assert!(!conf.contains(bad), "{} is not a kitty option", bad);
+        }
+        // Renamed options that kitty DOES understand must be used instead.
+        assert!(conf.contains("window_padding_width"), "padding must use window_padding_width");
+        assert!(conf.contains("active_tab_title_template"), "the tab title option is active_tab_title_template");
+        // kitty spells the zero key "0"; "zero" is dropped as an unknown key.
+        assert!(conf.contains("map ctrl+0 change_font_size all 0"));
+    }
+
+    #[test]
+    fn toolkit_manifest_covers_every_embedded_source() {
+        // WHYFAIL13 follow-up (2026-10-01): every shipped lslsetup.exe embedded
+        // a broken bin/lsl-pin-favorites while the fix sat in bin/ unshipped -
+        // nothing connected "a toolkit source changed" to "the built exe is
+        // stale". build.rs now re-hashes each source listed in
+        // assets/toolkit_sources.sha256 and fails the build on drift; this test
+        // keeps the manifest complete, so a newly embedded file cannot be
+        // added without recording its hash.
+        let manifest = include_str!("../assets/toolkit_sources.sha256");
+        let listed: Vec<&str> = manifest
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.split_once("  ").expect("hash<2 spaces>path").1)
+            .collect();
+        assert_eq!(
+            listed.len(),
+            FIRSTBOOT_TOOLKIT.len(),
+            "assets/toolkit_sources.sha256 lists {} sources but FIRSTBOOT_TOOLKIT embeds {} - \
+             regenerate with `bash misc/build-toolkit-manifest.sh`",
+            listed.len(),
+            FIRSTBOOT_TOOLKIT.len()
+        );
+        for (rel, _) in FIRSTBOOT_TOOLKIT {
+            let unix = rel.replace('\\', "/");
+            assert!(
+                listed.iter().any(|l| *l == unix),
+                "{} is embedded but missing from assets/toolkit_sources.sha256 - \
+                 regenerate with `bash misc/build-toolkit-manifest.sh`",
+                unix
+            );
+        }
+    }
+
+    #[test]
+    fn z0_blob_is_fresh_against_its_source_manifest() {
+        // WHYFAIL10: this blob is generated from misc/ by misc/build-z0.sh and
+        // shipped verbatim as casper/filesystem_z0_firstboot.squashfs. include_bytes!
+        // makes cargo depend on the blob, NOT on misc/, so an edit to misc/
+        // used to reship a stale firstboot layer (the progress dialog stayed
+        // broken for ~14h). build.rs enforces the freshness at build time via
+        // assets/z0_sources.sha256; assert it here too so `cargo test` fails on
+        // its own. Rebuild with `bash misc/build-z0.sh` whenever misc/ changes.
         assert!(Z0_BLOB.len() >= 4096 && Z0_BLOB.len() <= 1 << 20, "z0 size implausible: {}", Z0_BLOB.len());
         assert_eq!(&Z0_BLOB[0..4], &[0x68, 0x73, 0x71, 0x73], "z0 must start with hsqs magic");
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let manifest = include_str!("../assets/z0_sources.sha256");
+        let mut checked = 0usize;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (want, rel) = line.split_once("  ").expect("malformed z0_sources.sha256 line");
+            let bytes =
+                std::fs::read(root.join(rel)).unwrap_or_else(|e| panic!("read {}: {}", rel, e));
+            use sha2::Digest as _;
+            let mut h = sha2::Sha256::new();
+            h.update(&bytes);
+            let got = format!("{:x}", h.finalize());
+            assert_eq!(
+                got, want,
+                "{} changed since the z0 blob was packed - run `bash misc/build-z0.sh` and \
+                 commit the regenerated blob + assets/z0_sources.sha256",
+                rel
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "z0_sources.sha256 listed no sources");
     }
 }
 
@@ -1229,11 +1369,23 @@ fn cpio_pad4(n: usize) -> usize {
     (4 - (n % 4)) % 4
 }
 
+/// Padding for a newc *name* field. The newc header is 110 bytes and 110 % 4
+/// == 2, so the name field must be padded to align (110 + namesize); padding
+/// `namesize` alone misplaces every entry after the first by 2 bytes. GNU cpio
+/// resyncs on the resulting bad magic, but the kernel's initramfs unpacker
+/// (init/initramfs.c unpack_to_rootfs) does not: it stops there and silently
+/// drops the remaining members (notably scripts/casper-premount/ORDER, without
+/// which casper never sources the ramclone hook, so Boot to RAM never shows a
+/// progress dialog).
+fn cpio_pad_name(namesize: usize) -> usize {
+    (4 - ((110 + namesize) % 4)) % 4
+}
+
 fn cpio_newc_file(name: &str, data: &[u8], mode: u32) -> Vec<u8> {
     let mut out = cpio_newc_header(name, data.len() as u64, mode);
     out.extend_from_slice(name.as_bytes());
     out.push(0);
-    out.extend_from_slice(&vec![0u8; cpio_pad4(name.len() + 1)]);
+    out.extend_from_slice(&vec![0u8; cpio_pad_name(name.len() + 1)]);
     out.extend_from_slice(data);
     out.extend_from_slice(&vec![0u8; cpio_pad4(data.len())]);
     out
@@ -1283,7 +1435,7 @@ fn parse_cpio_newc(data: &[u8]) -> Result<Vec<(String, u32, Vec<u8>)>, String> {
             .map_err(|_| "cpio parse: non-utf8 name".to_string())?
             .to_string();
         pos += namesize;
-        pos += cpio_pad4(namesize);
+        pos += cpio_pad_name(namesize);
         if name == "TRAILER!!!" {
             break;
         }
@@ -1306,6 +1458,145 @@ fn build_cpio_newc(entries: &[(String, u32, Vec<u8>)]) -> Vec<u8> {
     }
     out.extend_from_slice(&cpio_newc_trailer());
     out
+}
+
+/// Walk a cpio newc archive exactly the way the kernel's initramfs unpacker
+/// does (init/initramfs.c unpack_to_rootfs): each member must start on a 4-byte
+/// boundary at `110 + namesize` padded, and bad magic is fatal — there is no
+/// resync. GNU cpio DOES resync, which is why a round-trip against GNU cpio
+/// happily "passes" an archive the kernel silently truncates.
+///
+/// Returns the names walked (including TRAILER!!!) or the offset it stopped at.
+fn kernel_unpack_names(data: &[u8]) -> Result<Vec<String>, usize> {
+    let mut names = Vec::new();
+    let mut pos = 0usize;
+    loop {
+        if pos + 110 > data.len() || &data[pos..pos + 6] != b"070701" {
+            return Err(pos);
+        }
+        let hex = |off: usize| -> Result<usize, usize> {
+            let s = std::str::from_utf8(&data[pos + off..pos + off + 8]).map_err(|_| pos)?;
+            usize::from_str_radix(s, 16).map_err(|_| pos)
+        };
+        let namesize = hex(94)?;
+        let filesize = hex(54)?;
+        let name_start = pos + 110;
+        if name_start + namesize > data.len() {
+            return Err(pos);
+        }
+        let name = std::str::from_utf8(&data[name_start..name_start + namesize - 1])
+            .map_err(|_| pos)?
+            .to_string();
+        // The kernel aligns to 4 after the NAME, not after namesize alone.
+        pos = name_start + cpio_pad_name(namesize) + namesize;
+        names.push(name.clone());
+        if name == "TRAILER!!!" {
+            return Ok(names);
+        }
+        if pos + filesize > data.len() {
+            return Err(pos);
+        }
+        pos += filesize + cpio_pad4(filesize);
+    }
+}
+
+#[cfg(test)]
+mod cpio_tests {
+    use super::*;
+
+    #[test]
+    fn pad_name_aligns_the_110_byte_header() {
+        // 110 % 4 == 2, so padding namesize alone leaves every entry after the
+        // first misaligned by 2 bytes.
+        for namesize in 1..=64usize {
+            assert_eq!(
+                (110 + namesize + cpio_pad_name(namesize)) % 4,
+                0,
+                "namesize {} is not 4-aligned after the header",
+                namesize
+            );
+        }
+        assert_eq!(cpio_pad_name(2), 0); // "." + NUL -> 112
+        assert_eq!(cpio_pad_name(42), 0); // the hdd-mirror hook name
+    }
+
+    #[test]
+    fn archive_survives_the_kernel_unpack_rule() {
+        let entries: Vec<(String, u32, Vec<u8>)> = vec![
+            (
+                "scripts/casper-premount/zz_lsl_hdd_mirror".to_string(),
+                0o755,
+                b"#!/bin/sh\nget_backing_device\n".to_vec(),
+            ),
+            (
+                "scripts/casper-premount/ORDER".to_string(),
+                0o644,
+                b"zz_lsl_hdd_mirror\n".to_vec(),
+            ),
+            (
+                "scripts/live-premount/00lsl_liveboot_mirror".to_string(),
+                0o755,
+                b"mirror\n".to_vec(),
+            ),
+            (
+                "scripts/casper-premount/odd".to_string(),
+                0o644,
+                vec![7u8; 13], // unaligned data too
+            ),
+        ];
+        let archive = build_cpio_newc(&entries);
+        let names = kernel_unpack_names(&archive).expect("kernel would drop the archive tail");
+        assert_eq!(
+            names,
+            vec![
+                "scripts/casper-premount/zz_lsl_hdd_mirror",
+                "scripts/casper-premount/ORDER",
+                "scripts/live-premount/00lsl_liveboot_mirror",
+                "scripts/casper-premount/odd",
+                "TRAILER!!!",
+            ]
+        );
+        // And the data must round-trip byte-exactly.
+        let parsed = parse_cpio_newc(&archive).expect("parse");
+        assert_eq!(parsed.len(), entries.len());
+        for (a, b) in parsed.iter().zip(entries.iter()) {
+            assert_eq!(a.0, b.0);
+            assert_eq!(a.2, b.2);
+        }
+    }
+
+    #[test]
+    fn old_wrong_padding_is_rejected_by_the_kernel_rule() {
+        // Reproduce the shipped bug: build the first entry correctly, then
+        // mis-pad a later name by namesize alone. The kernel must refuse it.
+        let mut archive = cpio_newc_file("scripts/casper-premount/zz_lsl_hdd_mirror", b"hook", 0o755);
+        // Second entry written with the OLD (wrong) rule.
+        let mut bad = cpio_newc_header("scripts/casper-premount/ORDER", 5, 0o644);
+        bad.extend_from_slice(b"scripts/casper-premont/ORDER");
+        bad.push(0);
+        bad.extend_from_slice(&vec![0u8; cpio_pad4(29)]); // wrong: pad4(namesize)
+        bad.extend_from_slice(b"order");
+        bad.extend_from_slice(&vec![0u8; cpio_pad4(5)]);
+        archive.extend_from_slice(&bad);
+        assert!(
+            kernel_unpack_names(&archive).is_err(),
+            "the kernel must reject mis-aligned member padding"
+        );
+    }
+
+    #[test]
+    fn order_survives_injection_the_way_casper_needs_it() {
+        // The regression that shipped: without ORDER, casper never sources the
+        // ramclone hook and Boot to RAM shows no progress dialog.
+        let entries: Vec<(String, u32, Vec<u8>)> = vec![(
+            "scripts/casper-premount/9990-live-ramclone".to_string(),
+            0o755,
+            b"#!/bin/sh\n".to_vec(),
+        )];
+        let archive = build_cpio_newc(&entries);
+        let names = kernel_unpack_names(&archive).expect("kernel-unpackable");
+        assert!(names.iter().any(|n| n == "TRAILER!!!"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1386,7 +1677,6 @@ fn compress_initrd(data: &[u8], comp: InitrdCompression) -> Result<Vec<u8>, Stri
 /// Find the start of the compressed/initrd payload after any microcode cpio prefix.
 /// Returns (prefix_bytes, payload_bytes, compression).
 fn split_initrd(data: &[u8]) -> Result<(&[u8], &[u8], InitrdCompression), String> {
-    let trailer = b"TRAILER!!!";
     let mut pos = 0usize;
     // Scan for cpio trailers (microcode prefix uses plain cpio newc).
     while pos + 110 <= data.len() {
@@ -1405,7 +1695,7 @@ fn split_initrd(data: &[u8]) -> Result<(&[u8], &[u8], InitrdCompression), String
             break;
         }
         let name = std::str::from_utf8(&data[pos + 110..name_end - 1]).unwrap_or("");
-        let entry_end = name_end + cpio_pad4(namesize) + filesize + cpio_pad4(filesize);
+        let entry_end = name_end + cpio_pad_name(namesize) + filesize + cpio_pad4(filesize);
         if entry_end > data.len() {
             break;
         }

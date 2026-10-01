@@ -95,6 +95,19 @@ bash "$REPO_ROOT/tests/lsl-reclaim-win-swap.tests.sh" || echo "  (reclaim-win-sw
 echo "Checking the embedded z0 firstboot layer is fresh (WHYFAIL10)..."
 bash "$REPO_ROOT/misc/check-z0-freshness.sh" "$REPO_ROOT"
 
+# rust9x/lslsetup embeds 36 repo files with include_str! into FIRSTBOOT_TOOLKIT
+# (bin/lsl-pin-favorites, config.sh, uproot, onboot.sh, systemd units, ...) and
+# the nofmt installer writes the stick's /cdrom from that array ALONE. A
+# committed/prebuilt lslsetup.exe keeps whatever those files held when it was
+# COMPILED, so a fix in bin/ can sit unshipped indefinitely - on 2026-10-01
+# every shipped exe still embedded the broken pin script (it split gsettings
+# arrays on newlines, dropping every pinned app from the panel) while the fix
+# was already in bin/. build.rs re-hashes the sources against
+# assets/toolkit_sources.sha256 at build time; verify the manifest covers the
+# working tree here too, so a stale toolkit fails the bundle build and CI.
+echo "Checking the embedded firstboot toolkit is fresh (WHYFAIL13 follow-up)..."
+bash "$REPO_ROOT/misc/check-toolkit-freshness.sh" "$REPO_ROOT"
+
 # --- 1) minimal first-boot layer -------------------------------------------
 LAYER="$STAGE/layer"
 mkdir -p "$LAYER/usr/local/sbin" "$LAYER/usr/local/bin" \

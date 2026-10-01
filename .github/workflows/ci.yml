@@ -50,6 +50,16 @@ jobs:
         # byte-accurate gate (same check build.sh runs before packaging).
         run: bash misc/check-z0-freshness.sh "$PWD"
 
+      - name: Verify the embedded firstboot toolkit matches bin/ (WHYFAIL13 follow-up)
+        # src/lslfiles.rs include_str!s 36 repo files into FIRSTBOOT_TOOLKIT and
+        # the nofmt installer writes the stick's /cdrom from that array alone. A
+        # committed/prebuilt exe keeps whatever those files held when it was
+        # COMPILED, so a fix in bin/ can sit unshipped - on 2026-10-01 every
+        # shipped lslsetup.exe still embedded the broken bin/lsl-pin-favorites.
+        # build.rs enforces assets/toolkit_sources.sha256; this is the same gate
+        # build.sh runs before packaging (no external tools required).
+        run: bash misc/check-toolkit-freshness.sh "$PWD"
+
   bats:
     name: Bash tests (bats)
     runs-on: ubuntu-latest
