@@ -75,6 +75,25 @@ append_unique() {
     printf '%s\n' "$@" "$item"
 }
 
+# Parse `gsettings get` output for a string-array ("as") key into one item per
+# line. `gsettings get` prints ['a.desktop', 'b.desktop'] on a SINGLE line, so
+# the old parser (strip [], quotes and commas, then read newline-delimited)
+# collapsed the whole existing list into one bogus token: the array became
+# ['a.desktop b.desktop', ...] and every pre-existing favorite disappeared from
+# the panel. Split on commas instead.
+parse_gsettings_array() {
+    local raw="$1"
+    raw="${raw#[}"; raw="${raw%]}"
+    raw="${raw//\'/}"
+    local tok
+    local IFS=','
+    for tok in $raw; do
+        tok="${tok#"${tok%%[![:space:]]*}"}"
+        tok="${tok%"${tok##*[![:space:]]}"}"
+        [ -n "$tok" ] && printf '%s\n' "$tok"
+    done
+}
+
 want=()
 term="$(choose_terminal_desktop_id 2>/dev/null || true)"
 brave="$(choose_brave_desktop_id 2>/dev/null || true)"
@@ -82,19 +101,28 @@ brave="$(choose_brave_desktop_id 2>/dev/null || true)"
 [ -n "${brave:-}" ] && want+=("$brave")
 [ "${#want[@]}" -gt 0 ] || exit 0
 
-# Read current favorites as plain lines (strip brackets/quotes/commas).
+# Read current favorites, one per line.
 cur_raw="$(gsettings get org.cinnamon favorite-apps 2>/dev/null || true)"
-cur_raw="${cur_raw#[}"
-cur_raw="${cur_raw%]}"
-cur_raw="${cur_raw//\'/}"
-cur_raw="${cur_raw//,/}"
 
 cur=()
 while IFS= read -r tok; do
-    tok="${tok#"${tok%%[![:space:]]*}"}"
-    tok="${tok%"${tok##*[![:space:]]}"}"
     [ -n "$tok" ] && cur+=("$tok")
-done <<<"$cur_raw"
+done < <(parse_gsettings_array "$cur_raw")
+
+# Self-heal a value corrupted by an earlier version of this script: it wrote
+# space-joined multiples back as one quoted element. Any element containing a
+# space cannot be a desktop-file id, so split those on spaces.
+healed=()
+for tok in "${cur[@]}"; do
+    if [[ "$tok" == *" "* ]]; then
+        for sub in $tok; do
+            [ -n "$sub" ] && healed+=("$sub")
+        done
+    else
+        healed+=("$tok")
+    fi
+done
+[ "${#healed[@]}" -eq 0 ] || cur=("${healed[@]}")
 
 for app in "${want[@]}"; do
     mapfile -t cur < <(append_unique "$app" "${cur[@]}")

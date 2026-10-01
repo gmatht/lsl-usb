@@ -116,6 +116,41 @@ teardown() {
     [[ "$output" == *"not look like a live session"* ]]
 }
 
+# --- lsl-toram: --progress protocol (the zenity "PCT # text" feed) ---
+@test "lsl-toram: rejects an unknown option" {
+    run bash bin/lsl-toram.sh --bogus
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"Unknown option"* ]]
+}
+
+@test "lsl-toram: --progress emits the protocol and closes at 100" {
+    mkdir -p "$TMPDIR_TEST/bin" "$TMPDIR_TEST/run"
+    printf '#!/bin/bash\necho 0\n' > "$TMPDIR_TEST/bin/id"
+    chmod +x "$TMPDIR_TEST/bin/id"
+    # Rewrite /run paths to the temp dir (as the in-flight-write test does), then
+    # take the already-running early exit - the only path reachable off a live
+    # root, but it exercises arg parsing, say()/progress() and the 100 close.
+    sed "s#/run/#$TMPDIR_TEST/run/#g" bin/lsl-toram.sh > "$TMPDIR_TEST/toram.sh"
+    chmod +x "$TMPDIR_TEST/toram.sh"
+    : > "$TMPDIR_TEST/run/lsl-toram.done"
+    run env PATH="$TMPDIR_TEST/bin:$PATH" bash "$TMPDIR_TEST/toram.sh" --progress
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"100 #"* ]]
+}
+
+@test "lsl-toram: without --progress keeps the human output (no protocol)" {
+    mkdir -p "$TMPDIR_TEST/bin" "$TMPDIR_TEST/run"
+    printf '#!/bin/bash\necho 0\n' > "$TMPDIR_TEST/bin/id"
+    chmod +x "$TMPDIR_TEST/bin/id"
+    sed "s#/run/#$TMPDIR_TEST/run/#g" bin/lsl-toram.sh > "$TMPDIR_TEST/toram.sh"
+    chmod +x "$TMPDIR_TEST/toram.sh"
+    : > "$TMPDIR_TEST/run/lsl-toram.done"
+    run env PATH="$TMPDIR_TEST/bin:$PATH" bash "$TMPDIR_TEST/toram.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"already running from RAM"* ]]
+    [[ "$output" != *"100 #"* ]]
+}
+
 # --- lsl-flatpak-fat: usage + guard ---
 @test "lsl-flatpak-fat: usage without args" {
     run bash bin/lsl-flatpak-fat.sh
@@ -165,14 +200,61 @@ teardown() {
     bash -n bin/lsl-shutdown-gui
 }
 
+@test "lsl-shutdown-gui: toram case arm matches the label zenity returns" {
+    # zenity --radiolist returns the option TEXT, not its index, so the case
+    # arm must match the whole label including "(persistence to USB stops)".
+    # The old bare "Load to RAM + remove USB" pattern fell through to the
+    # catch-all `*) exit 0`: selecting the option did nothing at all.
+    grep -qF '"Load to RAM + remove USB"*|"7")' bin/lsl-shutdown-gui
+}
+
+@test "lsl-shutdown-gui: Load to RAM runs toram --progress and reports success" {
+    mkdir -p "$TMPDIR_TEST/bin"
+    # zenity mock: the radiolist returns the toram label; --progress drains
+    # the feeder; --info/--error are recorded so we can assert the notice.
+    cat > "$TMPDIR_TEST/bin/zenity" <<'EOF'
+#!/bin/bash
+for a in "$@"; do
+    case "$a" in
+        --list) echo "Load to RAM + remove USB (persistence to USB stops)"; exit 0 ;;
+        --progress) cat >/dev/null; exit 0 ;;
+        --info) echo "INFO $*" >> "$ZENITY_LOG"; exit 0 ;;
+        --error) echo "ERROR $*" >> "$ZENITY_LOG"; exit 0 ;;
+    esac
+done
+exit 0
+EOF
+    chmod +x "$TMPDIR_TEST/bin/zenity"
+    # pkexec mock: run the target directly (the run_privileged ladder).
+    printf '#!/bin/bash\nexec "$@"\n' > "$TMPDIR_TEST/bin/pkexec"
+    chmod +x "$TMPDIR_TEST/bin/pkexec"
+    # toram mock: record its argv and speak the progress protocol.
+    cat > "$TMPDIR_TEST/toram" <<'EOF'
+#!/bin/bash
+echo "toram $*" >> "$TORAM_LOG"
+echo "42 # half"
+echo "100 # done"
+EOF
+    chmod +x "$TMPDIR_TEST/toram"
+    export TORAM_LOG="$TMPDIR_TEST/toram.log" ZENITY_LOG="$TMPDIR_TEST/zenity.log"
+    : > "$TORAM_LOG"
+    : > "$ZENITY_LOG"
+    run env PATH="$TMPDIR_TEST/bin:$PATH" LSL_TORAM_BIN="$TMPDIR_TEST/toram" \
+        bash bin/lsl-shutdown-gui
+    [ "$status" -eq 0 ]
+    grep -q 'toram --progress' "$TORAM_LOG"
+    grep -q 'Session is now running from RAM' "$ZENITY_LOG"
+}
+
 @test "shutdown chain: sibling scripts resolve from the nofmt toolkit" {
     # lsl-shutdown-gui resolves uphome via PATH or /cdrom/bin/uphome; uphome
     # execs lsl-flush-home.sh (USB) and sources lsl-common.sh, and calls
-    # persist-wifi.sh. The nofmt installer writes /cdrom/bin from
+    # persist-wifi.sh. The "Load to RAM + remove USB" option execs
+    # /cdrom/bin/lsl-toram.sh. The nofmt installer writes /cdrom/bin from
     # FIRSTBOOT_TOOLKIT only - anything referenced but not embedded fails
     # at shutdown with "Could not find 'uphome'". Every name must exist
     # in repo bin/ AND be embedded in the toolkit array.
-    for name in uphome lsl-flush-home.sh lsl-common.sh persist-wifi.sh; do
+    for name in uphome lsl-flush-home.sh lsl-common.sh persist-wifi.sh lsl-toram.sh; do
         [ -f "bin/$name" ]
         grep -qF "bin\\\\$name" rust9x/lslsetup/src/lslfiles.rs
     done
@@ -554,24 +636,23 @@ EOF
     [[ "$output" == *"root"* ]]   # proceeds to the root check
 }
 
-@test "uproot: append extends the newest layer chain and repoints boot refs" {
-    # casper stacks layers by stripping dot-suffixes UPWARD from the layer
-    # named on the kernel cmdline (layerfs-path). A sibling name like
-    # filesystem.z0.<new-ts> is NEVER stacked (the Sep 16-21 layers sat
-    # inert for exactly this reason): the new layer must EXTEND the current
-    # newest name, and menu.lst / grub.cfg must point at it.
+@test "uproot: append writes a flat filesystem_z<ts> layer that sorts above all of them" {
+    # casper globs *.squashfs and stacks the matches lexically, so an append
+    # only has to sort above everything already on the stick - no chain to
+    # extend and no boot config to rewrite. This is the invariant that the old
+    # dot-chain naming broke: five appends sat inert because no config named
+    # them (see WHYFAIL14).
     CD="$TMPDIR_TEST/cdrom"
     mkdir -p "$CD/casper" "$CD/EFI/BOOT"
-    touch "$CD/casper/filesystem.squashfs" "$CD/casper/filesystem.z0.squashfs" \
-          "$CD/casper/filesystem.z0.20260921085616.squashfs"
-    printf 'kernel /vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs quiet\n' > "$CD/menu.lst"
-    printf 'linux /vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs quiet\n' > "$CD/EFI/BOOT/grub.cfg"
+    touch "$CD/casper/filesystem.squashfs" "$CD/casper/filesystem_z0_firstboot.squashfs" \
+          "$CD/casper/filesystem_z20260921085616.squashfs"
+    printf 'kernel /vmlinuz boot=casper rootdelay=15 quiet\n' > "$CD/menu.lst"
     cp bin/uproot "$TMPDIR_TEST/uproot.sh"
     sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/uproot.sh"
     eval "$(sed -n '/^write_append_layer()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
     eval "$(sed -n '/^repoint_layerfs_refs()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
     eval "$(sed -n '/^prune_superseded_layers()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
-    eval "$(sed -n '/^active_layer_path()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    eval "$(sed -n '/^latest_append_layer()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
     mkdir -p /tmp/squashfs/upper
     mksquashfs() { echo "$*" >> "$TMPDIR_TEST/mk.log"; }
     lsl_ensure_cdrom_space() { return 0; }
@@ -579,41 +660,81 @@ EOF
     log() { :; }
     upper_bytes=123
     write_append_layer
-    # the new layer EXTENDS the newest existing name
-    grep -qE "caser/filesystem\.z0\.20260921085616\.[0-9]+\.squashfs|casper/filesystem\.z0\.20260921085616\.[0-9]+\.squashfs" "$TMPDIR_TEST/mk.log"
-    # and the boot configs now stack it
-    new="$(sed -n 's/.*layerfs-path=\([^ ]*\).*/\1/p' "$CD/menu.lst")"
-    [[ "$new" == *casper/filesystem.z0.20260921085616.*.squashfs ]]
-    new2="$(sed -n 's/.*layerfs-path=\([^ ]*\).*/\1/p' "$CD/EFI/BOOT/grub.cfg")"
-    [[ "$new2" == *casper/filesystem.z0.20260921085616.*.squashfs ]]
-    [ "$new" = "$new2" ]
+    # a flat filesystem_z<14 digits>.squashfs - no dotted stem, no inheritance
+    grep -qE "casper/filesystem_z[0-9]{14}\.squashfs" "$TMPDIR_TEST/mk.log"
+    # and it must sort ABOVE the base, the stub and every existing append
+    new="$(sed -n 's|.*/casper/\(filesystem_z[0-9]*\.squashfs\).*|\1|p' "$TMPDIR_TEST/mk.log" | head -n1)"
+    [[ "$new" > "filesystem.squashfs" ]]
+    [[ "$new" > "filesystem_z0_firstboot.squashfs" ]]
+    [[ "$new" > "filesystem_z20260921085616.squashfs" ]]
 }
 
-@test "uproot: append starts a fresh chain when no dotted layer exists" {
+@test "uproot: append reaps superseded appends but keeps base and stub" {
+    # mksquashfs is stubbed, so it records the call without creating the file;
+    # write_append_layer's fail-safe then removes it. That means the layer the
+    # prune is handed does not exist on disk, and the fail-safe refuses to act
+    # (covered separately below). To exercise the reaping itself, drive
+    # prune_superseded_layers directly with a keeper that really is newest.
     CD="$TMPDIR_TEST/cdrom"
-    mkdir -p "$CD/casper" "$CD/EFI/BOOT"
-    touch "$CD/casper/filesystem.squashfs" "$CD/casper/filesystem.z0.squashfs"
-    printf 'kernel /vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs quiet\n' > "$CD/menu.lst"
+    mkdir -p "$CD/casper"
+    touch "$CD/casper/filesystem.squashfs" "$CD/casper/filesystem_z0_firstboot.squashfs" \
+          "$CD/casper/filesystem_z20260916164712.squashfs" \
+          "$CD/casper/filesystem_z20260919045856.squashfs" \
+          "$CD/casper/filesystem_z20260930120000.squashfs"
     cp bin/uproot "$TMPDIR_TEST/uproot.sh"
     sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/uproot.sh"
     eval "$(sed -n '/^write_append_layer()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
     eval "$(sed -n '/^repoint_layerfs_refs()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
     eval "$(sed -n '/^prune_superseded_layers()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
-    eval "$(sed -n '/^active_layer_path()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
-    mkdir -p /tmp/squashfs/upper
-    mksquashfs() { echo "$*" >> "$TMPDIR_TEST/mk.log"; }
-    lsl_ensure_cdrom_space() { return 0; }
-    lsl_cdrom_is_vfat() { return 1; }
+    eval "$(sed -n '/^latest_append_layer()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
     log() { :; }
-    upper_bytes=123
-    write_append_layer
-    grep -qE "casper/filesystem\.z0\.[0-9]+\.squashfs" "$TMPDIR_TEST/mk.log"
-    new="$(sed -n 's/.*layerfs-path=\([^ ]*\).*/\1/p' "$CD/menu.lst")"
-    [[ "$new" == *casper/filesystem.z0.*.squashfs ]]
-    [[ "$new" != *z0.squashfs ]]   # repointed, not left at the stub z0
+    STICK_DIR="$CD" prune_superseded_layers "$CD/casper/filesystem_z20260930120000.squashfs"
+    # base and stub survive (the stub carries lsl-firstboot.service)
+    [ -f "$CD/casper/filesystem.squashfs" ]
+    [ -f "$CD/casper/filesystem_z0_firstboot.squashfs" ]
+    # the two older appends are reaped, the newest survives
+    [ ! -f "$CD/casper/filesystem_z20260916164712.squashfs" ]
+    [ ! -f "$CD/casper/filesystem_z20260919045856.squashfs" ]
+    [ -f "$CD/casper/filesystem_z20260930120000.squashfs" ]
 }
 
-@test "uproot: repoint_layerfs_refs updates every boot config location" {
+@test "uproot: prune skips when the freshly written layer is absent" {
+    # Fail-safe: if the new layer is not on disk, nothing defines "newest", so
+    # the prune must not delete anything at all.
+    CD="$TMPDIR_TEST/cdrom"
+    mkdir -p "$CD/casper"
+    touch "$CD/casper/filesystem.squashfs" "$CD/casper/filesystem_z0_firstboot.squashfs" \
+          "$CD/casper/filesystem_z20260916164712.squashfs"
+    cp bin/uproot "$TMPDIR_TEST/uproot.sh"
+    sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/uproot.sh"
+    eval "$(sed -n '/^prune_superseded_layers()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    eval "$(sed -n '/^latest_append_layer()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    log() { :; }
+    # a keeper that does not exist on disk
+    run prune_superseded_layers "$CD/casper/filesystem_z20991231235959.squashfs"
+    [ -f "$CD/casper/filesystem_z20260916164712.squashfs" ]
+}
+
+@test "uproot: prune refuses to act without a resolvable appended layer" {
+    # Fail-safe: a prune that cannot name what to keep must delete nothing.
+    CD="$TMPDIR_TEST/cdrom"
+    mkdir -p "$CD/casper"
+    touch "$CD/casper/filesystem.squashfs" "$CD/casper/filesystem_z0_firstboot.squashfs" \
+          "$CD/casper/filesystem_z20260916164712.squashfs"
+    cp bin/uproot "$TMPDIR_TEST/uproot.sh"
+    sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/uproot.sh"
+    eval "$(sed -n '/^prune_superseded_layers()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    eval "$(sed -n '/^latest_append_layer()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
+    log() { :; }
+    # a keeper that is not an append (e.g. the base) must be rejected outright
+    run prune_superseded_layers "$CD/casper/filesystem.squashfs"
+    [ -f "$CD/casper/filesystem_z20260916164712.squashfs" ]
+}
+
+@test "uproot: repoint_layerfs_refs strips a stale layerfs-path from every boot config" {
+    # A stick written by an older installer still carries layerfs-path=, which
+    # would now name a file that no longer exists - casper panics with "File
+    # system layers are missing". So the shim's remaining job is to REMOVE it.
     CD="$TMPDIR_TEST/cdrom"
     mkdir -p "$CD/EFI/BOOT" "$CD/efi/grub"
     printf 'kernel /vmlinuz boot=casper layerfs-path=/cdrom/casper/filesystem.z0.squashfs quiet\n' > "$CD/menu.lst"
@@ -623,14 +744,12 @@ EOF
     sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/uproot.sh"
     eval "$(sed -n '/^repoint_layerfs_refs()/,/^}/p' "$TMPDIR_TEST/uproot.sh")"
     log() { :; }
-    repoint_layerfs_refs "$CD/casper/filesystem.z0.20991231235959.20991231235959.squashfs"
+    repoint_layerfs_refs "$CD/casper/filesystem_z20260930120000.squashfs"
     for f in "$CD/menu.lst" "$CD/EFI/BOOT/grub.cfg" "$CD/efi/grub/menu.lst"; do
-        grep -q "layerfs-path=$CD/casper/filesystem.z0.20991231235959.20991231235959.squashfs" "$f"
+        ! grep -q "layerfs-path=" "$f"
+        # the rest of the kernel line must survive the strip
+        grep -q "boot=casper" "$f"
     done
-    # a location that does not exist is skipped, not an error
-    repoint_layerfs_refs "$CD/casper/filesystem.z0.squashfs"
-    grep -q "layerfs-path=$CD/casper/filesystem.z0.squashfs " "$CD/menu.lst" ||
-        grep -q "layerfs-path=$CD/casper/filesystem.z0.squashfs$" "$CD/menu.lst"
 }
 
 # --- build.sh: produces the bundle ---
@@ -1297,6 +1416,19 @@ EOF
     [[ "$output" == *"a"* ]]
 }
 
+@test "lsl-pin-favorites: parse_gsettings_array splits on commas, not newlines" {
+    eval "$(sed -n '/^parse_gsettings_array()/,/^}/p' bin/lsl-pin-favorites)"
+    # gsettings get prints the whole "as" array on a single line.
+    run parse_gsettings_array "['org.gnome.Calculator.desktop', 'org.x.editor.desktop', 'kitty.desktop']"
+    [ "$status" -eq 0 ]
+    [ "${#lines[@]}" -eq 3 ]
+    [ "${lines[0]}" = "org.gnome.Calculator.desktop" ]
+    [ "${lines[1]}" = "org.x.editor.desktop" ]
+    [ "${lines[2]}" = "kitty.desktop" ]
+    run parse_gsettings_array "[]"
+    [ "${#lines[@]}" -eq 0 ]
+}
+
 # --- bin/add-steam-libraries -------------------------------------------------
 @test "add-steam-libraries: adds a library to libraryfolders.vdf" {
     # Brace-aware extraction (tests/extract_fn.py): the function contains a
@@ -1585,18 +1717,57 @@ EOF
     rm -rf "$T"
 }
 
-@test "lsl-copy-sfs-hdd: copies layers to HDD and reports status" {
+@test "lsl-copy-sfs-hdd: merges layers into one self-contained layer" {
+    # The mirror is a SINGLE self-contained squashfs now, because casper's
+    # LAYERFS_PATH walk on a dot-free name resolves to exactly that one file -
+    # it cannot stack a chain that no longer exists (see WHYFAIL14).
     T="$(mktemp -d)"
-    USBDIR="$T/usb"; HDD="$T/hdd"; mkdir -p "$USBDIR/casper" "$HDD"
-    echo data > "$USBDIR/casper/filesystem.squashfs"
-    echo home > "$USBDIR/home.sfs"
+    USBDIR="$T/usb"; HDD="$T/hdd"; mkdir -p "$USBDIR/casper"
     printf 'LSL_DATA_DIR=/mnt/c/Users/lsl-usb\n' > "$USBDIR/lsl-usb.env"
+    # Real squashfs layers: a base rootfs, the firstboot stub, and an append.
+    # build_layer <srcdir> <marker> <out.squashfs> [extra-file ...]
+    build_layer() {
+        local d marker out extra
+        d="$1"; marker="$2"; out="$3"; shift 3
+        rm -rf "$d"; mkdir -p "$d/sbin" "$d/etc"
+        echo "#!/bin/sh" > "$d/sbin/init"; chmod +x "$d/sbin/init"
+        echo "$marker" > "$d/etc/marker"
+        for extra in "$@"; do echo "$extra" > "$d/etc/$extra"; done
+        mksquashfs "$d" "$out" -comp zstd >/dev/null 2>&1
+        rm -rf "$d"
+    }
+    build_layer "$T/l1" base "$T/usb/casper/filesystem.squashfs"
+    build_layer "$T/l2" stub "$T/usb/casper/filesystem_z0_firstboot.squashfs"
+    build_layer "$T/l3" appended "$T/usb/casper/filesystem_z20260930120000.squashfs" newfile
     run env LSL_CDROM="$USBDIR" LSL_DATA_DIR="$HDD" bash bin/lsl-copy-sfs-hdd.sh --yes
     [ "$status" -eq 0 ]
-    [ -f "$HDD/sfs/filesystem.squashfs" ]
-    [ -f "$HDD/sfs/home.sfs" ]
+    # exactly one layer is published, and it is the merged one
+    [ -f "$HDD/sfs/filesystem_zmerged.squashfs" ]
+    [ ! -f "$HDD/sfs/filesystem.squashfs" ]
+    # it carries content from EVERY layer, newest winning
+    run bash -c "unsquashfs -cat '$HDD/sfs/filesystem_zmerged.squashfs' etc/marker"
+    [ "$output" = "appended" ]
+    run bash -c "unsquashfs -cat '$HDD/sfs/filesystem_zmerged.squashfs' etc/newfile"; [ "$output" = "newfile" ]
+    # and it is a real rootfs (no /sbin/init would drop the boot to initramfs)
+    run bash -c "unsquashfs -cat '$HDD/sfs/filesystem_zmerged.squashfs' sbin/init"
+    [[ "$output" == *"#!/bin/sh"* ]]
+    # --status reports the merged layer, not per-layer copies
     run env LSL_CDROM="$USBDIR" LSL_DATA_DIR="$HDD" bash bin/lsl-copy-sfs-hdd.sh --status
-    [[ "$output" == *"OK (5 B, current)"* ]]
+    [[ "$output" == *"filesystem_zmerged.squashfs: present"* ]]
+    rm -rf "$T"
+}
+
+@test "lsl-copy-sfs-hdd: refuses to publish a layer with no /sbin/init" {
+    # A merged tree without an init would brick the mirror boot silently, so
+    # the builder must refuse rather than publish it.
+    T="$(mktemp -d)"
+    USBDIR="$T/usb"; HDD="$T/hdd"; mkdir -p "$USBDIR/casper" "$T/l1"
+    printf 'LSL_DATA_DIR=/mnt/c/Users/lsl-usb\n' > "$USBDIR/lsl-usb.env"
+    echo "not a rootfs" > "$T/l1/file"
+    mksquashfs "$T/l1" "$USBDIR/casper/filesystem.squashfs" -comp zstd >/dev/null 2>&1
+    run env LSL_CDROM="$USBDIR" LSL_DATA_DIR="$HDD" bash bin/lsl-copy-sfs-hdd.sh --yes
+    [ "$status" -ne 0 ]
+    [ ! -f "$HDD/sfs/filesystem_zmerged.squashfs" ]
     rm -rf "$T"
 }
 
@@ -1682,6 +1853,15 @@ EOF
     sh -n initramfs/live-ramclone
 }
 
+@test "live-ramclone: no sourced-shell-killing '&& return || exit' guard" {
+    # run_scripts SOURCES this hook so its get_backing_device override reaches
+    # casper. `[ cond ] && return 0 || exit 0` would exit casper's shell whenever
+    # cond is FALSE, so every early-out must be an `if ...; then return ...; fi`.
+    # (Comment lines are excluded: the fix's own NOTE quotes the bad idiom.)
+    ! grep -vE '^[[:space:]]*#' initramfs/live-ramclone |
+        grep -qE '&&[[:space:]]*return 0.*\|\|[[:space:]]*exit 0'
+}
+
 @test "lsl-ramclone-progress: no-op when ramclone is not on the cmdline" {
     printf 'BOOT_IMAGE=/vmlinuz quiet splash\n' > "$TMPDIR_TEST/cmdline"
     run env LSL_CMDLINE_FILE="$TMPDIR_TEST/cmdline" LSL_RAMCLONE_DIR="$TMPDIR_TEST/ramclone" \
@@ -1705,3 +1885,146 @@ EOF
     grep -q '"--ramclone"' misc/lsl-progress-gtk.py
 }
 
+
+# --- misc/lsl-firstboot.sh: fine-grained `packages` progress -----------------
+# Regression for the "Install packages stuck at 44%" report (2026-09-30): the
+# monitor used to fold the single LSL_STEP n/m marker straight into pct, so the
+# whole ~470-package apt run showed one frozen value (step 4/9 -> 44). The
+# monitor now derives pct for the `packages` task from apt's own stdout.
+#
+# Harness: extract the real monitor, stub the task_* status writers so we can
+# capture the published pct/detail stream, and feed a synthetic log (tail is
+# stubbed to dump the file, since the real one uses --pid/-F on a live log).
+run_monitor() {
+    local logfile="$1"
+    LOG="$logfile" bash -c '
+        set -uo pipefail
+        LSL_TASK="packages"
+        task_begin()    { LSL_TASK="$1"; printf "BEGIN|%s|%s\n" "$LSL_TASK" "${2:-}"; }
+        task_progress() { printf "PROG|%s|%s\n" "$1" "${2:-}"; }
+        task_done()     { printf "DONE|%s\n" "$1"; }
+        tail() { cat "$LOG"; }
+        eval "$(python3 tests/extract_fn.py misc/lsl-firstboot.sh monitor_uproot_progress)"
+        monitor_uproot_progress 0
+    '
+}
+
+@test "firstboot monitor: packages pct follows apt output, not one frozen step value" {
+    cat > "$TMPDIR_TEST/apt.log" <<'EOF'
+LSL_STEP 4/9 base packages (amd64)
+Need to get 100 MB of archives.
+Get:1 http://x a [1 MB]
+Get:2 http://x b [1 MB]
+Get:3 http://x c [1 MB]
+Get:4 http://x d [1 MB]
+Unpacking a
+Setting up a
+Unpacking b
+Setting up b
+Unpacking c
+Setting up c
+Unpacking d
+Setting up d
+EOF
+    run run_monitor "$TMPDIR_TEST/apt.log"
+    [ "$status" -eq 0 ]
+    # The download phase must produce SEVERAL distinct pct values (the old code
+    # emitted exactly one, 44, for the entire step).
+    local n
+    n="$(printf '%s\n' "$output" | grep '^PROG|' | cut -d'|' -f2 | sort -u | wc -l)"
+    [ "$n" -ge 4 ]
+    # ...and it must sweep well past 44 during the downloads.
+    printf '%s\n' "$output" | grep -q '^PROG|60|'
+}
+
+@test "firstboot monitor: published pct never moves backwards" {
+    cat > "$TMPDIR_TEST/mono.log" <<'EOF'
+LSL_STEP 4/9 base packages (amd64)
+Need to get 10 MB of archives.
+Get:1 http://x a [1 MB]
+Get:2 http://x b [1 MB]
+Unpacking a
+Setting up a
+Unpacking b
+Setting up b
+LSL_STEP 5/9 snap support
+LSL_STEP 6/9 web browser
+LSL_STEP 9/9 CLI tools
+LSL_TASK layer
+Writing new layer squashfs: /cdrom/casper/filesystem_z20260101000000.squashfs
+[=/    ]  5000/10000  50%
+[====/] 10000/10000 100%
+EOF
+    run run_monitor "$TMPDIR_TEST/mono.log"
+    [ "$status" -eq 0 ]
+    python3 - "$output" <<'PY'
+import sys
+vals = [int(l.split("|")[1]) for l in sys.argv[1].splitlines() if l.startswith("PROG|")]
+assert vals, "no progress emitted"
+for a, b in zip(vals, vals[1:]):
+    assert b >= a, "pct went backwards: %d -> %d" % (a, b)
+PY
+}
+
+@test "firstboot monitor: hands off to layer packing and tracks mksquashfs" {
+    cat > "$TMPDIR_TEST/layer.log" <<'EOF'
+LSL_STEP 4/9 base packages (amd64)
+Need to get 1 MB of archives.
+Get:1 http://x a [1 MB]
+Unpacking a
+Setting up a
+LSL_TASK layer
+Writing new layer squashfs: /cdrom/casper/filesystem_z20260101000000.squashfs
+[=/] 2500/10000 25%
+[==/] 7500/10000 75%
+EOF
+    run run_monitor "$TMPDIR_TEST/layer.log"
+    [ "$status" -eq 0 ]
+    printf '%s\n' "$output" | grep -q '^DONE|packages$'
+    printf '%s\n' "$output" | grep -q '^BEGIN|layer|'
+    printf '%s\n' "$output" | grep -q '^PROG|75|'
+}
+
+@test "firstboot monitor: malformed apt lines do not abort or divide by zero" {
+    cat > "$TMPDIR_TEST/bad.log" <<'EOF'
+LSL_STEP
+LSL_STEP x/y label
+Need to get  MB of archives.
+Get:abc
+Unpacking
+Setting up
+LSL_STEP 4/9
+Need to get 2 MB of archives.
+Get:1 a b [1]
+Setting up z
+EOF
+    run run_monitor "$TMPDIR_TEST/bad.log"
+    [ "$status" -eq 0 ]
+    printf '%s\n' "$output" | grep -q '^PROG|'
+}
+
+@test "firstboot monitor: syntax" {
+    bash -n misc/lsl-firstboot.sh
+}
+
+@test "firstboot monitor: detail shows n/m package counts from apt's plan line" {
+    # apt announces "N upgraded, M newly installed"; the detail text must show
+    # that count rather than the MB figure from "Need to get" (which is a size).
+    cat > "$TMPDIR_TEST/count.log" <<'EOF'
+LSL_STEP 4/9 base packages (amd64)
+155 upgraded, 312 newly installed, 0 to remove and 419 not upgraded.
+Need to get 346 MB of archives.
+Get:1 http://x a [1 MB]
+Get:2 http://x b [1 MB]
+Unpacking a
+Setting up a
+Unpacking b
+Setting up b
+EOF
+    run run_monitor "$TMPDIR_TEST/count.log"
+    [ "$status" -eq 0 ]
+    # 155 + 312 = 467: the download line must be labelled /467, never /346.
+    printf '%s\n' "$output" | grep -q 'Downloading packages (1/467)'
+    printf '%s\n' "$output" | grep -q 'Installing packages (1/467)'
+    ! printf '%s\n' "$output" | grep -q '/346'
+}
