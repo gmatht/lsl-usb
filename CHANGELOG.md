@@ -24,6 +24,17 @@ install completed.
   silently and kitty ran unconfigured; `misc\kitty.conf` is now embedded and
   `misc` is copied in the bundle path too, with a regression test.
 
+- **The panel lost every pinned app, kitty included.** `bin/lsl-pin-favorites`
+  stripped `[]`/quotes/commas from `gsettings get org.cinnamon favorite-apps`
+  and then read the result line-wise. `gsettings` prints an `as` array on a
+  **single line**, so the whole existing favorites list became one token:
+  `['Calculator Calendar xed ...', 'kitty.desktop', 'brave-browser.desktop']`.
+  `XApp.Favorites` cannot resolve that element and Cinnamon drops it silently,
+  so Calculator/Calendar/xed/mintinstall/cinnamon-settings/terminal all vanished
+  along with the kitty pin - and every re-run re-read and preserved the damage.
+  A new `parse_gsettings_array()` splits on commas, and a self-heal splits
+  space-joined elements so sticks already carrying the corruption repair
+  themselves. Regression test added. See `WHYFAIL17.md`.
 - **A Mint stick booted as `ubuntu`.** casper's built-in live identity is
   `USERNAME="ubuntu"` / `HOST="ubuntu"` (`/etc/casper.conf`), and Linux Mint only
   boots as `mint` because *its own GRUB* passes `username=mint hostname=mint`
@@ -48,10 +59,22 @@ install completed.
   profile with a cleartext PSK, `hostname`, `lightdm.conf`, `machine-id`). Harmless
   today because that upper is RAM; becomes live the moment persistence is added,
   and applies to every persistent live USB, not just this one.
+- `rust9x/lslsetup/WHYFAIL15.md` — the fix was in `bin/`, but every shipped
+  `lslsetup.exe` embedded the old copy: the firstboot toolkit is embedded with
+  `include_str!`, and a committed/prebuilt exe keeps the bytes it was compiled
+  with. `assets/toolkit_sources.sha256` (written by
+  `misc/build-toolkit-manifest.sh`) now pins all 36 embedded sources; `build.rs`
+  fails the build on drift, `misc/check-toolkit-freshness.sh` is the by-hand/CI
+  gate (also asserting the manifest covers every embedded source), and `build.sh`
+  and CI run it next to the z0 check. Same guard shape as `WHYFAIL10`.
 - `WHYFAIL16.md` — every build trace is blank: the version is read from a file the
   nofmt path never puts on the stick, and `unwrap_or_default()` hides the failure.
   So a stick cannot report its own build, which is what `lsl-diag.sh` exists to
   ask.
+- `WHYFAIL17.md` — the panel lost every pinned app because
+  `bin/lsl-pin-favorites` parsed `gsettings get` output line-wise; an `as` array
+  arrives on one line, so the whole favorites list collapsed into one
+  unresolvable entry. Companion to `WHYFAIL15`.
 - `FINDINGS-COMPRESSION.md` — the six `mksquashfs` call sites, why
   `-Xcompression-level 22` is outside the documented range, and what level 9 vs 19
   actually buys on real layer content (~6 %, for a large time cost).
@@ -59,8 +82,8 @@ install completed.
   `DESIGN-BOOT-TO-RAM-VARIANTS.md` — design notes for persistence on F2FS, the
   wizard page that would drive it, and every block-layer option for Boot-to-RAM
   (with what was **measured** marked apart from what was merely read).
-- `rust9x/lslsetup/WHYFAIL13/14/16.md`, `WHYFAIL9/11.md`, `FRAGILE_HOME.md` —
-  previously untracked post-mortems now committed.
+- `rust9x/lslsetup/WHYFAIL13/14/16.md`, `WHYFAIL9/11.md`, `WHYFAIL15.md`,
+  `WHYFAIL17.md`, `FRAGILE_HOME.md` — post-mortems committed.
 
 ### Changed
 
@@ -68,7 +91,7 @@ install completed.
 
 ### Notes
 
-- **The repository has two WHYFAIL series**: `WHYFAIL5/6/7/9/11/12` at the root and
+- **The repository has two WHYFAIL series**: `WHYFAIL5/6/7/9/11/12/17` at the root and
   `WHYFAIL13/14/15/16` under `rust9x/lslsetup/`. Numbers 1-4, 8 and 10 exist in
   neither; `WHYFAIL8` and `WHYFAIL10` are cited by other documents but were never
   written. `README.md` now says so.

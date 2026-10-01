@@ -527,8 +527,9 @@ fix, and — importantly — what is *not* yet in effect on a booting stick.
 
 > **Note:** there are **two** WHYFAIL series. This repo root holds
 > `WHYFAIL5/6/7/9/11/12`; [`rust9x/lslsetup/`](rust9x/lslsetup/) holds
-> `WHYFAIL13/14/15/16`. Numbers 1–4, 8 and 10 exist in neither — treat the numbering
-> as a shared sequence split across two directories, not as a gap in coverage.
+> `WHYFAIL13/14/15/16`; the root also carries `WHYFAIL17`. Numbers 1–4, 8 and 10
+> exist in neither — treat the numbering as a shared sequence split across two
+> directories, not as a gap in coverage.
 >
 > **[`RULES.md`](RULES.md) collects every "rule worth keeping"** from all of them
 > (plus the design notes) into one place, with an index of the gaps above.
@@ -544,6 +545,10 @@ fix, and — importantly — what is *not* yet in effect on a booting stick.
   `machine-id`). Harmless today because that upper is RAM and `uproot` packs a
   different one; becomes live the moment persistence is added — and every
   persistent live USB has the same problem.
+- [`WHYFAIL17.md`](WHYFAIL17.md) — the panel lost every pinned app (kitty included)
+  because `bin/lsl-pin-favorites` parsed `gsettings get` output line-wise: an `as`
+  array arrives on one line, so the whole favorites list collapsed into a single
+  unresolvable entry and Cinnamon silently dropped it. Companion to `WHYFAIL15`.
 - [`FRAGILE_HOME.md`](FRAGILE_HOME.md) — companion to WHYFAIL9: the three ways
   lsl-usb answers "is `/home` persistent?", all 8 call sites and the risk each
   carries, and the rules for changing persistence code safely.
@@ -563,6 +568,10 @@ place rather than quietly rewriting.
   variants and every block-layer option for them (dm-clone, dm-cache, a user-mode
   NBD device), with what was **measured** versus what was merely read. §11
   supersedes §1-10 where they disagree.
+- [`DESIGN-SNAP-PERSISTENCE.md`](DESIGN-SNAP-PERSISTENCE.md) — why snaps vanish on
+  reboot (all of snapd's state is on the RAM overlay), why the layer approach dies
+  at the 4 GiB FAT32 cap, and the three workable options. Copies the flatpak
+  precedent's *principle* even though flatpak's mechanism cannot transfer.
 - [`FINDINGS-COMPRESSION.md`](FINDINGS-COMPRESSION.md) — the six `mksquashfs`
   call sites, why `-Xcompression-level 22` is outside the documented range, and
   what 9 vs 19 actually buys on real layer content.

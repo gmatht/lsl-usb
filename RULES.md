@@ -12,11 +12,12 @@ document that carries the evidence. **Where a rule and a document disagree, the
 document is authoritative** — several of the rules below are corrections of the
 first answer given, and the documents record both.
 
-**Count:** the source documents carry 62 rule blocks; the **49 collected here** are
+**Count:** the source documents carry 69 rule blocks; the **53 collected here** are
 those with a generalisable lesson (status notices and superseded-by markers are
-dropped). Sources: `WHYFAIL5/6/7/9/11/12` (repo root), `WHYFAIL13/14/15/16`
+dropped). Sources: `WHYFAIL5/6/7/9/11/12/17` (repo root), `WHYFAIL13/14/15/16`
 (`rust9x/lslsetup/`), `DESIGN-F2FS-PERSISTENCE`, `DESIGN-PERSISTENCE-PANE`,
-`DESIGN-BOOT-TO-RAM-VARIANTS`, `FINDINGS-COMPRESSION`, `FRAGILE_HOME`.
+`DESIGN-BOOT-TO-RAM-VARIANTS`, `DESIGN-SNAP-PERSISTENCE`, `FINDINGS-COMPRESSION`,
+`FRAGILE_HOME`.
 
 ---
 
@@ -153,6 +154,23 @@ repeatedly: reasoning from a specification instead of running it.
 > part is a way of avoiding the hard question.
 > — `DESIGN-BOOT-TO-RAM-VARIANTS.md` §11.11
 
+> **Find the precedent before inventing the mechanism.** Flatpaks had this exact
+> problem — gigabytes of app data that must not go into a 4 GiB-capped layer — and
+> the tree already solved it by keeping the bulk on FAT and publishing only a
+> three-line config. The *principle* transfers to snaps even though flatpak's
+> `--installation` mechanism does not. — `DESIGN-SNAP-PERSISTENCE.md`
+
+> **A comment describing a capability is not the capability.**
+> `squashfs_config.sh:104` says the installer "can preload .snap files onto the USB
+> (`/cdrom/snaps/`)". It cannot — nothing writes that directory and nothing installs
+> from it. The comment is an intent that was never implemented, and it reads as a
+> description of working code. — `DESIGN-SNAP-PERSISTENCE.md`
+
+> **Check the filesystem can represent what you are storing.** FAT cannot hold
+> symlinks or ownership; snapd's state needs both. The capacity question ("is there
+> room?") is the one people ask; the representability question ("can this
+> filesystem express it?") is the one that decides. — `DESIGN-SNAP-PERSISTENCE.md`
+
 > **`unwrap_or_default()` on a required file is a silent lie.** It converts "the
 > input I depend on is missing" into "the value is empty", and the two are not the
 > same thing to whoever reads the output. The build stamp on every shipped stick
@@ -207,6 +225,12 @@ repeatedly: reasoning from a specification instead of running it.
 > week" silently wrong. Every `lslsetup.exe` on the box embedded a stale copy of a
 > fixed script. **Pin the bytes, not the path** — the release must be able to say
 > *which* revision its bytes came from. — `rust9x/lslsetup/WHYFAIL15.md`
+
+> **`gsettings get` prints an `as` array on one line; split on commas.** A
+> line-oriented loop over a comma-delimited value does not fail loudly - it
+> produces exactly one token, the whole list, and every write-back makes the
+> damage permanent (the Cinnamon panel lost every pinned app this way). When the
+> format is declarative, parse the declaration. — `WHYFAIL17.md`
 
 > **A prediction is not a record.** `FRAGILE_HOME.md` — the three ways this tree
 > answers "is `/home` persistent?", and why a fresh resolve must never override what
@@ -290,6 +314,7 @@ repeatedly: reasoning from a specification instead of running it.
 | document | what it holds |
 |---|---|
 | `WHYFAIL5/6/7/9/11/12.md` | live-boot post-mortems: symptom, evidence, cause, fix, what is not yet in effect |
+| `WHYFAIL17.md` | **the panel lost every pinned app (kitty included)** — `gsettings get` prints an `as` array on one line, and a line-wise parse collapsed the whole favorites list into one unresolvable entry |
 | `rust9x/lslsetup/WHYFAIL13.md` | the zenity/`100`-sentinel post-mortem — **note: a second WHYFAIL series lives in this subtree** |
 | `rust9x/lslsetup/WHYFAIL14.md` | casper layer naming: `layerfs-path=` and the dot-walk |
 | `rust9x/lslsetup/WHYFAIL16.md` | **every build trace is blank** — the version is read from a file the nofmt path never puts on the stick, and `unwrap_or_default()` hides it |
@@ -306,7 +331,7 @@ Found while assembling this file. Recording them rather than leaving them to be
 rediscovered.
 
 **1. There are two WHYFAIL series, and the index only knew about one.** The root
-holds `WHYFAIL5/6/7/9/11/12`; `rust9x/lslsetup/` holds `WHYFAIL13/14/15`.
+holds `WHYFAIL5/6/7/9/11/12/17`; `rust9x/lslsetup/` holds `WHYFAIL13/14/15/16`.
 Nothing in either `README` says so, so the numbering looks like it has holes
 (1–4, 8, 10 are absent from *both*) when the real structure is one series split
 across two directories.
