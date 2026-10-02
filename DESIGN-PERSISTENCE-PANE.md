@@ -38,27 +38,35 @@ command line reproduces them.
   if it ever is: it enables `libeatmydata` and **nothing else** — never
   partitioning, formatting, erasing, or any disk write. §2.6 removed the only
   control that could have given a destructive "prank" somewhere to hide.
-- **§2.3-2.4 the space slider — built as specified.** A **trackbar** (the Win32
-  slider, in comctl32 and therefore available on Windows 95), stepped in 1 GiB,
-  with its bounds **derived from the attached stick's size**:
+- **§2.3-2.4 the space slider — built to the corrected rules.** A **trackbar**
+  (the Win32 slider, in comctl32 and therefore available on Windows 95), stepped
+  in 1 GiB:
 
-  | | rule | source |
-  |---|---|---|
-  | max | `total − 32 GB` — at most 32 GB may ever be FAT | §2.4 |
-  | default | **3/4 of the persistence space** | §2.3 |
-  | min | ~4 GB: base layer + extracted kernel + room for one appended layer | §2.3 |
+  | | rule |
+  |---|---|
+  | min | **1 GiB** |
+  | max | **`total − iso − (vmlinuz + initrd)`** — what is actually left on the stick |
+  | default | **3/4 of the available persistence space** (§2.3) |
 
-  So a 125 GB stick gives `4..93`, default 69, and the pane states the split
-  outright — "56 GB FAT / 69 GB persistence" — because §4 says the slider should
-  show both numbers, making it a choice about the stick rather than an abstract
-  size. A stick that cannot host the split (≤32 GB, or none attached) collapses
-  to a valid non-empty range and says so instead of showing a division of
-  nothing.
+  So a 128 GB stick holding a 3 GB ISO gives `1..124`, default 93, and the pane
+  states the split outright — "35 GB FAT / 93 GB persistence" — because §4 says
+  the slider should show both numbers, making it a choice about the stick rather
+  than an abstract size. A stick that cannot hold the image at all collapses to a
+  valid non-empty range and says so.
 
-  **Two earlier drafts of this pane ignored all of the above**, using fixed
-  1..64 constants with a 4 GiB default and a comment claiming no stick-size probe
-  existed. `Volume::size_gb()` was already in use on the ISO page, so the size was
-  available and the claim was false. `largest_usb_gib()` reads it now.
+  > **Correction to §2.4, which had the rule backwards.** This document said
+  > *"with the FAT capped at 32 GB, the persistence partition gets
+  > `total − 32 GB`"* — using the FAT ceiling as the persistence **maximum**. It is
+  > a ceiling on FAT, so it is a **minimum** on persistence: a 128 GB stick
+  > cannot give persistence more than 96 GB however the slider is set. Reading it
+  > as a maximum wasted the rest of a large device. The slider is bounded by what
+  > the ISO and kernel actually consume, not by 32.
+
+  **Two earlier drafts of this pane ignored the sizing rules entirely**, using
+  fixed 1..64 constants with a 4 GiB default and a comment claiming no
+  stick-size probe existed; a third then inverted the ceiling as above.
+  `Volume::size_gb()` was already in use on the ISO page, so the size was
+  available both times. `largest_usb_gib()` reads it now.
 
 - **An earlier draft used a combo box**, on the stated grounds that the vendored
   `nwg` had no slider. That was also wrong: `nwg` exports `TrackBar`, and it is the
@@ -212,11 +220,15 @@ So the rule becomes:
   in the field including Explorer and every non-Insider build.
 - **Do not treat it as a law.** A future version can probe: attempt the larger
   format and fall back. Until then, capping is correct and free.
-- **Consequence for the slider:** with the FAT capped at 32 GB, the persistence
-  partition gets `total − 32 GB`. On a 64 GB stick that is 32 GB of persistence; on
-  this 125 GB stick it is 93 GB. If `total − 32 GB` is *less* than the
-  minimum from 2.3, the stick cannot host this design and the pane must say so
-  rather than offer a slider that cannot be satisfied.
+- **Consequence for the slider:** **none, and this line used to say otherwise.**
+  A ceiling on FAT is a *floor* on persistence, so 32 GB does not bound
+  persistence from above — it only rules out configurations where the FAT side
+  would need more than 32. Persistence is bounded by what the ISO and kernel
+  actually consume (`total − iso − kernel`), which for any ordinary image is far
+  above `total − 32`. On a 128 GB stick with a 3 GB ISO the FAT side wants only
+  ~4 GB, so the whole remainder is available. The 32 GB ceiling becomes binding
+  only for an image so large that FAT cannot hold the remainder, which is worth
+  saying plainly rather than leaving it to be rediscovered.
 
 ### 2.5 Not enough space — what to do
 

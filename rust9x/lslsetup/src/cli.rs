@@ -389,37 +389,45 @@ mod tests {
         // The default must be findable, or the pane would pre-check a radio whose
         // index does not map back to the default.
         assert!(crate::gui::PERSIST_BACKENDS.contains(&crate::gui::PERSIST_DEFAULT));
-        // The design's arithmetic (§2.3-§2.4), pinned so it cannot drift back to
-        // fixed constants:
-        //   * max = total - 32   (at most 32 GB may be FAT)
+        // The slider's rules, pinned so they cannot drift back to fixed constants:
+        //   * min = 1 GiB
+        //   * max = total - iso - (vmlinuz + initrd)
         //   * default = 3/4 of that max
-        //   * min = what must fit on FAT (~4 GB: base layer + kernel + a layer)
-        let (min, max, default) = crate::gui::persist_gib_bounds(125);
-        assert_eq!(min, 4, "the FAT side must hold the image plus a layer");
-        assert_eq!(max, 93, "at most 32 of 125 GB may be FAT");
-        assert_eq!(default, 69, "the default is 3/4 of the persistence space");
+        // 32 GB is a CEILING on FAT, not the stick size - so it does NOT bound
+        // persistence from above. Getting that backwards is what previously made
+        // 93 (which is total-32) look like a maximum.
+        let (min, max, default) = crate::gui::persist_gib_bounds(128, 3);
+        assert_eq!(min, 1, "the minimum is 1 GiB");
+        assert_eq!(max, 124, "128 - 3 (ISO) - 1 (kernel+initrd)");
+        assert_eq!(default, 93, "the default is 3/4 of the available space");
         assert!((min..=max).contains(&default), "default must be reachable");
 
-        // A 64 GB stick: 32 FAT / 32 persistence, default 24.
-        let (min64, max64, def64) = crate::gui::persist_gib_bounds(64);
-        assert_eq!(max64, 32);
-        assert_eq!(def64, 24);
-        assert!((min64..=max64).contains(&def64));
+        // No ISO chosen yet: only the kernel allowance bounds the maximum.
+        let (_, max0, def0) = crate::gui::persist_gib_bounds(128, 0);
+        assert_eq!(max0, 127);
+        assert_eq!(def0, 95);
 
-        // A stick too small to split collapses to a valid, non-empty range
-        // rather than an inverted one - an inverted trackbar range is what made
-        // the slider unusable in the first place.
-        for tiny in [0u32, 1, 16, 32] {
-            let (lo, hi, d) = crate::gui::persist_gib_bounds(tiny);
-            assert!(lo <= hi, "range inverted for {} GB: {}..{}", tiny, lo, hi);
-            assert!((lo..=hi).contains(&d), "default {} outside {}..{} for {} GB", d, lo, hi, tiny);
-            assert!(lo > 0, "a 0 GiB persistence partition is not a usable size");
+        // With no ISO at all the 32 GB FAT ceiling is the only real limit, and it
+        // does not cap persistence: 128 GB of stick still yields a large range.
+        let (_, max_noiso, _) = crate::gui::persist_gib_bounds(128, 0);
+        assert!(
+            max_noiso > 96,
+            "persistence must not be capped at total-32; that inverts the rule"
+        );
+
+        // A stick smaller than the image: never invert the range (an inverted
+        // trackbar range is what makes the control unusable).
+        for (total, iso) in [(0u32, 0u32), (1, 0), (4, 3), (8, 16), (16, 16)] {
+            let (lo, hi, d) = crate::gui::persist_gib_bounds(total, iso);
+            assert!(lo <= hi, "range inverted for {}/{}: {}..{}", total, iso, lo, hi);
+            assert!((lo..=hi).contains(&d), "default {} outside {}..{} for {}/{}", d, lo, hi, total, iso);
+            assert!(lo >= 1, "the minimum is 1 GiB, got {}", lo);
         }
 
-        // The readout shows the split the design asks for, not a bare number.
-        assert_eq!(crate::gui::persist_split_text(125, 69 * 1024), "56 GB FAT / 69 GB persistence");
+        // The readout shows the split, not a bare number.
+        assert_eq!(crate::gui::persist_split_text(128, 93 * 1024), "35 GB FAT / 93 GB persistence");
         assert!(crate::gui::persist_split_text(0, 4096).contains("No USB stick"));
-        assert!(crate::gui::persist_split_text(16, 4096).contains("too small"));
+        assert!(crate::gui::persist_split_text(4, 8192).contains("cannot hold"));
         // ...and the size readout names the MiB the env file actually receives.
         assert_eq!(crate::gui::persist_gib_text(4096), "4.0 GiB (4096 MiB)");
     }

@@ -126,39 +126,70 @@ pub const PERSIST_BACKENDS: [&str; 3] = ["squashfs", "btrfs", "f2fs"];
 /// behave exactly as it did, so the default is not a judgement call.
 pub const PERSIST_DEFAULT: &str = "squashfs";
 
-/// Default persistence size, MiB. Matches `LSL_HOME_BTRFS_MIB`'s shipped
-/// default (4096) so choosing btrfs on a fresh install reproduces what HDD mode
-/// already gave you.
-pub const PERSIST_MIB_DEFAULT: u32 = 4096;
+/// Minimum persistence size, GiB. One gigabyte is the smallest partition worth
+/// creating: below that the ISO's own appended layer and a user's data do not
+/// both fit with any headroom.
+pub const PERSIST_GIB_MIN: usize = 1;
 
-/// Slider bounds and default, DERIVED from the target stick's size (design
-/// §2.3-§2.4) rather than being fixed constants.
+/// Ceiling on the FAT side, GiB — a constraint on the **other** partition, so it
+/// deliberately does NOT appear in the slider's arithmetic.
 ///
-/// A TRACKBAR (Win32 `TRACKBAR_CLASS`, comctl32 — present on Windows 95, which
-/// this exe must run on) stepped in 1 GiB increments.
-pub fn persist_gib_bounds(total_gib: u32) -> (usize, usize, usize) {
-    // Windows refuses to format FAT32 past 32 GB (Explorer and every
-    // non-Insider build still enforce it), so the FAT side is capped and
-    // persistence gets `total - FAT_MAX_GIB`. This is a formatting-safety BOUND,
-    // not a target: the FAT side only needs iso + extracted kernel + slack, so
-    // on a large stick most of the capacity legitimately belongs to persistence.
-    const FAT_MAX_GIB: u32 = 32;
-    // Measured on this stick: base squashfs 2.5 GB + vmlinuz/initrd ~98 MB, plus
-    // room for at least one appended layer (first boot produces one).
-    const MIN_FAT_GIB: usize = 4;
+/// Windows has historically refused to format FAT32 past 32 GB (Explorer and
+/// every non-Insider build still enforce it), so the stick's FAT partition is at
+/// MOST this. That makes 32 a ceiling on FAT, i.e. a FLOOR of `total - 32` on
+/// persistence — **not a cap on persistence**. Reading it the other way round
+/// (as an earlier draft did) made a 128 GB stick offer at most 96 GB of
+/// persistence and silently wasted the rest of the device.
+///
+/// It binds when the stick is large relative to its image: a 128 GB stick
+/// holding a 3 GB ISO wants only ~4 GB of FAT, well under the ceiling, so the
+/// whole remainder is legitimately available. A stick holding a ~100 GB image
+/// cannot fit FAT at all under this rule, and that is where the ceiling bites.
+pub const FAT_MAX_GIB: u32 = 32;
 
-    if total_gib == 0 || (total_gib as usize) <= FAT_MAX_GIB as usize {
-        // No usable split (no target picked yet, or a stick too small). Keep a
-        // valid non-empty range so the control behaves; the pane's note explains
-        // why the stick cannot host persistence.
-        return (MIN_FAT_GIB, MIN_FAT_GIB, MIN_FAT_GIB);
+/// Slider bounds and default for a stick of `total_gib` GiB holding an ISO of
+/// `iso_gib` GiB, per the rules the design was corrected to state:
+///
+/// - **max** = `total - iso - kernel_and_initrd`. The persistence side cannot
+///   need more room than the stick has left once the ISO, the extracted kernel
+///   and the initrd are accounted for; anything beyond that is unreachable space.
+/// - **min** = 1 GiB.
+/// - **default** = 3/4 of the available persistence space, as §2.3 specifies.
+///
+/// `iso_gib` is 0 when no ISO is selected yet, in which case the kernel allowance
+/// alone bounds the maximum - the pane is rebuilt once an ISO is chosen.
+///
+/// When the stick cannot host the image at all the range collapses to a valid
+/// non-empty one and the caller is expected to say so, rather than offering a
+/// slider whose every position fails.
+pub fn persist_gib_bounds(total_gib: u32, iso_gib: u32) -> (usize, usize, usize) {
+    // vmlinuz + initrd, measured on this stick (~98 MB); rounded up to 1 GiB so
+    // the allowance survives the rounding of total and iso to whole gigabytes.
+    const KERNEL_GIB: u32 = 1;
+
+    if total_gib == 0 {
+        return (PERSIST_GIB_MIN, PERSIST_GIB_MIN, PERSIST_GIB_MIN);
     }
-    // Hard ceiling only so a nonsensical `total` cannot exceed what a trackbar
-    // can represent; the real maximum is total - 32.
-    let max = ((total_gib - FAT_MAX_GIB) as usize).min(4096).max(MIN_FAT_GIB);
-    // Default = 3/4 of the available persistence space, as specified.
-    let default = (max * 3 / 4).clamp(MIN_FAT_GIB, max);
-    (MIN_FAT_GIB, max, default)
+    let need = iso_gib.saturating_add(KERNEL_GIB);
+    // Saturating: a stick smaller than the ISO leaves nothing, and an inverted
+    // range (min > max) is what makes a trackbar unusable.
+    let max = total_gib.saturating_sub(need).max(PERSIST_GIB_MIN as u32) as usize;
+    // Hard ceiling so a nonsensical total cannot exceed what a trackbar range
+    // can represent.
+    let max = max.min(4096);
+    // 3/4 of what is actually available.
+    let default = (max * 3 / 4).max(PERSIST_GIB_MIN).min(max);
+    (PERSIST_GIB_MIN, max, default)
+}
+
+/// GiB of an ISO file, or 0 when unknown/unreadable.
+fn iso_size_gib(path: &str) -> u32 {
+    if path.is_empty() {
+        return 0;
+    }
+    sys::file_size(path)
+        .map(|b| (b / (1024 * 1024 * 1024)) as u32)
+        .unwrap_or(0)
 }
 
 /// Largest USB volume currently attached, in GiB, rounded down.
@@ -266,14 +297,12 @@ pub fn persist_split_text(total_gib: u32, persist_mib: u32) -> String {
     if total_gib == 0 {
         return "No USB stick detected yet - persistence size cannot be sized yet.".to_string();
     }
-    if (total_gib as usize) <= 32 {
-        return format!(
-            "This stick is {} GB, too small to leave at most 32 GB for FAT.",
-            total_gib
-        );
+    let persist_gb = persist_mib as f64 / 1024.0;
+    let fat_gb = total_gib as f64 - persist_gb;
+    if fat_gb <= 0.0 {
+        return format!("This {} GB stick cannot hold the image plus persistence.", total_gib);
     }
-    let fat_gib = total_gib as f64 - (persist_mib as f64 / 1024.0);
-    format!("{:.0} GB FAT / {:.0} GB persistence", fat_gib.max(0.0), persist_mib as f64 / 1024.0)
+    format!("{:.0} GB FAT / {:.0} GB persistence", fat_gb, persist_gb)
 }
 
 /// Refresh the persistence pane's size readout from the slider's live position.
@@ -3857,12 +3886,14 @@ pub fn run_gui(
         // one; the name was the only thing missing.
         push_lbl(&mut p, &crate::locale::tr("Persistence space:"), 10, y, -20, 18);
         y += 20;
-        // Bounds and default are DERIVED from the target's size (design
-        // §2.3-§2.4): max is total-32 so at most 32 GB is ever FAT, and the
-        // default is 3/4 of what that leaves. `largest_usb_gib` reads the size
-        // already exposed by Volume::size_gb - the same value the ISO page shows
-        // next to each candidate stick.
-        let (gib_min, gib_max, gib_default) = persist_gib_bounds(largest_usb_gib());
+        // Bounds and default are DERIVED from the target's size and the selected
+        // ISO: max is what is left after the image, kernel and initrd; min is
+        // 1 GiB; default is 3/4 of that. `largest_usb_gib` reads the size already
+        // exposed by Volume::size_gb - the same value the ISO page shows next to
+        // each candidate stick.
+        let stick_gib = largest_usb_gib();
+        let iso_gib = iso_size_gib(iso_arg);
+        let (gib_min, gib_max, gib_default) = persist_gib_bounds(stick_gib, iso_gib);
         // Range AND position go through the BUILDER, in that order, rather than
         // via set_range_min/set_range_max/set_pos after the build. Calling them
         // afterwards sends TBM_SETRANGEMIN, TBM_SETRANGEMAX and TBM_SETPOSNOTIFY
@@ -3896,12 +3927,11 @@ pub fn run_gui(
             .build(&mut lbl_val);
         p.push(PageItem { ctl: PageCtl::Lbl(lbl_val, 1), x: 420, y, w: 220, h: 20, idx: 0 });
         y += 36;
-        // Show the split the design asks for ("32 GB FAT / 93 GB persistence"),
-        // so the user is choosing a division of the stick rather than an
-        // abstract number.
+        // Show the split ("32 GB FAT / 93 GB persistence"), so the user is choosing a
+        // division of the stick rather than an abstract number (design §4).
         push_lbl(
             &mut p,
-            &persist_split_text(largest_usb_gib(), default_mib),
+            &persist_split_text(stick_gib, default_mib),
             10,
             y,
             -20,
@@ -5532,7 +5562,7 @@ fn harvest_gui_result(
     // live value comes from the slider. Kept at the derived default for the
     // currently attached stick so the two agree.
     let mut persist_mib = {
-        let (_, _, d) = persist_gib_bounds(largest_usb_gib());
+        let (_, _, d) = persist_gib_bounds(largest_usb_gib(), 0);
         (d as u32) * 1024
     };
     let mut cache_tmpfs = true;
