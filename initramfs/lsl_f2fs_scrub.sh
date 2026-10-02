@@ -32,7 +32,16 @@ lsl_scrub_dbg() {
 }
 
 # ---- opt-out gates -----------------------------------------------------------
-grep -qw lsl_no_f2fs_scrub /proc/cmdline 2>/dev/null && return 0 2>/dev/null || exit 0
+# NB: the cmdline check must be an `if`, not a one-liner. In
+# `grep ... && return 0 2>/dev/null || exit 0` the `&&`/`||` are
+# left-associative, so it parses as `( grep && return 0 ) || exit 0`: when the
+# flag is ABSENT (every normal boot) grep fails, `return` is skipped, and `exit 0`
+# fires. Sourced by casper, that exits casper's own top-level shell and the boot
+# dies before the root overlay is mounted. Match the `if` form used by
+# lsl_hdd_mirror.sh / lsl_liveboot_mirror.sh.
+if grep -qw lsl_no_f2fs_scrub /proc/cmdline 2>/dev/null; then
+    return 0 2>/dev/null || exit 0
+fi
 [ "${LSL_PERSIST:-0}" = "1" ] || return 0 2>/dev/null || exit 0
 [ "${LSL_PERSIST_SCRUB:-1}" = "1" ] || return 0 2>/dev/null || exit 0
 

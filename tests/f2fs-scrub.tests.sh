@@ -39,6 +39,50 @@ else
     ok "the hook has no bare exit (safe to source)"
 fi
 
+# BEHAVIOURAL companion to the grep above, because the grep is necessary but not
+# sufficient: `CMD && return 0 2>/dev/null || exit 0` contains no bare `exit` and
+# passes that check, yet `&&`/`||` are left-associative so it parses as
+# `( CMD && return 0 ) || exit 0`. When CMD is false - the NORMAL case, e.g.
+# grepping /proc/cmdline for a flag that is not set - `return` is skipped and
+# `exit 0` fires, killing the shell that sourced us. That defect shipped once
+# (the cmdline opt-out gate) and the grep above could not see it.
+#
+# So execute the hook the way casper does and assert the sourcing shell survives.
+# Sourcing is safe here: with no f2fs device labelled lsl-persist the hook walks
+# its guards and returns before mounting anything.
+scrub_sandbox="$(mktemp -d)"
+# Mirror the cmdline opt-out so the guard is exercised deterministically either
+# way; what matters is that control RETURNS to us rather than exiting.
+cat > "$scrub_sandbox/case.sh" <<EOF
+echo "MARKER_BEFORE_SOURCE"
+. "$HOOK"
+echo "MARKER_AFTER_SOURCE"
+EOF
+
+if out="$(LSL_PERSIST=0 sh "$scrub_sandbox/case.sh" 2>/dev/null)"; then
+    if printf '%s\n' "$out" | grep -q MARKER_BEFORE_SOURCE \
+       && printf '%s\n' "$out" | grep -q MARKER_AFTER_SOURCE; then
+        ok "sourcing the hook returns to the caller (it does not exit casper's shell)"
+    else
+        bad "sourcing the hook did not return normally - the boot would die here"
+    fi
+else
+    bad "the sourced hook terminated the shell with a non-zero status"
+fi
+
+# And the specific trap: no one-liner may combine `&& return` with `|| exit 0`,
+# because that is the form whose behaviour depends on the left side succeeding.
+# Comments are stripped first so the prose above does not trip its own check.
+# NB: do not write this as `&& return [^|]* || exit` - the character class cannot
+# cross the `|` in `2>/dev/null`, so it silently matches nothing.
+scrub_code="$(sed 's/#.*$//' "$HOOK")"
+if printf '%s\n' "$scrub_code" | grep -nE '&&[[:space:]]*return.*\|[[:space:]]*exit' | grep -q .; then
+    bad "the hook has a '&& return ... || exit' one-liner; when the left side is false it EXITS the sourcing shell"
+else
+    ok "no '&& return ... || exit' one-liner (the left-associativity trap)"
+fi
+rm -rf "$scrub_sandbox"
+
 # POSIX sh only: this runs in an initramfs where bash may not exist. Comments are
 # stripped first - the header explains *why* the file avoids `exit`, and matching
 # that prose would fail every run. `$((...))` is POSIX arithmetic, not a bash-ism.

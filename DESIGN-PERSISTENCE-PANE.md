@@ -1,12 +1,22 @@
 # DESIGN — Persistence pane
 
 **Status: BACKEND SELECTION IMPLEMENTED 2026-10-01; the other controls are not.**
-Built: the backend radio (all four backends), a bounded size selector, and the
+Built: the backend radio (all four backends), a trackbar size slider, and the
 cache-on-tmpfs policy, at page 4 between "system" and "wifi". `INSTALL_PAGE`
 moved 5 → 6. The settings reach Linux through `LSL_PERSIST` /
 `LSL_HOME_BTRFS_MIB` / `LSL_CACHE_TMPFS` in `lsl-usb.env`, and the matching
 `--persist` / `--persist-mib` / `--cache-tmpfs` flags exist so the FINISHED page's
 command line reproduces them.
+
+> **A GUI page can pass every unit test and still be visibly broken.** The first
+> build of this pane did: its items were absent from `relayout()`'s `pages` array,
+> so they never passed through `layout_page()` and kept the raw builder geometry —
+> including the negative widths that mean "fill the width" everywhere else in the
+> file. The "Persistence space:" label simply did not render. No test asserted on
+> page layout, and the crate's tests run headless, so nothing caught it; it was
+> found by launching the wizard. **Adding a page means adding it to `pages` as
+> well as to `show_page()` — the two lists are separate and only one of them
+> controls whether the controls are positioned.**
 
 **Not built, deliberately:**
 
@@ -20,13 +30,17 @@ command line reproduces them.
   if it ever is: it enables `libeatmydata` and **nothing else** — never
   partitioning, formatting, erasing, or any disk write. §2.6 removed the only
   control that could have given a destructive "prank" somewhere to hide.
-- **§2.3-2.4 the space slider proper.** Replaced with a bounded combo box. The
-  vendored `nwg` is a Windows 95-era toolkit with **no Slider control**, so a
-  trackbar would mean porting one in for a single number. The offered sizes are
-  also not the full `total − FAT` split the design describes: a btrfs image is a
-  FILE, so FAT32's 4 GiB single-file cap — not the 32 GB FAT cap — is the binding
-  constraint, and it is stated in the pane instead of being enforced at write
-  time.
+- **§2.3-2.4 the space slider proper.** Built as a **trackbar** (the Win32
+  slider, in comctl32 and therefore available on Windows 95) stepping 1–64 GiB.
+  What it is *not* yet is the design's continuous FAT/persistence **split**:
+  there is no stick-size probe in this pane, and one cannot be added until the
+  selected target's size is known — which only happens on the INSTALL page,
+  after this one. So the slider is a bounded size chooser, and the binding limit
+  (FAT32's 4 GiB single-file cap on a btrfs image) is stated in the label rather
+  than discovered at write time.
+- **An earlier draft used a combo box**, on the stated grounds that the vendored
+  `nwg` had no slider. That was wrong: `nwg` exports `TrackBar`, and it is the
+  Win32 control this design wanted all along. Corrected.
 
 **Related:** `DESIGN-F2FS-PERSISTENCE.md` (the scrub/regenerate mechanism this pane
 drives), `DESIGN-BOOT-TO-RAM-VARIANTS.md` §11 (what the block layer can and

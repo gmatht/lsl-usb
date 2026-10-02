@@ -389,11 +389,18 @@ mod tests {
         // The default must be findable, or the pane would pre-check a radio whose
         // index does not map back to the default.
         assert!(crate::gui::PERSIST_BACKENDS.contains(&crate::gui::PERSIST_DEFAULT));
-        // Every offered size must convert to a positive MiB value.
-        for g in crate::gui::PERSIST_SIZE_GIB {
-            assert!(g > 0);
-        }
-        assert!(crate::gui::PERSIST_SIZE_GIB
-            .contains(&((crate::gui::PERSIST_MIB_DEFAULT / 1024) as i32)));
+        // The slider's default position must be INSIDE its range, or the trackbar
+        // silently clamps it and the pane pre-selects a size nobody asked for.
+        let default_gib = (crate::gui::PERSIST_MIB_DEFAULT / 1024) as usize;
+        assert!(
+            default_gib >= crate::gui::PERSIST_GIB_MIN && default_gib <= crate::gui::PERSIST_GIB_MAX,
+            "the slider default ({} GiB) is outside its range {}-{}",
+            default_gib,
+            crate::gui::PERSIST_GIB_MIN,
+            crate::gui::PERSIST_GIB_MAX
+        );
+        assert!(crate::gui::PERSIST_GIB_MIN > 0, "0 GiB is not a usable size");
+        // ...and the readout must show the MiB the env file actually receives.
+        assert_eq!(crate::gui::persist_gib_text(crate::gui::PERSIST_MIB_DEFAULT), "4.0 GiB (4096 MiB)");
     }
 }

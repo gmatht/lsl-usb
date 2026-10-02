@@ -131,10 +131,28 @@ pub const PERSIST_DEFAULT: &str = "squashfs";
 /// already gave you.
 pub const PERSIST_MIB_DEFAULT: u32 = 4096;
 
-/// Size choices offered, GiB. Deliberately NOT every integer: a btrfs image on
-/// FAT32 cannot exceed 4 GiB, so a continuous slider would mostly offer values
-/// that cannot work. See the combo-box rationale at the construction site.
-pub const PERSIST_SIZE_GIB: [i32; 7] = [1, 2, 4, 8, 16, 32, 64];
+/// Slider bounds, GiB. A TRACKBAR (Win32 `TRACKBAR_CLASS`, comctl32 — present on
+/// Windows 95, which this exe must run on) stepped in 1 GiB increments.
+///
+/// The design's slider expresses a continuous SPLIT ("32 GB FAT / 93 GB
+/// persistence") derived from the target stick's size. That is not what this
+/// control does: there is no stick-size probe in this pane, and adding one is a
+/// separate change (it needs the volume size for the selected target, which is
+/// only known once a target is picked). Until then the slider is a bounded size
+/// chooser, and the real limit is stated in the label rather than discovered at
+/// write time.
+pub const PERSIST_GIB_MIN: usize = 1;
+pub const PERSIST_GIB_MAX: usize = 64;
+
+/// Readout text for a persistence size in MiB: "4.0 GiB (4096 MiB)".
+///
+/// Shown beside the slider so the value is legible rather than inferred from
+/// the handle position, and in MiB as well because that is the unit the env file
+/// and `--persist-mib` use - a "3.5 GiB" slider that silently rounds would
+/// otherwise write a number the user never saw.
+pub fn persist_gib_text(mib: u32) -> String {
+    format!("{:.1} GiB ({} MiB)", mib as f64 / 1024.0, mib)
+}
 
 /// Persistence-page backend caveats (design s2.1). Height is part of the
 /// multiline-label contract asserted by `multiline_labels_fit_their_height`.
@@ -1345,18 +1363,11 @@ pub(crate) const FASTSTARTUP_NOTE: &str = "Disables hibernate and Fast Startup (
 /// win32 control has exactly one owner (nwg's Drop DESTROYS the window, so
 /// nwg controls must never be cloned-and-kept — see the ScrollBar note in
 /// run_gui).
-///
-/// `nwg::ComboBox<D>` is generic, and writing `nwg::ComboBox<String>` inline in
-/// the variant list below made the parser resolve `ComboBox` against this enum's
-/// own variant names (`Combo`). The alias sidesteps that and keeps the list
-/// readable.
-pub type PersistCombo = nwg::ComboBox<String>;
-
 pub(crate) enum PageCtl {
     Lbl(Box<nwg::Label>, u8),
     Check(Box<nwg::CheckBox>, u8),
     Radio(Box<nwg::RadioButton>, u8),
-    Combo(Box<PersistCombo>, u8),
+    Track(Box<nwg::TrackBar>, u8),
     Edit(Box<nwg::TextBox>, u8),
     EditLine(Box<nwg::TextInput>, u8),
     Btn(Box<nwg::Button>, u8),
@@ -1388,7 +1399,7 @@ pub(crate) type PageItems = Rc<std::cell::RefCell<Vec<PageItem>>>;
 
 fn ctl_kind(ctl: &PageCtl) -> u8 {
     match ctl {
-        PageCtl::Lbl(_, k) | PageCtl::Check(_, k) | PageCtl::Radio(_, k) | PageCtl::Combo(_, k) | PageCtl::Edit(_, k) | PageCtl::EditLine(_, k) | PageCtl::Btn(_, k) => *k,
+        PageCtl::Lbl(_, k) | PageCtl::Check(_, k) | PageCtl::Radio(_, k) | PageCtl::Track(_, k) | PageCtl::Edit(_, k) | PageCtl::EditLine(_, k) | PageCtl::Btn(_, k) => *k,
     }
 }
 
@@ -1414,7 +1425,7 @@ fn layout_page(items: &PageItems, fw: i32, off: i32, shift: i32, top: i32, bot_e
             PageCtl::Lbl(b, _) => place!(b),
             PageCtl::Check(b, _) => place!(b),
             PageCtl::Radio(b, _) => place!(b),
-            PageCtl::Combo(b, _) => place!(b),
+            PageCtl::Track(b, _) => place!(b),
             PageCtl::Edit(b, _) => place!(b),
             PageCtl::EditLine(b, _) => place!(b),
             PageCtl::Btn(b, _) => place!(b),
@@ -1440,7 +1451,7 @@ fn ctl_hwnd(items: &PageItems, kind: u8) -> Option<usize> {
                 PageCtl::Lbl(b, _) => b.handle.hwnd(),
                 PageCtl::Check(b, _) => b.handle.hwnd(),
                 PageCtl::Radio(b, _) => b.handle.hwnd(),
-                PageCtl::Combo(b, _) => b.handle.hwnd(),
+                PageCtl::Track(b, _) => b.handle.hwnd(),
                 PageCtl::Edit(b, _) => b.handle.hwnd(),
                 PageCtl::EditLine(b, _) => b.handle.hwnd(),
                 PageCtl::Btn(b, _) => b.handle.hwnd(),
@@ -1652,6 +1663,7 @@ struct LayoutCtx<'a> {
     wifi_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
     install_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
     fp_content: &'a Cell<i32>,
+    persist_content: i32,
     guard: &'a Cell<bool>,
     iso_content: &'a Cell<i32>,
     sys_content: i32,
@@ -1765,6 +1777,11 @@ fn relayout(c: &LayoutCtx, cw: i32, ch: i32) {
         (c.sb_iso, c.iso, c.iso_off, c.iso_geom, c.iso_content.get(), iso_top, iso_bot, iso_shift),
         (c.sb_fp, c.fp, c.fp_off, c.fp_geom, c.fp_content.get(), 30, 32, 0),
         (c.sb_sys, c.sys, c.sys_off, c.sys_geom, c.sys_content, 4, 32, 0),
+        // The persistence page must be in this list too, or its items never pass
+        // through layout_page() and keep the raw builder geometry - including the
+        // NEGATIVE widths (".size((-20, 18))" meaning "fill the width"), which
+        // nwg takes literally. That is why its labels did not render.
+        (c.sb_persist, c.persist, c.persist_off, c.persist_geom, c.persist_content, 4, 32, 0),
         (c.sb_wifi, c.wifi_items, c.wifi_off, c.wifi_geom, c.wifi_content, 4, 32, 0),
         (c.sb_install, c.install, c.install_off, c.install_geom, c.install_content.get(), 4, 32, 0),
     ];
@@ -3673,32 +3690,38 @@ pub fn run_gui(
         push_lbl(&mut p, PERSIST_NOTE, 20, y + 4, -30, 92);
         y += 104;
 
-        // Size selector. A COMBO BOX, not a trackbar/slider: this nwg is
-        // vendored for Windows 95 and has no Slider control, so a slider would
-        // mean porting a control into a Win95-era toolkit for one number. The
-        // combo gives the same bounded choice and runs everywhere this exe does.
-        // Sizes are the practical set, not every integer: a btrfs image on FAT32
-        // cannot exceed 4 GiB anyway, so 1/2/4/8/16/32/64 covers what is real and
-        // makes the cap visible instead of something to discover at write time.
+        // Size slider: a TRACKBAR, which is the Win32 slider and ships in comctl32
+        // (available on Windows 95, the floor this exe targets). `nwg` exposes it
+        // as TrackBar, not Slider - an earlier draft of this pane concluded the
+        // toolkit had no slider at all and used a combo box instead. It did have
+        // one; the name was the only thing missing.
         push_lbl(&mut p, &crate::locale::tr("Persistence space:"), 10, y, -20, 18);
         y += 20;
-        let mut cb_size: Box<PersistCombo> = Box::default();
-        let _ = nwg::ComboBox::builder()
+        let mut tb: Box<nwg::TrackBar> = Box::default();
+        let _ = nwg::TrackBar::builder()
+            .flags(nwg::TrackBarFlags::VISIBLE)
             .position((10, y))
-            .size((160, 200))
+            .size((400, 30))
             .parent(&frame_persist)
-            .build(&mut cb_size);
-        for gib in PERSIST_SIZE_GIB {
-            cb_size.push(format!("{} GiB", gib));
-        }
-        // Select the default (4 GiB), not index 0: the collection starts at 1.
-        let def_idx = PERSIST_SIZE_GIB
-            .iter()
-            .position(|g| *g == (PERSIST_MIB_DEFAULT / 1024) as i32)
-            .unwrap_or(0);
-        cb_size.set_selection(Some(def_idx));
-        p.push(PageItem { ctl: PageCtl::Combo(cb_size, 0), x: 10, y, w: 160, h: 200, idx: 0 });
-        y += 28;
+            .build(&mut tb);
+        tb.set_range_min(PERSIST_GIB_MIN);
+        tb.set_range_max(PERSIST_GIB_MAX);
+        // The default position is the MiB default expressed in the slider's GiB
+        // units, not index 0.
+        tb.set_pos((PERSIST_MIB_DEFAULT / 1024) as usize);
+        p.push(PageItem { ctl: PageCtl::Track(tb, 0), x: 10, y, w: 400, h: 30, idx: 0 });
+        // Readout of the current slider value. Static text would go stale the
+        // moment the slider moves, and the value is the thing the user is
+        // choosing - it has to be visible, not inferred from the handle.
+        let mut lbl_val: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text(&persist_gib_text(PERSIST_MIB_DEFAULT))
+            .position((420, y))
+            .size((220, 20))
+            .parent(&frame_persist)
+            .build(&mut lbl_val);
+        p.push(PageItem { ctl: PageCtl::Lbl(lbl_val, 1), x: 420, y, w: 220, h: 20, idx: 0 });
+        y += 36;
 
         // Cache policy. Default on: on a USB stick the write reduction is large
         // and the data is disposable. Bounded by LSL_HOME_TMPFS_MIB (2 GiB) so
@@ -3727,6 +3750,10 @@ pub fn run_gui(
         glog(&format!("scrollbar build error: {e:?}"));
     }
     let frame_persist = Rc::new(frame_persist);
+    // Content height for the pane's scroll geometry: the last item's bottom plus
+    // padding. Measured the same way as the system page rather than hardcoded,
+    // so the slider's readout and the notes cannot overflow the scroll band.
+    let persist_content: i32 = persist_items.borrow().iter().map(|i| i.y + i.h).max().unwrap_or(0) + 10;
 
     // ---- page 5: wifi (master switch + per-network list) ----
     let _ = nwg::Frame::builder()
@@ -4038,6 +4065,7 @@ pub fn run_gui(
             wifi_geom: &wifi_geom,
             install_geom: &install_geom,
             fp_content: &fp_content,
+            persist_content: persist_content,
             guard: &in_relayout,
             iso_content: &iso_content,
             sys_content: sys_content,
@@ -4401,6 +4429,7 @@ pub fn run_gui(
                         wifi_geom: &wifi_geom,
                         install_geom: &install_geom,
                         fp_content: &fp_content,
+                        persist_content: persist_content,
                         guard: &in_relayout,
                         iso_content: &iso_content,
                         sys_content: sys_content,
@@ -5317,12 +5346,9 @@ fn harvest_gui_result(
                     }
                 }
             }
-            PageCtl::Combo(cb, 0) => {
-                if let Some(i) = cb.selection() {
-                    if let Some(gib) = PERSIST_SIZE_GIB.get(i) {
-                        persist_mib = (*gib as u32) * 1024;
-                    }
-                }
+            PageCtl::Track(tb, 0) => {
+                let gib = tb.pos().max(PERSIST_GIB_MIN) as u32;
+                persist_mib = gib * 1024;
             }
             PageCtl::Check(cb, 0) => {
                 cache_tmpfs = cb.check_state() == nwg::CheckBoxState::Checked;
