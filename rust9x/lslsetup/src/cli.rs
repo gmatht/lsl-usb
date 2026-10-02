@@ -171,7 +171,7 @@ Options:
   --data-dir <path>           LSL_DATA_DIR to write into lsl-usb.env
   --persist <backend>         Persistence backend for lsl-usb.env:
                              squashfs (default; home.sfs on the stick),
-                             none (RAM only), btrfs (home.btrfs loopback),
+                             btrfs (home.btrfs loopback),
                              f2fs (a real partition; experimental)
   --persist-mib <MiB>         Persistence image size for the btrfs backend
                              (default 4096; a FAT32 stick caps one file at 4 GiB)

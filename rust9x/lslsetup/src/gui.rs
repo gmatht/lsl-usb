@@ -111,15 +111,15 @@ pub struct GuiResult {
     pub ramclone: bool,                        // INSTALL-page "Boot to RAM" checkbox (default: off)
     pub extra_isos: Vec<String>,               // page-1 "extra boot" checkboxes (loopback-only, no firstboot)
     pub download_extras: Vec<(String, String)>, // page-1 kind-11 ticks: (url, name) to download, then loopback-only
-    pub persist_backend: String,                // "none" | "squashfs" | "btrfs" | "f2fs" (PERSISTENCE page radio)
-    pub persist_mib: u32,                       // size chosen on the slider, 0 for "none"
+    pub persist_backend: String,                // "squashfs" | "btrfs" | "f2fs" (PERSISTENCE page radio)
+    pub persist_mib: u32,                       // size chosen on the size combo
     pub cache_tmpfs: bool,                      // keep caches in RAM instead of a persistent image
 }
 
 /// Persistence backends, in the order the pane lists them. Positional, not
 /// label-derived: the harvest maps a Radio's INDEX to a value, because the
 /// labels are translated and must never be parsed (see locale.rs).
-pub const PERSIST_BACKENDS: [&str; 4] = ["squashfs", "none", "btrfs", "f2fs"];
+pub const PERSIST_BACKENDS: [&str; 3] = ["squashfs", "btrfs", "f2fs"];
 
 /// Default backend. `squashfs` is what the tree did before the pane existed, and
 /// it is the only backend with a working scrub story today - a new stick must
@@ -144,6 +144,77 @@ pub const PERSIST_MIB_DEFAULT: u32 = 4096;
 pub const PERSIST_GIB_MIN: usize = 1;
 pub const PERSIST_GIB_MAX: usize = 64;
 
+/// FAT32 cannot hold a single file of 4 GiB or more, and the btrfs backend is a
+/// FILE (`home-<distro>.btrfs`) inside the data dir. When that dir is stick-
+/// resident the image lands on FAT32, so any slider value at or above this cap
+/// produces a `truncate -s` that FAT32 cannot satisfy and an image that is
+/// silently short - `mkfs.btrfs` then fails or writes a filesystem whose size
+/// disagrees with the file, and /home simply stops persisting.
+///
+/// 4095 MiB, not 4096: FAT32's ceiling is 4 GiB minus one cluster
+/// (4294901760 bytes, `lsl_fat32_max_bytes`), and 4096 MiB is exactly 4 GiB -
+/// already over it. A round "4 GiB" in the UI would therefore still overflow.
+pub const PERSIST_FAT32_MAX_MIB: u32 = 4095;
+
+/// Clamp a chosen persistence size to what the destination filesystem can hold.
+///
+/// `on_fat32` reflects where the image will actually be written, not which
+/// backend was picked: btrfs-on-a-stick is the case the cap exists for, and
+/// btrfs-on-NTFS is not. Only the btrfs backend is a single file, so squashfs
+/// and f2fs are untouched - f2fs is a real partition and is bounded by the
+/// stick, which is the user's problem to notice, not ours to invent a limit for.
+pub fn clamp_persist_mib(mib: u32, on_fat32: bool) -> u32 {
+    if on_fat32 && mib > PERSIST_FAT32_MAX_MIB {
+        PERSIST_FAT32_MAX_MIB
+    } else {
+        mib
+    }
+}
+
+/// Is the volume holding `data_dir` FAT32?
+///
+/// `data_dir` is typed as a Linux path (`/mnt/c/Users/you/lsl-usb`) because that
+/// is what goes into lsl-usb.env, so the Windows drive letter has to be recovered
+/// from the `/mnt/<letter>/` prefix before the filesystem can be asked about it.
+///
+/// Conservative by design: anything we cannot positively identify as FAT32
+/// answers false, which means "do not clamp". Under-capping would deny the user
+/// a size the destination can actually hold; over-capping writes an image that
+/// silently fails to persist. The first failure is visible, the second is not.
+pub fn data_dir_on_fat32(data_dir: &str) -> bool {
+    let letter = match wsl_drive_letter(data_dir) {
+        Some(l) => l,
+        None => return false,
+    };
+    sys::list_volumes()
+        .iter()
+        .find(|v| v.letter.eq_ignore_ascii_case(&letter))
+        .map(|v| {
+            let fs = v.fs.to_ascii_lowercase();
+            fs.starts_with("fat") || fs == "fat32"
+        })
+        .unwrap_or(false)
+}
+
+/// Recover the Windows drive letter from a WSL-style path: `/mnt/c/foo` -> `c`.
+///
+/// Returns None for a real Linux path (`/home/...`, `/persist/...`), which is
+/// the answer for "not a Windows volume, so no FAT32 cap".
+pub fn wsl_drive_letter(path: &str) -> Option<String> {
+    let p = path.trim().replace('\\', "/");
+    let rest = p.strip_prefix("/mnt/")?;
+    let letter = rest.chars().next()?;
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    // Must be a whole path segment: `/mnt/ce/...` is not drive C.
+    let after = &rest[1..];
+    if !after.is_empty() && !after.starts_with('/') {
+        return None;
+    }
+    Some(letter.to_ascii_lowercase().to_string())
+}
+
 /// Readout text for a persistence size in MiB: "4.0 GiB (4096 MiB)".
 ///
 /// Shown beside the slider so the value is legible rather than inferred from
@@ -152,6 +223,39 @@ pub const PERSIST_GIB_MAX: usize = 64;
 /// otherwise write a number the user never saw.
 pub fn persist_gib_text(mib: u32) -> String {
     format!("{:.1} GiB ({} MiB)", mib as f64 / 1024.0, mib)
+}
+
+/// Refresh the persistence pane's size readout from the slider's live position.
+///
+/// The readout was originally STATIC text written once at page-build time, so it
+/// displayed the default ("4.0 GiB") no matter where the slider was moved: the
+/// pane showed a number that did not describe the control beside it, and the
+/// number Install writes was not the number on screen. This is called at the top
+/// of every event dispatch and only writes when the text actually changes.
+fn sync_persist_readout(items: &PageItems) {
+    let mut track: Option<usize> = None;
+    let mut label: Option<usize> = None;
+    for (i, it) in items.borrow().iter().enumerate() {
+        match &it.ctl {
+            PageCtl::Track(_, 0) => track = Some(i),
+            PageCtl::Lbl(_, 1) => label = Some(i),
+            _ => {}
+        }
+    }
+    let (Some(ti), Some(li)) = (track, label) else {
+        return;
+    };
+    let items_ref = items.borrow();
+    let mib = match &items_ref[ti].ctl {
+        PageCtl::Track(tb, _) => (tb.pos().max(PERSIST_GIB_MIN) as u32) * 1024,
+        _ => return,
+    };
+    if let PageCtl::Lbl(lb, _) = &items_ref[li].ctl {
+        let want = persist_gib_text(mib);
+        if lb.text() != want {
+            lb.set_text(&want);
+        }
+    }
 }
 
 /// Persistence-page backend caveats (design s2.1). Height is part of the
@@ -3657,7 +3761,6 @@ pub fn run_gui(
             .iter()
             .zip([
                 "Squashfs layer (home.sfs on the stick) - recommended",
-                "None - RAM only, nothing survives a reboot",
                 "Btrfs image (home.btrfs loopback on the data dir)",
                 "F2FS partition (experimental; needs a second partition)",
             ])
@@ -3697,22 +3800,32 @@ pub fn run_gui(
         // one; the name was the only thing missing.
         push_lbl(&mut p, &crate::locale::tr("Persistence space:"), 10, y, -20, 18);
         y += 20;
+        let default_gib = (PERSIST_MIB_DEFAULT / 1024) as usize;
+        // Range AND position go through the BUILDER, in that order, rather than
+        // via set_range_min/set_range_max/set_pos after the build. Calling them
+        // afterwards sends TBM_SETRANGEMIN, TBM_SETRANGEMAX and TBM_SETPOSNOTIFY
+        // separately, and Win32 re-clamps the position when the range changes -
+        // so a set_pos(4) issued before the range was applied (or reset by it)
+        // is silently undone. The builder issues TBM_SETRANGE once and then the
+        // position, so the default actually sticks.
         let mut tb: Box<nwg::TrackBar> = Box::default();
         let _ = nwg::TrackBar::builder()
             .flags(nwg::TrackBarFlags::VISIBLE)
             .position((10, y))
             .size((400, 30))
+            .range(Some(PERSIST_GIB_MIN..PERSIST_GIB_MAX))
+            .pos(Some(default_gib))
             .parent(&frame_persist)
             .build(&mut tb);
-        tb.set_range_min(PERSIST_GIB_MIN);
-        tb.set_range_max(PERSIST_GIB_MAX);
-        // The default position is the MiB default expressed in the slider's GiB
-        // units, not index 0.
-        tb.set_pos((PERSIST_MIB_DEFAULT / 1024) as usize);
         p.push(PageItem { ctl: PageCtl::Track(tb, 0), x: 10, y, w: 400, h: 30, idx: 0 });
-        // Readout of the current slider value. Static text would go stale the
-        // moment the slider moves, and the value is the thing the user is
-        // choosing - it has to be visible, not inferred from the handle.
+        // Live readout of the current value.
+        //
+        // This was STATIC text set once at build time, so the pane showed
+        // "4.0 GiB" no matter where the slider was dragged - the control looked
+        // broken and, worse, the number on screen did not describe the value
+        // that Install would write. It is now refreshed from the slider's
+        // notification (below) AND read back from pos() at Install, so what is
+        // displayed is what is harvested.
         let mut lbl_val: Box<nwg::Label> = Box::default();
         let _ = nwg::Label::builder()
             .text(&persist_gib_text(PERSIST_MIB_DEFAULT))
@@ -4343,9 +4456,16 @@ pub fn run_gui(
     let btn_everything_c = btn_everything.clone();
     let btn_reboot_c = btn_reboot.clone();
     let working_c = working.clone();
+    let persist_items_c = persist_items.clone();
 
         move |event, data, handle| {
         use nwg::Event;
+        // Keep the slider's readout in step with the control. A trackbar posts
+        // no nwg event of its own here, so the cheapest correct place is the top
+        // of every dispatch: read pos() and rewrite the label when the text
+        // changes. It only touches the label when the value actually differs, so
+        // this costs nothing while the slider is idle.
+        sync_persist_readout(&persist_items_c);
         match event {
             // Per-window Ctrl+Alt+B fallback: RegisterHotKey is a single-slot
             // system resource - when another instance (or app) owns the combo,
@@ -5332,8 +5452,8 @@ fn harvest_gui_result(
     // translated string to pick a backend would break silently in every other
     // language - the exact failure locale.rs warns about. If no radio is
     // checked (should not happen; WS_GROUP always leaves one) fall back to the
-    // default rather than to "none", because defaulting to no-persistence would
-    // look like the tool quietly discarded the user's settings.
+    // default, so a missed radio can never silently resolve to a backend the
+    // user did not pick.
     let mut persist_backend = PERSIST_DEFAULT.to_string();
     let mut persist_mib = PERSIST_MIB_DEFAULT;
     let mut cache_tmpfs = true;
@@ -5356,10 +5476,20 @@ fn harvest_gui_result(
             _ => {}
         }
     }
-    // "none" has no size; 0 is the honest value and the shell side ignores it.
-    if persist_backend == "none" {
-        persist_mib = 0;
+    // The btrfs backend is a single FILE inside the data dir. If that dir is on
+    // a FAT32 volume the file cannot exceed ~4 GiB, and nothing downstream would
+    // notice: `truncate -s` on FAT32 yields a short file, mkfs.btrfs writes a
+    // filesystem that disagrees with it, and /home quietly stops persisting.
+    // The design (s2.1) requires this be settled HERE rather than at write time.
+    //
+    // Clamp by DESTINATION, not by backend: the same btrfs file on the HDD's
+    // NTFS data dir has no such limit, so capping on the backend name would
+    // throw away the large sizes HDD mode exists to offer.
+    if persist_backend == "btrfs" {
+        persist_mib = clamp_persist_mib(persist_mib, data_dir_on_fat32(&data_text));
     }
+    // Every backend keeps the chosen size: a 0 here would mean "no persistence",
+    // which the pane can no longer express.
     let wsl_vhdx: Vec<String> = vhdx_text
         .lines()
         .map(|l| l.trim().to_string())
@@ -5850,6 +5980,58 @@ mod tests {
                 need
             );
         }
+    }
+
+    /// The btrfs image is a FILE. On FAT32 that caps it at ~4 GiB, and the
+    /// slider reaches 64 GiB - so the harvest must clamp, or `truncate -s` writes
+    /// a short file on the stick and /home silently stops persisting.
+    #[test]
+    fn fat32_caps_the_btrfs_image_at_four_gib() {
+        // The slider's own maximum, 64 GiB, must not survive on FAT32.
+        assert_eq!(clamp_persist_mib(64 * 1024, true), PERSIST_FAT32_MAX_MIB);
+        assert_eq!(clamp_persist_mib(8 * 1024, true), PERSIST_FAT32_MAX_MIB);
+        // 4 GiB is ALREADY over the FAT32 ceiling, so it clamps too - a round
+        // "4 GiB" in the UI would still overflow the filesystem.
+        assert_eq!(clamp_persist_mib(4 * 1024, true), PERSIST_FAT32_MAX_MIB);
+        // At or under the cap the value is untouched.
+        assert_eq!(clamp_persist_mib(1 * 1024, true), 1 * 1024);
+        assert_eq!(clamp_persist_mib(2 * 1024, true), 2 * 1024);
+        // NTFS (the HDD data dir) has no such limit - this is the case that makes
+        // the clamp conditional rather than a flat 4 GiB cap.
+        assert_eq!(clamp_persist_mib(64 * 1024, false), 64 * 1024);
+        assert_eq!(clamp_persist_mib(4 * 1024, false), 4 * 1024);
+    }
+
+    /// The GUI caps in MiB; the tree's byte-level ceiling is 4294901760
+    /// (`lsl_fat32_max_bytes`). They must not contradict each other: a MiB cap
+    /// that implied MORE bytes than FAT32 allows would still write a short file.
+    /// 4096 MiB is exactly 4 GiB, which is already over the FAT32 limit - so the
+    /// cap has to sit at or below 4095 MiB, not at it.
+    #[test]
+    fn the_mib_cap_never_exceeds_the_bytes_the_shell_allows() {
+        let max_bytes: u64 = 4294901760;
+        assert!(u64::from(PERSIST_FAT32_MAX_MIB) * 1024 * 1024 <= max_bytes);
+    }
+
+    #[test]
+    fn wsl_paths_map_to_drive_letters_and_linux_paths_do_not() {
+        assert_eq!(wsl_drive_letter("/mnt/c/Users/lsl-usb").as_deref(), Some("c"));
+        assert_eq!(wsl_drive_letter("/mnt/d/lsl").as_deref(), Some("d"));
+        // A multi-character first segment is not a drive letter.
+        assert_eq!(wsl_drive_letter("/mnt/ce/foo"), None);
+        // Real Linux paths: no Windows volume, so no FAT32 cap.
+        assert_eq!(wsl_drive_letter("/home/ubuntu"), None);
+        assert_eq!(wsl_drive_letter("/persist"), None);
+        assert_eq!(wsl_drive_letter(""), None);
+    }
+
+    /// Anything we cannot identify must NOT clamp: under-capping denies a size
+    /// the destination can hold (visible), over-capping writes an image that
+    /// silently fails to persist (not visible).
+    #[test]
+    fn an_unidentifiable_data_dir_does_not_clamp() {
+        assert!(!data_dir_on_fat32("/home/ubuntu/lsl-usb"));
+        assert!(!data_dir_on_fat32(""));
     }
 
     #[test]
