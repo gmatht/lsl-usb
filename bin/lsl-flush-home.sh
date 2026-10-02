@@ -35,6 +35,16 @@ if [ "$_ehm" = "usb-fallback" ]; then
     exit 1
 fi
 
+# An f2fs upper is ALREADY persistent - it is the partition itself, written live.
+# Packing it into home.sfs as well would duplicate every change into two places,
+# and on the next boot the squashfs copy (the overlay LOWER) would shadow the
+# partition's newer content. So there is nothing to flush: say so and stop.
+if [ "$_ehm" = "f2fs" ]; then
+    echo "lsl-flush-home.sh: /home is persistent on the f2fs partition; nothing to flush." >&2
+    echo "  Changes are already written to ${LSL_PERSIST_MNT:-/persist}/upper as you make them." >&2
+    exit 0
+fi
+
 if ! mountpoint -q /home 2>/dev/null; then
     echo "lsl-flush-home.sh: /home is not mounted." >&2
     exit 1

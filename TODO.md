@@ -86,35 +86,52 @@ OPEN 2026-10-01 (WHYFAIL12): machine identity in the overlay upper - latent
     - user-mode NBD + pivot       -> viable; used set enumerable (s11.12):
       walk + FIEMAP skipping EXTENT_UNWRITTEN. This stick: 0.38 GiB live
       data vs 4.2 GiB "du". Pivot safe once every enumerated extent is read.
-OPEN 2026-10-01: PERSISTENCE PANE (design only) - DESIGN-PERSISTENCE-PANE.md.
-  New wizard page between "system" and "wifi": backend radio (none/squashfs/
-  btrfs/f2fs), random-write check (advisory - NO calibrated threshold yet),
-  space slider (default 3/4, min = base layer 2.5GB + 98MB kernel + 1GB layer
-  room = 3.6GB), 32GB FAT cap, caches-on-tmpfs, and an EATMYDATA SPEED OPTION.
-  NO DESTRUCTIVE CONTROL: "Erase this stick" was REMOVED (design v6 s2.6) - the
-  pane is non-destructive end to end. Formatting belongs to the Rufus flow, where
-  Rufus prompts. Do not add a repartition/erase control here without its own
-  design.
-  (s2.8: wrap the sync-heavy first-boot steps - dpkg/apt, mksquashfs, layer copy.
-  Default off. NOTE the manpage CAVEAT applies to us: uproot chroots into the
-  target image (uproot:526-553) and the arch can differ from the host, so
-  libeatmydata1 must be present IN THE CHROOT for the target arch, and the option
-  must VERIFY the preload loaded or it silently does nothing).
-  *** HARD CONSTRAINT: the eatmydata option enables the eatmydata UTILITY AND
-  NOTHING ELSE. It must NEVER be wired to partitioning/formatting/any disk write
-  - those live behind "Erase this stick" only - and must never be an excuse to
-  install anything the user did not ask for. Formatting a drive is not funny and
-  a destructive checkbox is not a waiver. DO NOT IMPLEMENT MALWARE. ***
-  Three findings (design doc s9):
-    - GPT refused for BIOS because grub4dos stage1 needs sectors 1..15 and the
-      GPT header+entries occupy exactly those. Repartitioning must produce MBR.
-    - Windows CANNOT resize FAT32 (Disk Management greys out Shrink; diskpart:
-      "the file system does not support it"). So "shrink FAT, leave room" is
-      impossible - instead CREATE an unformatted partition and let firstboot
-      mkfs.f2fs it. lslsetup already opens \\.\PhysicalDriveN and writes raw
-      sectors (nofmt.rs:443,2769), so a partition-table write extends existing
-      capability. This also makes it QEMU-testable without Windows.
-  Blocks: lslsetup does NOT partition today (zero sfdisk/IOCTL_DISK_SET_*).
+OPEN 2026-10-01: PERSISTENCE PANE - PARTIALLY BUILT (backend selection only).
+  DONE: the wizard page itself (page 4, between "system" and "wifi") with the
+    four-backend radio (none/squashfs/btrfs/f2fs), a bounded size selector, and
+    the cache-on-tmpfs policy. INSTALL_PAGE 5->6. Harvested by control KIND and
+    radio INDEX, never by label - the labels are translated. Reaches Linux via
+    LSL_PERSIST / LSL_HOME_BTRFS_MIB / LSL_CACHE_TMPFS in lsl-usb.env, with
+    --persist / --persist-mib / --cache-tmpfs flags for headless reproduction.
+    NO DESTRUCTIVE CONTROL: nothing on the page repartitions, formats, or erases.
+  NOT DONE, and why:
+    - The RANDOM-WRITE CHECK (s2.2) is not implemented. There is NO calibrated
+      threshold and nothing to calibrate against; a wrong threshold turns away a
+      working stick. The design itself says ship advisory-only and calibrate
+      first. THIS IS THE NEXT THING TO BUILD IF THE PANE IS FINISHED OFF.
+    - eatmydata (s2.8) is not implemented. If it ever is, the hard constraint
+      stands: it enables libeatmydata AND NOTHING ELSE - never partitioning,
+      formatting, erasing, or any disk write, and never installing anything the
+      user did not ask for. Do not implement malware.
+    - The size control is a COMBO BOX, not the designed slider: the vendored nwg
+      is Win95-era and has no Slider control. Offered sizes are bounded, and the
+      real limit (FAT32's 4 GiB single-file cap on a btrfs image) is stated in
+      the pane rather than discovered at write time.
+    - The FAT/persistence SPLIT (s2.3-2.4) is not implemented - it needs
+      repartitioning, which needs its own design.
+
+OPEN 2026-10-01: F2FS PERSISTENCE - Linux side BUILT, unverified on hardware.
+  P1 bin/lsl-f2fs-provision (format by label, never repartitions),
+  P2 initramfs/lsl_f2fs_scrub.sh (casper-premount hook, injected in both initrds),
+  P3 bin/lsl-regen-identity (per-boot rewrite, called from onboot.sh).
+  Also fixed: uphome and lsl-flush-home.sh would have fought the f2fs backend by
+  packing an ALREADY-persistent upper into home.sfs, where the squashfs copy
+  (the overlay LOWER) would shadow the partition's newer content.
+
+  STILL OPEN, and it is the part that matters:
+    - DESIGN-F2FS-PERSISTENCE.md s10 steps 2-5 are NOT written. The scrub's
+      STATIC checks run in tests/f2fs-scrub.tests.sh; its f2fs half skips
+      without root. Step 1 tests the scrub IN ISOLATION and would pass even if
+      the hook never ran at the right moment - so nothing here may be read as
+      "works on a boot". The QEMU ordering test (step 2) and the two-machine
+      simulation (step 3) are the ones that would actually prove it.
+    - WINDOWS-SIDE PROVISIONING (s8.1) is not implemented. lslsetup does not
+      create the partition; only the Linux formatter exists. That is the
+      difference between "works on a stick we prepared by hand" and "works for
+      a user".
+    - The DENYLIST is the weak point and is unchanged: it removes the machine
+      identity we know about, not machine identity.
+    - No loop-device name is recorded at mount time (see the btrfs-growd note).
 
 DONE 2026-10-01: COMPRESSION - FINDINGS-COMPRESSION.md, applied.
   Every mksquashfs call now takes -Xcompression-level "$LSL_SQUASHFS_COMPRESSION_LEVEL",

@@ -39,6 +39,20 @@ if [ "$_ehm" = "usb" ] || { [ -z "$_ehm" ] && lsl_is_usb_mode; }; then
     exec "$SCRIPT_DIR/lsl-flush-home.sh"
 fi
 
+# f2fs upper: every write already went straight to the partition, so there is no
+# image to flush and no btrfs to sync. Only the wifi record still needs writing.
+# It MUST be handled before the HDD branch below, which would sync btrfs paths
+# that do not exist on an f2fs boot and then report a misleading success.
+if [ "$_ehm" = "f2fs" ]; then
+    echo "f2fs mode: /home is already persistent on ${LSL_PERSIST_MNT:-/persist}; syncing…"
+    if [ -x "$SCRIPT_DIR/persist-wifi.sh" ]; then
+        "$SCRIPT_DIR/persist-wifi.sh" || true
+    fi
+    sync
+    echo "f2fs home sync complete (changes were written live, not packed)."
+    exit 0
+fi
+
 echo "HDD mode: syncing btrfs…"
 btrfs filesystem sync /home 2>/dev/null || true
 if mountpoint -q /mnt/lsl-cache 2>/dev/null; then

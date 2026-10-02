@@ -1,7 +1,12 @@
 #!/bin/bash
-# Mount the live user's /home: RAM-only (Boot to RAM, no persistence), a
-# tmpfs-overlay over the per-distro home.sfs (USB mode), or a loop-mounted
-# home.btrfs/cache.btrfs pair on the LSL data dir (HDD mode).
+# Mount the live user's /home: RAM-only (Boot to RAM, no persistence, or the
+# persistence pane's "None"), a tmpfs-overlay over the per-distro home.sfs
+# (squashfs backend), a loop-mounted home.btrfs/cache.btrfs pair (btrfs backend),
+# or a F2FS partition holding the overlay upper (f2fs backend).
+#
+# The backend is chosen by LSL_PERSIST in lsl-usb.env; see
+# DESIGN-PERSISTENCE-PANE.md s1.2 and lsl_persist_backend(). Default is
+# squashfs, which is exactly what this script did before the knob existed.
 #
 # Split out of onboot.sh so the display manager can wait for the /home mount
 # ALONE (lsl-home.service is Before=display-manager.service): a session that
@@ -23,6 +28,12 @@ export LSL_ENV_FILE
 . "$SCRIPT_DIR/lsl-common.sh"
 
 lsl_load_config
+
+# Which persistence backend the user chose (persistence pane / lsl-usb.env).
+# Read BEFORE the branch below: `none` means the RAM-only path, `btrfs` and
+# `f2fs` mean the data-dir path even when that dir is on the stick, and only
+# `squashfs` keeps the old "is the data dir on the stick?" question.
+LSL_PERSIST_BACKEND="$(lsl_persist_backend)"
 
 # Adopt a pre-per-distro home/cache image (first boot after this change).
 lsl_home_migrate_legacy
@@ -115,8 +126,13 @@ fi
 # user a RAM-only home and touch no persistence at all. Building a valid
 # /home/<user> (owned by the user, seeded from /etc/skel) is required -
 # LightDM's autologin session dies without it and drops back to the greeter.
+#
+# LSL_PERSIST=none reaches the SAME branch from the persistence pane: both mean
+# "nothing survives a reboot", and keeping them on one code path means the RAM
+# home cannot drift between the two entry points.
 LSL_EPHEMERAL_HOME=0
 grep -q 'lsl_home=tmpfs' "${LSL_CMDLINE_FILE:-/proc/cmdline}" 2>/dev/null && LSL_EPHEMERAL_HOME=1
+[ "$LSL_PERSIST_BACKEND" = "none" ] && LSL_EPHEMERAL_HOME=1
 
 if [ "$LSL_EPHEMERAL_HOME" = "1" ]; then
     mkdir -p /run/lsl-live-home
@@ -128,19 +144,64 @@ if [ "$LSL_EPHEMERAL_HOME" = "1" ]; then
             cp -a "/run/lsl-live-home/$LSL_DESKTOP_USER/." "/home/$LSL_DESKTOP_USER/" 2>/dev/null || true
             chown -R "$LSL_DESKTOP_USER:$LSL_DESKTOP_USER" "/home/$LSL_DESKTOP_USER" 2>/dev/null || true
         fi
-        echo "lsl: RAM-only home (Boot to RAM, no persistence); changes are lost on reboot." >&2
+        if [ "$LSL_PERSIST_BACKEND" = "none" ]; then
+            echo "lsl: RAM-only home (persistence = none); changes are lost on reboot." >&2
+        else
+            echo "lsl: RAM-only home (Boot to RAM, no persistence); changes are lost on reboot." >&2
+        fi
     else
         echo "lsl: could not mount tmpfs on /home; keeping the live home." >&2
     fi
     umount /run/lsl-live-home 2>/dev/null || true
     rmdir /run/lsl-live-home 2>/dev/null || true
     echo "LSL_MODE=ram" > /run/lsl-usb.state
-elif lsl_is_usb_mode || [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
+elif lsl_uses_overlay_backend; then
     mkdir -p "$LSL_HOME_TMPFS" "$LSL_HOME_UPPER" "$LSL_HOME_WORK" "$LSL_HOME_LOWER"
     if ! mountpoint -q "$LSL_HOME_TMPFS" 2>/dev/null; then
         mount -t tmpfs -o "size=${LSL_HOME_TMPFS_MIB:-2048}M" tmpfs "$LSL_HOME_TMPFS"
     fi
     mkdir -p "$LSL_HOME_UPPER" "$LSL_HOME_WORK" "$LSL_HOME_LOWER"
+
+    # ---- f2fs backend: the overlay upper lives on the F2FS partition --------
+    # Everything above this point is identical to the squashfs backend - same
+    # tmpfs for work/, same home.sfs lower. Only the upper differs: instead of a
+    # directory that vanishes at reboot, it is bind-mounted from the persistent
+    # partition. That single change is what makes /home survive a reboot.
+    #
+    # Every failure here degrades to the tmpfs upper rather than to no /home:
+    # a missing partition must not mean a missing home.
+    _lsl_f2fs_ok=0
+    if [ "$LSL_PERSIST_BACKEND" = "f2fs" ]; then
+        _lsl_f2fs_dev=""
+        if [ -b "/dev/disk/by-label/$LSL_PERSIST_LABEL" ]; then
+            _lsl_f2fs_dev="/dev/disk/by-label/$LSL_PERSIST_LABEL"
+        elif command -v blkid >/dev/null 2>&1; then
+            _lsl_f2fs_dev="$(blkid -L "$LSL_PERSIST_LABEL" 2>/dev/null || true)"
+        fi
+        if [ -z "$_lsl_f2fs_dev" ] || [ ! -b "$_lsl_f2fs_dev" ]; then
+            echo "lsl: WARNING: persistence=f2fs but no '$LSL_PERSIST_LABEL' partition found;" >&2
+            echo "       falling back to a RAM upper (/home will NOT persist)." >&2
+            echo "       Create and format one with bin/lsl-f2fs-provision." >&2
+        elif ! grep -qw f2fs /proc/filesystems 2>/dev/null; then
+            echo "lsl: WARNING: this kernel has no f2fs driver; using a RAM upper." >&2
+        elif ! mount -t f2fs "$_lsl_f2fs_dev" "$LSL_PERSIST_MNT" 2>/dev/null; then
+            echo "lsl: WARNING: could not mount $_lsl_f2fs_dev at $LSL_PERSIST_MNT;" >&2
+            echo "       using a RAM upper (/home will NOT persist this boot)." >&2
+        else
+            mkdir -p "$LSL_PERSIST_MNT/upper" 2>/dev/null || true
+            # Bind the persistent upper over the tmpfs one. work/ stays on tmpfs
+            # deliberately: overlayfs requires upper and work on the same
+            # filesystem, so the bind gives us that.
+            if mount --bind "$LSL_PERSIST_MNT/upper" "$LSL_HOME_UPPER" 2>/dev/null; then
+                _lsl_f2fs_ok=1
+                echo "lsl: persistent home upper on $_lsl_f2fs_dev ($LSL_PERSIST_MNT/upper)." >&2
+            else
+                echo "lsl: WARNING: could not bind the f2fs upper; using a RAM upper." >&2
+                umount "$LSL_PERSIST_MNT" 2>/dev/null || true
+            fi
+        fi
+    fi
+
     if [ ! -f $HOME_SFS ]; then
         # First boot of a Windows-installed image: seed home.sfs from the live
         # /home (keeps the mint user's login home) so the USB-mode overlay works.
@@ -181,17 +242,34 @@ elif lsl_is_usb_mode || [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
     # A fallback tmpfs overlay (HDD data dir not persistent yet) records its own
     # mode so downstream consumers can tell it apart from a real USB stick: both
     # have a RAM upper layer, but only the fallback is a transient accident.
+    #
+    # `f2fs` is recorded separately from `usb` even though the overlay shape is
+    # identical, because they differ in the property that matters to every
+    # consumer: a usb upper is RAM (changes die at reboot) and an f2fs upper is
+    # NOT (they survive). lsl_effective_home_is_usb() must therefore NOT claim an
+    # f2fs home is stick-persistable in the same way - a caller that flushes the
+    # upper back to home.sfs would fight the real persistence.
     _lsl_state_mode=usb
     if [ "${LSL_FALLBACK_USB_HOME:-0}" = "1" ]; then
         _lsl_state_mode=usb-fallback
+    fi
+    if [ "$_lsl_f2fs_ok" = "1" ]; then
+        _lsl_state_mode=f2fs
     fi
     {
         echo "LSL_HOME_LOWER=$LSL_HOME_LOWER"
         echo "LSL_HOME_UPPER=$LSL_HOME_UPPER"
         echo "LSL_HOME_WORK=$LSL_HOME_WORK"
         echo "LSL_MODE=$_lsl_state_mode"
+        [ "$_lsl_f2fs_ok" = "1" ] && echo "LSL_PERSIST_MOUNT=$LSL_PERSIST_MNT"
+        true
     } > /run/lsl-usb.state
 else
+    # HDD path: loop-backed home.btrfs + cache.btrfs on the data dir. Reached
+    # when the data dir is not stick-resident (the original trigger) OR when the
+    # pane chose the btrfs backend explicitly - btrfs on a stick is the same
+    # machinery pointed at a different directory, so there is nothing to branch
+    # on beyond which directory lsl_*_btrfs_path resolves to.
     HOME_IMG="$(lsl_home_btrfs_path)"
     CACHE_IMG="$(lsl_cache_btrfs_path)"
     mkdir -p "$(dirname "$HOME_IMG")"

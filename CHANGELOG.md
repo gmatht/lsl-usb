@@ -7,7 +7,46 @@ All notable changes to lsl-usb. Format based on [Keep a Changelog](https://keepa
 Four open proposals closed. `FINDINGS-COMPRESSION.md`, `TODO.md` and
 `docs/BTRFS-GROWD.md` carry the full reasoning for each.
 
+### Added
+
+- **F2FS persistence, Linux side (`DESIGN-F2FS-PERSISTENCE.md` P1+P2+P3).**
+  `/home` can now live on a real F2FS partition instead of a RAM upper that
+  vanishes at reboot. Three parts, and all three are needed:
+  - **P1** `bin/lsl-f2fs-provision` formats a partition **by label**
+    (`lsl-persist`) and **never repartitions** — a stick must already have a
+    second partition, created by Rufus or by hand. It refuses to reformat
+    anything carrying a different filesystem without `--force`.
+  - **P2** `initramfs/lsl_f2fs_scrub.sh` runs as a casper-premount hook,
+    strictly before the overlay mounts, and removes machine identity from the
+    persistent upper — the netplan/NetworkManager profile (which carries a
+    cleartext WPA PSK), hostname, hosts, machine-id, resolv.conf, casper.conf,
+    lightdm.conf, and the snakeoil key pair. Mounts read-only first, and finds
+    the device **by label** so a partition another tool made is never hijacked.
+  - **P3** `bin/lsl-regen-identity` rewrites those paths for *this* boot. **P2
+    without P3 is not a fix**: deleting a file unmasks the lower's stale copy
+    rather than producing a correct one (`WHYFAIL12`).
+  - Wired into both initrds (`build.sh` and the Rust `repack_initrd`) because the
+    hook is *sourced* by casper and uses `return`.
+  - **Not verified on hardware.** The scrub's static checks run in
+    `tests/f2fs-scrub.tests.sh`; the design's own QEMU ordering and two-machine
+    tests are not written, so this must not be read as "works on a boot".
+
+- **A persistence page in the wizard** (`DESIGN-PERSISTENCE-PANE.md`), at page 4
+  between "system" and "wifi". Four backends — none / squashfs (default, what
+  the tree always did) / btrfs / f2fs — plus a bounded size selector and
+  cache-on-tmpfs. Reaches Linux through `LSL_PERSIST`, `LSL_HOME_BTRFS_MIB` and
+  `LSL_CACHE_TMPFS` in `lsl-usb.env`, with matching `--persist`, `--persist-mib`
+  and `--cache-tmpfs` flags so the FINISHED page's command line reproduces it.
+  **Non-destructive end to end**: there is no erase control, and nothing on the
+  page can repartition or format.
+
 ### Fixed
+
+- **`uphome` and `lsl-flush-home.sh` would have fought the f2fs backend.** An f2fs
+  upper is *already* persistent, so packing the merged home into `home.sfs` would
+  duplicate every change into two places — and on the next boot the squashfs copy
+  (the overlay **lower**) would shadow the partition's newer content. Both now
+  detect the `f2fs` mode and say there is nothing to flush.
 
 - **Every build trace was blank (WHYFAIL16).** The build stamp read its version
   from `<bundle>\VERSION` and `unwrap_or_default()`-ed a failed read to the empty
@@ -32,6 +71,13 @@ Four open proposals closed. `FINDINGS-COMPRESSION.md`, `TODO.md` and
   the first) nor resizes `/home` where an overlay may be stacked.
 
 ### Changed
+
+- **`lsl-mount-home.sh` branches on `LSL_PERSIST` rather than on where the data
+  dir lives.** `none` reuses the existing RAM-only path (so the pane and
+  Boot-to-RAM cannot drift apart), `f2fs` reuses the overlay shape with a
+  persistent upper, and `btrfs` takes the loop-image path even on a stick. Any
+  f2fs failure degrades to a RAM upper with a warning rather than to no `/home`.
+  An unknown `LSL_PERSIST` falls back to `squashfs` **and says so**.
 
 - **Squashfs compression: one constant at level 15.** The tree passed
   `-Xcompression-level 22` at seven call sites — past libzstd's regular range

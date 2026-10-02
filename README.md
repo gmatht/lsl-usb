@@ -224,6 +224,26 @@ the bundle can ship a complete, always-fresh cache with no dependence on the
 - `LSL_SFS_HDD_CACHE` (default: `0`)
   - Set to `1` (by the installer wizard or `lsl-copy-sfs-hdd.sh --use`) so
     `lsl-precache.sh` warms the page cache from the HDD copy of the layers.
+- `LSL_PERSIST` (default: `squashfs`)
+  - What persists across boots: `none` (RAM only), `squashfs` (a
+    `home-<distro>.sfs` overlay on the stick — the pre-pane default and the only
+    backend with a working identity scrub), `btrfs` (a loopback
+    `home-<distro>.btrfs`), or `f2fs` (a real partition). Set by the wizard's
+    persistence page or `--persist`. An unknown value falls back to `squashfs`
+    **and prints a warning** — a typo must not silently mean "no persistence".
+- `LSL_PERSIST_MIB` / `LSL_HOME_BTRFS_MIB` (default: `4096`)
+  - Persistence image size for the `btrfs` backend. A btrfs image is a *file*, so
+    on a FAT32 stick it is capped by the 4 GiB single-file limit
+    ([4 GiB − 64 KiB](https://palmpedia.net/wiki/FAT32#File_size_limit)).
+- `LSL_PERSIST_LABEL` (default: `lsl-persist`) / `LSL_PERSIST_MNT` (default: `/persist`)
+  - Label and mountpoint of the F2FS partition. Looked up **by label** so a
+    partition another tool created is never hijacked.
+- `LSL_CACHE_TMPFS` (default: `1`)
+  - Keep `~/.cache` and `/var/cache` in RAM (recreated each boot) instead of a
+    persistent image. Saves USB wear; costs up to `LSL_HOME_TMPFS_MIB` of RAM.
+- `LSL_PERSIST_SCRUB` (default: `1`)
+  - Run the boot-time identity scrub against the F2FS partition. See
+    [`DESIGN-F2FS-PERSISTENCE.md`](DESIGN-F2FS-PERSISTENCE.md).
 - `LSL_SQUASHFS_COMPRESSION_LEVEL` (default: `15`)
   - zstd level for every `mksquashfs` call. One constant, defined in
     `bin/lsl-common.sh`, so the setting is reviewable in one place. **15** is the
@@ -600,9 +620,14 @@ place rather than quietly rewriting.
 - [`DESIGN-F2FS-PERSISTENCE.md`](DESIGN-F2FS-PERSISTENCE.md) — persisting `/home`
   on an F2FS partition: provisioning, the identity scrub in a `casper-premount`
   hook, the per-boot regenerators, open questions and a verification plan.
+  **P1+P2+P3 built (Linux side)**: `bin/lsl-f2fs-provision`,
+  `initramfs/lsl_f2fs_scrub.sh`, `bin/lsl-regen-identity`. Not yet verified on
+  hardware — the QEMU ordering and two-machine tests are not written.
 - [`DESIGN-PERSISTENCE-PANE.md`](DESIGN-PERSISTENCE-PANE.md) — the wizard page
-  that would drive it: backend, space slider, cache-on-tmpfs, the `eatmydata`
-  speed option, and how the space is actually obtained (no destructive control).
+  that drives it: backend, size, cache-on-tmpfs, and how the space is obtained
+  (no destructive control). **Backend selection built**; the random-write check,
+  the space split and the `eatmydata` option are not, and why is recorded in the
+  document.
 - [`DESIGN-BOOT-TO-RAM-VARIANTS.md`](DESIGN-BOOT-TO-RAM-VARIANTS.md) — Boot-to-RAM
   variants and every block-layer option for them (dm-clone, dm-cache, a user-mode
   NBD device), with what was **measured** versus what was merely read. §11

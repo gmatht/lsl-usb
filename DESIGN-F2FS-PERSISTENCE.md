@@ -1,9 +1,29 @@
 # DESIGN — F2FS persistence with a boot-time identity scrub
 
-**Status:** design only. No code written. Nothing in this document is tested on a
-real boot; every claim about casper is quoted from the initrd on the actual stick
+**Status: P1 + P2 + P3 IMPLEMENTED (Linux side), 2026-10-01. Not yet run on real
+hardware.** Every claim about casper is quoted from the initrd on the actual stick
 (`unmkinitramfs /cdrom/_ISO/linuxmint-22.3-cinnamon-64bit/initrd.lz`), and every
 claim about our own code is line-referenced to the tree it is written from.
+
+| part | what | where |
+|---|---|---|
+| **P1** provision | create/format the F2FS partition by label; never repartitions | `bin/lsl-f2fs-provision` |
+| **P2** scrub | remove identity from the persistent upper before the overlay mounts | `initramfs/lsl_f2fs_scrub.sh`, injected by `build.sh` and `rust9x/lslsetup/src/lslfiles.rs` |
+| **P3** regenerate | rewrite identity for THIS boot after `/home` is up | `bin/lsl-regen-identity`, called from `onboot.sh` |
+
+**What is NOT done**, and is not claimed:
+
+- **Windows-side provisioning** (§8.1). `lslsetup` does not create the partition;
+  only the Linux-side formatter exists. The pane says so where the choice is made.
+- **Verification steps 2-5 of §10.** The QEMU ordering test and the two-machine
+  simulation are not written. Step 1 (the scrub unit test) is
+  `tests/f2fs-scrub.tests.sh`, and its static half runs everywhere; its f2fs half
+  skips without root. **The design's own words: step 1 tests the scrub in
+  isolation and would pass even if the hook never ran at the right moment.** That
+  remains true, so nothing here should be read as "this works on a boot".
+- **The denylist's completeness** (§7, §11). It removes the identity we know
+  about, not machine identity. This is unchanged by the implementation and is
+  the honest weak point.
 
 **Scope:** how to make a persistent `/home` (or persistent root) on an F2FS
 filesystem, while removing machine-specific files from the persistent upper

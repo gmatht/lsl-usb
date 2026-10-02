@@ -1,15 +1,35 @@
 # DESIGN — Persistence pane
 
-**Status:** design, discussion and report only. **No code written.** Every fact
-about the existing tree is line-referenced; every number about a stick is either
-measured on this one or quoted with its source.
+**Status: BACKEND SELECTION IMPLEMENTED 2026-10-01; the other controls are not.**
+Built: the backend radio (all four backends), a bounded size selector, and the
+cache-on-tmpfs policy, at page 4 between "system" and "wifi". `INSTALL_PAGE`
+moved 5 → 6. The settings reach Linux through `LSL_PERSIST` /
+`LSL_HOME_BTRFS_MIB` / `LSL_CACHE_TMPFS` in `lsl-usb.env`, and the matching
+`--persist` / `--persist-mib` / `--cache-tmpfs` flags exist so the FINISHED page's
+command line reproduces them.
 
-**Goal:** a new wizard page where the user chooses what persists across boots, how
-much space it gets, and what happens to caches — replacing the current
-all-or-nothing behaviour with an explicit, bounded choice.
+**Not built, deliberately:**
+
+- **§2.2 random-write capability check.** Not implemented. It is the least-proven
+  control in this design and there is **no calibrated threshold** — the document's
+  own recommendation is "ship advisory-only, and calibrate before it does
+  anything else", and there is nothing to calibrate against yet. A wrong threshold
+  turns away a working stick, so shipping it uncalibrated would be worse than
+  shipping nothing.
+- **§2.8 `eatmydata`.** Not implemented, and the hard constraint in §2.8 stands
+  if it ever is: it enables `libeatmydata` and **nothing else** — never
+  partitioning, formatting, erasing, or any disk write. §2.6 removed the only
+  control that could have given a destructive "prank" somewhere to hide.
+- **§2.3-2.4 the space slider proper.** Replaced with a bounded combo box. The
+  vendored `nwg` is a Windows 95-era toolkit with **no Slider control**, so a
+  trackbar would mean porting one in for a single number. The offered sizes are
+  also not the full `total − FAT` split the design describes: a btrfs image is a
+  FILE, so FAT32's 4 GiB single-file cap — not the 32 GB FAT cap — is the binding
+  constraint, and it is stated in the pane instead of being enforced at write
+  time.
 
 **Related:** `DESIGN-F2FS-PERSISTENCE.md` (the scrub/regenerate mechanism this pane
-would drive), `DESIGN-BOOT-TO-RAM-VARIANTS.md` §11 (what the block layer can and
+drives), `DESIGN-BOOT-TO-RAM-VARIANTS.md` §11 (what the block layer can and
 cannot do), `WHYFAIL12.md` (why identity files must be scrubbed), `FINDINGS-COMPRESSION.md`
 (compression levels, not covered here).
 

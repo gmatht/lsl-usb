@@ -1,0 +1,135 @@
+#!/bin/bash
+# lsl-regen-identity - rewrite machine identity for THIS boot.
+#
+# Part P3 of DESIGN-F2FS-PERSISTENCE.md, and the half that is easy to forget:
+# the initrd scrub (P2) DELETES identity paths from the persistent upper, which
+# does not produce a correct file - it UNMASKS the lower's stale copy from
+# home-<distro>.sfs. Without this step the scrub relocates the staleness instead
+# of removing it. P2 and P3 are one operation.
+#
+# Run from onboot.sh on every boot, after /home is up. Idempotent by
+# construction: every file is written from the CURRENT machine's state, so
+# running it twice changes nothing. Same discipline as lsl_merge_fstab, which is
+# why /etc/fstab is the one identity-adjacent item WHYFAIL12 calls safe.
+#
+# What is regenerated, and from what:
+#   hostname, hosts       <- the live desktop user (never invented; see
+#                            lsl_desktop_user / WHYFAIL13)
+#   lightdm.conf          <- autologin-user = the same user
+#   casper.conf           <- USERNAME/HOST from the live session
+#   machine-id            <- systemd-machine-id-setup, so this machine's id
+#   snakeoil TLS          <- make-ssl-cert, regenerated not persisted
+#
+# Deliberately NOT regenerated: the Wi-Fi profile. bin/persist-wifi.sh already
+# writes a REPLAY script to /cdrom/wifi.sh (`nmcli device wifi connect ...`),
+# which onboot.sh runs. Replaying a command is better than persisting a profile:
+# no PSK sits in the persistent layer at all. See WHYFAIL12's PSK note.
+#
+# NEVER invent a username. If no desktop user resolves, do nothing and say so -
+# writing into a guessed home is exactly the WHYFAIL13 bug.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/lsl-common.sh"
+
+PREFIX="${LSL_REGEN_PREFIX:-lsl}"
+
+regen_log() { echo "lsl-regen: $*" >&2; }
+
+DESKTOP_USER="$(lsl_desktop_user)"
+if [ -z "$DESKTOP_USER" ]; then
+    regen_log "no desktop user resolvable; skipping identity regeneration"
+    exit 0
+fi
+
+# The host name: the live session's own idea of it if it has one, else the user.
+# $HOSTNAME inside an initramfs/chroot can be the build host's, so prefer the
+# kernel-visible one and fall back to the user name.
+HOST="$(hostname 2>/dev/null | tr -d '\r' || true)"
+[ -n "$HOST" ] || HOST="$DESKTOP_USER"
+
+# ---- hostname / hosts -------------------------------------------------------
+# Written whole, not appended, so a stale entry from another machine cannot
+# survive. This is what makes the scrub's deletion meaningful.
+{
+    echo "$HOST"
+} > /etc/hostname 2>/dev/null || regen_log "could not write /etc/hostname"
+
+{
+    echo "127.0.0.1	localhost"
+    echo "127.0.1.1	$HOST"
+    echo ""
+    echo "# ::1	localhost ip6-localhost ip6-loopback"
+    echo "# fe00::0	ip6-localnet"
+    echo "# ff00::0	ip6-mcastprefix"
+    echo "# ff02::1	ip6-allnodes"
+    echo "# ff02::2	ip6-allrouters"
+} > /etc/hosts 2>/dev/null || regen_log "could not write /etc/hosts"
+
+# ---- lightdm autologin ------------------------------------------------------
+# casper's lightdm.conf pins autologin-user=ubuntu; on a Mint stick the session
+# user is mint, and a mismatch drops the session back to the greeter. Written
+# from the resolved user every boot rather than relying on the scrubbed copy.
+LIGHTDM_DIR=/etc/lightdm
+if mkdir -p "$LIGHTDM_DIR" 2>/dev/null && [ -w "$LIGHTDM_DIR" ]; then
+    {
+        echo "[Seat:*]"
+        echo "autologin-user=$DESKTOP_USER"
+        echo "autologin-user-timeout=0"
+        echo "autologin-session=ubuntu-x-session"
+        echo "user-session=ubuntu-x-session"
+    } > "$LIGHTDM_DIR/lightdm.conf" 2>/dev/null || regen_log "could not write lightdm.conf"
+fi
+
+# ---- casper.conf ------------------------------------------------------------
+# USERNAME/HOST are what casper uses to decide the live session user. They must
+# describe THIS session, so they are captured per boot rather than persisted.
+if [ -w /etc ] || mkdir -p /etc 2>/dev/null; then
+    {
+        echo "USERNAME=\"$DESKTOP_USER\""
+        echo "USERNAME_FULL=\"$DESKTOP_USER\""
+        echo "HOST=\"$HOST\""
+        echo "BUILD_SYSTEM=\"Ubuntu\""
+        echo "ISO_NAME=\"lsl-usb\""
+    } > /etc/casper.conf 2>/dev/null || regen_log "could not write /etc/casper.conf"
+fi
+
+# ---- machine-id -------------------------------------------------------------
+# An absent machine-id is fine (systemd creates one); a machine-id carried over
+# from another machine is not, because it keys state that should be per-machine.
+# Only regenerate when one is genuinely missing or empty, so we do not churn the
+# id on every boot of the same machine.
+mid() {
+    if [ -s /etc/machine-id ]; then
+        cat /etc/machine-id 2>/dev/null | tr -d '\r\n'
+    elif [ -s /var/lib/dbus/machine-id ]; then
+        cat /var/lib/dbus/machine-id 2>/dev/null | tr -d '\r\n'
+    fi
+}
+if [ -z "$(mid)" ]; then
+    if command -v systemd-machine-id-setup >/dev/null 2>&1; then
+        systemd-machine-id-setup >/dev/null 2>&1 || true
+    fi
+    if [ -z "$(mid)" ] && [ -r /proc/sys/kernel/random/boot_id ]; then
+        # Last resort: derive a per-boot id from the kernel boot id. Weaker than
+        # a real machine-id (it changes every boot) but it is at least unique to
+        # THIS boot, which is what the scrub was protecting.
+        tr -d '\r\n-' < /proc/sys/kernel/random/boot_id > /etc/machine-id 2>/dev/null || true
+        regen_log "systemd-machine-id-setup unavailable; used the kernel boot id"
+    fi
+fi
+
+# ---- snakeoil TLS -----------------------------------------------------------
+# The cert/key pair is per-host. A persisted pair makes every machine present the
+# same key. Regenerate when absent; do not overwrite a pair this boot created.
+if [ ! -s /etc/ssl/certs/ssl-cert-snakeoil.pem ] || \
+   [ ! -s /etc/ssl/private/ssl-cert-snakeoil.key ]; then
+    if command -v make-ssl-cert >/dev/null 2>&1; then
+        make-ssl-cert generate-default-snakeoil --force-overwrite >/dev/null 2>&1 \
+            || regen_log "snakeoil regeneration failed (harmless)"
+    fi
+fi
+
+regen_log "identity regenerated for this boot (user=$DESKTOP_USER host=$HOST)"
+exit 0

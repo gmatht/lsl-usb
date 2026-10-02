@@ -379,6 +379,20 @@ else
     echo "lsl: WARNING: /cdrom/bin/lsl-mount-home.sh is missing; /home not mounted this boot (persistence off)." >&2
 fi
 
+# Regenerate machine identity for THIS boot, after /home is final (P3 of
+# DESIGN-F2FS-PERSISTENCE.md).
+#
+# This is the other half of the initrd scrub and is not optional: the scrub
+# DELETES identity paths from the persistent upper, which does not produce a
+# correct file - it unmasks the lower's stale copy. Without this step the scrub
+# relocates the staleness instead of removing it (WHYFAIL12).
+#
+# Harmless on every other backend: it rewrites hostname/hosts/lightdm/casper.conf
+# from the live session, which is correct regardless of where /home lives.
+if [ -r /cdrom/bin/lsl-regen-identity ]; then
+    bash /cdrom/bin/lsl-regen-identity || true
+fi
+
 # Flatpak-on-FAT, ON by default when the stick holds a FAT installation (or
 # a sideload repo to build one from): mount the FUSE view, publish the
 # 'lsl-fat' installation system-wide, and expose its apps to every desktop

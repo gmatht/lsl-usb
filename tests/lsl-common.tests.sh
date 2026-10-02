@@ -471,6 +471,65 @@ LSL_DISTRO_KEY="a b/c"
 assert '[ "$(lsl_distro_key)" = "a_b_c" ]' 'lsl_distro_key: sanitises the id'
 unset LSL_DISTRO_KEY
 
+# --- lsl_persist_backend: normalisation + the typo rule -----------------------
+# An unknown LSL_PERSIST must NOT be silently accepted. The failure this guards
+# is a user typing e.g. "F2FS " or "btfs" and getting a DIFFERENT backend than
+# they asked for with no error - and worse, "none" being inferred somewhere,
+# which would silently stop persisting their files.
+for v in none NONE ram squashfs SFS usb btrfs f2fs; do
+    ( unset LSL_PERSIST; export LSL_PERSIST="$v"
+      b="$(lsl_persist_backend 2>/dev/null)"
+      case "$v" in
+        NONE|ram) [ "$b" = none ] ;;
+        SFS|usb)  [ "$b" = squashfs ] ;;
+        *)        [ "$b" = "$(printf '%s' "$v" | tr 'A-Z' 'a-z')" ] ;;
+      esac ) && R_PB=0 || R_PB=1
+    assert '[ "$R_PB" -eq 0 ]' "lsl_persist_backend: '$v' normalises correctly"
+done
+# Unset -> squashfs (today's behaviour must be the default).
+( unset LSL_PERSIST; [ "$(lsl_persist_backend)" = squashfs ] ) && R_PB=0 || R_PB=1
+assert '[ "$R_PB" -eq 0 ]' 'lsl_persist_backend: unset -> squashfs (pre-pane default)'
+# Unknown -> squashfs, with a WARNING on stderr. Silence would make a typo
+# invisible.
+( unset LSL_PERSIST; export LSL_PERSIST="btrfss"
+  err="$(lsl_persist_backend 2>&1 >/dev/null)"
+  b="$(lsl_persist_backend 2>/dev/null)"
+  [ "$b" = squashfs ] && [ -n "$err" ] ) && R_PB=0 || R_PB=1
+assert '[ "$R_PB" -eq 0 ]' 'lsl_persist_backend: typo -> squashfs AND says so'
+
+# --- lsl_uses_overlay_backend: which backends need an overlay -----------------
+# f2fs reuses the overlay shape with a different upper; btrfs needs loop images.
+# Getting this backwards is what would make the btrfs backend silently mount the
+# wrong thing.
+LSL_PERSIST_BACKEND=f2fs
+assert 'lsl_uses_overlay_backend' 'uses_overlay: f2fs -> overlay'
+LSL_PERSIST_BACKEND=btrfs
+assert '! lsl_uses_overlay_backend' 'uses_overlay: btrfs -> NOT an overlay'
+LSL_PERSIST_BACKEND=none
+assert '! lsl_uses_overlay_backend' 'uses_overlay: none -> NOT an overlay'
+# squashfs is an overlay ONLY when the data dir is stick-resident.
+LSL_PERSIST_BACKEND=squashfs; LSL_DATA_DIR=/cdrom/lsl-data
+assert 'lsl_uses_overlay_backend' 'uses_overlay: squashfs + /cdrom -> overlay'
+LSL_DATA_DIR=/mnt/c/Users/lsl-usb
+assert '! lsl_uses_overlay_backend' 'uses_overlay: squashfs + /mnt/c -> NOT (that is HDD mode)'
+
+# --- lsl_identity_paths: the scrub list ---------------------------------------
+# The list is a DENYLIST (WHYFAIL12). It must at minimum contain the paths whose
+# staleness is user-visible and security-relevant: the wifi profile with its
+# cleartext PSK, the hostname, the machine-id, and the autologin user.
+IDP="$(lsl_identity_paths)"
+for p in etc/netplan etc/NetworkManager/system-connections etc/hostname etc/hosts \
+         etc/machine-id etc/resolv.conf etc/casper.conf etc/lightdm/lightdm.conf; do
+    assert "printf '%s\n' \"\$IDP\" | grep -qx '$p'" "identity list includes $p"
+done
+# No leading slashes: `rm -rf /etc/hostname` against the upper would try to
+# delete the REAL path, not the layer's copy. This is the mistake the design
+# calls out for mksquashfs and it applies identically here.
+assert '! printf "%s\n" "$IDP" | grep -q "^/"' 'identity paths are relative (no leading slash)'
+# No globs: every entry is an exact path, so `rm -rf` cannot over-match.
+assert '! printf "%s\n" "$IDP" | grep -q "\*"' 'identity paths contain no globs'
+unset LSL_PERSIST_BACKEND LSL_DATA_DIR
+
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

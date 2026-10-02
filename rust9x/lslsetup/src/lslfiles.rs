@@ -1830,12 +1830,13 @@ pub fn repack_initrd(initrd_path: &str, hooks: &[(String, Vec<u8>, u32)]) -> Res
 const CASPER_PREMOUNT_ORDER: &[u8] =
     b"for f in /scripts/casper-premount/*; do\n\
 case \"$f\" in\n\
-*/ORDER|*/zz_lsl_hdd_mirror|*/9990-live-ramclone) continue ;;\n\
+*/ORDER|*/zz_lsl_hdd_mirror|*/zz_lsl_f2fs_scrub|*/9990-live-ramclone) continue ;;\n\
 esac\n\
 [ -x \"$f\" ] && \"$f\" \"$@\" 2>/dev/null || true\n\
 done\n\
 . /scripts/casper-premount/zz_lsl_hdd_mirror \"$@\" 2>/dev/null || true\n\
-. /scripts/casper-premount/9990-live-ramclone \"$@\" 2>/dev/null || true\n";
+. /scripts/casper-premount/9990-live-ramclone \"$@\" 2>/dev/null || true\n\
+. /scripts/casper-premount/zz_lsl_f2fs_scrub \"$@\" 2>/dev/null || true\n";
 
 /// ORDER body for scripts/live-premount (Debian live-boot). Same idea:
 /// preserve the base's own live-premount scripts, then source the hook.
@@ -1853,6 +1854,16 @@ done\n\
 /// with an ORDER file that casper's run_scripts sources. The ORDER line
 /// guards the HDD-mirror hook (zz_lsl_hdd_mirror) so both can coexist.
 pub fn make_ramclone_initrd(hook_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    make_ramclone_initrd_with(hook_bytes, None)
+}
+
+/// As `make_ramclone_initrd`, but also carrying the F2FS identity-scrub hook.
+/// Boot-to-RAM is where persistence matters most (the whole point is that the
+/// session survives without the stick), so the scrub must be present here too.
+pub fn make_ramclone_initrd_with(
+    hook_bytes: &[u8],
+    f2fs_hook: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
     let mut archive = Vec::new();
     // Hook script: sourced by casper's run_scripts, overrides get_backing_device.
     archive.extend_from_slice(&cpio_newc_file(
@@ -1860,6 +1871,13 @@ pub fn make_ramclone_initrd(hook_bytes: &[u8]) -> Result<Vec<u8>, String> {
         hook_bytes,
         0o100755,
     ));
+    if let Some(f) = f2fs_hook {
+        archive.extend_from_slice(&cpio_newc_file(
+            "scripts/casper-premount/zz_lsl_f2fs_scrub",
+            f,
+            0o100755,
+        ));
+    }
     // ORDER file: see CASPER_PREMOUNT_ORDER - it must re-run the base's own
     // casper-premount scripts, not just ours.
     archive.extend_from_slice(&cpio_newc_file(
@@ -1881,6 +1899,7 @@ pub fn make_ramclone_initrd(hook_bytes: &[u8]) -> Result<Vec<u8>, String> {
 static INITRAMFS_LIVE_RAMCLONE: &str = include_str!("../../../initramfs/live-ramclone");
 static INITRAMFS_HDD_MIRROR: &str = include_str!("../../../initramfs/lsl_hdd_mirror.sh");
 static INITRAMFS_LIVEBOOT_MIRROR: &str = include_str!("../../../initramfs/lsl_liveboot_mirror.sh");
+static INITRAMFS_F2FS_SCRUB: &str = include_str!("../../../initramfs/lsl_f2fs_scrub.sh");
 
 /// Hook bytes for a secondary initrd: the bundle file when it exists, else the
 /// embedded copy (LF-normalized - Windows checkouts are CRLF and the guest
@@ -1898,7 +1917,11 @@ fn hook_bytes(path: &str, embedded: &str) -> Result<Vec<u8>, String> {
 pub fn install_ramclone_initrd(vol_letter: &str, bundle_dir: &str) -> Result<(), String> {
     let hook = format!("{}\\initramfs\\live-ramclone", bundle_dir);
     let data = hook_bytes(&hook, INITRAMFS_LIVE_RAMCLONE)?;
-    let compressed = make_ramclone_initrd(&data)?;
+    let f2fs = hook_bytes(
+        &format!("{}\\initramfs\\lsl_f2fs_scrub.sh", bundle_dir),
+        INITRAMFS_F2FS_SCRUB,
+    )?;
+    let compressed = make_ramclone_initrd_with(&data, Some(&f2fs))?;
     let dest = format!("{}:\\casper\\initrd.ramclone.gz", vol_letter);
     std::fs::write(&dest, &compressed).map_err(|e| format!("write ramclone initrd: {}", e))?;
     out::info(&format!(
@@ -1913,6 +1936,21 @@ pub fn install_ramclone_initrd(vol_letter: &str, bundle_dir: &str) -> Result<(),
 /// Includes both casper-premount and live-boot-premount variants, plus
 /// ORDER files so each framework sources the hook.
 pub fn make_hddmirror_initrd(casper_hook: &[u8], live_hook: &[u8]) -> Result<Vec<u8>, String> {
+    make_hddmirror_initrd_with(casper_hook, live_hook, None)
+}
+
+/// As `make_hddmirror_initrd`, but also carrying the F2FS identity-scrub hook in
+/// `scripts/casper-premount/` (P2 of DESIGN-F2FS-PERSISTENCE.md).
+///
+/// The scrub is included here rather than only in the F2FS-specific path because
+/// it is harmless when `LSL_PERSIST` is not `f2fs` (it returns immediately) and
+/// the F2FS backend must work on a NORMAL boot, which loads this initrd - not
+/// only when a mirror or ramclone initrd happens to be selected.
+pub fn make_hddmirror_initrd_with(
+    casper_hook: &[u8],
+    live_hook: &[u8],
+    f2fs_hook: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
     let mut archive = Vec::new();
     // casper variant
     archive.extend_from_slice(&cpio_newc_file(
@@ -1920,6 +1958,13 @@ pub fn make_hddmirror_initrd(casper_hook: &[u8], live_hook: &[u8]) -> Result<Vec
         casper_hook,
         0o100755,
     ));
+    if let Some(f) = f2fs_hook {
+        archive.extend_from_slice(&cpio_newc_file(
+            "scripts/casper-premount/zz_lsl_f2fs_scrub",
+            f,
+            0o100755,
+        ));
+    }
     archive.extend_from_slice(&cpio_newc_file(
         "scripts/casper-premount/ORDER",
         CASPER_PREMOUNT_ORDER,
@@ -1948,9 +1993,14 @@ pub fn make_hddmirror_initrd(casper_hook: &[u8], live_hook: &[u8]) -> Result<Vec
 pub fn install_hddmirror_initrd(vol_letter: &str, bundle_dir: &str) -> Result<(), String> {
     let casper_hook = format!("{}\\initramfs\\lsl_hdd_mirror.sh", bundle_dir);
     let live_hook = format!("{}\\initramfs\\lsl_liveboot_mirror.sh", bundle_dir);
+    let f2fs_hook = format!("{}\\initramfs\\lsl_f2fs_scrub.sh", bundle_dir);
     let casper = hook_bytes(&casper_hook, INITRAMFS_HDD_MIRROR)?;
     let live = hook_bytes(&live_hook, INITRAMFS_LIVEBOOT_MIRROR)?;
-    let compressed = make_hddmirror_initrd(&casper, &live)?;
+    // The scrub is embedded-only: it is new to this tree, so no released bundle
+    // carries it, and hook_bytes falls back to the include_str! copy. A bundle
+    // copy still wins when a future bundle ships one.
+    let f2fs = hook_bytes(&f2fs_hook, INITRAMFS_F2FS_SCRUB)?;
+    let compressed = make_hddmirror_initrd_with(&casper, &live, Some(&f2fs))?;
     let dest = format!("{}:\\casper\\initrd.hddmirror.gz", vol_letter);
     std::fs::write(&dest, &compressed).map_err(|e| format!("write hddmirror initrd: {}", e))?;
     out::info(&format!(

@@ -36,6 +36,14 @@ pub struct Opts {
     // settings the GUI also collects, exposed as flags so a FINISHED-page
     // command line can reproduce the exact wizard choices headlessly
     pub data_dir: String,
+    /// Persistence backend written to lsl-usb.env as LSL_PERSIST. Empty means
+    /// "not specified" - the installer then leaves the env file alone rather
+    /// than overwriting a setting the user made by hand.
+    pub persist_backend: String,
+    /// Persistence image size in MiB (LSL_HOME_BTRFS_MIB). 0 = unspecified.
+    pub persist_mib: u32,
+    /// Keep caches in RAM (LSL_CACHE_TMPFS). Defaults to on, matching the pane.
+    pub cache_tmpfs: bool,
     pub wifi: bool,             // copy wifi profiles (default on)
     pub wifi_networks: Vec<String>,
     pub efu: bool,              // write the Everything EFU index (default on)
@@ -79,6 +87,12 @@ impl Default for Opts {
             wsl_vhdx: Vec::new(),
             flatpak_apps: Vec::new(),
             extra_isos: Vec::new(),
+            // Persistence: empty backend = "leave lsl-usb.env alone", so the
+            // headless default does NOT overwrite a hand-edited LSL_PERSIST.
+            // cache_tmpfs defaults ON to match the pane (design s2.7).
+            persist_backend: String::new(),
+            persist_mib: 0,
+            cache_tmpfs: true,
             skip_iso_download: false,
             skip_rufus: false,
             no_gui: false,
@@ -155,6 +169,14 @@ Options:
   --auto-upload              Check for pending boot telemetry and prompt to upload; then exit
   --preload-rust-tools       Download fd/bat/zoxide onto <USB>:\\bin
   --data-dir <path>           LSL_DATA_DIR to write into lsl-usb.env
+  --persist <backend>         Persistence backend for lsl-usb.env:
+                             squashfs (default; home.sfs on the stick),
+                             none (RAM only), btrfs (home.btrfs loopback),
+                             f2fs (a real partition; experimental)
+  --persist-mib <MiB>         Persistence image size for the btrfs backend
+                             (default 4096; a FAT32 stick caps one file at 4 GiB)
+  --cache-tmpfs / --no-cache-tmpfs
+                             Keep caches in RAM instead of a persistent image
   --no-wifi                   Do not copy wifi profiles
   --wifi-network <name>       Copy only this wifi profile (repeatable)
   --no-efu                    Do not write the Everything EFU index
@@ -223,6 +245,28 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--gui-test-boot-page" => o.gui_test_boot_page = true,
             "--auto-upload" => o.auto_upload = true,
             "--data-dir" => o.data_dir = next()?,
+            "--persist" => {
+                let v = next()?.to_ascii_lowercase();
+                // Validate here, not at write time: an unknown backend reaching
+                // lsl-usb.env would be silently downgraded to squashfs by
+                // lsl_persist_backend() on the Linux side, so the user would
+                // get a different backend than the one they typed.
+                if !crate::gui::PERSIST_BACKENDS.contains(&v.as_str()) {
+                    return Err(format!(
+                        "--persist must be one of: {}",
+                        crate::gui::PERSIST_BACKENDS.join(", ")
+                    ));
+                }
+                o.persist_backend = v;
+            }
+            "--persist-mib" => {
+                let v = next()?;
+                o.persist_mib = v
+                    .parse::<u32>()
+                    .map_err(|_| "--persist-mib must be a whole number of MiB".to_string())?;
+            }
+            "--cache-tmpfs" => o.cache_tmpfs = true,
+            "--no-cache-tmpfs" => o.cache_tmpfs = false,
             "--no-wifi" => o.wifi = false,
             "--wifi-network" => o.wifi_networks.push(next()?),
             "--no-efu" => o.efu = false,
@@ -294,5 +338,62 @@ mod tests {
         assert!(o.data_dir.is_empty());
         assert!(o.wifi_networks.is_empty());
         assert!(o.extra_isos.is_empty());
+        // Persistence: an UNSPECIFIED backend must stay unspecified so a headless
+        // run does not overwrite a hand-edited LSL_PERSIST in lsl-usb.env. The
+        // pane's own default (squashfs) is applied by the GUI, not by the CLI.
+        assert!(o.persist_backend.is_empty(), "no backend means 'leave env alone'");
+        assert_eq!(o.persist_mib, 0);
+        assert!(o.cache_tmpfs, "cache-on-tmpfs defaults on, matching the pane");
+    }
+
+    #[test]
+    fn persistence_flags_round_trip() {
+        let o = parse(&args(&["--persist", "f2fs", "--persist-mib", "8192", "--no-cache-tmpfs"]))
+            .unwrap();
+        assert_eq!(o.persist_backend, "f2fs");
+        assert_eq!(o.persist_mib, 8192);
+        assert!(!o.cache_tmpfs);
+        // Case is normalised so `--persist F2FS` cannot reach lsl-usb.env as
+        // "F2FS" and be silently downgraded to squashfs on the Linux side.
+        let o2 = parse(&args(&["--persist", "BTRFS"])).unwrap();
+        assert_eq!(o2.persist_backend, "btrfs");
+    }
+
+    /// WHYFAIL-class guard: an unknown backend must be REJECTED here, not
+    /// written to lsl-usb.env and downgraded later. Accepting it would mean the
+    /// user typed one thing and got another with no error.
+    #[test]
+    fn unknown_persistence_backend_is_rejected_at_parse_time() {
+        assert!(parse(&args(&["--persist", "btfs"])).is_err());
+        assert!(parse(&args(&["--persist", ""])).is_err());
+        // ...and a non-numeric size is an error, not a silent 0.
+        assert!(parse(&args(&["--persist-mib", "4gb"])).is_err());
+    }
+
+    /// Every backend the GUI can offer must be accepted by the CLI, or the
+    /// FINISHED page's "copy this command line" would produce something that
+    /// fails to re-run.
+    #[test]
+    fn cli_accepts_every_backend_the_pane_offers() {
+        for b in crate::gui::PERSIST_BACKENDS {
+            let o = parse(&args(&["--persist", b])).unwrap_or_else(|e| panic!("{} rejected: {}", b, e));
+            assert_eq!(o.persist_backend, b);
+        }
+    }
+
+    /// The pane's radio INDEX must select the same backend the constant names -
+    /// the harvest maps positionally, never by label (labels are translated).
+    #[test]
+    fn pane_radio_order_matches_the_backend_list() {
+        assert_eq!(crate::gui::PERSIST_BACKENDS[0], crate::gui::PERSIST_DEFAULT);
+        // The default must be findable, or the pane would pre-check a radio whose
+        // index does not map back to the default.
+        assert!(crate::gui::PERSIST_BACKENDS.contains(&crate::gui::PERSIST_DEFAULT));
+        // Every offered size must convert to a positive MiB value.
+        for g in crate::gui::PERSIST_SIZE_GIB {
+            assert!(g > 0);
+        }
+        assert!(crate::gui::PERSIST_SIZE_GIB
+            .contains(&((crate::gui::PERSIST_MIB_DEFAULT / 1024) as i32)));
     }
 }

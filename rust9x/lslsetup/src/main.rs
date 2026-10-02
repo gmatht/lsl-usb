@@ -1127,6 +1127,46 @@ fn run() {
     } else {
         out::info("Leaving LSL_RECLAIM_WIN_SWAP off (unchecked in installer).");
     }
+
+    // --persist / --persist-mib / --cache-tmpfs. Only written when a backend was
+    // actually named: an empty backend means "leave lsl-usb.env alone", so a
+    // headless run does not overwrite a setting the user edited by hand.
+    if !opts.persist_backend.is_empty() {
+        let env_file = format!("{}:\\lsl-usb.env", vol.letter);
+        if sys::path_exists(&env_file) {
+            lslfiles::env_file_set(&env_file, "LSL_PERSIST", &opts.persist_backend);
+            out::info(&format!(
+                "Set LSL_PERSIST={} in lsl-usb.env (persistence backend)",
+                opts.persist_backend
+            ));
+            if opts.persist_mib > 0 {
+                lslfiles::env_file_set(
+                    &env_file,
+                    "LSL_HOME_BTRFS_MIB",
+                    &opts.persist_mib.to_string(),
+                );
+                out::info(&format!(
+                    "Set LSL_HOME_BTRFS_MIB={} in lsl-usb.env",
+                    opts.persist_mib
+                ));
+            }
+            lslfiles::env_file_set(
+                &env_file,
+                "LSL_CACHE_TMPFS",
+                if opts.cache_tmpfs { "1" } else { "0" },
+            );
+            if opts.persist_backend == "f2fs" {
+                out::warn("f2fs needs a second partition on the stick, formatted with");
+                out::warn("bin/lsl-f2fs-provision on a booted stick. Until then it falls back");
+                out::warn("to a RAM upper and /home will NOT persist.");
+            }
+        } else {
+            out::warn(&format!(
+                "lsl-usb.env not found on {}:\\; persistence settings not written.",
+                vol.letter
+            ));
+        }
+    }
     apply_fast_startup_choice(fast_startup_off, reclaim_win_swap);
 
     // Skip the SFS copy when the GUI nofmt path already performed it
@@ -1773,6 +1813,38 @@ fn gui_tail_in_dialog(
         fin_tick(ui, "Swap reclaim off...");
         out::info("Leaving LSL_RECLAIM_WIN_SWAP off (unchecked).");
     }
+
+    // Persistence backend + size (the PERSISTENCE page). Written to
+    // lsl-usb.env so the Linux side reads them on every boot - lsl-common.sh's
+    // lsl_persist_backend() is the single definition of what these mean.
+    //
+    // LSL_HOME_BTRFS_MIB is set too, because the btrfs backend reuses exactly
+    // that image: changing only LSL_PERSIST would silently install btrfs at the
+    // old 4 GiB default regardless of what the slider said.
+    if !g.persist_backend.is_empty() {
+        fin_tick(ui, "Setting persistence backend...");
+        let env_file = format!("{}:\\lsl-usb.env", vol_letter);
+        if sys::path_exists(&env_file) {
+            lslfiles::env_file_set(&env_file, "LSL_PERSIST", &g.persist_backend);
+            out::info(&format!("Set LSL_PERSIST={} in lsl-usb.env", g.persist_backend));
+            if g.persist_mib > 0 {
+                lslfiles::env_file_set(&env_file, "LSL_HOME_BTRFS_MIB", &g.persist_mib.to_string());
+                out::info(&format!("Set LSL_HOME_BTRFS_MIB={} in lsl-usb.env", g.persist_mib));
+            }
+            if g.cache_tmpfs {
+                lslfiles::env_file_set(&env_file, "LSL_CACHE_TMPFS", "1");
+            } else {
+                lslfiles::env_file_set(&env_file, "LSL_CACHE_TMPFS", "0");
+            }
+            if g.persist_backend == "f2fs" {
+                out::info("F2FS needs a second partition on the stick (Rufus persistent-partition");
+                out::info("size, or partition it yourself) formatted with bin/lsl-f2fs-provision.");
+                out::info("Until then it falls back to a RAM upper and /home will NOT persist.");
+            }
+        } else {
+            out::warn("lsl-usb.env not found; persistence settings were NOT written.");
+        }
+    }
     fin_tick(ui, "Fast Startup / hibernate...");
     apply_fast_startup_choice(g.fast_startup_off, g.reclaim_win_swap);
     fin_tick(ui, "Locating WSL VHDX...");
@@ -1970,6 +2042,19 @@ fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str, metr
     if !g.data_dir.is_empty() {
         lines.push(format!("  - LSL_DATA_DIR: {}", g.data_dir));
     }
+    // Persistence: always shown, because the backend is a real behavioural
+    // choice and a summary that omitted it would not be reproducible.
+    lines.push(format!("  - persistence: {}", g.persist_backend));
+    if g.persist_mib > 0 {
+        lines.push(format!("  - persistence size: {} MiB", g.persist_mib));
+    }
+    lines.push(format!(
+        "  - caches: {}",
+        if g.cache_tmpfs { "in RAM (recreated each boot)" } else { "persistent image" }
+    ));
+    if g.persist_backend == "f2fs" {
+        lines.push("  - NOTE: f2fs needs a second partition (see bin/lsl-f2fs-provision)".into());
+    }
     if g.wifi {
         lines.push(format!("  - copy wifi profiles{}", if g.wifi_networks.is_empty() { String::new() } else { format!(" ({} selected)", g.wifi_networks.len()) }));
     } else {
@@ -2041,6 +2126,19 @@ fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str, metr
     if !g.data_dir.is_empty() {
         a.push(format!("--data-dir \"{}\"", g.data_dir));
     }
+    // Reproducing the wizard's persistence choice needs the backend ALWAYS, not
+    // only when it differs from the default: the env file on an existing stick
+    // may already carry a different LSL_PERSIST, and omitting the flag would
+    // leave that in place.
+    a.push(format!("--persist {}", g.persist_backend));
+    if g.persist_mib > 0 {
+        a.push(format!("--persist-mib {}", g.persist_mib));
+    }
+    a.push(if g.cache_tmpfs {
+        "--cache-tmpfs".to_string()
+    } else {
+        "--no-cache-tmpfs".to_string()
+    });
     if !g.wifi {
         a.push("--no-wifi".into());
     } else {

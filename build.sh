@@ -166,9 +166,11 @@ repack_initrd() {
     local casper_hook="$REPO_ROOT/initramfs/lsl_hdd_mirror.sh"
     local live_hook="$REPO_ROOT/initramfs/lsl_liveboot_mirror.sh"
     local antix_hook="$REPO_ROOT/initramfs/lsl_antix_mirror.sh"
+    local f2fs_hook="$REPO_ROOT/initramfs/lsl_f2fs_scrub.sh"
     [ -f "$casper_hook" ] || { echo "ERROR: $casper_hook missing" >&2; rm -rf "$tmp"; return 1; }
     [ -f "$live_hook" ] || { echo "ERROR: $live_hook missing" >&2; rm -rf "$tmp"; return 1; }
     [ -f "$antix_hook" ] || { echo "ERROR: $antix_hook missing" >&2; rm -rf "$tmp"; return 1; }
+    [ -f "$f2fs_hook" ] || { echo "ERROR: $f2fs_hook missing" >&2; rm -rf "$tmp"; return 1; }
     local injected=0
     for d in "$tmp"/*/; do
         # --- Debian live-boot (also antiX's live-init fork roots) ---
@@ -216,6 +218,20 @@ repack_initrd() {
             order="${d}scripts/casper-premount/ORDER"
             if [ -f "$order" ] && ! grep -q 'zz_lsl_hdd_mirror' "$order"; then
                 printf '. /scripts/casper-premount/zz_lsl_hdd_mirror "$@"\n' >> "$order"
+            fi
+            injected=1
+        fi
+        # --- casper (Mint/Ubuntu): F2FS identity scrub (P2 of DESIGN-F2FS) ---
+        # Same sourcing requirement as the mirror hook: it uses `return`, which
+        # is only valid sourced, and it must run in casper's shell. Placed AFTER
+        # the mirror hook because the scrub mounts/unmounts a device and the
+        # mirror hook only sets a variable.
+        if [ -d "${d}scripts/casper-premount" ] && [ ! -f "${d}scripts/casper-premount/zz_lsl_f2fs_scrub" ]; then
+            cp "$f2fs_hook" "${d}scripts/casper-premount/zz_lsl_f2fs_scrub"
+            chmod +x "${d}scripts/casper-premount/zz_lsl_f2fs_scrub"
+            order="${d}scripts/casper-premount/ORDER"
+            if [ -f "$order" ] && ! grep -q 'zz_lsl_f2fs_scrub' "$order"; then
+                printf '. /scripts/casper-premount/zz_lsl_f2fs_scrub "$@"\n' >> "$order"
             fi
             injected=1
         fi

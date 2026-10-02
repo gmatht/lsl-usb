@@ -1,0 +1,147 @@
+#!/bin/bash
+# lsl-f2fs-provision - create (or verify) the F2FS persistence partition.
+#
+# Part P1 of DESIGN-F2FS-PERSISTENCE.md. This is the LINUX-side provisioner:
+# the design recommends building it first because it is the only path that can
+# be tested in QEMU without shipping an F2FS formatter for Windows (s8.1).
+#
+# It does NOT repartition anything. It formats a partition that already exists
+# (created by Rufus, by diskpart, or by hand); see the note in
+# DESIGN-PERSISTENCE-PANE.md s2.6 - formatting belongs to the Rufus flow, where
+# Rufus prompts, not to a checkbox in our wizard. With no candidate partition
+# this reports what it would need and exits non-zero without touching a disk.
+#
+# Usage:
+#   lsl-f2fs-provision                 # find a labelled/unlabelled partition
+#   lsl-f2fs-provision --device /dev/sdb2
+#   lsl-f2fs-provision --status        # report only, never format
+#   lsl-f2fs-provision --force         # reformat an existing lsl-persist (DESTRUCTIVE)
+#
+# Exit: 0 already provisioned or newly created, 1 not possible / refused.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/lsl-common.sh"
+
+LSL_PERSIST_LABEL="${LSL_PERSIST_LABEL:-lsl-persist}"
+LSL_PERSIST_MNT="${LSL_PERSIST_MNT:-/persist}"
+
+DEVICE=""
+STATUS_ONLY=0
+FORCE=0
+for a in "$@"; do
+    case "$a" in
+        --device) DEVICE="${2:-}"; shift 2 || true ;;
+        --device=*) DEVICE="${a#*=}"; shift ;;
+        --status) STATUS_ONLY=1; shift ;;
+        --force) FORCE=1; shift ;;
+        -h|--help)
+            sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *) echo "lsl-f2fs-provision: unknown option: $a" >&2; exit 1 ;;
+    esac
+done
+
+# A labelled device we created is unambiguous and safe. An UNLABELLED candidate
+# is NOT: the design is explicit (s8.2) that the hook must refuse a device we
+# did not create, so a stick whose second partition came from mkusb or a Rufus
+# casper-rw is left alone rather than hijacked.
+find_labelled() {
+    local d
+    for d in "/dev/disk/by-label/$LSL_PERSIST_LABEL" \
+             "/dev/disk/by-label/LSL-PERSIST" \
+             "/dev/disk/by-label/lsl-persist"; do
+        [ -b "$d" ] && { readlink -f "$d"; return 0; }
+    done
+    # Fall back to a label scan (blkid may know devices by-label cannot resolve,
+    # e.g. a partition table we did not write).
+    if command -v blkid >/dev/null 2>&1; then
+        d="$(blkid -L "$LSL_PERSIST_LABEL" 2>/dev/null || true)"
+        [ -n "$d" ] && [ -b "$d" ] && { readlink -f "$d"; return 0; }
+    fi
+    return 1
+}
+
+fs_type() {
+    if command -v blkid >/dev/null 2>&1; then
+        blkid -o value -s TYPE "$1" 2>/dev/null
+    else
+        # No blkid (minimal initramfs-ish env): read the superblock magic.
+        head -c 4096 "$1" 2>/dev/null | od -An -tx1 -j1024 -N2 2>/dev/null \
+            | tr -d ' \n' | sed -n 's/^ef53$/ext4/p;s/^5346544e6f52$/ntfs/p'
+    fi
+}
+
+echo "lsl-f2fs-provision: looking for a '$LSL_PERSIST_LABEL' partition..."
+EXISTING="$(find_labelled || true)"
+
+if [ -n "$DEVICE" ]; then
+    if [ ! -b "$DEVICE" ]; then
+        echo "lsl-f2fs-provision: $DEVICE is not a block device; nothing done." >&2
+        exit 1
+    fi
+    if [ -n "$EXISTING" ] && [ "$(readlink -f "$DEVICE")" != "$EXISTING" ]; then
+        # Two different candidates: refuse rather than guess which is ours.
+        echo "lsl-f2fs-provision: refusing - '$LSL_PERSIST_LABEL' is already on $EXISTING" >&2
+        echo "                      and --device names a different one ($DEVICE)." >&2
+        exit 1
+    fi
+    TARGET="$(readlink -f "$DEVICE")"
+elif [ -n "$EXISTING" ]; then
+    TARGET="$EXISTING"
+else
+    TARGET=""
+fi
+
+if [ -n "$TARGET" ]; then
+    TYPE="$(fs_type "$TARGET")"
+    case "$TYPE" in
+        f2fs)
+            echo "lsl-f2fs-provision: already provisioned: $TARGET (f2fs, label '$LSL_PERSIST_LABEL')."
+            if ! grep -q "^$LSL_PERSIST_MNT[[:space:]]" /etc/fstab 2>/dev/null; then
+                echo "  note: $LSL_PERSIST_MNT has no /etc/fstab entry yet (onboot.sh adds one)."
+            fi
+            exit 0 ;;
+        "")
+            echo "lsl-f2fs-provision: $TARGET is labelled but its filesystem type is unreadable." >&2
+            exit 1 ;;
+        *)
+            echo "lsl-f2fs-provision: $TARGET carries label '$LSL_PERSIST_LABEL' but is $TYPE, not f2fs." >&2
+            echo "  Refusing to reformat it: it may hold data. Use --force only if you are certain." >&2
+            [ "$FORCE" = "1" ] || exit 1 ;;
+    esac
+fi
+
+if [ "$STATUS_ONLY" = "1" ]; then
+    echo "lsl-f2fs-provision: no '$LSL_PERSIST_LABEL' partition found; nothing formatted."
+    exit 1
+fi
+
+if [ -z "$TARGET" ]; then
+    echo "lsl-f2fs-provision: no '$LSL_PERSIST_LABEL' partition found, and this tool does not" >&2
+    echo "  create partitions. Create a second partition on the stick first (Rufus offers a" >&2
+    echo "  persistent-partition size; diskpart/sfdisk work too), then re-run this." >&2
+    echo "  Nothing was written to any disk." >&2
+    exit 1
+fi
+
+command -v mkfs.f2fs >/dev/null 2>&1 || {
+    echo "lsl-f2fs-provision: mkfs.f2fs not found (package: f2fs-tools)." >&2
+    echo "  Partition $TARGET was left untouched." >&2
+    exit 1
+}
+grep -qw f2fs /proc/filesystems 2>/dev/null || {
+    echo "lsl-f2fs-provision: this kernel has no f2fs driver (/proc/filesystems)." >&2
+    echo "  Partition $TARGET was left untouched." >&2
+    exit 1
+}
+
+echo "lsl-f2fs-provision: formatting $TARGET as f2fs, label '$LSL_PERSIST_LABEL'..."
+if ! mkfs.f2fs -q -l "$LSL_PERSIST_LABEL" "$TARGET"; then
+    echo "lsl-f2fs-provision: mkfs.f2fs failed; $TARGET left as it was." >&2
+    exit 1
+fi
+
+echo "lsl-f2fs-provision: done. $TARGET is now an f2fs partition labelled '$LSL_PERSIST_LABEL'."
+echo "  Set LSL_PERSIST=f2fs in lsl-usb.env to use it (the wizard's persistence pane does this)."

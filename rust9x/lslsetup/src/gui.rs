@@ -111,15 +111,76 @@ pub struct GuiResult {
     pub ramclone: bool,                        // INSTALL-page "Boot to RAM" checkbox (default: off)
     pub extra_isos: Vec<String>,               // page-1 "extra boot" checkboxes (loopback-only, no firstboot)
     pub download_extras: Vec<(String, String)>, // page-1 kind-11 ticks: (url, name) to download, then loopback-only
+    pub persist_backend: String,                // "none" | "squashfs" | "btrfs" | "f2fs" (PERSISTENCE page radio)
+    pub persist_mib: u32,                       // size chosen on the slider, 0 for "none"
+    pub cache_tmpfs: bool,                      // keep caches in RAM instead of a persistent image
 }
 
-/// Wizard pages: 0 hw, 1 iso, 2 flatpak, 3 system, 4 wifi, 5 install.
+/// Persistence backends, in the order the pane lists them. Positional, not
+/// label-derived: the harvest maps a Radio's INDEX to a value, because the
+/// labels are translated and must never be parsed (see locale.rs).
+pub const PERSIST_BACKENDS: [&str; 4] = ["squashfs", "none", "btrfs", "f2fs"];
+
+/// Default backend. `squashfs` is what the tree did before the pane existed, and
+/// it is the only backend with a working scrub story today - a new stick must
+/// behave exactly as it did, so the default is not a judgement call.
+pub const PERSIST_DEFAULT: &str = "squashfs";
+
+/// Default persistence size, MiB. Matches `LSL_HOME_BTRFS_MIB`'s shipped
+/// default (4096) so choosing btrfs on a fresh install reproduces what HDD mode
+/// already gave you.
+pub const PERSIST_MIB_DEFAULT: u32 = 4096;
+
+/// Size choices offered, GiB. Deliberately NOT every integer: a btrfs image on
+/// FAT32 cannot exceed 4 GiB, so a continuous slider would mostly offer values
+/// that cannot work. See the combo-box rationale at the construction site.
+pub const PERSIST_SIZE_GIB: [i32; 7] = [1, 2, 4, 8, 16, 32, 64];
+
+/// Persistence-page backend caveats (design s2.1). Height is part of the
+/// multiline-label contract asserted by `multiline_labels_fit_their_height`.
+pub const PERSIST_NOTE: &str = "Btrfs keeps everything in one image file, so on a FAT32 stick it is capped by the 4 GiB single-file limit and grows less gracefully than a real partition. F2FS needs a second partition created at format time (Rufus offers a persistent-partition size); this page does not repartition anything. Squashfs is the default and the only backend with a working identity scrub today.";
+
+/// Cache-policy note (design s2.7). Bounded by LSL_HOME_TMPFS_MIB (2 GiB), so it
+/// cannot exhaust RAM. Honest about the cost: "~/.cache holds some state a user
+/// might miss".
+pub const PERSIST_CACHE_NOTE: &str = "Caches are recreated each boot instead of being written to the stick: saves wear and is usually what you want. Costs up to ~2 GiB of RAM, and offline mail / build caches kept in ~/.cache will be cleared on reboot.";
+
+/// Wizard pages: 0 hw, 1 iso, 2 flatpak, 3 system, 4 PERSISTENCE, 5 wifi, 6 install.
 /// The nav button reads "Next >" on every page BEFORE the install page and
-/// "Install" only on the install page itself - clicking it on page 5 runs
+/// "Install" only on the install page itself - clicking it on the last page runs
 /// the working phase (Rufus launch / built-in copy), never before.
-pub(crate) const INSTALL_PAGE: usize = 5;
+///
+/// The persistence page sits after "system" (which sets the data dir, and so
+/// decides whether stick-resident persistence is even possible) and before
+/// "install" (which needs the chosen sizes at write time).
+pub(crate) const PERSIST_PAGE: usize = 4;
+pub(crate) const WIFI_PAGE: usize = 5;
+pub(crate) const INSTALL_PAGE: usize = 6;
 pub(crate) const NEXT_LABEL: &str = "Next >";
 pub(crate) const INSTALL_LABEL: &str = "Install";
+
+/// Show exactly the frame for `page`. One helper for all six pages, because the
+/// Next/Back handlers and the install hotkey each had their own copy of this
+/// list and adding a page means editing all of them consistently - which is
+/// exactly the kind of repetition that silently leaves a page unreachable.
+fn show_page(
+    page: usize,
+    hw: &nwg::Frame,
+    iso: &nwg::Frame,
+    fp: &nwg::Frame,
+    sys: &nwg::Frame,
+    persist: &nwg::Frame,
+    wifi: &nwg::Frame,
+    install: &nwg::Frame,
+) {
+    hw.set_visible(page == 0);
+    iso.set_visible(page == 1);
+    fp.set_visible(page == 2);
+    sys.set_visible(page == 3);
+    persist.set_visible(page == PERSIST_PAGE);
+    wifi.set_visible(page == WIFI_PAGE);
+    install.set_visible(page == INSTALL_PAGE);
+}
 
 /// Nav-button caption for `page`: "Install" only on the INSTALL page.
 /// Pure helper so the caption rule is unit-testable (the live button is
@@ -1284,10 +1345,18 @@ pub(crate) const FASTSTARTUP_NOTE: &str = "Disables hibernate and Fast Startup (
 /// win32 control has exactly one owner (nwg's Drop DESTROYS the window, so
 /// nwg controls must never be cloned-and-kept — see the ScrollBar note in
 /// run_gui).
+///
+/// `nwg::ComboBox<D>` is generic, and writing `nwg::ComboBox<String>` inline in
+/// the variant list below made the parser resolve `ComboBox` against this enum's
+/// own variant names (`Combo`). The alias sidesteps that and keeps the list
+/// readable.
+pub type PersistCombo = nwg::ComboBox<String>;
+
 pub(crate) enum PageCtl {
     Lbl(Box<nwg::Label>, u8),
     Check(Box<nwg::CheckBox>, u8),
     Radio(Box<nwg::RadioButton>, u8),
+    Combo(Box<PersistCombo>, u8),
     Edit(Box<nwg::TextBox>, u8),
     EditLine(Box<nwg::TextInput>, u8),
     Btn(Box<nwg::Button>, u8),
@@ -1319,7 +1388,7 @@ pub(crate) type PageItems = Rc<std::cell::RefCell<Vec<PageItem>>>;
 
 fn ctl_kind(ctl: &PageCtl) -> u8 {
     match ctl {
-        PageCtl::Lbl(_, k) | PageCtl::Check(_, k) | PageCtl::Radio(_, k) | PageCtl::Edit(_, k) | PageCtl::EditLine(_, k) | PageCtl::Btn(_, k) => *k,
+        PageCtl::Lbl(_, k) | PageCtl::Check(_, k) | PageCtl::Radio(_, k) | PageCtl::Combo(_, k) | PageCtl::Edit(_, k) | PageCtl::EditLine(_, k) | PageCtl::Btn(_, k) => *k,
     }
 }
 
@@ -1345,6 +1414,7 @@ fn layout_page(items: &PageItems, fw: i32, off: i32, shift: i32, top: i32, bot_e
             PageCtl::Lbl(b, _) => place!(b),
             PageCtl::Check(b, _) => place!(b),
             PageCtl::Radio(b, _) => place!(b),
+            PageCtl::Combo(b, _) => place!(b),
             PageCtl::Edit(b, _) => place!(b),
             PageCtl::EditLine(b, _) => place!(b),
             PageCtl::Btn(b, _) => place!(b),
@@ -1370,6 +1440,7 @@ fn ctl_hwnd(items: &PageItems, kind: u8) -> Option<usize> {
                 PageCtl::Lbl(b, _) => b.handle.hwnd(),
                 PageCtl::Check(b, _) => b.handle.hwnd(),
                 PageCtl::Radio(b, _) => b.handle.hwnd(),
+                PageCtl::Combo(b, _) => b.handle.hwnd(),
                 PageCtl::Edit(b, _) => b.handle.hwnd(),
                 PageCtl::EditLine(b, _) => b.handle.hwnd(),
                 PageCtl::Btn(b, _) => b.handle.hwnd(),
@@ -1538,6 +1609,7 @@ struct LayoutCtx<'a> {
     frame_iso: &'a nwg::Frame,
     frame_fp: &'a nwg::Frame,
     frame_sys: &'a nwg::Frame,
+    frame_persist: &'a nwg::Frame,
     frame_wifi: &'a nwg::Frame,
     frame_install: &'a nwg::Frame,
     lbl_hw: &'a nwg::Label,
@@ -1549,6 +1621,7 @@ struct LayoutCtx<'a> {
     sb_iso: &'a nwg::ScrollBar,
     sb_fp: &'a nwg::ScrollBar,
     sb_sys: &'a nwg::ScrollBar,
+    sb_persist: &'a nwg::ScrollBar,
     sb_wifi: &'a nwg::ScrollBar,
     sb_install: &'a nwg::ScrollBar,
     btn_everything: &'a nwg::Button,
@@ -1561,6 +1634,7 @@ struct LayoutCtx<'a> {
     iso: &'a PageItems,
     fp: &'a PageItems,
     sys: &'a PageItems,
+    persist: &'a PageItems,
     wifi_items: &'a PageItems,
     install: &'a PageItems,
     wifi: &'a std::cell::RefCell<Vec<Box<nwg::CheckBox>>>,
@@ -1568,11 +1642,13 @@ struct LayoutCtx<'a> {
     iso_off: &'a Cell<i32>,
     fp_off: &'a Cell<i32>,
     sys_off: &'a Cell<i32>,
+    persist_off: &'a Cell<i32>,
     wifi_off: &'a Cell<i32>,
     install_off: &'a Cell<i32>,
     iso_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
     fp_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
     sys_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
+    persist_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
     wifi_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
     install_geom: &'a Cell<(i32, i32, i32, i32, i32)>,
     fp_content: &'a Cell<i32>,
@@ -2777,11 +2853,13 @@ pub fn run_gui(
     let iso_off: Rc<Cell<i32>> = Rc::new(Cell::new(0));
     let fp_off: Rc<Cell<i32>> = Rc::new(Cell::new(0));
     let sys_off: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+    let persist_off: Rc<Cell<i32>> = Rc::new(Cell::new(0));
     let wifi_off: Rc<Cell<i32>> = Rc::new(Cell::new(0));
     let install_off: Rc<Cell<i32>> = Rc::new(Cell::new(0));
     let iso_geom: Rc<Cell<(i32, i32, i32, i32, i32)>> = Rc::new(Cell::new((0, 0, 0, 0, 0)));
     let fp_geom: Rc<Cell<(i32, i32, i32, i32, i32)>> = Rc::new(Cell::new((0, 0, 0, 0, 0)));
     let sys_geom: Rc<Cell<(i32, i32, i32, i32, i32)>> = Rc::new(Cell::new((0, 0, 0, 0, 0)));
+    let persist_geom: Rc<Cell<(i32, i32, i32, i32, i32)>> = Rc::new(Cell::new((0, 0, 0, 0, 0)));
     let wifi_geom: Rc<Cell<(i32, i32, i32, i32, i32)>> = Rc::new(Cell::new((0, 0, 0, 0, 0)));
     let install_geom: Rc<Cell<(i32, i32, i32, i32, i32)>> = Rc::new(Cell::new((0, 0, 0, 0, 0)));
     let fp_content: Rc<Cell<i32>> = Rc::new(Cell::new(0));
@@ -2828,12 +2906,21 @@ pub fn run_gui(
     let mut sb_sys: nwg::ScrollBar = Default::default();
     let sys_items: PageItems = Rc::new(std::cell::RefCell::new(Vec::new()));
 
-    // page 4: wifi — master switch + per-network list
+    // page 4: PERSISTENCE — backend radio + size slider + cache policy.
+    // Non-destructive end to end (DESIGN-PERSISTENCE-PANE.md s2.6): it chooses a
+    // backend and a size, and nothing it can do erases anything. There is
+    // deliberately no "erase this stick" control here — formatting belongs to
+    // the Rufus flow, where Rufus prompts.
+    let mut frame_persist: nwg::Frame = Default::default();
+    let mut sb_persist: nwg::ScrollBar = Default::default();
+    let persist_items: PageItems = Rc::new(std::cell::RefCell::new(Vec::new()));
+
+    // page 5: wifi — master switch + per-network list
     let mut frame_wifi: nwg::Frame = Default::default();
     let mut sb_wifi: nwg::ScrollBar = Default::default();
     let wifi_items: PageItems = Rc::new(std::cell::RefCell::new(Vec::new()));
 
-    // page 5: INSTALL NOW — USB write method + target USB picker.
+    // page 6: INSTALL NOW — USB write method + target USB picker.
     // The Rufus / built-in choice lives HERE and only here: no
     // write-method radio may appear on any earlier page (the
     // win-install-page GUI test asserts that).
@@ -3515,13 +3602,139 @@ pub fn run_gui(
 
     let sys_content = 536 + 20 + 10;
 
-    // ---- page 4: wifi (master switch + per-network list) ----
+    // ---- page 4: PERSISTENCE ----
+    // Backend radio, then the size slider, then the cache policy. Harvested by
+    // control KIND and radio INDEX (PERSIST_BACKENDS), never by label text: the
+    // labels below are translated, and parsing a translated label silently
+    // installs the wrong backend (locale.rs is explicit about this).
+    {
+        // The frame FIRST: every control below parents to it, and a control
+        // parented to a default-constructed Frame has no HWND - it builds without
+        // error and then never displays.
+        let _ = nwg::Frame::builder()
+            .position((MARGIN, 88))
+            .size((DEF_CW - 2 * MARGIN, DEF_CH - 88 - NAV_H))
+            .parent(&window)
+            .build(&mut frame_persist);
+
+        let mut p = persist_items.borrow_mut();
+        let mut y: i32 = 6;
+
+        // A local label helper: the system page's `push_lbl` closure is scoped
+        // inside that page's own block and captures `frame_sys`, so it cannot be
+        // reused here.
+        let mut push_lbl = |items: &mut Vec<PageItem>, text: &str, x: i32, yy: i32, w: i32, h: i32| {
+            let mut lb: Box<nwg::Label> = Box::default();
+            let _ = nwg::Label::builder()
+                .text(text)
+                .position((x, yy))
+                .size((w, h))
+                .parent(&frame_persist)
+                .build(&mut lb);
+            items.push(PageItem { ctl: PageCtl::Lbl(lb, 0), x, y: yy, w, h, idx: 0 });
+        };
+
+        // Group header, then one radio per backend. The FIRST radio carries
+        // WS_GROUP so Win32 auto-unchecks only its siblings.
+        for (i, (backend, label)) in PERSIST_BACKENDS
+            .iter()
+            .zip([
+                "Squashfs layer (home.sfs on the stick) - recommended",
+                "None - RAM only, nothing survives a reboot",
+                "Btrfs image (home.btrfs loopback on the data dir)",
+                "F2FS partition (experimental; needs a second partition)",
+            ])
+            .enumerate()
+        {
+            let mut rb: Box<nwg::RadioButton> = Box::default();
+            let _ = nwg::RadioButton::builder()
+                .flags(if i == 0 {
+                    nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
+                } else {
+                    nwg::RadioButtonFlags::VISIBLE
+                })
+                .text(&crate::locale::tr(label))
+                .position((10, y))
+                .size((780, 22))
+                .parent(&frame_persist)
+                .build(&mut rb);
+            if *backend == PERSIST_DEFAULT {
+                rb.set_check_state(nwg::RadioButtonState::Checked);
+            }
+            // kind = index into PERSIST_BACKENDS
+            p.push(PageItem { ctl: PageCtl::Radio(rb, i as u8), x: 10, y, w: -20, h: 22, idx: 0 });
+            y += 26;
+        }
+
+        // Backend caveats, stated where the choice is made. The design is
+        // explicit that F2FS is experimental and that a btrfs image on FAT32
+        // hits the 4 GiB single-file cap - better said here than discovered at
+        // write time (s2.1).
+        push_lbl(&mut p, PERSIST_NOTE, 20, y + 4, -30, 92);
+        y += 104;
+
+        // Size selector. A COMBO BOX, not a trackbar/slider: this nwg is
+        // vendored for Windows 95 and has no Slider control, so a slider would
+        // mean porting a control into a Win95-era toolkit for one number. The
+        // combo gives the same bounded choice and runs everywhere this exe does.
+        // Sizes are the practical set, not every integer: a btrfs image on FAT32
+        // cannot exceed 4 GiB anyway, so 1/2/4/8/16/32/64 covers what is real and
+        // makes the cap visible instead of something to discover at write time.
+        push_lbl(&mut p, &crate::locale::tr("Persistence space:"), 10, y, -20, 18);
+        y += 20;
+        let mut cb_size: Box<PersistCombo> = Box::default();
+        let _ = nwg::ComboBox::builder()
+            .position((10, y))
+            .size((160, 200))
+            .parent(&frame_persist)
+            .build(&mut cb_size);
+        for gib in PERSIST_SIZE_GIB {
+            cb_size.push(format!("{} GiB", gib));
+        }
+        // Select the default (4 GiB), not index 0: the collection starts at 1.
+        let def_idx = PERSIST_SIZE_GIB
+            .iter()
+            .position(|g| *g == (PERSIST_MIB_DEFAULT / 1024) as i32)
+            .unwrap_or(0);
+        cb_size.set_selection(Some(def_idx));
+        p.push(PageItem { ctl: PageCtl::Combo(cb_size, 0), x: 10, y, w: 160, h: 200, idx: 0 });
+        y += 28;
+
+        // Cache policy. Default on: on a USB stick the write reduction is large
+        // and the data is disposable. Bounded by LSL_HOME_TMPFS_MIB (2 GiB) so
+        // it cannot exhaust RAM (design s2.7). nwg's CheckBoxBuilder has no
+        // `.checked()`, so the initial tick is set after the build.
+        let mut cb: Box<nwg::CheckBox> = Box::default();
+        let _ = nwg::CheckBox::builder()
+            .flags(nwg::CheckBoxFlags::VISIBLE)
+            .text(&crate::locale::tr("Keep caches in RAM (~/.cache, /var/cache recreated each boot)"))
+            .position((10, y))
+            .size((780, 22))
+            .parent(&frame_persist)
+            .build(&mut cb);
+        cb.set_check_state(nwg::CheckBoxState::Checked);
+        p.push(PageItem { ctl: PageCtl::Check(cb, 0), x: 10, y, w: -20, h: 22, idx: 0 });
+        y += 26;
+        push_lbl(&mut p, PERSIST_CACHE_NOTE, 20, y, -30, 44);
+    }
+    if let Err(e) = nwg::ScrollBar::builder()
+        .flags(nwg::ScrollBarFlags::VERTICAL | nwg::ScrollBarFlags::VISIBLE)
+        .position((826, 4))
+        .size((18, 588))
+        .parent(&frame_persist)
+        .build(&mut sb_persist)
+    {
+        glog(&format!("scrollbar build error: {e:?}"));
+    }
+    let frame_persist = Rc::new(frame_persist);
+
+    // ---- page 5: wifi (master switch + per-network list) ----
     let _ = nwg::Frame::builder()
         .position((MARGIN, 88))
         .size((DEF_CW - 2 * MARGIN, DEF_CH - 88 - NAV_H))
         .parent(&window)
         .build(&mut frame_wifi);
-        let frame_wifi = Rc::new(frame_wifi);
+    let frame_wifi = Rc::new(frame_wifi);
     {
         let mut wifi = wifi_items.borrow_mut();
         let mut master: Box<nwg::CheckBox> = Box::default();
@@ -3782,6 +3995,7 @@ pub fn run_gui(
             frame_iso: &*frame_iso,
             frame_fp: &*frame_fp,
             frame_sys: &*frame_sys,
+            frame_persist: &*frame_persist,
             frame_wifi: &*frame_wifi,
             frame_install: &*frame_install,
             lbl_hw: &lbl_hw,
@@ -3793,6 +4007,7 @@ pub fn run_gui(
             sb_iso: &sb_iso,
             sb_fp: &sb_fp,
             sb_sys: &sb_sys,
+            sb_persist: &sb_persist,
             sb_wifi: &sb_wifi,
             sb_install: &*sb_install,
             btn_everything: &*btn_everything,
@@ -3805,6 +4020,7 @@ pub fn run_gui(
             iso: &iso_items,
             fp: &fp_items,
             sys: &sys_items,
+            persist: &persist_items,
             wifi_items: &wifi_items,
             install: &install_items,
             wifi: &wifi_checks,
@@ -3812,11 +4028,13 @@ pub fn run_gui(
             iso_off: &iso_off,
             fp_off: &fp_off,
             sys_off: &sys_off,
+            persist_off: &persist_off,
             wifi_off: &wifi_off,
             install_off: &install_off,
             iso_geom: &iso_geom,
             fp_geom: &fp_geom,
             sys_geom: &sys_geom,
+            persist_geom: &persist_geom,
             wifi_geom: &wifi_geom,
             install_geom: &install_geom,
             fp_content: &fp_content,
@@ -3837,6 +4055,7 @@ pub fn run_gui(
     frame_iso.set_visible(false);
     frame_fp.set_visible(false);
     frame_sys.set_visible(false);
+    frame_persist.set_visible(false);
     frame_wifi.set_visible(false);
     frame_install.set_visible(false);
     window.set_visible(true);
@@ -3886,8 +4105,17 @@ pub fn run_gui(
             fw_cell.clone(),
         ),
         bind_page_scroll(
-            &*frame_wifi,
+            &*frame_persist,
             0x4C56_04usize,
+            sb_persist.handle.hwnd(),
+            persist_items.clone(),
+            persist_geom.clone(),
+            persist_off.clone(),
+            fw_cell.clone(),
+        ),
+        bind_page_scroll(
+            &*frame_wifi,
+            0x4C56_05usize,
             sb_wifi.handle.hwnd(),
             wifi_items.clone(),
             wifi_geom.clone(),
@@ -3896,7 +4124,7 @@ pub fn run_gui(
         ),
         bind_page_scroll(
             &*frame_install,
-            0x4C56_05usize,
+            0x4C56_06usize,
             sb_install.handle.hwnd(),
             install_items.clone(),
             install_geom.clone(),
@@ -3959,6 +4187,7 @@ pub fn run_gui(
         let frame_iso = frame_iso.clone();
         let frame_fp = frame_fp.clone();
         let frame_sys = frame_sys.clone();
+        let frame_persist = frame_persist.clone();
         let frame_wifi = frame_wifi.clone();
         let frame_install = frame_install.clone();
         let btn_back = btn_back.clone();
@@ -3973,12 +4202,16 @@ pub fn run_gui(
             }
             glog("hotkey: jump to INSTALL");
             page.set(INSTALL_PAGE);
-            frame_hw.set_visible(false);
-            frame_iso.set_visible(false);
-            frame_fp.set_visible(false);
-            frame_sys.set_visible(false);
-            frame_wifi.set_visible(false);
-            frame_install.set_visible(true);
+            show_page(
+                INSTALL_PAGE,
+                &frame_hw,
+                &frame_iso,
+                &frame_fp,
+                &frame_sys,
+                &frame_persist,
+                &frame_wifi,
+                &frame_install,
+            );
             btn_back.set_enabled(true);
             btn_next.set_enabled(true);
             btn_reboot.set_visible(false);
@@ -4039,6 +4272,7 @@ pub fn run_gui(
         let iso_items = iso_items.clone();
         let fp_items = fp_items.clone();
         let sys_items = sys_items.clone();
+        let persist_items = persist_items.clone();
         let wifi_items = wifi_items.clone();
         let install_items = install_items.clone();
         let bg_downloads = bg_downloads.clone();
@@ -4048,6 +4282,7 @@ pub fn run_gui(
         let iso_off = iso_off.clone();
         let fp_off = fp_off.clone();
         let sys_off = sys_off.clone();
+        let persist_off = persist_off.clone();
         let wifi_off = wifi_off.clone();
         let install_off = install_off.clone();
         let bios_tt_c = bios_tt.clone();
@@ -4055,6 +4290,7 @@ pub fn run_gui(
         let iso_geom = iso_geom.clone();
         let fp_geom = fp_geom.clone();
         let sys_geom = sys_geom.clone();
+        let persist_geom = persist_geom.clone();
         let wifi_geom = wifi_geom.clone();
         let install_geom = install_geom.clone();
         let fp_content = fp_content.clone();
@@ -4069,6 +4305,7 @@ pub fn run_gui(
     let frame_iso_c = frame_iso.clone();
     let frame_fp_c = frame_fp.clone();
     let frame_sys_c = frame_sys.clone();
+    let frame_persist_c = frame_persist.clone();
     let frame_wifi_c = frame_wifi.clone();
     let frame_install_c = frame_install.clone();
     let sb_install_c = sb_install.clone();
@@ -4121,6 +4358,7 @@ pub fn run_gui(
                         frame_iso: &*frame_iso_c,
                         frame_fp: &*frame_fp_c,
                         frame_sys: &*frame_sys_c,
+                        frame_persist: &*frame_persist_c,
                         frame_wifi: &*frame_wifi_c,
                         frame_install: &*frame_install_c,
                         lbl_hw: &lbl_hw,
@@ -4132,6 +4370,7 @@ pub fn run_gui(
                         sb_iso: &sb_iso,
                         sb_fp: &sb_fp,
                         sb_sys: &sb_sys,
+                        sb_persist: &sb_persist,
                         sb_wifi: &sb_wifi,
                         sb_install: &*sb_install_c,
                         btn_everything: &*btn_everything_c,
@@ -4144,6 +4383,7 @@ pub fn run_gui(
                         iso: &iso_items,
                         fp: &fp_items,
                         sys: &sys_items,
+                        persist: &persist_items,
                         wifi_items: &wifi_items,
                         install: &install_items,
                         wifi: &wifi_checks,
@@ -4151,11 +4391,13 @@ pub fn run_gui(
                         iso_off: &iso_off,
                         fp_off: &fp_off,
                         sys_off: &sys_off,
+                        persist_off: &persist_off,
                         wifi_off: &wifi_off,
                         install_off: &install_off,
                         iso_geom: &iso_geom,
                         fp_geom: &fp_geom,
                         sys_geom: &sys_geom,
+                        persist_geom: &persist_geom,
                         wifi_geom: &wifi_geom,
                         install_geom: &install_geom,
                         fp_content: &fp_content,
@@ -4255,12 +4497,16 @@ pub fn run_gui(
                     let cur = p2.get();
                     if cur < INSTALL_PAGE {
                         p2.set(cur + 1);
-                        frame_hw_c.set_visible(p2.get() == 0);
-                        frame_iso_c.set_visible(p2.get() == 1);
-                        frame_fp_c.set_visible(p2.get() == 2);
-                        frame_sys_c.set_visible(p2.get() == 3);
-                        frame_wifi_c.set_visible(p2.get() == 4);
-                        frame_install_c.set_visible(p2.get() == INSTALL_PAGE);
+                        show_page(
+                            p2.get(),
+                            &frame_hw_c,
+                            &frame_iso_c,
+                            &frame_fp_c,
+                            &frame_sys_c,
+                            &frame_persist_c,
+                            &frame_wifi_c,
+                            &frame_install_c,
+                        );
                         btn_back_c.set_enabled(p2.get() > 0);
                         btn_next_c.set_text(&nav_label(p2.get()));
                         btn_reboot_c.set_visible(p2.get() == 0);
@@ -4279,6 +4525,7 @@ pub fn run_gui(
                             &iso_items,
                             &fp_items,
                             &sys_items,
+                            &persist_items,
                             &wifi_items,
                             &install_items,
                             &wifi_checks,
@@ -4352,12 +4599,16 @@ pub fn run_gui(
                     let cur = p2.get();
                     if cur > 0 {
                         p2.set(cur - 1);
-                        frame_hw_c.set_visible(p2.get() == 0);
-                        frame_iso_c.set_visible(p2.get() == 1);
-                        frame_fp_c.set_visible(p2.get() == 2);
-                        frame_sys_c.set_visible(p2.get() == 3);
-                        frame_wifi_c.set_visible(p2.get() == 4);
-                        frame_install_c.set_visible(p2.get() == INSTALL_PAGE);
+                        show_page(
+                            p2.get(),
+                            &frame_hw_c,
+                            &frame_iso_c,
+                            &frame_fp_c,
+                            &frame_sys_c,
+                            &frame_persist_c,
+                            &frame_wifi_c,
+                            &frame_install_c,
+                        );
                         btn_back_c.set_enabled(p2.get() > 0);
                         btn_next_c.set_enabled(true);
                         btn_next_c.set_text(&nav_label(p2.get()));
@@ -4753,11 +5004,16 @@ pub fn run_gui(
         btn_everything.set_enabled(true);
         btn_reboot.set_visible(false);
         page.set(INSTALL_PAGE);
-        frame_hw.set_visible(false);
-        frame_iso.set_visible(false);
-        frame_fp.set_visible(false);
-        frame_sys.set_visible(false);
-        frame_wifi.set_visible(false);
+        show_page(
+            INSTALL_PAGE,
+            &frame_hw,
+            &frame_iso,
+            &frame_fp,
+            &frame_sys,
+            &frame_persist,
+            &frame_wifi,
+            &frame_install,
+        );
         btn_next.set_text(&nav_label(INSTALL_PAGE));
         confirmed.set(false);
         working.set(false);
@@ -4816,6 +5072,7 @@ fn harvest_gui_result(
     iso_items: &PageItems,
     fp_items: &PageItems,
     sys_items: &PageItems,
+    persist_items: &PageItems,
     wifi_items: &PageItems,
     install_items: &PageItems,
     wifi_checks: &Rc<std::cell::RefCell<Vec<Box<nwg::CheckBox>>>>,
@@ -5039,6 +5296,44 @@ fn harvest_gui_result(
             wifi = b.check_state() == nwg::CheckBoxState::Checked;
         }
     }
+
+    // persistence page: the CHECKED radio's INDEX selects PERSIST_BACKENDS.
+    //
+    // Index, never the label: the labels are translated (de/th), and matching a
+    // translated string to pick a backend would break silently in every other
+    // language - the exact failure locale.rs warns about. If no radio is
+    // checked (should not happen; WS_GROUP always leaves one) fall back to the
+    // default rather than to "none", because defaulting to no-persistence would
+    // look like the tool quietly discarded the user's settings.
+    let mut persist_backend = PERSIST_DEFAULT.to_string();
+    let mut persist_mib = PERSIST_MIB_DEFAULT;
+    let mut cache_tmpfs = true;
+    for it in persist_items.borrow().iter() {
+        match &it.ctl {
+            PageCtl::Radio(rb, k) => {
+                if rb.check_state() == nwg::RadioButtonState::Checked {
+                    if let Some(b) = PERSIST_BACKENDS.get(*k as usize) {
+                        persist_backend = b.to_string();
+                    }
+                }
+            }
+            PageCtl::Combo(cb, 0) => {
+                if let Some(i) = cb.selection() {
+                    if let Some(gib) = PERSIST_SIZE_GIB.get(i) {
+                        persist_mib = (*gib as u32) * 1024;
+                    }
+                }
+            }
+            PageCtl::Check(cb, 0) => {
+                cache_tmpfs = cb.check_state() == nwg::CheckBoxState::Checked;
+            }
+            _ => {}
+        }
+    }
+    // "none" has no size; 0 is the honest value and the shell side ignores it.
+    if persist_backend == "none" {
+        persist_mib = 0;
+    }
     let wsl_vhdx: Vec<String> = vhdx_text
         .lines()
         .map(|l| l.trim().to_string())
@@ -5070,6 +5365,9 @@ fn harvest_gui_result(
         efu,
         drivers,
         sfs_hdd: sfs,
+        persist_backend,
+        persist_mib,
+        cache_tmpfs,
         rust_tools,
         distro_arch,
         reclaim_win_swap: reclaim,

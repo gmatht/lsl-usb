@@ -77,8 +77,85 @@ lsl_load_config() {
     : "${LSL_BTRFS_GROW_INTERVAL_SEC:=60}"
     : "${LSL_HOME_TMPFS_MIB:=2048}"
     : "${LSL_RECLAIM_WIN_SWAP:=0}"
+    # ---- Persistence backend selection (DESIGN-PERSISTENCE-PANE.md s1.2) ----
+    # none   = RAM only; nothing survives a reboot (today's `lsl_home=tmpfs`)
+    # squashfs = home-<distro>.sfs on the stick - the default, and the only
+    #            backend with a working scrub story today
+    # btrfs  = home-<distro>.btrfs loopback image (on the stick or on the HDD)
+    # f2fs   = a real F2FS partition, experimental (DESIGN-F2FS-PERSISTENCE.md)
+    : "${LSL_PERSIST:=squashfs}"
+    : "${LSL_PERSIST_MIB:=4096}"
+    : "${LSL_CACHE_TMPFS:=0}"
     export LSL_DATA_DIR LSL_HOME_IDLE_SEC LSL_HOME_BTRFS_MIB LSL_CACHE_BTRFS_MIB
     export LSL_BTRFS_GROW_CHUNK_MIB LSL_BTRFS_MIN_FREE_PCT LSL_BTRFS_GROW_INTERVAL_SEC LSL_HOME_TMPFS_MIB LSL_RECLAIM_WIN_SWAP
+    export LSL_PERSIST LSL_PERSIST_MIB LSL_CACHE_TMPFS
+}
+
+# Normalise LSL_PERSIST to one of the four known backends. An unknown value is
+# NOT silently accepted: it falls back to squashfs and says so, because a typo
+# in lsl-usb.env must not silently mean "no persistence" (the user would find
+# out when their files vanished) nor silently mean something else.
+lsl_persist_backend() {
+    local v="${LSL_PERSIST:-squashfs}"
+    v="$(printf '%s' "$v" | tr -d '\r' | tr 'A-Z' 'a-z')"
+    case "$v" in
+        none|ram)          echo none ;;
+        squashfs|sfs|usb)  echo squashfs ;;
+        btrfs)             echo btrfs ;;
+        f2fs)              echo f2fs ;;
+        *)
+            echo "lsl: unknown LSL_PERSIST='$v'; falling back to squashfs." >&2
+            echo squashfs
+            ;;
+    esac
+}
+
+# The F2FS partition's label and mountpoint. A LABEL, not a device path, so a
+# partition created by hand or by another tool is found the same way. Kept in
+# the existing vocabulary: /persist is already treated as stick-resident by
+# lsl_is_usb_mode.
+LSL_PERSIST_LABEL="${LSL_PERSIST_LABEL:-lsl-persist}"
+LSL_PERSIST_MNT="${LSL_PERSIST_MNT:-/persist}"
+
+# True when /home should be an OVERLAY (lower = home-<distro>.sfs, upper = a
+# directory), false when it should be loop-mounted btrfs images.
+#
+# f2fs uses the overlay shape with a different upper, so it is here. btrfs needs
+# loop images and is NOT, which is why the pane cannot simply map "stick" to
+# "squashfs" any more. A named helper rather than an inline condition because the
+# rule now has three cases and the alternative is an unreadable elif chain.
+lsl_uses_overlay_backend() {
+    case "${LSL_PERSIST_BACKEND:-squashfs}" in
+        f2fs)     return 0 ;;
+        squashfs) lsl_is_usb_mode && return 0 || return 1 ;;
+        *)        return 1 ;;
+    esac
+}
+
+# The identity paths removed from a persistent upper before the overlay mounts,
+# and rewritten every boot afterwards (WHYFAIL12).
+#
+# This is a DENYLIST and it is the honest weak point of the design: these paths
+# were found by inspecting one machine, so a different workload will write
+# machine facts we did not enumerate. It removes the identity we know about, not
+# machine identity. An allowlist would be stronger but is a much larger change.
+#
+# bump the version whenever this list changes - it is baked into the initrd, so
+# a stick built before a change keeps the old list and would otherwise be
+# indistinguishable from one that never ran the scrub.
+lsl_identity_paths() {
+    cat <<'EOF'
+etc/netplan
+etc/NetworkManager/system-connections
+etc/hostname
+etc/hosts
+etc/machine-id
+etc/resolv.conf
+etc/casper.conf
+etc/lightdm/lightdm.conf
+etc/ssl/certs/ssl-cert-snakeoil.pem
+etc/ssl/private/ssl-cert-snakeoil.key
+EOF
 }
 
 lsl_desktop_user() {
