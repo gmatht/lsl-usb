@@ -9,14 +9,22 @@ moved 5 → 6. The settings reach Linux through `LSL_PERSIST` /
 command line reproduces them.
 
 > **A GUI page can pass every unit test and still be visibly broken.** The first
-> build of this pane did: its items were absent from `relayout()`'s `pages` array,
-> so they never passed through `layout_page()` and kept the raw builder geometry —
-> including the negative widths that mean "fill the width" everywhere else in the
-> file. The "Persistence space:" label simply did not render. No test asserted on
-> page layout, and the crate's tests run headless, so nothing caught it; it was
-> found by launching the wizard. **Adding a page means adding it to `pages` as
-> well as to `show_page()` — the two lists are separate and only one of them
-> controls whether the controls are positioned.**
+> build of this pane did, twice: its items were absent from `relayout()`'s `pages`
+> array, so they never passed through `layout_page()` and kept the raw builder
+> geometry — including the negative widths that mean "fill the width" everywhere
+> else in the file, so the "Persistence space:" label simply did not render. Then
+> the slider's range and position were applied as three separate Win32 messages
+> after the build, and Win32 re-clamps a trackbar's position when its range
+> changes — so the handle was pinned at the minimum — while the value label beside
+> it was static text that never updated. **Two of the three defects were invisible
+> to the crate's tests: they run headless, and nothing asserts on live control
+> state.** Both were found by launching the wizard.
+>
+> Two rules that came out of it: adding a page means adding it to **both**
+> `show_page()` (visibility) and `pages` (geometry) — they are separate lists, and
+> only the second positions anything. And a control's initial state goes through
+> its **builder**, not through setters after the fact, so ordering is guaranteed
+> rather than raced.
 
 **Not built, deliberately:**
 
