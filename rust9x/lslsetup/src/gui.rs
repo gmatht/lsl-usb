@@ -131,18 +131,49 @@ pub const PERSIST_DEFAULT: &str = "squashfs";
 /// already gave you.
 pub const PERSIST_MIB_DEFAULT: u32 = 4096;
 
-/// Slider bounds, GiB. A TRACKBAR (Win32 `TRACKBAR_CLASS`, comctl32 — present on
-/// Windows 95, which this exe must run on) stepped in 1 GiB increments.
+/// Slider bounds and default, DERIVED from the target stick's size (design
+/// §2.3-§2.4) rather than being fixed constants.
 ///
-/// The design's slider expresses a continuous SPLIT ("32 GB FAT / 93 GB
-/// persistence") derived from the target stick's size. That is not what this
-/// control does: there is no stick-size probe in this pane, and adding one is a
-/// separate change (it needs the volume size for the selected target, which is
-/// only known once a target is picked). Until then the slider is a bounded size
-/// chooser, and the real limit is stated in the label rather than discovered at
-/// write time.
-pub const PERSIST_GIB_MIN: usize = 1;
-pub const PERSIST_GIB_MAX: usize = 64;
+/// A TRACKBAR (Win32 `TRACKBAR_CLASS`, comctl32 — present on Windows 95, which
+/// this exe must run on) stepped in 1 GiB increments.
+pub fn persist_gib_bounds(total_gib: u32) -> (usize, usize, usize) {
+    // Windows refuses to format FAT32 past 32 GB (Explorer and every
+    // non-Insider build still enforce it), so the FAT side is capped and
+    // persistence gets `total - FAT_MAX_GIB`. This is a formatting-safety BOUND,
+    // not a target: the FAT side only needs iso + extracted kernel + slack, so
+    // on a large stick most of the capacity legitimately belongs to persistence.
+    const FAT_MAX_GIB: u32 = 32;
+    // Measured on this stick: base squashfs 2.5 GB + vmlinuz/initrd ~98 MB, plus
+    // room for at least one appended layer (first boot produces one).
+    const MIN_FAT_GIB: usize = 4;
+
+    if total_gib == 0 || (total_gib as usize) <= FAT_MAX_GIB as usize {
+        // No usable split (no target picked yet, or a stick too small). Keep a
+        // valid non-empty range so the control behaves; the pane's note explains
+        // why the stick cannot host persistence.
+        return (MIN_FAT_GIB, MIN_FAT_GIB, MIN_FAT_GIB);
+    }
+    // Hard ceiling only so a nonsensical `total` cannot exceed what a trackbar
+    // can represent; the real maximum is total - 32.
+    let max = ((total_gib - FAT_MAX_GIB) as usize).min(4096).max(MIN_FAT_GIB);
+    // Default = 3/4 of the available persistence space, as specified.
+    let default = (max * 3 / 4).clamp(MIN_FAT_GIB, max);
+    (MIN_FAT_GIB, max, default)
+}
+
+/// Largest USB volume currently attached, in GiB, rounded down.
+///
+/// The pane's slider is derived from this. 0 when no removable volume is visible,
+/// which makes persist_gib_bounds fall back to the "stick too small" case
+/// rather than guessing a size. `Volume::size_gb` is already used for the ISO
+/// page's volume list, so no new capability is needed to read it.
+pub fn largest_usb_gib() -> u32 {
+    sys::find_usb_volumes("", &[])
+        .iter()
+        .map(|v| v.size_gb() as u32)
+        .max()
+        .unwrap_or(0)
+}
 
 /// FAT32 cannot hold a single file of 4 GiB or more, and the btrfs backend is a
 /// FILE (`home-<distro>.btrfs`) inside the data dir. When that dir is stick-
@@ -225,6 +256,26 @@ pub fn persist_gib_text(mib: u32) -> String {
     format!("{:.1} GiB ({} MiB)", mib as f64 / 1024.0, mib)
 }
 
+/// "32 GB FAT / 93 GB persistence" — the split the design asks the slider to
+/// express (§4). Showing both numbers rather than a bare percentage is what
+/// makes the control a choice about the stick instead of an abstract size.
+///
+/// When the stick is unknown or too small to split, say that instead of
+/// printing a division of nothing.
+pub fn persist_split_text(total_gib: u32, persist_mib: u32) -> String {
+    if total_gib == 0 {
+        return "No USB stick detected yet - persistence size cannot be sized yet.".to_string();
+    }
+    if (total_gib as usize) <= 32 {
+        return format!(
+            "This stick is {} GB, too small to leave at most 32 GB for FAT.",
+            total_gib
+        );
+    }
+    let fat_gib = total_gib as f64 - (persist_mib as f64 / 1024.0);
+    format!("{:.0} GB FAT / {:.0} GB persistence", fat_gib.max(0.0), persist_mib as f64 / 1024.0)
+}
+
 /// Refresh the persistence pane's size readout from the slider's live position.
 ///
 /// The readout was originally STATIC text written once at page-build time, so it
@@ -247,9 +298,15 @@ fn sync_persist_readout(items: &PageItems) {
     };
     let items_ref = items.borrow();
     let mib = match &items_ref[ti].ctl {
-        PageCtl::Track(tb, _) => (tb.pos().max(PERSIST_GIB_MIN) as u32) * 1024,
-        _ => return,
-    };
+            // Clamp to the control's OWN minimum rather than a global constant: the
+            // range is derived per-target (persist_gib_bounds), so a stale constant
+            // here could scale a position that is already below it to zero.
+            PageCtl::Track(tb, _) => {
+                let lo = tb.range_min().max(1);
+                (tb.pos().max(lo) as u32) * 1024
+            }
+            _ => return,
+        };
     if let PageCtl::Lbl(lb, _) = &items_ref[li].ctl {
         let want = persist_gib_text(mib);
         if lb.text() != want {
@@ -3760,9 +3817,9 @@ pub fn run_gui(
         for (i, (backend, label)) in PERSIST_BACKENDS
             .iter()
             .zip([
-                "Squashfs layer (home.sfs on the stick) - recommended",
-                "Btrfs image (home.btrfs loopback on the data dir)",
-                "F2FS partition (experimental; needs a second partition)",
+                "Manual Squashfs (home.sfs on the stick) - recommended",
+                "HardDisk (Btrfs image on the data dir)",
+                "USB Partition (F2FS; experimental, needs a second partition)",
             ])
             .enumerate()
         {
@@ -3800,21 +3857,25 @@ pub fn run_gui(
         // one; the name was the only thing missing.
         push_lbl(&mut p, &crate::locale::tr("Persistence space:"), 10, y, -20, 18);
         y += 20;
-        let default_gib = (PERSIST_MIB_DEFAULT / 1024) as usize;
+        // Bounds and default are DERIVED from the target's size (design
+        // §2.3-§2.4): max is total-32 so at most 32 GB is ever FAT, and the
+        // default is 3/4 of what that leaves. `largest_usb_gib` reads the size
+        // already exposed by Volume::size_gb - the same value the ISO page shows
+        // next to each candidate stick.
+        let (gib_min, gib_max, gib_default) = persist_gib_bounds(largest_usb_gib());
         // Range AND position go through the BUILDER, in that order, rather than
         // via set_range_min/set_range_max/set_pos after the build. Calling them
         // afterwards sends TBM_SETRANGEMIN, TBM_SETRANGEMAX and TBM_SETPOSNOTIFY
         // separately, and Win32 re-clamps the position when the range changes -
-        // so a set_pos(4) issued before the range was applied (or reset by it)
-        // is silently undone. The builder issues TBM_SETRANGE once and then the
-        // position, so the default actually sticks.
+        // so a set_pos issued before the range was applied is silently undone.
+        let default_mib = (gib_default as u32) * 1024;
         let mut tb: Box<nwg::TrackBar> = Box::default();
         let _ = nwg::TrackBar::builder()
             .flags(nwg::TrackBarFlags::VISIBLE)
             .position((10, y))
             .size((400, 30))
-            .range(Some(PERSIST_GIB_MIN..PERSIST_GIB_MAX))
-            .pos(Some(default_gib))
+            .range(Some(gib_min..gib_max))
+            .pos(Some(gib_default))
             .parent(&frame_persist)
             .build(&mut tb);
         p.push(PageItem { ctl: PageCtl::Track(tb, 0), x: 10, y, w: 400, h: 30, idx: 0 });
@@ -3824,17 +3885,29 @@ pub fn run_gui(
         // "4.0 GiB" no matter where the slider was dragged - the control looked
         // broken and, worse, the number on screen did not describe the value
         // that Install would write. It is now refreshed from the slider's
-        // notification (below) AND read back from pos() at Install, so what is
+        // position (below) AND read back from pos() at Install, so what is
         // displayed is what is harvested.
         let mut lbl_val: Box<nwg::Label> = Box::default();
         let _ = nwg::Label::builder()
-            .text(&persist_gib_text(PERSIST_MIB_DEFAULT))
+            .text(&persist_gib_text(default_mib))
             .position((420, y))
             .size((220, 20))
             .parent(&frame_persist)
             .build(&mut lbl_val);
         p.push(PageItem { ctl: PageCtl::Lbl(lbl_val, 1), x: 420, y, w: 220, h: 20, idx: 0 });
         y += 36;
+        // Show the split the design asks for ("32 GB FAT / 93 GB persistence"),
+        // so the user is choosing a division of the stick rather than an
+        // abstract number.
+        push_lbl(
+            &mut p,
+            &persist_split_text(largest_usb_gib(), default_mib),
+            10,
+            y,
+            -20,
+            18,
+        );
+        y += 22;
 
         // Cache policy. Default on: on a USB stick the write reduction is large
         // and the data is disposable. Bounded by LSL_HOME_TMPFS_MIB (2 GiB) so
@@ -5455,7 +5528,13 @@ fn harvest_gui_result(
     // default, so a missed radio can never silently resolve to a backend the
     // user did not pick.
     let mut persist_backend = PERSIST_DEFAULT.to_string();
-    let mut persist_mib = PERSIST_MIB_DEFAULT;
+    // Only used when the page carries no TrackBar at all (headless/tests); the
+    // live value comes from the slider. Kept at the derived default for the
+    // currently attached stick so the two agree.
+    let mut persist_mib = {
+        let (_, _, d) = persist_gib_bounds(largest_usb_gib());
+        (d as u32) * 1024
+    };
     let mut cache_tmpfs = true;
     for it in persist_items.borrow().iter() {
         match &it.ctl {
@@ -5467,7 +5546,10 @@ fn harvest_gui_result(
                 }
             }
             PageCtl::Track(tb, 0) => {
-                let gib = tb.pos().max(PERSIST_GIB_MIN) as u32;
+                // Clamp to the control's own range: it is derived from the
+                // target's size, so the global constants no longer apply.
+                let lo = tb.range_min().max(1);
+                let gib = tb.pos().max(lo) as u32;
                 persist_mib = gib * 1024;
             }
             PageCtl::Check(cb, 0) => {

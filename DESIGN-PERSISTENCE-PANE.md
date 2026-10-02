@@ -38,17 +38,31 @@ command line reproduces them.
   if it ever is: it enables `libeatmydata` and **nothing else** — never
   partitioning, formatting, erasing, or any disk write. §2.6 removed the only
   control that could have given a destructive "prank" somewhere to hide.
-- **§2.3-2.4 the space slider proper.** Built as a **trackbar** (the Win32
-  slider, in comctl32 and therefore available on Windows 95) stepping 1–64 GiB.
-  What it is *not* yet is the design's continuous FAT/persistence **split**:
-  there is no stick-size probe in this pane, and one cannot be added until the
-  selected target's size is known — which only happens on the INSTALL page,
-  after this one. So the slider is a bounded size chooser, and the binding limit
-  (FAT32's 4 GiB single-file cap on a btrfs image) is stated in the label rather
-  than discovered at write time.
+- **§2.3-2.4 the space slider — built as specified.** A **trackbar** (the Win32
+  slider, in comctl32 and therefore available on Windows 95), stepped in 1 GiB,
+  with its bounds **derived from the attached stick's size**:
+
+  | | rule | source |
+  |---|---|---|
+  | max | `total − 32 GB` — at most 32 GB may ever be FAT | §2.4 |
+  | default | **3/4 of the persistence space** | §2.3 |
+  | min | ~4 GB: base layer + extracted kernel + room for one appended layer | §2.3 |
+
+  So a 125 GB stick gives `4..93`, default 69, and the pane states the split
+  outright — "56 GB FAT / 69 GB persistence" — because §4 says the slider should
+  show both numbers, making it a choice about the stick rather than an abstract
+  size. A stick that cannot host the split (≤32 GB, or none attached) collapses
+  to a valid non-empty range and says so instead of showing a division of
+  nothing.
+
+  **Two earlier drafts of this pane ignored all of the above**, using fixed
+  1..64 constants with a 4 GiB default and a comment claiming no stick-size probe
+  existed. `Volume::size_gb()` was already in use on the ISO page, so the size was
+  available and the claim was false. `largest_usb_gib()` reads it now.
+
 - **An earlier draft used a combo box**, on the stated grounds that the vendored
-  `nwg` had no slider. That was wrong: `nwg` exports `TrackBar`, and it is the
-  Win32 control this design wanted all along. Corrected.
+  `nwg` had no slider. That was also wrong: `nwg` exports `TrackBar`, and it is the
+  Win32 control this design wanted all along.
 
 **Related:** `DESIGN-F2FS-PERSISTENCE.md` (the scrub/regenerate mechanism this pane
 drives), `DESIGN-BOOT-TO-RAM-VARIANTS.md` §11 (what the block layer can and

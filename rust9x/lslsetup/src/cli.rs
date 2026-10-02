@@ -389,18 +389,38 @@ mod tests {
         // The default must be findable, or the pane would pre-check a radio whose
         // index does not map back to the default.
         assert!(crate::gui::PERSIST_BACKENDS.contains(&crate::gui::PERSIST_DEFAULT));
-        // The slider's default position must be INSIDE its range, or the trackbar
-        // silently clamps it and the pane pre-selects a size nobody asked for.
-        let default_gib = (crate::gui::PERSIST_MIB_DEFAULT / 1024) as usize;
-        assert!(
-            default_gib >= crate::gui::PERSIST_GIB_MIN && default_gib <= crate::gui::PERSIST_GIB_MAX,
-            "the slider default ({} GiB) is outside its range {}-{}",
-            default_gib,
-            crate::gui::PERSIST_GIB_MIN,
-            crate::gui::PERSIST_GIB_MAX
-        );
-        assert!(crate::gui::PERSIST_GIB_MIN > 0, "0 GiB is not a usable size");
-        // ...and the readout must show the MiB the env file actually receives.
-        assert_eq!(crate::gui::persist_gib_text(crate::gui::PERSIST_MIB_DEFAULT), "4.0 GiB (4096 MiB)");
+        // The design's arithmetic (§2.3-§2.4), pinned so it cannot drift back to
+        // fixed constants:
+        //   * max = total - 32   (at most 32 GB may be FAT)
+        //   * default = 3/4 of that max
+        //   * min = what must fit on FAT (~4 GB: base layer + kernel + a layer)
+        let (min, max, default) = crate::gui::persist_gib_bounds(125);
+        assert_eq!(min, 4, "the FAT side must hold the image plus a layer");
+        assert_eq!(max, 93, "at most 32 of 125 GB may be FAT");
+        assert_eq!(default, 69, "the default is 3/4 of the persistence space");
+        assert!((min..=max).contains(&default), "default must be reachable");
+
+        // A 64 GB stick: 32 FAT / 32 persistence, default 24.
+        let (min64, max64, def64) = crate::gui::persist_gib_bounds(64);
+        assert_eq!(max64, 32);
+        assert_eq!(def64, 24);
+        assert!((min64..=max64).contains(&def64));
+
+        // A stick too small to split collapses to a valid, non-empty range
+        // rather than an inverted one - an inverted trackbar range is what made
+        // the slider unusable in the first place.
+        for tiny in [0u32, 1, 16, 32] {
+            let (lo, hi, d) = crate::gui::persist_gib_bounds(tiny);
+            assert!(lo <= hi, "range inverted for {} GB: {}..{}", tiny, lo, hi);
+            assert!((lo..=hi).contains(&d), "default {} outside {}..{} for {} GB", d, lo, hi, tiny);
+            assert!(lo > 0, "a 0 GiB persistence partition is not a usable size");
+        }
+
+        // The readout shows the split the design asks for, not a bare number.
+        assert_eq!(crate::gui::persist_split_text(125, 69 * 1024), "56 GB FAT / 69 GB persistence");
+        assert!(crate::gui::persist_split_text(0, 4096).contains("No USB stick"));
+        assert!(crate::gui::persist_split_text(16, 4096).contains("too small"));
+        // ...and the size readout names the MiB the env file actually receives.
+        assert_eq!(crate::gui::persist_gib_text(4096), "4.0 GiB (4096 MiB)");
     }
 }
