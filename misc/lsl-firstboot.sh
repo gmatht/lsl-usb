@@ -826,7 +826,16 @@ monitor_uproot_progress() {
                 esac
                 _pct="$(printf '%s' "$line" | grep -o '[0-9][0-9]*%' | tail -n 1 | tr -d '%')"
                 case "$_pct" in ''|*[!0-9]*) continue ;; esac
-                task_progress "$_pct" "Compressing layer (${_pct}%)…" 2>/dev/null || true
+                # The SAME high-water mark the packages arms use. Without it the
+                # layer arm can publish a percentage BELOW what the tail steps
+                # already reached (e.g. steps creep to 98, then mksquashfs's
+                # first bar line says 50), and the dialog's bar jumps backwards -
+                # the one behaviour the whole high-water design exists to prevent.
+                # This was invisible while the test harness's `tail` mock was too
+                # coarse to extract any percentage at all (see the comment in
+                # tests/bash.tests.bats run_monitor).
+                [ "$_pct" -gt "$_pkg_pct" ] 2>/dev/null && _pkg_pct="$_pct"
+                task_progress "$_pkg_pct" "Compressing layer (${_pkg_pct}%)…" 2>/dev/null || true
                 ;;
         esac
     done 2>/dev/null || true

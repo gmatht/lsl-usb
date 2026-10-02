@@ -1042,6 +1042,36 @@ load_growd_funcs() {
     eval "$(sed -n '/^lsl_refresh_image_loops()/,/^}/p' bin/lsl-common.sh)"
 }
 
+# Standard losetup mock for these tests.
+#
+# The shared lsl_refresh_image_loops resolves devices with `losetup -j <img>` and
+# then calls `losetup -c <dev>` on each, skipping any that fails `[ -b ]`.
+# Two traps, both of which make this test fail for a reason unrelated to growd:
+#
+#   1. A mock implementing only `-c` makes the helper find NOTHING to refresh,
+#      so the expected `losetup -c` line is simply absent. `-j` must answer in
+#      real losetup's backing-file form.
+#   2. `[ -b "$dev" ]` uses the shell BUILTIN, which a shell function named
+#      `test` cannot shadow - the pre-existing `test() {...}` override in some
+#      of these tests does nothing for `-b`. The device must therefore be a REAL
+#      block device; /dev/loop0 is one on any host that can run these tests
+#      (and the whole file already assumes a Linux block-device environment).
+#
+# The device is passed via a global (LSL_MOCK_LOOP), not a closure variable:
+# bats runs `run` in a subshell, and a closure defined in a helper function does
+# not survive into it.
+mock_losetup() {
+    LSL_MOCK_LOOP="$1"
+    losetup() {
+        case "$1" in
+            -j) [ -n "$LSL_MOCK_LOOP" ] && \
+                    printf '%s: [2049]:12345 (%s)\n' "$LSL_MOCK_LOOP" "$IMG" ;;
+            -c) echo "losetup -c $2" >> "$TMPDIR_TEST/losetup.log" ;;
+            *)  return 0 ;;
+        esac
+    }
+}
+
 @test "lsl-btrfs-growd: grows the image and refreshes the loop device" {
     load_growd_funcs
     IMG="$TMPDIR_TEST/home.btrfs"
@@ -1052,12 +1082,11 @@ load_growd_funcs() {
     df() { echo "Filesystem 1K-blocks Used Available Use% Mounted on"; echo "/dev/loop0 1048576 950000 48576 95% /home"; }
     btrfs() { echo "btrfs $*" >> "$TMPDIR_TEST/btrfs.log"; }
     truncate() { echo "truncate $*" >> "$TMPDIR_TEST/truncate.log"; }
-    losetup() { case "$1" in -j) echo "/dev/loop0: [2049]:12345 ($IMG)" ;; -c) echo "losetup -c $2" >> "$TMPDIR_TEST/losetup.log" ;; esac; }
+    mock_losetup /dev/loop0
     # findmnt now supplies the loop device (the script prefers it over losetup -j).
     findmnt() { echo "/dev/loop0"; }
-    # The script only runs the primary losetup -c when the loop device is a real
-    # block device; pretend /dev/loop0 is one so the online-grow path is exercised.
-    test() { case "$1" in -b) [ "$2" = "/dev/loop0" ] ;; *) command test "$@" ;; esac; }
+    # No `test` override needed: `[ -b /dev/loop0 ]` uses the shell builtin, which
+    # a shell function cannot shadow - the device is real instead.
     run try_grow /home "$IMG" home
     [ "$status" -eq 0 ]
     grep -q "truncate -s +1024M" "$TMPDIR_TEST/truncate.log"
@@ -1078,7 +1107,7 @@ load_growd_funcs() {
     # Old findmnt (or another mount stacked above): no loop line at all.
     findmnt() { case "$*" in *TARGET*) printf '/lower\n' ;; *) printf 'overlay\n' ;; esac; }
     # ... so the image path (canonicalized) is the only lead.
-    losetup() { case "$1" in -j) echo "/dev/loop0: [2049]:12345 ($IMG)" ;; -c) echo "losetup -c $2" >> "$TMPDIR_TEST/losetup.log" ;; esac; }
+    mock_losetup /dev/loop0
     run try_grow /home "$IMG" home
     [ "$status" -eq 0 ]
     grep -q "losetup -c /dev/loop0" "$TMPDIR_TEST/losetup.log"
@@ -1098,7 +1127,7 @@ load_growd_funcs() {
     # findmnt lists every mount stacked on the path (verified live:
     # loop line first, overlay second) - plus the loop's own mountpoint.
     findmnt() { case "$*" in *TARGET*) printf '/lower\n' ;; *) printf '/dev/loop0\noverlay\n' ;; esac; }
-    losetup() { case "$1" in -c) echo "losetup -c $2" >> "$TMPDIR_TEST/losetup.log" ;; esac; }
+    mock_losetup /dev/loop0
     run try_grow /home "$IMG" home
     [ "$status" -eq 0 ]
     grep -q "losetup -c /dev/loop0" "$TMPDIR_TEST/losetup.log"
@@ -1591,21 +1620,33 @@ load_growd_funcs() {
 @test "lsl-btrfs-growd: refreshes EVERY loop attached to the image, not just the first" {
     # A stale loop left over from a crashed boot keeps the old size cached, so
     # refreshing only the first device (the old head -1 behaviour) silently
-    # misses the growth. Both devices must be refreshed.
+    # misses the growth. Two devices must both be refreshed.
     eval "$(sed -n '/^lsl_refresh_image_loops()/,/^}/p' bin/lsl-common.sh)"
     IMG="$TMPDIR_TEST/home.btrfs"
     touch "$IMG"
+    # Pick two loop devices that REALLY exist. `[ -b ]` is a shell builtin and
+    # cannot be overridden by a function named `test`, so the helper's own guard
+    # cannot be mocked away - the device names have to be genuine.
+    DEV_A=""; DEV_B=""
+    for d in /dev/loop*; do
+        [ -b "$d" ] || continue
+        if [ -z "$DEV_A" ]; then DEV_A="$d"
+        elif [ -z "$DEV_B" ]; then DEV_B="$d"; break; fi
+    done
+    if [ -z "$DEV_A" ] || [ -z "$DEV_B" ]; then
+        skip "need two real block devices under /dev/loop* to test the multi-loop case"
+    fi
+    A="$DEV_A"; B="$DEV_B"
     losetup() {
         case "$1" in
-            -j) printf '/dev/loop0: [2049]:12345 (%s)\n/dev/loop1: [2050]:12345 (%s)\n' "$IMG" "$IMG" ;;
+            -j) printf '%s: [2049]:12345 (%s)\n%s: [2050]:12345 (%s)\n' "$A" "$IMG" "$B" "$IMG" ;;
             -c) echo "losetup -c $2" >> "$TMPDIR_TEST/losetup.log" ;;
+            *)  return 0 ;;
         esac
     }
-    # Both devices report as block devices so neither is skipped.
-    test() { case "$1" in -b) return 0 ;; *) command test "$@" ;; esac; }
     lsl_refresh_image_loops "$IMG"
-    grep -q "losetup -c /dev/loop0" "$TMPDIR_TEST/losetup.log"
-    grep -q "losetup -c /dev/loop1" "$TMPDIR_TEST/losetup.log"
+    grep -q "losetup -c $A" "$TMPDIR_TEST/losetup.log"
+    grep -q "losetup -c $B" "$TMPDIR_TEST/losetup.log"
 }
 
 @test "lsl-btrfs-growd: honors LSL_BTRFS_GROW_INTERVAL_SEC in the loop" {
@@ -1617,6 +1658,11 @@ load_growd_funcs() {
 #!/bin/bash
 set -e
 lsl_is_usb_mode() { return 1; }
+# The loop gates on lsl_effective_home_is_hdd (WHYFAIL9 moved it off the live
+# lsl_is_usb_mode resolve). Stubbing only lsl_is_usb_mode left the predicate
+# undefined, so the loop exited 0 before ever reaching sleep() and this test
+# failed on a missing sleep.log - a stale harness, not a daemon bug.
+lsl_effective_home_is_hdd() { return 0; }
 lsl_load_config() { :; }
 lsl_home_btrfs_path() { echo /x/home.btrfs; }
 lsl_cache_btrfs_path() { echo /x/cache.btrfs; }
@@ -1920,6 +1966,17 @@ EOF
 # Harness: extract the real monitor, stub the task_* status writers so we can
 # capture the published pct/detail stream, and feed a synthetic log (tail is
 # stubbed to dump the file, since the real one uses --pid/-F on a live log).
+#
+# The `tail` mock must handle ARGS, not just dump the file. monitor_uproot_progress
+# uses `tail` twice: once as the log source (`tail --pid -n 0 -F "$LOG"`, which the
+# mock replaces with `cat`) and once to take the LAST match out of a progress line
+# (`... | tail -n 1`). A mock that ignored its arguments made that second call emit
+# the whole log, so `_pct` became a multi-line blob, the numeric guard rejected it,
+# and every layer percentage was silently dropped - the test then failed on a
+# missing PROG line for a reason that had nothing to do with the monitor.
+#
+# Only the log-source form is special-cased; everything else falls through to the
+# real tail, which is what production uses.
 run_monitor() {
     local logfile="$1"
     LOG="$logfile" bash -c '
@@ -1928,7 +1985,12 @@ run_monitor() {
         task_begin()    { LSL_TASK="$1"; printf "BEGIN|%s|%s\n" "$LSL_TASK" "${2:-}"; }
         task_progress() { printf "PROG|%s|%s\n" "$1" "${2:-}"; }
         task_done()     { printf "DONE|%s\n" "$1"; }
-        tail() { cat "$LOG"; }
+        tail() {
+            case " $* " in
+                *" --pid "*|*" -F "*) cat "$LOG" ;;
+                *) command tail "$@" ;;
+            esac
+        }
         eval "$(python3 tests/extract_fn.py misc/lsl-firstboot.sh monitor_uproot_progress)"
         monitor_uproot_progress 0
     '
@@ -2007,7 +2069,21 @@ EOF
     [ "$status" -eq 0 ]
     printf '%s\n' "$output" | grep -q '^DONE|packages$'
     printf '%s\n' "$output" | grep -q '^BEGIN|layer|'
-    printf '%s\n' "$output" | grep -q '^PROG|75|'
+    # The layer arm must PUBLISH the mksquashfs percentages. It does so through
+    # the shared high-water mark, so the published value is the running maximum,
+    # not this line's raw percentage - assert the intent (layer percentages reach
+    # the dialog) rather than one exact number that the monotonicity rule is
+    # entitled to raise.
+    printf '%s\n' "$output" | grep -q '^PROG|.*|Compressing layer'
+    printf '%s\n' "$output" | grep -qE '^PROG\|(2[5-9]|[3-9][0-9])\|.*Compressing layer'
+    # ...and it must never regress.
+    printf '%s\n' "$output" | python3 -c '
+import sys
+vals = [int(l.split("|")[1]) for l in sys.stdin.read().splitlines() if l.startswith("PROG|")]
+assert vals, "no progress emitted"
+for a, b in zip(vals, vals[1:]):
+    assert b >= a, "pct went backwards: %d -> %d" % (a, b)
+'
 }
 
 @test "firstboot monitor: malformed apt lines do not abort or divide by zero" {
