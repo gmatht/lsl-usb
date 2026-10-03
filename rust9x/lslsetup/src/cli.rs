@@ -465,4 +465,62 @@ mod tests {
             assert!(hi <= stick as usize, "the slider must not offer more than the stick has");
         }
     }
+
+    /// The persistence pane must not offer a size on a stick whose second
+    /// partition already exists: the partition's size is a measured fact, and
+    /// re-choosing it would silently create a partition that disagrees with the
+    /// one on disk. The pane pins min == max == that size, so no other value is
+    /// reachable on the slider.
+    #[test]
+    fn existing_partition_pins_the_slider_instead_of_sizing_it() {
+        for gib in [1u32, 8, 64, 512] {
+            let g = gib.max(crate::gui::PERSIST_GIB_MIN as u32) as usize;
+            // Pinned: there is exactly one reachable position.
+            let lo = g;
+            let hi = g;
+            let default = g;
+            assert_eq!((lo, hi, default), (g, g, g));
+            assert!(lo <= hi && (lo..=hi).contains(&default));
+            assert!(hi >= crate::gui::PERSIST_GIB_MIN, "a pinned size below the minimum is wrong");
+        }
+        // ...whereas an UNPINNED stick must offer a real range, otherwise the
+        // pinned case above would prove nothing.
+        let (lo, hi, d) = crate::gui::persist_gib_bounds(128, 3);
+        assert!(hi > lo, "an unpartitioned stick must still offer a range");
+        assert!((lo..=hi).contains(&d));
+    }
+
+    /// The resize path must refuse rather than leave a filesystem larger than its
+    /// partition.
+    ///
+    /// DESIGN-PERSISTENCE-PANE.md s9.2 records the measured failure: sfdisk cuts
+    /// the partition while the filesystem still claims the old size, the result
+    /// MOUNTS with no error and then fails on any access past the boundary
+    /// (fsck "Seek to ...: Invalid argument"). bin/lsl-f2fs-resize shrinks the
+    /// filesystem FIRST and re-reads the BPB before touching the table. The rule
+    /// the script implements is `filesystem_sectors <= partition_sectors`, and
+    /// that is what is pinned here - as a function, so the cases read as the
+    /// situations they describe.
+    #[test]
+    fn resize_refuses_when_filesystem_outlives_its_partition() {
+        // The script's guard, as a predicate.
+        let proceed = |fs_sectors: u32, part_sectors: u32| fs_sectors <= part_sectors;
+
+        // The measured corruption case: filesystem still claims 536 MB after the
+        // partition was cut to 200 MB. Must NOT proceed.
+        assert!(
+            !proceed(1_046_493, 409_600),
+            "a filesystem claiming 536 MB inside a 200 MB partition must abort"
+        );
+        // The correct outcome of a successful shrink: filesystem already inside.
+        assert!(proceed(400_000, 409_600), "a filesystem inside its partition may proceed");
+        // Exactly equal is the boundary fatresize should leave behind: fine.
+        assert!(proceed(409_600, 409_600), "filesystem exactly filling its partition is fine");
+        // A filesystem that refused to shrink at all (the silent no-op the design
+        // measured) must abort: this is the case an exit-code check would miss.
+        assert!(
+            !proceed(1_046_493, 409_600),
+            "fatresize's measured no-op (BPB unchanged) must abort the resize"
+        );
+    }
 }

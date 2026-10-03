@@ -192,6 +192,30 @@ fn iso_size_gib(path: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// Size in GiB of a persistence partition ALREADY present on the selected
+/// stick, or None when the stick has no second partition (or has no readable
+/// MBR at all — a GPT stick, or one still unpartitioned).
+///
+/// Read-only: this parses the partition table and touches nothing. It is what
+/// the pane's "use existing partitioning" checkbox keys on, and it is why that
+/// box can default to ticked — the partition's size is a measured fact, not a
+/// value the user has to choose again.
+pub fn existing_persist_partition() -> Option<u32> {
+    for c in crate::nofmt::probe_candidates(false) {
+        if let Some(parts) = crate::nofmt::read_partitions(&c.volume.letter) {
+            if let Some(p) = parts.persist {
+                let gib = p.size_gib();
+                // Ignore anything too small to be a persistence area (a few
+                // hundred MB is alignment slack or a recovery partition).
+                if gib >= PERSIST_GIB_MIN as u32 {
+                    return Some(gib);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Largest candidate target's size, in GiB — the stick the persistence slider is
 /// sized against.
 ///
@@ -3903,16 +3927,65 @@ pub fn run_gui(
         // as TrackBar, not Slider - an earlier draft of this pane concluded the
         // toolkit had no slider at all and used a combo box instead. It did have
         // one; the name was the only thing missing.
-        push_lbl(&mut p, &crate::locale::tr("Persistence space:"), 10, y, -20, 18);
-        y += 20;
-        // Bounds and default are DERIVED from the target's size and the selected
-        // ISO: max is what is left after the image, kernel and initrd; min is
-        // 1 GiB; default is 3/4 of that. `largest_usb_gib` reads the size already
-        // exposed by Volume::size_gb - the same value the ISO page shows next to
-        // each candidate stick.
+        //
+        // Bounds and default come from the target's size and the selected ISO.
         let stick_gib = largest_usb_gib();
         let iso_gib = iso_size_gib(iso_arg);
-        let (gib_min, gib_max, gib_default) = persist_gib_bounds(stick_gib, iso_gib);
+
+        // "Use existing partitioning": when the stick ALREADY has a second,
+        // non-FAT partition there is nothing to size - it exists, and its size is
+        // a fact rather than a choice. The checkbox is then ticked by default,
+        // the slider is greyed and pinned to that partition's real size, and the
+        // page says which partition it found. Ticking it off hands sizing back to
+        // the slider (and, at install, to the shrink-then-repartition path).
+        let existing = existing_persist_partition();
+        let use_existing = existing.is_some();
+
+        {
+            let mut cb: Box<nwg::CheckBox> = Box::default();
+            let _ = nwg::CheckBox::builder()
+                .flags(nwg::CheckBoxFlags::VISIBLE)
+                .text(&crate::locale::tr("Use existing partitioning (shrink not needed)"))
+                .position((10, y))
+                .size((780, 22))
+                .parent(&frame_persist)
+                .build(&mut cb);
+            if use_existing {
+                cb.set_check_state(nwg::CheckBoxState::Checked);
+            }
+            p.push(PageItem { ctl: PageCtl::Check(cb, 1), x: 10, y, w: -20, h: 22, idx: 0 });
+            y += 26;
+            push_lbl(
+                &mut p,
+                &match existing {
+                    Some(gib) => format!(
+                        "Found a {} GB non-FAT partition on this stick; persistence uses it as-is.",
+                        gib
+                    ),
+                    None => "No second partition found - sizing one requires shrinking the \
+FAT filesystem first, which happens at first boot."
+                        .to_string(),
+                },
+                20,
+                y,
+                -30,
+                34,
+            );
+            y += 40;
+        }
+
+        push_lbl(&mut p, &crate::locale::tr("Persistence space:"), 10, y, -20, 18);
+        y += 20;
+        // When honouring an existing partition the slider is PINNED to that
+        // partition's size and disabled: it is not a choice, and offering a range
+        // here would suggest the size can still be edited.
+        let (gib_min, gib_max, gib_default) = match existing {
+            Some(gib) => {
+                let g = gib.max(PERSIST_GIB_MIN as u32) as usize;
+                (g, g, g)
+            }
+            None => persist_gib_bounds(stick_gib, iso_gib),
+        };
         // Range AND position go through the BUILDER, in that order, rather than
         // via set_range_min/set_range_max/set_pos after the build. Calling them
         // afterwards sends TBM_SETRANGEMIN, TBM_SETRANGEMAX and TBM_SETPOSNOTIFY
@@ -3928,6 +4001,9 @@ pub fn run_gui(
             .pos(Some(gib_default))
             .parent(&frame_persist)
             .build(&mut tb);
+        if use_existing {
+            tb.set_enabled(false);
+        }
         p.push(PageItem { ctl: PageCtl::Track(tb, 0), x: 10, y, w: 400, h: 30, idx: 0 });
         // Live readout of the current value.
         //

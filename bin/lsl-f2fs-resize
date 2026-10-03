@@ -1,0 +1,204 @@
+#!/bin/bash
+# lsl-f2fs-resize - create the persistence partition on a stick that has none.
+#
+# Part P1b of DESIGN-F2FS-PERSISTENCE.md, and the s9.2 option-2 fallback: a stick
+# that is ONE partition filling the whole device has no free space for a second
+# partition. The space is *inside* the FAT filesystem, so it must be shrunk out
+# before a partition can exist there.
+#
+# WHY THIS RUNS ON THE STICK, NOT IN THE WINDOWS INSTALLER
+#   Windows cannot shrink FAT32 at all - Disk Management greys out Shrink Volume
+#   and diskpart returns "the volume cannot be shrunken because the file system
+#   does not support it" (design s9.2a). There is no Windows API for it. The
+#   first boot is also the safe moment: it is the boot that CREATES persistence,
+#   so nothing is at risk in shrinking before it.
+#
+# ORDER MATTERS, AND THE FAILURE MODE IS SILENT CORRUPTION
+#   A partition shrink is not a filesystem shrink. sfdisk will happily cut the
+#   partition while the filesystem still claims the old size; the result MOUNTS
+#   with no error and then fails on any access past the boundary (measured in the
+#   design: partition 200 MB, filesystem claiming 536 MB, fsck "Seek to
+#   535803392: Invalid argument"). Worse, fatresize -s on an unmounted loopback
+#   partition was measured to exit 0, print a banner, and leave the BPB untouched.
+#
+#   So the filesystem MUST be shrunk before the partition is, and every step is
+#   VERIFIED against on-disk geometry rather than trusted from an exit code.
+#
+#   Shrink:  filesystem first, then partition
+#   Grow:    partition first, then filesystem
+#
+# Usage:
+#   lsl-f2fs-resize --disk /dev/sdX [--want-gib N] [--dry-run] [--force]
+#
+# Exit: 0 done (or already partitioned), 1 refused/failed, 2 nothing to do.
+set -uo pipefail
+
+SECTOR_SIZE=512
+LSL_PERSIST_LABEL="${LSL_PERSIST_LABEL:-lsl-persist}"
+WANT_GIB=0
+DRY_RUN=0
+FORCE=0
+
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --disk) DISK="${2:-}"; shift 2 ;;
+        --disk=*) DISK="${1#*=}"; shift ;;
+        --want-gib) WANT_GIB="${2:-0}"; shift 2 ;;
+        --want-gib=*) WANT_GIB="${1#*=}"; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --force) FORCE=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "lsl-f2fs-resize: unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+die() { echo "lsl-f2fs-resize: $*" >&2; exit 1; }
+log() { echo "lsl-f2fs-resize: $*" >&2; }
+run() { if [ "$DRY_RUN" = 1 ]; then echo "  [dry-run] $*"; else "$@"; fi; }
+
+[ -n "${DISK:-}" ] || { usage >&2; die "--disk is required"; }
+[ -b "$DISK" ] || die "$DISK is not a block device"
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+
+# Refuse anything that is not a whole disk. A wrong --disk is how a resize
+# becomes data loss.
+case "$DISK" in
+    /dev/sd?|/dev/sd??|/dev/mmcblk[0-9]*p[0-9]*) die "$DISK looks like a PARTITION; pass the whole disk" ;;
+esac
+if [ -e /sys/class/block/$(basename "$DISK")/partition ]; then
+    die "$DISK is a partition; pass the whole disk"
+fi
+
+command -v sfdisk >/dev/null 2>&1 || die "sfdisk not installed (util-linux)"
+command -v mkfs.f2fs >/dev/null 2>&1 || die "mkfs.f2fs not installed (f2fs-tools)"
+grep -qw f2fs /proc/filesystems 2>/dev/null || die "this kernel has no f2fs driver"
+
+# ---------------------------------------------------------------- read layout
+disk_size_sectors="$(blockdev --getsz "$DISK" 2>/dev/null)" || die "cannot read $DISK size"
+[ -n "$disk_size_sectors" ] || die "blockdev --getsz returned nothing for $DISK"
+
+table="$(sfdisk -d "$DISK" 2>/dev/null)" || die "sfdisk could not read $DISK"
+
+# Already has a non-FAT partition? Then there is nothing to create.
+if printf '%s\n' "$table" | grep -qiE '^(start|.*,\s*[0-9a-f]+)\s' && \
+   printf '%s\n' "$table" | grep -qiE 'Linux|0x83'; then
+    echo "lsl-f2fs-resize: $DISK already has a Linux partition; nothing to do."
+    exit 2
+fi
+
+fat_start="$(printf '%s\n' "$table" | awk -F'[:,]' '/start=/ {gsub(/ /,"",$2); print $2; exit}')"
+fat_sectors="$(printf '%s\n' "$table" | awk -F'[:,]' '/size=/ {gsub(/ /,"",$2); print $2; exit}')"
+[ -n "${fat_start:-}" ] && [ -n "${fat_sectors:-}" ] || die "could not parse the FAT partition from sfdisk output"
+
+fat_end=$(( fat_start + fat_sectors ))
+
+# Bytes the FAT filesystem must still be able to hold after the shrink: the ISO
+# (or whatever is written to it), the extracted kernel+initrd, and slack. We
+# REFUSE rather than guess if that does not fit, because a too-small FAT cannot
+# hold the image and the install fails later in a much more confusing way.
+FAT_MIN_MIB="${FAT_MIN_MIB:-4096}"
+fat_min_sectors=$(( FAT_MIN_MIB * 1024 * 1024 / SECTOR_SIZE ))
+
+log "disk $DISK: $disk_size_sectors sectors; FAT at $fat_start (+$fat_sectors)"
+if [ "$fat_sectors" -lt "$fat_min_sectors" ]; then
+    die "the FAT partition is already only $(( fat_sectors * SECTOR_SIZE / 1024 / 1024 )) MiB; it must stay at least ${FAT_MIN_MIB} MiB to hold the image"
+fi
+
+# How much to hand to persistence: the requested size, else everything after the
+# FAT partition.
+avail_sectors=$(( disk_size_sectors - fat_end ))
+[ "$avail_sectors" -gt 0 ] || die "the FAT partition already runs to the end of the disk; nothing to take"
+
+if [ "$WANT_GIB" -gt 0 ]; then
+    want_sectors=$(( WANT_GIB * 1024 * 1024 * 1024 / SECTOR_SIZE ))
+    [ "$want_sectors" -le "$avail_sectors" ] || die "asked for ${WANT_GIB} GiB but only $(( avail_sectors * SECTOR_SIZE / 1024 / 1024 / 1024 )) GiB is available"
+else
+    want_sectors="$avail_sectors"
+fi
+
+new_fat_sectors=$(( fat_sectors - want_sectors ))
+[ "$new_fat_sectors" -ge "$fat_min_sectors" ] || \
+    die "taking ${WANT_GIB:-all} GiB would leave FAT below the ${FAT_MIN_MIB} MiB minimum"
+
+persist_mib=$(( want_sectors * SECTOR_SIZE / 1024 / 1024 ))
+log "shrink FAT $(( fat_sectors * SECTOR_SIZE / 1024 / 1024 )) MiB -> $(( new_fat_sectors * SECTOR_SIZE / 1024 / 1024 )) MiB, then add a ${persist_mib} MiB partition"
+
+fat_part="${DISK}1"
+
+# ------------------------------------------------------------ 1. shrink the FS
+# FIRST. Not optional, and verified: fatresize is documented in the design to
+# exit 0 while leaving the BPB alone, so success is decided by re-reading the BPB.
+if [ "$DRY_RUN" = 1 ]; then
+    echo "  [dry-run] fatresize -s $(( new_fat_sectors * SECTOR_SIZE / 1024 / 1024 ))M $fat_part"
+else
+    if command -v fatresize >/dev/null 2>&1; then
+        fatresize -s "$(( new_fat_sectors * SECTOR_SIZE / 1024 / 1024 ))M" "$fat_part" \
+            || log "fatresize exited non-zero; continuing to verify the geometry"
+    else
+        log "fatresize not installed - cannot shrink FAT safely; aborting"
+        echo "Install fatresize (apt install fatresize) and re-run; it is the only" >&2
+        echo "supported way to shrink FAT32 from Linux." >&2
+        exit 1
+    fi
+fi
+
+# VERIFY the filesystem actually shrank. This is the check the design says any
+# implementation of this path must have, because the alternative is a filesystem
+# claiming more than its partition - which mounts cleanly and then fails later.
+bpb_sectors="$(dd if="$fat_part" bs=1 skip=19 count=4 2>/dev/null | od -An -tu4 | tr -d ' ')"
+if [ -z "$bpb_sectors" ]; then
+    die "could not read the FAT BPB sector count from $fat_part"
+fi
+log "filesystem now claims $bpb_sectors sectors (target $new_fat_sectors)"
+if [ "$DRY_RUN" != 1 ] && [ "$bpb_sectors" -gt "$new_fat_sectors" ]; then
+    die "the filesystem still claims $bpb_sectors sectors but the partition is only $new_fat_sectors.
+    Shrinking the partition now would leave the filesystem larger than its
+    partition: it MOUNTS without error and then fails on any access past the
+    boundary. Refusing rather than corrupting the stick."
+fi
+
+# --------------------------------------------- 2. shrink the partition
+# Second. Only now, with the filesystem already inside the new size.
+if [ "$DRY_RUN" = 1 ]; then
+    echo "  [dry-run] sfdisk: resize part1 to $new_fat_sectors, add part2 at $fat_end"
+else
+    printf 'label: dos\n1 : start=%s, size=%s, type=0c\n2 : start=%s, size=%s, type=83\n' \
+        "$fat_start" "$new_fat_sectors" "$fat_end" "$want_sectors" \
+        | sfdisk --no-reread --force "$DISK" >/dev/null 2>&1 \
+        || die "sfdisk failed to rewrite the partition table"
+fi
+
+# --------------------------------------------- 3. format the new partition
+persist_part="${DISK}2"
+partprobe "$DISK" 2>/dev/null || true
+udevadm settle 2>/dev/null || sleep 1
+
+if [ ! -b "$persist_part" ]; then
+    die "$persist_part did not appear after the repartition (the kernel may need a re-read; reboot and re-run)"
+fi
+
+if [ "$DRY_RUN" = 1 ]; then
+    echo "  [dry-run] mkfs.f2fs -l $LSL_PERSIST_LABEL $persist_part"
+else
+    mkfs.f2fs -q -l "$LSL_PERSIST_LABEL" "$persist_part" \
+        || die "mkfs.f2fs failed on $persist_part; the FAT partition is intact and unchanged in size"
+fi
+
+# --------------------------------------------- 4. verify what we actually did
+# Read the table back rather than trusting the exit codes.
+new_table="$(sfdisk -d "$DISK" 2>/dev/null)"
+new_p2_sectors="$(printf '%s\n' "$new_table" | awk -F'[:,]' '/start=/ {n++} n==2 {gsub(/ /,"",$2); print $2; exit}')"
+if [ -n "${new_p2_sectors:-}" ] && [ "$new_p2_sectors" != "$want_sectors" ]; then
+    log "WARNING: partition 2 is $new_p2_sectors sectors, expected $want_sectors"
+fi
+if [ "$DRY_RUN" != 1 ]; then
+    echo "lsl-f2fs-resize: done."
+    echo "  $fat_part  FAT  $(( new_fat_sectors * SECTOR_SIZE / 1024 / 1024 )) MiB"
+    echo "  $persist_part  f2fs  $persist_mib MiB  (label $LSL_PERSIST_LABEL)"
+    echo
+    echo "Reboot to use it. On first boot lsl-mount-home.sh mounts the partition"
+    echo "and regenerates machine identity; until then /home is transient."
+fi
+exit 0

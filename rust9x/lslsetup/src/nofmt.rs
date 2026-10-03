@@ -435,6 +435,94 @@ pub fn probe_boot_caps(letter: &str, uefi_bootx64: &str) -> BootCaps {
     BootCaps { bios_ok, bios_why, uefi_ok, uefi_why }
 }
 
+/// One MBR partition-table entry, in sectors.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MbrPart {
+    pub boot: u8,
+    pub typ: u8,
+    pub start_lba: u32,
+    pub sectors: u32,
+}
+
+impl MbrPart {
+    pub fn is_fat(&self) -> bool {
+        matches!(self.typ, 0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E)
+    }
+    pub fn is_lsl_persist(&self) -> bool {
+        self.typ == 0x83 // Linux
+    }
+    pub fn size_gib(&self) -> u32 {
+        ((self.sectors as u64 * 512) / sys::GB as u64) as u32
+    }
+}
+
+/// Parse the four primary entries of an MBR partition table.
+///
+/// Returns None for a protective-MBR/GPT layout (type 0xEE) or a table with no
+/// used entry: grub4dos's stage1 needs sectors 1..15, which a GPT header and its
+/// entries occupy exactly, so a GPT stick is not a candidate for this mode
+/// (see the nofmt module docs).
+pub fn parse_mbr_parts(mbr: &[u8; 512]) -> Option<Vec<MbrPart>> {
+    if mbr.len() < 512 {
+        return None;
+    }
+    let mut out = Vec::new();
+    for i in 0..4usize {
+        let e = 446 + 16 * i;
+        let typ = mbr[e + 4];
+        if typ == 0 {
+            continue; // unused
+        }
+        if typ == 0xEE {
+            return None; // protective MBR: this is GPT
+        }
+        out.push(MbrPart {
+            boot: mbr[e],
+            typ,
+            start_lba: u32::from_le_bytes([mbr[e + 8], mbr[e + 9], mbr[e + 10], mbr[e + 11]]),
+            sectors: u32::from_le_bytes([mbr[e + 12], mbr[e + 13], mbr[e + 14], mbr[e + 15]]),
+        });
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// What the persistence page found on the selected stick.
+#[derive(Clone, Debug, Default)]
+pub struct StickPartitions {
+    /// A second, non-FAT partition already present (an F2FS/ Linux area).
+    pub persist: Option<MbrPart>,
+    /// The FAT partition the image will be written to.
+    pub fat: Option<MbrPart>,
+    /// Every entry, for diagnostics.
+    pub all: Vec<MbrPart>,
+}
+
+/// Parse the partition table of the stick behind `letter`.
+///
+/// Read-only: nothing here writes to the disk. The persistence page uses it to
+/// decide whether to pre-tick "use existing partitioning" and where to pin the
+/// slider.
+pub fn read_partitions(letter: &str) -> Option<StickPartitions> {
+    let head = read_head(letter)?;
+    let mut mbr = [0u8; 512];
+    mbr.copy_from_slice(&head[..512]);
+    let all = parse_mbr_parts(&mbr)?;
+    let fat = all.iter().copied().find(|p| p.is_fat());
+    // "Existing persistence" = a Linux-type entry that is not the FAT one. The
+    // label is not readable from an MBR entry, so type + not-FAT is the honest
+    // test; the pane says "a non-FAT partition was found" rather than claiming
+    // it knows the filesystem.
+    let persist = all
+        .iter()
+        .copied()
+        .find(|p| p.is_lsl_persist() && Some(p.start_lba) != fat.map(|f| f.start_lba));
+    Some(StickPartitions { persist, fat, all })
+}
+
 /// Read the first two sectors of the physical disk behind `letter`.
 fn read_head(letter: &str) -> Option<Vec<u8>> {
     let phys = device_number(letter).ok()?;
@@ -4176,6 +4264,63 @@ mod tests {
         m[511] = 0xAA;
         m
     }
+
+    /// Write one MBR entry: (index, boot flag, type, start LBA, sectors).
+    fn put_entry(m: &mut [u8; 512], idx: usize, boot: u8, typ: u8, start: u32, sectors: u32) {
+        let e = 446 + 16 * idx;
+        m[e] = boot;
+        m[e + 4] = typ;
+        m[e + 8..e + 12].copy_from_slice(&start.to_le_bytes());
+        m[e + 12..e + 16].copy_from_slice(&sectors.to_le_bytes());
+    }
+
+    #[test]
+        fn mbr_partition_parsing_finds_a_second_partition() {
+            // The pane's "use existing partitioning" case: FAT plus a Linux partition.
+            const GIB: u32 = 1024 * 1024 * 1024 / 512; // sectors per GiB
+            let mut m = valid_mbr();
+            put_entry(&mut m, 0, 0x00, 0x0C, 2048, 100 * GIB);
+            put_entry(&mut m, 1, 0x00, 0x83, 2048 + 100 * GIB, 8 * GIB);
+            let parts = parse_mbr_parts(&m).expect("a table with two entries must parse");
+            assert_eq!(parts.len(), 2);
+            assert!(parts[0].is_fat(), "type 0x0C is FAT32");
+            assert!(!parts[1].is_fat());
+            assert!(parts[1].is_lsl_persist(), "type 0x83 is Linux");
+            assert_eq!(parts[1].size_gib(), 8, "8 GiB of sectors is 8 GiB");
+            // The FAT partition must not be mistaken for the persistence one -
+            // this is the distinction the whole "existing partition" check rests on.
+            assert_ne!(
+                Some(parts[0].start_lba),
+                Some(parts[1].start_lba),
+                "the two partitions must be distinguishable"
+            );
+        }
+
+        #[test]
+        fn mbr_parsing_refuses_gpt_and_empty_tables() {
+            // A protective MBR (0xEE) means GPT: the BIOS stage1 needs sectors 1..15,
+            // which GPT occupies, so this is not a candidate and must not be
+            // silently treated as MBR with a weird partition.
+            let mut gpt = valid_mbr();
+            put_entry(&mut gpt, 0, 0x00, 0xEE, 1, 2_000_000);
+            assert!(parse_mbr_parts(&gpt).is_none(), "a protective MBR must not parse as MBR");
+
+            // No used entries at all.
+            let mut empty = valid_mbr();
+            empty[446 + 4] = 0;
+            assert!(parse_mbr_parts(&empty).is_none(), "an empty table has nothing to use");
+        }
+
+        #[test]
+        fn fat_type_bytes_are_recognised() {
+            // Every FAT variant Windows or Rufus may leave behind.
+            for t in [0x01u8, 0x04, 0x06, 0x0B, 0x0C, 0x0E] {
+                assert!(MbrPart { boot: 0, typ: t, start_lba: 0, sectors: 1 }.is_fat(), "type {:#04x} is FAT", t);
+            }
+            for t in [0x07u8, 0x83, 0x82, 0x0F] {
+                assert!(!MbrPart { boot: 0, typ: t, start_lba: 0, sectors: 1 }.is_fat(), "type {:#04x} is not FAT", t);
+            }
+        }
 
     #[test]
     fn assets_match_pinned_hashes() {
