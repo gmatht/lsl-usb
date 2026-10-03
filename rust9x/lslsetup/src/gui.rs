@@ -192,18 +192,37 @@ fn iso_size_gib(path: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// Largest USB volume currently attached, in GiB, rounded down.
+/// Largest candidate target's size, in GiB — the stick the persistence slider is
+/// sized against.
 ///
-/// The pane's slider is derived from this. 0 when no removable volume is visible,
-/// which makes persist_gib_bounds fall back to the "stick too small" case
-/// rather than guessing a size. `Volume::size_gb` is already used for the ISO
-/// page's volume list, so no new capability is needed to read it.
+/// This deliberately uses `probe_candidates`, NOT `find_usb_volumes`. The latter
+/// answers "which volumes already contain an LSL live image?", so with an empty
+/// label it falls through to `has_casper_squashfs()` and silently drops every
+/// BLANK stick — which is the normal case when the user is about to write one.
+/// That made the slider report "no USB stick detected" for a perfectly good
+/// D:, and the pane sized persistence from the fallback range instead of the
+/// device actually present.
+///
+/// `probe_candidates` is the same enumeration the INSTALL page lists, so the
+/// slider is sized from a stick that is actually offered as a target. Volumes
+/// that cannot be written (system volume, refused bus) are skipped when a better
+/// candidate exists; a refused one is still better than no number at all when it
+/// is the only candidate, which is what the fallback ordering below encodes.
 pub fn largest_usb_gib() -> u32 {
-    sys::find_usb_volumes("", &[])
-        .iter()
-        .map(|v| v.size_gb() as u32)
-        .max()
-        .unwrap_or(0)
+    let mut best: Option<(u32, bool)> = None;
+    for c in crate::nofmt::probe_candidates(false) {
+        let gb = c.volume.size_gb() as u32;
+        if gb == 0 {
+            continue;
+        }
+        let writable = matches!(c.status, crate::nofmt::CandidateStatus::Ready);
+        // Prefer a writable candidate; among equals prefer the largest.
+        best = Some(match best {
+            Some((b, w)) if (w, b) >= (writable, gb) => (b, w),
+            _ => (gb, writable),
+        });
+    }
+    best.map(|(gb, _)| gb).unwrap_or(0)
 }
 
 /// FAT32 cannot hold a single file of 4 GiB or more, and the btrfs backend is a

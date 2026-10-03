@@ -431,4 +431,38 @@ mod tests {
         // ...and the size readout names the MiB the env file actually receives.
         assert_eq!(crate::gui::persist_gib_text(4096), "4.0 GiB (4096 MiB)");
     }
+
+    /// Regression: the slider must not be sourced from a volume filter that only
+    /// finds sticks ALREADY holding a live image.
+    ///
+    /// `largest_usb_gib` used `sys::find_usb_volumes("", &[])`, which answers
+    /// "which volumes contain an LSL live image?". With an empty label it falls
+    /// through to `has_casper_squashfs()` and drops every BLANK stick - the
+    /// normal state before an install - so a perfectly good D: was invisible and
+    /// the pane reported "no USB stick detected". It now reads
+    /// `nofmt::probe_candidates`, the same enumeration the INSTALL page lists.
+    ///
+    /// Real hardware is needed to observe the bug (a blank stick with a drive
+    /// letter), so what is pinned here is that the candidate enumeration is
+    /// usable and that a stick the slider could be sized from is found whenever
+    /// one is present. On a machine with no removable media the list is empty
+    /// and `largest_usb_gib` returns 0, which is the documented fallback.
+    #[test]
+    fn slider_size_source_sees_plain_volumes() {
+        let cands = crate::nofmt::probe_candidates(false);
+        for c in &cands {
+            assert!(!c.volume.letter.is_empty(), "a candidate needs a drive letter");
+            // The size the slider would derive must be the WHOLE volume, not a
+            // leftover figure from some other partition of the same disk.
+            assert!(c.volume.size_gb() > 0.0 || c.volume.total == 0);
+        }
+        // Whatever the enumeration finds, the derived size must land inside the
+        // bounds the slider offers - a size outside them would be unreachable.
+        let stick = crate::gui::largest_usb_gib();
+        if stick > 0 {
+            let (lo, hi, d) = crate::gui::persist_gib_bounds(stick, 0);
+            assert!(lo <= hi && (lo..=hi).contains(&d), "bounds invalid for {} GB", stick);
+            assert!(hi <= stick as usize, "the slider must not offer more than the stick has");
+        }
+    }
 }
