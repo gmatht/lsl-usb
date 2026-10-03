@@ -721,6 +721,7 @@ pub(crate) fn apply_method_caps(
 /// so newly inserted USB sticks are visible.
 pub(crate) fn build_install_page(
     install_items: &PageItems,
+    persist_items: &PageItems,
     frame_install: &nwg::Frame,
     font_bold: &nwg::Font,
     bios_tt: &nwg::Tooltip,
@@ -731,10 +732,9 @@ pub(crate) fn build_install_page(
     if clear {
         install_items.borrow_mut().clear();
     }
-    // Publish the chosen target for the persistence pane, which sizes itself
-    // from the same device. Without this the pane has to guess from all
-    // candidates, which is how it came to describe a stick the user never picked.
-    PERSIST_TARGET.with(|c| *c.borrow_mut() = selected_target_from(install_items));
+    // The target radios live on the PERSISTENCE page (this page draws a pointer
+    // to them), so re-publishing the target from HERE would read this page's
+    // items and always find nothing. The persistence page publishes it.
     let mut items = install_items.borrow_mut();
     let mut iy = 6i32;
     // title (bold) - the win-install-page GUI test keys on this text
@@ -766,7 +766,7 @@ pub(crate) fn build_install_page(
     // install time).
     let mut cap: Box<nwg::Label> = Box::default();
     let _ = nwg::Label::builder()
-        .text(&crate::locale::tr("Target USB (for the non-destructive copy):"))
+        .text(&crate::locale::tr("Target USB (chosen on the PERSISTENCE page):"))
         .position((10, iy))
         .size((560, 18))
         .parent(frame_install)
@@ -774,49 +774,19 @@ pub(crate) fn build_install_page(
     cap.set_font(Some(font_bold));
     items.push(PageItem { ctl: PageCtl::Lbl(cap, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
     iy += 22;
-    let cands: Vec<crate::nofmt::Candidate> = crate::nofmt::probe_candidates(false)
-        .into_iter()
-        .filter(|c| c.target.is_some() && !matches!(c.status, crate::nofmt::CandidateStatus::Refused(_)))
-        .collect();
-    // targets sort by letter inside probe_candidates already.
-    if cands.is_empty() {
-        let mut none: Box<nwg::Label> = Box::default();
+    // The target radios themselves now live on the PERSISTENCE page (kind 4),
+    // because the persistence size is derived from the chosen stick - which the
+    // picker cannot be downstream of. Draw a pointer at their real location, so
+    // the two pages can never disagree about which device is selected.
+    {
+        let mut ptr: Box<nwg::Label> = Box::default();
         let _ = nwg::Label::builder()
-            .text(&crate::locale::tr("[No usable target volumes detected - plug in a stick]"))
+            .text(&crate::locale::tr("  (chosen on the PERSISTENCE page)"))
             .position((26, iy))
             .size((560, 20))
             .parent(frame_install)
-            .build(&mut none);
-        items.push(PageItem { ctl: PageCtl::Lbl(none, 0), x: 26, y: iy, w: -20, h: 20, idx: 0 });
-        iy += 24;
-    }
-    let first_ready = cands.iter().position(|c| matches!(c.status, crate::nofmt::CandidateStatus::Ready));
-    for (n, c) in cands.iter().enumerate() {
-        let t = c.target.as_ref().unwrap();
-        let size_gb = t.total as f64 / crate::sys::GB as f64;
-        let text = match &c.status {
-            crate::nofmt::CandidateStatus::Ready =>
-                format!("{}:  {}  {}  ({:.1} GB)", t.letter, t.label, t.fs, size_gb),
-            crate::nofmt::CandidateStatus::NeedsContentCheck(w) =>
-                format!("{}:  {}  {}  ({:.1} GB)  [check contents: {}]", t.letter, t.label, t.fs, size_gb, w),
-            crate::nofmt::CandidateStatus::Refused(_) => continue, // filtered above; keep arm
-        };
-        let mut rb: Box<nwg::RadioButton> = Box::default();
-        let _ = nwg::RadioButton::builder()
-            .flags(if n == 0 {
-                nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
-            } else {
-                nwg::RadioButtonFlags::VISIBLE
-            })
-            .text(&text)
-            .position((10, iy))
-            .size((780, 20))
-            .parent(frame_install)
-            .build(&mut rb);
-        if Some(n) == first_ready {
-            rb.set_check_state(nwg::RadioButtonState::Checked);
-        }
-        items.push(PageItem { ctl: PageCtl::Radio(rb, 4), x: 10, y: iy, w: -20, h: 20, idx: 0 });
+            .build(&mut ptr);
+        items.push(PageItem { ctl: PageCtl::Lbl(ptr, 0), x: 26, y: iy, w: -20, h: 20, idx: 0 });
         iy += 24;
     }
     // write-method radios (kind 3): one group, exactly one checked.
@@ -935,11 +905,8 @@ pub(crate) fn build_install_page(
             .parent(frame_install)
             .build(&mut cb);
         check_tt.register(cb.as_ref(), &crate::locale::tr("Adds a DeleteMe folder, fills free space with 4 GB pseudo-random chunks, reads every byte back with OS caching DISABLED (bad/fake sticks cannot hide), then deletes DeleteMe. Catches dying and fake-capacity flash."));
-        let first_letter = cands.iter().find_map(|c| {
-            if matches!(c.status, crate::nofmt::CandidateStatus::Ready) {
-                c.target.as_ref().map(|t| t.letter.clone())
-            } else { None }
-        }).unwrap_or_default();
+        // The preselected stick lives on the PERSISTENCE page now.
+        let first_letter = selected_target_from(persist_items).unwrap_or_default();
         if !first_letter.is_empty() && !is_lsl_stick(&first_letter) {
             cb.set_check_state(nwg::CheckBoxState::Checked);
         }
@@ -977,9 +944,13 @@ pub(crate) fn build_install_page(
         .build(&mut note);
     items.push(PageItem { ctl: PageCtl::Lbl(note, 0), x: 10, y: iy, w: -20, h: 18, idx: 0 });
     // default the BIOS/UEFI checkboxes to the preselected stick,
-    // then gate them on the preselected write method
-    let first_letter = cands.iter().find_map(|c| c.target.as_ref().map(|t| t.letter.clone())).unwrap_or_default();
+    // then gate them on the preselected write method.
+    //
+    // The target radios live on the PERSISTENCE page now, so the letter comes
+    // from THERE - reading it from this page's own items would always find
+    // nothing and leave the BIOS/UEFI boxes ungated.
     drop(items); // release the borrow_mut above: apply re-borrows
+    let first_letter = selected_target_from(persist_items).unwrap_or_default();
     apply_boot_caps(install_items, &first_letter, "", true);
     apply_method_caps(install_items, bios_tt, uefi_tt, effective_pre, &first_letter);
     let items = install_items.borrow();
@@ -3149,6 +3120,77 @@ pub(crate) fn build_persist_page(
         let mut p = persist_items.borrow_mut();
         let mut y: i32 = 6;
 
+        // ---- WHICH STICK, first ----
+        // The target picker (kind 4) lives HERE, not on the INSTALL page. Every
+        // number below - the slider bounds, its default, the FAT/persistence
+        // split - is derived from the selected stick, so a picker the user reaches
+        // only AFTER those numbers were shown cannot inform them. It was on the
+        // INSTALL page, which is why the pane had to guess a device and why it
+        // kept reporting the fallback size.
+        let mut cap: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text(&crate::locale::tr("USB stick for this install:"))
+            .position((10, y))
+            .size((560, 18))
+            .parent(frame)
+            .build(&mut cap);
+        p.push(PageItem { ctl: PageCtl::Lbl(cap, 0), x: 10, y, w: -20, h: 18, idx: 0 });
+        y += 22;
+
+        let cands: Vec<crate::nofmt::Candidate> = crate::nofmt::probe_candidates(false)
+            .into_iter()
+            .filter(|c| c.target.is_some() && !matches!(c.status, crate::nofmt::CandidateStatus::Refused(_)))
+            .collect();
+        if cands.is_empty() {
+            let mut none: Box<nwg::Label> = Box::default();
+            let _ = nwg::Label::builder()
+                .text(&crate::locale::tr("[No usable target volumes detected - plug in a stick]"))
+                .position((26, y))
+                .size((560, 20))
+                .parent(frame)
+                .build(&mut none);
+            p.push(PageItem { ctl: PageCtl::Lbl(none, 0), x: 26, y, w: -20, h: 20, idx: 0 });
+            y += 24;
+        }
+        let first_ready = cands
+            .iter()
+            .position(|c| matches!(c.status, crate::nofmt::CandidateStatus::Ready));
+        for (n, c) in cands.iter().enumerate() {
+            let t = c.target.as_ref().unwrap();
+            let size_gb = t.total as f64 / crate::sys::GB as f64;
+            let text = match &c.status {
+                crate::nofmt::CandidateStatus::Ready => {
+                    format!("{}:  {}  {}  ({:.1} GB)", t.letter, t.label, t.fs, size_gb)
+                }
+                crate::nofmt::CandidateStatus::NeedsContentCheck(w) => format!(
+                    "{}:  {}  {}  ({:.1} GB)  [check contents: {}]",
+                    t.letter, t.label, t.fs, size_gb, w
+                ),
+                crate::nofmt::CandidateStatus::Refused(_) => continue,
+            };
+            let mut rb: Box<nwg::RadioButton> = Box::default();
+            let _ = nwg::RadioButton::builder()
+                .flags(if n == 0 {
+                    nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
+                } else {
+                    nwg::RadioButtonFlags::VISIBLE
+                })
+                .text(&text)
+                .position((10, y))
+                .size((780, 20))
+                .parent(frame)
+                .build(&mut rb);
+            if Some(n) == first_ready {
+                rb.set_check_state(nwg::RadioButtonState::Checked);
+            }
+            p.push(PageItem { ctl: PageCtl::Radio(rb, 4), x: 10, y, w: -20, h: 20, idx: 0 });
+            y += 24;
+        }
+        // The picker's answer drives every number below, so publish it now rather
+        // than after the pane is built.
+        PERSIST_TARGET.with(|c| *c.borrow_mut() = selected_target_from(persist_items));
+        y += 8;
+
         // A local label helper: the system page's `push_lbl` closure is scoped
         // inside that page's own block and captures `frame_sys`, so it cannot be
         // reused here.
@@ -4245,8 +4287,19 @@ pub fn run_gui(
         .parent(&window)
         .build(&mut frame_install);
         let frame_install = Rc::new(frame_install);
+    // The PERSISTENCE page is built FIRST: it now owns the target picker, so the
+    // INSTALL page must read its answer rather than the other way round. Building
+    // the install page first is what made the pane size itself against a guess.
+    // Shared Rc<Cell>: the click handler re-derives the pane when the target
+    // changes, and the relayout contexts must see the same height it produced.
+    let persist_content = std::rc::Rc::new(std::cell::Cell::new(build_persist_page(
+        &persist_items,
+        &frame_persist,
+        iso_arg,
+    )));
     let install_content = Rc::new(Cell::new(build_install_page(
         &install_items,
+        &persist_items,
         &frame_install,
         &font_bold,
         &bios_tt,
@@ -4254,15 +4307,6 @@ pub fn run_gui(
         write_mode_pre,
         false,
     )));
-    // The INSTALL page is now built, so it knows which stick is selected. Rebuild
-    // the persistence page against THAT device: it was sized before this point,
-    // which is why it defaulted to 1 GB and showed a split for whichever volume
-    // happened to be largest rather than the one being written to.
-    let mut persist_content = build_persist_page(
-        &persist_items,
-        &frame_persist,
-        iso_arg,
-    );
     if let Err(e) = nwg::ScrollBar::builder()
         .flags(nwg::ScrollBarFlags::VERTICAL | nwg::ScrollBarFlags::VISIBLE)
         .position((826, 4))
@@ -4481,7 +4525,7 @@ pub fn run_gui(
             wifi_geom: &wifi_geom,
             install_geom: &install_geom,
             fp_content: &fp_content,
-            persist_content: persist_content,
+            persist_content: persist_content.get(),
             guard: &in_relayout,
             iso_content: &iso_content,
             sys_content: sys_content,
@@ -4763,6 +4807,9 @@ pub fn run_gui(
     let btn_reboot_c = btn_reboot.clone();
     let working_c = working.clone();
     let persist_items_c = persist_items.clone();
+    let install_items_c = install_items.clone();
+    let frame_persist_c = frame_persist.clone();
+    let persist_content_c = persist_content.clone();
 
         move |event, data, handle| {
         use nwg::Event;
@@ -4855,7 +4902,7 @@ pub fn run_gui(
                         wifi_geom: &wifi_geom,
                         install_geom: &install_geom,
                         fp_content: &fp_content,
-                        persist_content: persist_content,
+                        persist_content: persist_content_c.get(),
                         guard: &in_relayout,
                         iso_content: &iso_content,
                         sys_content: sys_content,
@@ -5170,23 +5217,56 @@ pub fn run_gui(
                             midx += 1;
                         }
                     }
-                    // INSTALL-page target click: refresh the BIOS/UEFI
-                    // checkboxes for the newly selected stick (grey out +
-                    // reason when unsupported) - via the method gate so a
-                    // Rufus/skip selection keeps them greyed out.
-                    for it in install_items.borrow().iter() {
-                        if let PageCtl::Radio(rb, 4) = &it.ctl {
-                            if rb.handle.hwnd().map(|h| h as usize) == Some(click_hwnd) {
-                                let letter = rb.text().split(':').next().unwrap_or("").trim().to_string();
-                                let mode = checked_method(&install_items);
-                                if mode == "nofmt" {
-                                    apply_boot_caps(&install_items, &letter, "", false);
-                                } else {
-                                    apply_method_caps(&install_items, &bios_tt_c, &uefi_tt_c, mode, &letter);
+                    // PERSISTENCE-page target click. Two consequences:
+                    //  1. the install page's BIOS/UEFI boxes are re-gated for the
+                    //     newly selected stick;
+                    //  2. the pane's own slider, default and split line are
+                    //     re-derived, because they are sized from THIS stick.
+                    //     Without (2) the pane keeps showing the previous
+                    //     stick's numbers while the picker says otherwise.
+                    let letter = {
+                        let mut found = String::new();
+                        for it in persist_items_c.borrow().iter() {
+                            if let PageCtl::Radio(rb, 4) = &it.ctl {
+                                if rb.handle.hwnd().map(|h| h as usize) == Some(click_hwnd) {
+                                    found = rb
+                                        .text()
+                                        .split(':')
+                                        .next()
+                                        .unwrap_or("")
+                                        .trim()
+                                        .to_string();
+                                    break;
                                 }
-                                break;
                             }
                         }
+                        found
+                    };
+                    if !letter.is_empty() {
+                        let mode = checked_method(&install_items_c);
+                        if mode == "nofmt" {
+                            apply_boot_caps(&install_items_c, &letter, "", false);
+                        } else {
+                            apply_method_caps(
+                                &install_items_c,
+                                &bios_tt_c,
+                                &uefi_tt_c,
+                                mode,
+                                &letter,
+                            );
+                        }
+                        // Re-size the persistence page against the new target,
+                        // preserving the backend and cache choices.
+                        let keep = (
+                            checked_persist_backend(&persist_items_c),
+                            checked_cache_tmpfs(&persist_items_c),
+                        );
+                        persist_content_c.set(build_persist_page(
+                            &persist_items_c,
+                            &frame_persist_c,
+                            &iso_arg2,
+                        ));
+                        restore_persist_choices(&persist_items_c, keep.0, keep.1);
                     }
                     // INSTALL-page BIOS/UEFI checkbox toggle: refresh the
                     // this-machine firmware line for the new selection.
@@ -5487,8 +5567,18 @@ pub fn run_gui(
                 Some(cb.check_state() == nwg::CheckBoxState::Checked)
             } else { None }
         });
+        // Rebuild the PERSISTENCE page FIRST on this path too: it owns the target
+        // picker, so a newly inserted stick only becomes visible to the install
+        // page after the pane has been rebuilt. Doing it in the other order
+        // leaves the install page reading a stale picker.
+        persist_content.set(build_persist_page(
+            &persist_items,
+            &frame_persist,
+            &iso_arg_retry,
+        ));
         install_content.set(build_install_page(
             &install_items,
+            &persist_items,
             &frame_install,
             &font_bold,
             &bios_tt,
@@ -5512,20 +5602,60 @@ pub fn run_gui(
                 }
             }
         }
-        // The target may have changed (a different stick, or one inserted since).
-        // Re-size the persistence page against it, so the slider and the split
-        // line describe the device the install will actually write to.
-        persist_content = build_persist_page(
-            &persist_items,
-            &frame_persist,
-            &iso_arg_retry,
-        );
         nwg::dispatch_thread_events();
         glog("dispatch end (retry)");
     }
 }
 
-/// The drive letter the INSTALL page's target radio has selected, or None.
+/// The persistence backend the user has ticked, as an index into PERSIST_BACKENDS.
+pub(crate) fn checked_persist_backend(items: &PageItems) -> usize {
+    for it in items.borrow().iter() {
+        if let PageCtl::Radio(rb, k) = &it.ctl {
+            if rb.check_state() == nwg::RadioButtonState::Checked {
+                return *k as usize;
+            }
+        }
+    }
+    0
+}
+
+/// Whether the cache-on-tmpfs checkbox is ticked.
+pub(crate) fn checked_cache_tmpfs(items: &PageItems) -> bool {
+    for it in items.borrow().iter() {
+        if let PageCtl::Check(cb, 0) = &it.ctl {
+            return cb.check_state() == nwg::CheckBoxState::Checked;
+        }
+    }
+    true
+}
+
+/// Re-apply the backend and cache choices after the pane is rebuilt.
+///
+/// Rebuilding resets every control to its default, which silently discards the
+/// user's backend choice (and defaulted the slider to 3/4 of the NEW stick - a
+/// number they never asked for). This restores the selections the rebuild would
+/// otherwise throw away.
+fn restore_persist_choices(items: &PageItems, backend: usize, cache_tmpfs: bool) {
+    for it in items.borrow_mut().iter_mut() {
+        match &mut it.ctl {
+            PageCtl::Radio(rb, k) => {
+                if *k as usize == backend {
+                    rb.set_check_state(nwg::RadioButtonState::Checked);
+                }
+            }
+            PageCtl::Check(cb, 0) => {
+                cb.set_check_state(if cache_tmpfs {
+                    nwg::CheckBoxState::Checked
+                } else {
+                    nwg::CheckBoxState::Unchecked
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The drive letter the PERSISTENCE page's target radio has selected, or None.
 ///
 /// One definition, used by BOTH the persistence pane (to size the slider) and the
 /// harvest (for `target_usb`). They used to read the radio differently - the pane
@@ -5896,10 +6026,10 @@ fn harvest_gui_result(
             Some(mode)
         },
         target_usb: {
-            // the INSTALL page's target-USB radio section (kind 4);
-            // drive letter of the checked entry, if any stick is plugged in.
-            // Shared with the persistence pane so both name the same device.
-            selected_target_from(install_items)
+            // The target-USB radio section (kind 4) now lives on the PERSISTENCE
+            // page - see build_persist_page. Shared reader so both the pane's
+            // sizing and this harvest name the same device.
+            selected_target_from(persist_items)
         },
         bios_boot: {
             // INSTALL-page BIOS checkbox (kind 5); default on when the
@@ -6226,6 +6356,43 @@ mod tests {
                 "{name} is never built: every control parented to it would panic on first access"
             );
         }
+    }
+
+    /// The target picker (kind 4) must live on the PERSISTENCE page.
+///
+/// Every number the pane shows - slider bounds, the 3/4 default, the
+/// FAT/persistence split - is derived from the selected stick, so a picker the
+/// user reaches only after those numbers cannot inform them. It used to live on
+/// the INSTALL page, which is why the pane kept guessing a device and reporting
+/// the fallback size.
+///
+/// This is a source check because the invariant is about WHERE a control is
+/// constructed, which no headless test can observe.
+#[test]
+    fn target_picker_lives_on_the_persistence_page() {
+        let src = include_str!("gui.rs");
+        let persist_fn = &src[src
+            .find("pub(crate) fn build_persist_page(")
+            .expect("build_persist_page must exist")..src
+            .find("\n/// The drive letter the PERSISTENCE page")
+            .expect("doc marker after build_persist_page")];
+        assert!(
+            persist_fn.contains("PageCtl::Radio(rb, 4)"),
+            "the target radios (kind 4) must be built on the persistence page, \
+             so the pane can size itself from the selected stick"
+        );
+        // ...and must be published before the sizing code reads them.
+        let picker_at = persist_fn
+            .find("PageCtl::Radio(rb, 4)")
+            .expect("picker present");
+        let sizes_at = persist_fn
+            .find("persist_gib_bounds(")
+            .expect("the pane must size itself");
+        assert!(
+            picker_at < sizes_at,
+            "the picker must be built BEFORE the sizing: otherwise the bounds \
+             are derived from a device the user has not picked yet"
+        );
     }
 
     #[test]
