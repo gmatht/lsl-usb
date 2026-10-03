@@ -200,8 +200,13 @@ fn iso_size_gib(path: &str) -> u32 {
 /// the pane's "use existing partitioning" checkbox keys on, and it is why that
 /// box can default to ticked — the partition's size is a measured fact, not a
 /// value the user has to choose again.
-pub fn existing_persist_partition() -> Option<u32> {
+pub fn existing_persist_partition(target: Option<&str>) -> Option<u32> {
     for c in crate::nofmt::probe_candidates(false) {
+        if let Some(t) = target {
+            if !c.volume.letter.eq_ignore_ascii_case(t) {
+                continue;
+            }
+        }
         if let Some(parts) = crate::nofmt::read_partitions(&c.volume.letter) {
             if let Some(p) = parts.persist {
                 let gib = p.size_gib();
@@ -214,6 +219,41 @@ pub fn existing_persist_partition() -> Option<u32> {
         }
     }
     None
+}
+
+/// Size, in GiB, of the stick persistence should be sized against.
+///
+/// `target` is the drive letter the INSTALL page has selected, when there is one.
+/// It is the AUTHORITATIVE source: sizing from "the largest candidate" instead
+/// is what made the pane report 1 GB on a machine with a 128 GB stick in D:, and
+/// made the split line describe a device the user never chose. Passing None (no
+/// target yet) falls back to the largest candidate, which is only ever a
+/// placeholder for a page the user has not finished with.
+///
+/// Read-only. Returns 0 when no candidate is visible, which is the documented
+/// "cannot size yet" case.
+pub fn persist_target_gib(target: Option<&str>) -> u32 {
+    let cands = crate::nofmt::probe_candidates(false);
+    let mut best: Option<(u32, bool)> = None;
+    for c in &cands {
+        // When a target is known, ONLY that volume counts. Falling back to
+        // "largest of the rest" would silently size against the wrong stick.
+        if let Some(t) = target {
+            if !c.volume.letter.eq_ignore_ascii_case(t) {
+                continue;
+            }
+        }
+        let gb = c.volume.size_gb() as u32;
+        if gb == 0 {
+            continue;
+        }
+        let writable = matches!(c.status, crate::nofmt::CandidateStatus::Ready);
+        best = Some(match best {
+            Some((b, w)) if (w, b) >= (writable, gb) => (b, w),
+            _ => (gb, writable),
+        });
+    }
+    best.map(|(gb, _)| gb).unwrap_or(0)
 }
 
 /// Largest candidate target's size, in GiB — the stick the persistence slider is
@@ -358,10 +398,12 @@ pub fn persist_split_text(total_gib: u32, persist_mib: u32) -> String {
 fn sync_persist_readout(items: &PageItems) {
     let mut track: Option<usize> = None;
     let mut label: Option<usize> = None;
+    let mut split: Option<usize> = None;
     for (i, it) in items.borrow().iter().enumerate() {
         match &it.ctl {
             PageCtl::Track(_, 0) => track = Some(i),
             PageCtl::Lbl(_, 1) => label = Some(i),
+            PageCtl::Lbl(_, 2) => split = Some(i),
             _ => {}
         }
     }
@@ -372,7 +414,7 @@ fn sync_persist_readout(items: &PageItems) {
     let mib = match &items_ref[ti].ctl {
             // Clamp to the control's OWN minimum rather than a global constant: the
             // range is derived per-target (persist_gib_bounds), so a stale constant
-            // here could scale a position that is already below it to zero.
+            // here could scale a position that is already below the minimum to zero.
             PageCtl::Track(tb, _) => {
                 let lo = tb.range_min().max(1);
                 (tb.pos().max(lo) as u32) * 1024
@@ -385,6 +427,38 @@ fn sync_persist_readout(items: &PageItems) {
             lb.set_text(&want);
         }
     }
+    // The split line ("N GB FAT / M GB persistence") must move with the slider
+    // too. It used to be written once at build time, so dragging the slider left
+    // a plausible-looking but stale division of the stick on screen - the same
+    // defect as the size readout, one label further along.
+    if let Some(si) = split {
+        if let PageCtl::Lbl(lb, _) = &items_ref[si].ctl {
+            let stick_gib = PERSIST_SPLIT_TOTAL.with(|c| c.get());
+            let want = persist_split_text(stick_gib, mib);
+            if lb.text() != want {
+                lb.set_text(&want);
+            }
+        }
+    }
+}
+
+/// The stick size the split line is computed against.
+///
+/// The pane is rebuilt once the INSTALL page has a target (see rebuild), so the
+/// division shown is that target's size. Until then this is the largest
+/// candidate, which is only used to render a line the user has not chosen yet.
+thread_local! {
+    static PERSIST_SPLIT_TOTAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The drive letter the persistence pane is sizing against.
+///
+/// Set from the INSTALL page's target radio whenever that page is built or
+/// rebuilt, and read when the persistence pane is (re)built. Both pages are in
+/// one window, so a thread-local is enough to pass the choice between them
+/// without threading it through every builder.
+thread_local! {
+    static PERSIST_TARGET: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Persistence-page backend caveats (design s2.1). Height is part of the
@@ -657,6 +731,10 @@ pub(crate) fn build_install_page(
     if clear {
         install_items.borrow_mut().clear();
     }
+    // Publish the chosen target for the persistence pane, which sizes itself
+    // from the same device. Without this the pane has to guess from all
+    // candidates, which is how it came to describe a stick the user never picked.
+    PERSIST_TARGET.with(|c| *c.borrow_mut() = selected_target_from(install_items));
     let mut items = install_items.borrow_mut();
     let mut iy = 6i32;
     // title (bold) - the win-install-page GUI test keys on this text
@@ -3050,6 +3128,215 @@ fn pump_pending(main: usize) {
     }
 }
 
+/// Build (or rebuild) the PERSISTENCE page controls. Returns the content height.
+///
+/// Kept as its own function so it can be called AGAIN once the INSTALL page has
+/// a chosen target: the pane's slider bounds, its default and its split line are
+/// all derived from the selected stick, so building it before the target is known
+/// is what made it fall back to 1 GB and describe the wrong device.
+pub(crate) fn build_persist_page(
+    persist_items: &PageItems,
+    frame: &nwg::Frame,
+    iso_arg: &str,
+) -> i32 {
+    persist_items.borrow_mut().clear();
+    // ---- page 4: PERSISTENCE ----
+    // Backend radio, then the size slider, then the cache policy. Harvested by
+    // control KIND and radio INDEX (PERSIST_BACKENDS), never by label text: the
+    // labels below are translated, and parsing a translated label silently
+    // installs the wrong backend (locale.rs is explicit about this).
+    {
+        let mut p = persist_items.borrow_mut();
+        let mut y: i32 = 6;
+
+        // A local label helper: the system page's `push_lbl` closure is scoped
+        // inside that page's own block and captures `frame_sys`, so it cannot be
+        // reused here.
+        let mut push_lbl = |items: &mut Vec<PageItem>, text: &str, x: i32, yy: i32, w: i32, h: i32, kind: u8| {
+            let mut lb: Box<nwg::Label> = Box::default();
+            let _ = nwg::Label::builder()
+                .text(text)
+                .position((x, yy))
+                .size((w, h))
+                .parent(frame)
+                .build(&mut lb);
+            items.push(PageItem { ctl: PageCtl::Lbl(lb, kind), x, y: yy, w, h, idx: 0 });
+        };
+
+        // Group header, then one radio per backend. The FIRST radio carries
+        // WS_GROUP so Win32 auto-unchecks only its siblings.
+        for (i, (backend, label)) in PERSIST_BACKENDS
+            .iter()
+            .zip([
+                "Manual Squashfs (home.sfs on the stick) - recommended",
+                "HardDisk (Btrfs image on the data dir)",
+                "USB Partition (F2FS; experimental, needs a second partition)",
+            ])
+            .enumerate()
+        {
+            let mut rb: Box<nwg::RadioButton> = Box::default();
+            let _ = nwg::RadioButton::builder()
+                .flags(if i == 0 {
+                    nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
+                } else {
+                    nwg::RadioButtonFlags::VISIBLE
+                })
+                .text(&crate::locale::tr(label))
+                .position((10, y))
+                .size((780, 22))
+                .parent(frame)
+                .build(&mut rb);
+            if *backend == PERSIST_DEFAULT {
+                rb.set_check_state(nwg::RadioButtonState::Checked);
+            }
+            // kind = index into PERSIST_BACKENDS
+            p.push(PageItem { ctl: PageCtl::Radio(rb, i as u8), x: 10, y, w: -20, h: 22, idx: 0 });
+            y += 26;
+        }
+
+        // Backend caveats, stated where the choice is made. The design is
+        // explicit that F2FS is experimental and that a btrfs image on FAT32
+        // hits the 4 GiB single-file cap - better said here than discovered at
+        // write time (s2.1).
+        push_lbl(&mut p, PERSIST_NOTE, 20, y + 4, -30, 92, 0);
+        y += 104;
+
+        // Size slider: a TRACKBAR, which is the Win32 slider and ships in comctl32
+        // (available on Windows 95, the floor this exe targets). `nwg` exposes it
+        // as TrackBar, not Slider - an earlier draft of this pane concluded the
+        // toolkit had no slider at all and used a combo box instead. It did have
+        // one; the name was the only thing missing.
+        //
+        // Bounds and default come from the target's size and the selected ISO.
+        //
+        // `target` is the INSTALL page's chosen drive letter when there is one.
+        // Sizing from "the largest candidate on the machine" instead is what made
+        // the pane report 1 GB while a 128 GB stick sat in D:, and made the split
+        // line describe a device the user never picked.
+        let target = PERSIST_TARGET.with(|c| c.borrow().clone());
+        let stick_gib = persist_target_gib(target.as_deref());
+        let iso_gib = iso_size_gib(iso_arg);
+
+        // "Use existing partitioning": when the stick ALREADY has a second,
+        // non-FAT partition there is nothing to size - it exists, and its size is
+        // a fact rather than a choice. The checkbox is then ticked by default,
+        // the slider is greyed and pinned to that partition's real size, and the
+        // page says which partition it found. Ticking it off hands sizing back to
+        // the slider (and, at install, to the shrink-then-repartition path).
+        let existing = existing_persist_partition(target.as_deref());
+        let use_existing = existing.is_some();
+
+        {
+            let mut cb: Box<nwg::CheckBox> = Box::default();
+            let _ = nwg::CheckBox::builder()
+                .flags(nwg::CheckBoxFlags::VISIBLE)
+                .text(&crate::locale::tr("Use existing partitioning (shrink not needed)"))
+                .position((10, y))
+                .size((780, 22))
+                .parent(frame)
+                .build(&mut cb);
+            if use_existing {
+                cb.set_check_state(nwg::CheckBoxState::Checked);
+            }
+            p.push(PageItem { ctl: PageCtl::Check(cb, 1), x: 10, y, w: -20, h: 22, idx: 0 });
+            y += 26;
+            push_lbl(
+                &mut p,
+                &match existing {
+                    Some(gib) => format!(
+                        "Found a {} GB non-FAT partition on this stick; persistence uses it as-is.",
+                        gib
+                    ),
+                    None => "No second partition found - sizing one requires shrinking the \
+FAT filesystem first, which happens at first boot."
+                        .to_string(),
+                },
+                20,
+                y,
+                -30,
+                34,
+                0,
+            );
+            y += 40;
+        }
+
+        push_lbl(&mut p, &crate::locale::tr("Persistence space:"), 10, y, -20, 18, 0);
+        y += 20;
+        // When honouring an existing partition the slider is PINNED to that
+        // partition's size and disabled: it is not a choice, and offering a range
+        // here would suggest the size can still be edited.
+        let (gib_min, gib_max, gib_default) = match existing {
+            Some(gib) => {
+                let g = gib.max(PERSIST_GIB_MIN as u32) as usize;
+                (g, g, g)
+            }
+            None => persist_gib_bounds(stick_gib, iso_gib),
+        };
+        // Range AND position go through the BUILDER, in that order, rather than
+        // via set_range_min/set_range_max/set_pos after the build. Calling them
+        // afterwards sends TBM_SETRANGEMIN, TBM_SETRANGEMAX and TBM_SETPOSNOTIFY
+        // separately, and Win32 re-clamps the position when the range changes -
+        // so a set_pos issued before the range was applied is silently undone.
+        let default_mib = (gib_default as u32) * 1024;
+        let mut tb: Box<nwg::TrackBar> = Box::default();
+        let _ = nwg::TrackBar::builder()
+            .flags(nwg::TrackBarFlags::VISIBLE)
+            .position((10, y))
+            .size((400, 30))
+            .range(Some(gib_min..gib_max))
+            .pos(Some(gib_default))
+            .parent(frame)
+            .build(&mut tb);
+        if use_existing {
+            tb.set_enabled(false);
+        }
+        p.push(PageItem { ctl: PageCtl::Track(tb, 0), x: 10, y, w: 400, h: 30, idx: 0 });
+        // Live readout of the current value.
+        //
+        // This was STATIC text set once at build time, so the pane showed
+        // "4.0 GiB" no matter where the slider was dragged - the control looked
+        // broken and, worse, the number on screen did not describe the value
+        // that Install would write. It is now refreshed from the slider's
+        // position (below) AND read back from pos() at Install, so what is
+        // displayed is what is harvested.
+        let mut lbl_val: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text(&persist_gib_text(default_mib))
+            .position((420, y))
+            .size((220, 20))
+            .parent(frame)
+            .build(&mut lbl_val);
+        p.push(PageItem { ctl: PageCtl::Lbl(lbl_val, 1), x: 420, y, w: 220, h: 20, idx: 0 });
+        y += 36;
+        // Show the split ("32 GB FAT / 93 GB persistence"), so the user is choosing a
+        // division of the stick rather than an abstract number (design §4).
+        // Kind 2 marks it as the LIVE label that sync_persist_readout rewrites as
+        // the slider moves - it was static text once, which left a stale division
+        // on screen while the slider moved.
+        PERSIST_SPLIT_TOTAL.with(|c| c.set(stick_gib));
+        push_lbl(&mut p, &persist_split_text(stick_gib, default_mib), 10, y, -20, 18, 2);
+        y += 22;
+
+        // Cache policy. Default on: on a USB stick the write reduction is large
+        // and the data is disposable. Bounded by LSL_HOME_TMPFS_MIB (2 GiB) so
+        // it cannot exhaust RAM (design s2.7). nwg's CheckBoxBuilder has no
+        // `.checked()`, so the initial tick is set after the build.
+        let mut cb: Box<nwg::CheckBox> = Box::default();
+        let _ = nwg::CheckBox::builder()
+            .flags(nwg::CheckBoxFlags::VISIBLE)
+            .text(&crate::locale::tr("Keep caches in RAM (~/.cache, /var/cache recreated each boot)"))
+            .position((10, y))
+            .size((780, 22))
+            .parent(frame)
+            .build(&mut cb);
+        cb.set_check_state(nwg::CheckBoxState::Checked);
+        p.push(PageItem { ctl: PageCtl::Check(cb, 0), x: 10, y, w: -20, h: 22, idx: 0 });
+        y += 26;
+        push_lbl(&mut p, PERSIST_CACHE_NOTE, 20, y, -30, 44, 0);
+    }
+    persist_items.borrow().iter().map(|i| i.y + i.h).max().unwrap_or(0) + 10
+}
+
 pub fn run_gui(
     wsl_vhdx_pre: &[String],
     flatpak_extra: &[String],
@@ -3852,219 +4139,7 @@ pub fn run_gui(
 
     let sys_content = 536 + 20 + 10;
 
-    // ---- page 4: PERSISTENCE ----
-    // Backend radio, then the size slider, then the cache policy. Harvested by
-    // control KIND and radio INDEX (PERSIST_BACKENDS), never by label text: the
-    // labels below are translated, and parsing a translated label silently
-    // installs the wrong backend (locale.rs is explicit about this).
-    {
-        // The frame FIRST: every control below parents to it, and a control
-        // parented to a default-constructed Frame has no HWND - it builds without
-        // error and then never displays.
-        let _ = nwg::Frame::builder()
-            .position((MARGIN, 88))
-            .size((DEF_CW - 2 * MARGIN, DEF_CH - 88 - NAV_H))
-            .parent(&window)
-            .build(&mut frame_persist);
-
-        let mut p = persist_items.borrow_mut();
-        let mut y: i32 = 6;
-
-        // A local label helper: the system page's `push_lbl` closure is scoped
-        // inside that page's own block and captures `frame_sys`, so it cannot be
-        // reused here.
-        let mut push_lbl = |items: &mut Vec<PageItem>, text: &str, x: i32, yy: i32, w: i32, h: i32| {
-            let mut lb: Box<nwg::Label> = Box::default();
-            let _ = nwg::Label::builder()
-                .text(text)
-                .position((x, yy))
-                .size((w, h))
-                .parent(&frame_persist)
-                .build(&mut lb);
-            items.push(PageItem { ctl: PageCtl::Lbl(lb, 0), x, y: yy, w, h, idx: 0 });
-        };
-
-        // Group header, then one radio per backend. The FIRST radio carries
-        // WS_GROUP so Win32 auto-unchecks only its siblings.
-        for (i, (backend, label)) in PERSIST_BACKENDS
-            .iter()
-            .zip([
-                "Manual Squashfs (home.sfs on the stick) - recommended",
-                "HardDisk (Btrfs image on the data dir)",
-                "USB Partition (F2FS; experimental, needs a second partition)",
-            ])
-            .enumerate()
-        {
-            let mut rb: Box<nwg::RadioButton> = Box::default();
-            let _ = nwg::RadioButton::builder()
-                .flags(if i == 0 {
-                    nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::GROUP
-                } else {
-                    nwg::RadioButtonFlags::VISIBLE
-                })
-                .text(&crate::locale::tr(label))
-                .position((10, y))
-                .size((780, 22))
-                .parent(&frame_persist)
-                .build(&mut rb);
-            if *backend == PERSIST_DEFAULT {
-                rb.set_check_state(nwg::RadioButtonState::Checked);
-            }
-            // kind = index into PERSIST_BACKENDS
-            p.push(PageItem { ctl: PageCtl::Radio(rb, i as u8), x: 10, y, w: -20, h: 22, idx: 0 });
-            y += 26;
-        }
-
-        // Backend caveats, stated where the choice is made. The design is
-        // explicit that F2FS is experimental and that a btrfs image on FAT32
-        // hits the 4 GiB single-file cap - better said here than discovered at
-        // write time (s2.1).
-        push_lbl(&mut p, PERSIST_NOTE, 20, y + 4, -30, 92);
-        y += 104;
-
-        // Size slider: a TRACKBAR, which is the Win32 slider and ships in comctl32
-        // (available on Windows 95, the floor this exe targets). `nwg` exposes it
-        // as TrackBar, not Slider - an earlier draft of this pane concluded the
-        // toolkit had no slider at all and used a combo box instead. It did have
-        // one; the name was the only thing missing.
-        //
-        // Bounds and default come from the target's size and the selected ISO.
-        let stick_gib = largest_usb_gib();
-        let iso_gib = iso_size_gib(iso_arg);
-
-        // "Use existing partitioning": when the stick ALREADY has a second,
-        // non-FAT partition there is nothing to size - it exists, and its size is
-        // a fact rather than a choice. The checkbox is then ticked by default,
-        // the slider is greyed and pinned to that partition's real size, and the
-        // page says which partition it found. Ticking it off hands sizing back to
-        // the slider (and, at install, to the shrink-then-repartition path).
-        let existing = existing_persist_partition();
-        let use_existing = existing.is_some();
-
-        {
-            let mut cb: Box<nwg::CheckBox> = Box::default();
-            let _ = nwg::CheckBox::builder()
-                .flags(nwg::CheckBoxFlags::VISIBLE)
-                .text(&crate::locale::tr("Use existing partitioning (shrink not needed)"))
-                .position((10, y))
-                .size((780, 22))
-                .parent(&frame_persist)
-                .build(&mut cb);
-            if use_existing {
-                cb.set_check_state(nwg::CheckBoxState::Checked);
-            }
-            p.push(PageItem { ctl: PageCtl::Check(cb, 1), x: 10, y, w: -20, h: 22, idx: 0 });
-            y += 26;
-            push_lbl(
-                &mut p,
-                &match existing {
-                    Some(gib) => format!(
-                        "Found a {} GB non-FAT partition on this stick; persistence uses it as-is.",
-                        gib
-                    ),
-                    None => "No second partition found - sizing one requires shrinking the \
-FAT filesystem first, which happens at first boot."
-                        .to_string(),
-                },
-                20,
-                y,
-                -30,
-                34,
-            );
-            y += 40;
-        }
-
-        push_lbl(&mut p, &crate::locale::tr("Persistence space:"), 10, y, -20, 18);
-        y += 20;
-        // When honouring an existing partition the slider is PINNED to that
-        // partition's size and disabled: it is not a choice, and offering a range
-        // here would suggest the size can still be edited.
-        let (gib_min, gib_max, gib_default) = match existing {
-            Some(gib) => {
-                let g = gib.max(PERSIST_GIB_MIN as u32) as usize;
-                (g, g, g)
-            }
-            None => persist_gib_bounds(stick_gib, iso_gib),
-        };
-        // Range AND position go through the BUILDER, in that order, rather than
-        // via set_range_min/set_range_max/set_pos after the build. Calling them
-        // afterwards sends TBM_SETRANGEMIN, TBM_SETRANGEMAX and TBM_SETPOSNOTIFY
-        // separately, and Win32 re-clamps the position when the range changes -
-        // so a set_pos issued before the range was applied is silently undone.
-        let default_mib = (gib_default as u32) * 1024;
-        let mut tb: Box<nwg::TrackBar> = Box::default();
-        let _ = nwg::TrackBar::builder()
-            .flags(nwg::TrackBarFlags::VISIBLE)
-            .position((10, y))
-            .size((400, 30))
-            .range(Some(gib_min..gib_max))
-            .pos(Some(gib_default))
-            .parent(&frame_persist)
-            .build(&mut tb);
-        if use_existing {
-            tb.set_enabled(false);
-        }
-        p.push(PageItem { ctl: PageCtl::Track(tb, 0), x: 10, y, w: 400, h: 30, idx: 0 });
-        // Live readout of the current value.
-        //
-        // This was STATIC text set once at build time, so the pane showed
-        // "4.0 GiB" no matter where the slider was dragged - the control looked
-        // broken and, worse, the number on screen did not describe the value
-        // that Install would write. It is now refreshed from the slider's
-        // position (below) AND read back from pos() at Install, so what is
-        // displayed is what is harvested.
-        let mut lbl_val: Box<nwg::Label> = Box::default();
-        let _ = nwg::Label::builder()
-            .text(&persist_gib_text(default_mib))
-            .position((420, y))
-            .size((220, 20))
-            .parent(&frame_persist)
-            .build(&mut lbl_val);
-        p.push(PageItem { ctl: PageCtl::Lbl(lbl_val, 1), x: 420, y, w: 220, h: 20, idx: 0 });
-        y += 36;
-        // Show the split ("32 GB FAT / 93 GB persistence"), so the user is choosing a
-        // division of the stick rather than an abstract number (design §4).
-        push_lbl(
-            &mut p,
-            &persist_split_text(stick_gib, default_mib),
-            10,
-            y,
-            -20,
-            18,
-        );
-        y += 22;
-
-        // Cache policy. Default on: on a USB stick the write reduction is large
-        // and the data is disposable. Bounded by LSL_HOME_TMPFS_MIB (2 GiB) so
-        // it cannot exhaust RAM (design s2.7). nwg's CheckBoxBuilder has no
-        // `.checked()`, so the initial tick is set after the build.
-        let mut cb: Box<nwg::CheckBox> = Box::default();
-        let _ = nwg::CheckBox::builder()
-            .flags(nwg::CheckBoxFlags::VISIBLE)
-            .text(&crate::locale::tr("Keep caches in RAM (~/.cache, /var/cache recreated each boot)"))
-            .position((10, y))
-            .size((780, 22))
-            .parent(&frame_persist)
-            .build(&mut cb);
-        cb.set_check_state(nwg::CheckBoxState::Checked);
-        p.push(PageItem { ctl: PageCtl::Check(cb, 0), x: 10, y, w: -20, h: 22, idx: 0 });
-        y += 26;
-        push_lbl(&mut p, PERSIST_CACHE_NOTE, 20, y, -30, 44);
-    }
-    if let Err(e) = nwg::ScrollBar::builder()
-        .flags(nwg::ScrollBarFlags::VERTICAL | nwg::ScrollBarFlags::VISIBLE)
-        .position((826, 4))
-        .size((18, 588))
-        .parent(&frame_persist)
-        .build(&mut sb_persist)
-    {
-        glog(&format!("scrollbar build error: {e:?}"));
-    }
     let frame_persist = Rc::new(frame_persist);
-    // Content height for the pane's scroll geometry: the last item's bottom plus
-    // padding. Measured the same way as the system page rather than hardcoded,
-    // so the slider's readout and the notes cannot overflow the scroll band.
-    let persist_content: i32 = persist_items.borrow().iter().map(|i| i.y + i.h).max().unwrap_or(0) + 10;
 
     // ---- page 5: wifi (master switch + per-network list) ----
     let _ = nwg::Frame::builder()
@@ -4158,6 +4233,15 @@ FAT filesystem first, which happens at first boot."
         write_mode_pre,
         false,
     )));
+    // The INSTALL page is now built, so it knows which stick is selected. Rebuild
+    // the persistence page against THAT device: it was sized before this point,
+    // which is why it defaulted to 1 GB and showed a split for whichever volume
+    // happened to be largest rather than the one being written to.
+    let mut persist_content = build_persist_page(
+        &persist_items,
+        &frame_persist,
+        iso_arg,
+    );
     if let Err(e) = nwg::ScrollBar::builder()
         .flags(nwg::ScrollBarFlags::VERTICAL | nwg::ScrollBarFlags::VISIBLE)
         .position((826, 4))
@@ -4490,7 +4574,10 @@ FAT filesystem first, which happens at first boot."
     let working2 = working.clone();
     let ui_cell2 = ui_cell.clone();
     let g_cell2 = g_cell.clone();
+    // Two clones: the main event closure takes one by move, and the retry path
+    // (back-to-options) needs one to re-size the persistence page.
     let iso_arg2 = iso_arg.to_string();
+    let iso_arg_retry = iso_arg.to_string();
     let browse_data_sys = sys_items.clone();
     // Ctrl+Alt+B hotkey: RegisterHotKey gives a GLOBAL (single-slot) system
     // hotkey - useful because focus usually sits on a child control whose
@@ -5404,14 +5491,42 @@ FAT filesystem first, which happens at first boot."
                 }
             }
         }
+        // The target may have changed (a different stick, or one inserted since).
+        // Re-size the persistence page against it, so the slider and the split
+        // line describe the device the install will actually write to.
+        persist_content = build_persist_page(
+            &persist_items,
+            &frame_persist,
+            &iso_arg_retry,
+        );
         nwg::dispatch_thread_events();
         glog("dispatch end (retry)");
     }
 }
 
-/// The wizard's harvest: turn the checked radios/checks/edits into a
-/// GuiResult. Runs inside the Install-click handler while the window is still
-/// alive (the working phase), NOT after the loop.
+/// The drive letter the INSTALL page's target radio has selected, or None.
+///
+/// One definition, used by BOTH the persistence pane (to size the slider) and the
+/// harvest (for `target_usb`). They used to read the radio differently - the pane
+/// re-derived a size from all candidates while the harvest read the chosen
+/// letter - so the pane could describe a different device from the one the
+/// install would write to.
+pub(crate) fn selected_target_from(items: &PageItems) -> Option<String> {
+    for it in items.borrow().iter() {
+        if let PageCtl::Radio(rb, 4) = &it.ctl {
+            if rb.check_state() == nwg::RadioButtonState::Checked {
+                let letter = rb.text().split(':').next().unwrap_or("").trim().to_string();
+                if !letter.is_empty() {
+                    return Some(letter);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Harvest the wizard's choices into `GuiResult`. Runs inside the Install-click
+/// handler while the window is still alive (the working phase), NOT after the loop.
 #[allow(clippy::too_many_arguments)]
 fn harvest_gui_result(
     iso_arg: &str,
@@ -5761,20 +5876,9 @@ fn harvest_gui_result(
         },
         target_usb: {
             // the INSTALL page's target-USB radio section (kind 4);
-            // drive letter of the checked entry, if any stick is plugged in
-            let mut target: Option<String> = None;
-            for it in install_items.borrow().iter() {
-                if let PageCtl::Radio(rb, 4) = &it.ctl {
-                    if rb.check_state() == nwg::RadioButtonState::Checked {
-                        let letter = rb.text().split(':').next().unwrap_or("").trim().to_string();
-                        if !letter.is_empty() {
-                            target = Some(letter);
-                        }
-                        break;
-                    }
-                }
-            }
-            target
+            // drive letter of the checked entry, if any stick is plugged in.
+            // Shared with the persistence pane so both name the same device.
+            selected_target_from(install_items)
         },
         bios_boot: {
             // INSTALL-page BIOS checkbox (kind 5); default on when the
