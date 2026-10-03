@@ -4139,6 +4139,27 @@ pub fn run_gui(
 
     let sys_content = 536 + 20 + 10;
 
+            // The frame must exist BEFORE any control parents to it, and it must be a
+    // real child of `window`. It was previously created inside the pane's
+    // inline block; extracting that block into build_persist_page() dropped the
+    // creation, leaving a Default::default() Frame with no HWND - every control
+    // then built "successfully" against nothing and the first access panicked
+    // with nwg's "RadioButton is not yet bound to a winapi object". The pane's
+    // scrollbar was lost the same way and is restored here too.
+    let _ = nwg::Frame::builder()
+        .position((MARGIN, 88))
+        .size((DEF_CW - 2 * MARGIN, DEF_CH - 88 - NAV_H))
+        .parent(&window)
+        .build(&mut frame_persist);
+    if let Err(e) = nwg::ScrollBar::builder()
+        .flags(nwg::ScrollBarFlags::VERTICAL | nwg::ScrollBarFlags::VISIBLE)
+        .position((826, 4))
+        .size((18, 588))
+        .parent(&frame_persist)
+        .build(&mut sb_persist)
+    {
+        glog(&format!("scrollbar build error: {e:?}"));
+    }
     let frame_persist = Rc::new(frame_persist);
 
     // ---- page 5: wifi (master switch + per-network list) ----
@@ -6174,9 +6195,41 @@ mod tests {
         assert_eq!(checked, vec![clicked_idx], "the clicked stick stays picked");
     }
 
+    /// Every page frame must be given a real HWND before any control parents to it.
+///
+/// nwg's controls build "successfully" against a parentless Frame and only panic
+/// on first ACCESS, with "... is not yet bound to a winapi object" - which is a
+/// runtime panic the headless test suite cannot see. The persistence pane hit it
+/// when its frame creation was lost in a refactor.
+///
+/// This is a source-level guard because the real failure is a runtime one: it
+/// checks that each page's `let mut frame_x: nwg::Frame = Default::default()`
+/// is followed by a `.build(&mut frame_x)` somewhere in run_gui.
+#[test]
+    fn every_page_frame_is_created_before_use() {
+        let src = include_str!("gui.rs");
+        for (name, holder) in [
+            ("frame_persist", "frame_persist"),
+            ("frame_wifi", "frame_wifi"),
+            ("frame_sys", "frame_sys"),
+            ("frame_fp", "frame_fp"),
+            ("frame_iso", "frame_iso"),
+        ] {
+            let decl = format!("let mut {name}: nwg::Frame = Default::default();");
+            assert!(
+                src.contains(&decl),
+                "{name} is declared but the declaration form changed - update this guard"
+            );
+            let built = format!(".build(&mut {holder})");
+            assert!(
+                src.contains(&built),
+                "{name} is never built: every control parented to it would panic on first access"
+            );
+        }
+    }
+
     #[test]
     fn bottom_bands_never_overlap() {
-        // the "Downloading ..." label band touches neither the scrollable
         // pages above nor the button row below, at any client height -
         // so no glyph (not even a 'g' descender) can paint over a neighbour.
         // label_h stays a full 20px line (codebase single-line metric: 18).
