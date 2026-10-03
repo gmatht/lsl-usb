@@ -90,6 +90,7 @@ use std::sync::mpsc;
 pub struct GuiResult {
     pub iso_path: String,
     pub flatpak_ids: Vec<String>,
+    pub snap_ids: Vec<String>,
     pub wsl_vhdx: Vec<String>,
     pub data_dir: String,
     pub wifi: bool,
@@ -399,12 +400,18 @@ fn sync_persist_readout(items: &PageItems) {
     let mut track: Option<usize> = None;
     let mut label: Option<usize> = None;
     let mut split: Option<usize> = None;
-    for (i, it) in items.borrow().iter().enumerate() {
-        match &it.ctl {
-            PageCtl::Track(_, 0) => track = Some(i),
-            PageCtl::Lbl(_, 1) => label = Some(i),
-            PageCtl::Lbl(_, 2) => split = Some(i),
-            _ => {}
+    // Collect indices in a SCOPED borrow. Holding `items.borrow()` in the `for`
+    // expression keeps that Ref alive until the end of the enclosing statement,
+    // so a second borrow() inside it panics with "already mutably borrowed".
+    {
+        let b = items.borrow();
+        for (i, it) in b.iter().enumerate() {
+            match &it.ctl {
+                PageCtl::Track(_, 0) => track = Some(i),
+                PageCtl::Lbl(_, 1) => label = Some(i),
+                PageCtl::Lbl(_, 2) => split = Some(i),
+                _ => {}
+            }
         }
     }
     let (Some(ti), Some(li)) = (track, label) else {
@@ -1890,6 +1897,36 @@ fn relayout_fp(fp: &PageItems, fp_content: &Cell<i32>, fw: i32, fh: i32) {
             max_y = max_y.max(it.y + it.h);
         }
     }
+    // ---- snaps (kind 2), below the flatpak extras ----
+    // Same shape as the flatpak block above but a second column/row group, so
+    // the page stays one scrollable list rather than a second page. The snap
+    // label states the cache trade-off because it is the one a user cannot
+    // discover from the UI afterwards.
+    let ys = yb + 130;
+    for it in items.iter_mut() {
+        let k = ctl_kind(&it.ctl);
+        let is_chk = matches!(&it.ctl, PageCtl::Check(_, _));
+        let is_lbl = matches!(&it.ctl, PageCtl::Lbl(_, _));
+        let is_edit = matches!(&it.ctl, PageCtl::Edit(_, _));
+        if is_chk && k == 2 {
+            it.x = 10;
+            it.y = ys;
+            it.w = -20;
+            it.h = 20;
+            max_y = max_y.max(it.y + 24);
+        } else if is_lbl && k == 2 {
+            it.x = 10;
+            it.y = ys + 28;
+            it.w = -20;
+            it.h = 18;
+        } else if is_edit && k == 2 {
+            it.x = 10;
+            it.y = ys + 48;
+            it.w = -20;
+            it.h = 52; // 3 lines deep
+            max_y = max_y.max(it.y + it.h);
+        }
+    }
     fp_content.set(max_y + 10);
 }
 
@@ -3188,7 +3225,12 @@ pub(crate) fn build_persist_page(
         }
         // The picker's answer drives every number below, so publish it now rather
         // than after the pane is built.
-        PERSIST_TARGET.with(|c| *c.borrow_mut() = selected_target_from(persist_items));
+        //
+        // `selected_target_in(&p)` and NOT `selected_target_from(persist_items)`:
+        // `p` is a live borrow_mut of persist_items' RefCell, so the latter would
+        // request a second borrow and panic with "RefCell already mutably
+        // borrowed" the moment the persistence page is built.
+        PERSIST_TARGET.with(|c| *c.borrow_mut() = selected_target_in(&p));
         y += 8;
 
         // A local label helper: the system page's `push_lbl` closure is scoped
@@ -3382,6 +3424,7 @@ FAT filesystem first, which happens at first boot."
 pub fn run_gui(
     wsl_vhdx_pre: &[String],
     flatpak_extra: &[String],
+    snap_extra: &[String],
     iso_arg: &str,
     mint_version: &str,
     download_dir: &str,
@@ -4046,6 +4089,97 @@ pub fn run_gui(
             y: 290,
             w: -20,
             h: 76,
+            idx: 0,
+        });
+    }
+    // ---- snaps (kind 2) ----
+    // Same page as flatpaks rather than a page of its own: both are "apps to
+    // preload", and a second page would cost a nav slot for no gain. The label
+    // states the one thing a user cannot find out later - that a cached snap is
+    // reinstalled with --dangerous, i.e. without signature checking.
+    {
+        let mut l: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text(&crate::locale::tr("Snaps to install on first boot (same apps, as snaps):"))
+            .position((10, 420))
+            .size((560, 18))
+            .parent(&*frame_fp)
+            .build(&mut l);
+        fp_items.borrow_mut().push(PageItem {
+            ctl: PageCtl::Lbl(l, 2),
+            x: 10,
+            y: 420,
+            w: -20,
+            h: 18,
+            idx: 0,
+        });
+        for (app, _name, matched) in crate::hardware::snap_suggestions().iter() {
+            let mut cb: Box<nwg::CheckBox> = Box::default();
+            let _ = nwg::CheckBox::builder()
+                .text(app)
+                .position((10, 442))
+                .size((275, 20))
+                .parent(&*frame_fp)
+                .build(&mut cb);
+            if *matched {
+                cb.set_check_state(nwg::CheckBoxState::Checked);
+            }
+            fp_items.borrow_mut().push(PageItem {
+                ctl: PageCtl::Check(cb, 2),
+                x: 10,
+                y: 442,
+                w: 275,
+                h: 20,
+                idx: 0,
+            });
+        }
+        let mut h: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text(&crate::locale::tr(
+                "Snaps are downloaded by the stick on first boot and cached there, so later boots are fast and work offline. A cached snap is reinstalled without signature checking.",
+            ))
+            .position((10, 620))
+            .size((560, 34))
+            .parent(&*frame_fp)
+            .build(&mut h);
+        fp_items.borrow_mut().push(PageItem {
+            ctl: PageCtl::Lbl(h, 2),
+            x: 10,
+            y: 620,
+            w: -20,
+            h: 34,
+            idx: 0,
+        });
+        let mut l2: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text(&crate::locale::tr("Extra snap names (comma-separated):"))
+            .position((10, 660))
+            .size((560, 18))
+            .parent(&*frame_fp)
+            .build(&mut l2);
+        fp_items.borrow_mut().push(PageItem {
+            ctl: PageCtl::Lbl(l2, 2),
+            x: 10,
+            y: 660,
+            w: -20,
+            h: 18,
+            idx: 0,
+        });
+        let mut e2: Box<nwg::TextBox> = Box::default();
+        let _ = nwg::TextBox::builder()
+            .flags(multiline_edit_flags())
+            .position((10, 680))
+            .size((560, 52))   // 3 lines deep
+            .text(&snap_extra.join(", "))
+            .parent(&*frame_fp)
+            .build(&mut e2);
+        e2.set_size(560, 52);
+        fp_items.borrow_mut().push(PageItem {
+            ctl: PageCtl::Edit(e2, 2),
+            x: 10,
+            y: 680,
+            w: -20,
+            h: 52,
             idx: 0,
         });
     }
@@ -5663,7 +5797,19 @@ fn restore_persist_choices(items: &PageItems, backend: usize, cache_tmpfs: bool)
 /// letter - so the pane could describe a different device from the one the
 /// install would write to.
 pub(crate) fn selected_target_from(items: &PageItems) -> Option<String> {
-    for it in items.borrow().iter() {
+    selected_target_in(&items.borrow())
+}
+
+/// The same lookup over an already-borrowed slice.
+///
+/// Split out because `build_persist_page` holds `borrow_mut()` on the page's
+/// RefCell while it builds the picker, so calling `selected_target_from` there
+/// asks for a second borrow of the same cell and panics at runtime with
+/// "RefCell already mutably borrowed" - which no compile-time check catches and
+/// no headless test exercises, since the borrow conflict only exists once the
+/// page is actually built against a real window.
+fn selected_target_in(items: &[PageItem]) -> Option<String> {
+    for it in items {
         if let PageCtl::Radio(rb, 4) = &it.ctl {
             if rb.check_state() == nwg::RadioButtonState::Checked {
                 let letter = rb.text().split(':').next().unwrap_or("").trim().to_string();
@@ -5843,8 +5989,10 @@ fn harvest_gui_result(
 
     // flatpaks: grid apps (kind 0), FSearch (kind 1), extra IDs (Edit kind 1)
     let mut flatpak_ids: Vec<String> = Vec::new();
+    let mut snap_ids: Vec<String> = Vec::new();
     let mut fsearch = false;
     let mut extra_text = String::new();
+    let mut snap_extra_text = String::new();
     for it in fp_items.borrow().iter() {
         match &it.ctl {
             PageCtl::Check(cb, 0) => {
@@ -5861,6 +6009,18 @@ fn harvest_gui_result(
             PageCtl::Edit(b, 1) => {
                 extra_text = b.text();
             }
+            // snaps: grid (kind 2) + extra names (Edit kind 2)
+            PageCtl::Check(cb, 2) => {
+                if cb.check_state() == nwg::CheckBoxState::Checked {
+                    let t = cb.text();
+                    if let Some((_, name)) = crate::hardware::SNAP_MAP.iter().find(|(app, _)| *app == t) {
+                        snap_ids.push(name.to_string());
+                    }
+                }
+            }
+            PageCtl::Edit(b, 2) => {
+                snap_extra_text = b.text();
+            }
             _ => {}
         }
     }
@@ -5872,6 +6032,12 @@ fn harvest_gui_result(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    snap_ids.extend(
+        snap_extra_text
+            .split(|c| c == ',' || c == '\n' || c == '\r')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    );
 
     // system page: Edit 1=vhdx, Edit 2=data dir, Checks 4..8
     let mut vhdx_text = String::new();
@@ -5987,6 +6153,7 @@ fn harvest_gui_result(
         extra_isos,
         download_extras,
         flatpak_ids: [flatpak_ids, extra].concat(),
+        snap_ids,
         wsl_vhdx,
         data_dir: data_text,
         wifi,
@@ -6393,6 +6560,108 @@ mod tests {
             "the picker must be built BEFORE the sizing: otherwise the bounds \
              are derived from a device the user has not picked yet"
         );
+    }
+
+    /// Reproduction for a startup panic after the target picker moved to the
+/// PERSISTENCE page.
+///
+/// `build_install_page` now takes `persist_items` and reads the target radios
+/// from THERE. Passing the wrong argument - or a page whose items were never
+/// populated - makes it look for kind-4 radios that do not exist, and the
+/// failure mode is a panic rather than a wrong number, so it must be pinned.
+///
+/// nwg needs a real window, so this checks the CONTRACT (which storage the
+/// install page must read the picker from) rather than constructing controls:
+/// the previous version silently read `install_items`, always found nothing,
+/// and left the BIOS/UEFI boxes ungated.
+#[test]
+    fn install_page_reads_the_picker_from_the_persistence_page() {
+        let src = include_str!("gui.rs");
+        let start = src
+            .find("pub(crate) fn build_install_page(")
+            .expect("build_install_page must exist");
+        let body = &src[start..start + 12_000];
+        // The signature must accept the persistence page's storage...
+        assert!(
+            body.contains("persist_items: &PageItems"),
+            "build_install_page must take persist_items: the picker moved there"
+        );
+        // ...and must read the target from it, not from its own items.
+        assert!(
+            body.contains("selected_target_from(persist_items)"),
+            "the install page must read the target from persist_items; \
+             reading its own items always finds nothing now the radios moved"
+        );
+        assert!(
+            !body.contains("selected_target_from(install_items)"),
+            "the install page must not read the target from its own items - \
+             that is the bug: the radios are on the persistence page"
+        );
+    }
+
+    /// The persistence page must be able to describe itself without a target,
+    /// and its sizing must never come out as something no slider can reach.
+    ///
+    /// With no candidate attached the pane used to fall back to the 1 GiB
+    /// minimum and present that as "3/4 of the stick", which is how the default
+    /// read as 1 GB. The bounds must always be a usable, ordered range.
+    #[test]
+    fn persist_bounds_are_always_a_usable_range() {
+        for total in [0u32, 1, 2, 8, 33, 64, 128, 500] {
+            for iso in [0u32, 1, 3, 40, 200] {
+                let (lo, hi, d) = persist_gib_bounds(total, iso);
+                assert!(lo >= PERSIST_GIB_MIN, "min {lo} below the floor for {total}/{iso}");
+                assert!(lo <= hi, "INVERTED range {lo}..{hi} for {total}/{iso}");
+                assert!((lo..=hi).contains(&d), "default {d} outside {lo}..{hi} for {total}/{iso}");
+                assert!(hi > 0);
+            }
+        }
+        // With no stick at all the pane must SAY so rather than imply a real
+        // division of a device that is not there.
+        assert!(persist_split_text(0, 4096).contains("No USB stick"));
+    }
+
+    /// REPRODUCTION for the startup panic
+/// "RefCell already mutably borrowed" in `selected_target_from`.
+///
+/// `build_persist_page` holds `persist_items.borrow_mut()` for the whole page
+/// (`let mut p = ...`). It used to publish the picker's answer with
+/// `selected_target_from(persist_items)`, which does `items.borrow()` on the SAME
+/// RefCell - a runtime panic the moment the persistence page is built.
+///
+/// The property that makes this safe is that the picker can be read WHILE a
+/// mutable borrow of the page is live, which is exactly the situation inside the
+/// builder. That is asserted here on a RefCell of the same shape: `p` is held,
+/// and the lookup must still be possible. A second `borrow()` in that state is
+/// what panicked, so this test fails if anyone reintroduces one.
+///
+/// `catch_unwind` is not usable for the failing variant (RefCell's borrow flag
+/// is not UnwindSafe), so the borrow is taken rather than caught.
+///
+/// Source-scraping the builder was tried first and is the wrong tool: the
+/// function contains format strings with braces, so brace counting overshoots by
+/// a factor of twenty and the assertion becomes meaningless.
+#[test]
+    fn the_picker_is_readable_while_the_page_is_borrowed() {
+        let items: PageItems = Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            // This is the builder's state: a live mutable borrow of the page.
+            let mut p = items.borrow_mut();
+            p.push(PageItem {
+                ctl: PageCtl::Lbl(Box::default(), 0),
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+                idx: 0,
+            });
+            // Reading the picker now must NOT need a second borrow. With the old
+            // `selected_target_from(persist_items)` this line panicked.
+            assert!(selected_target_in(&p).is_none());
+        }
+        // Once the mutable borrow is released, both accessors agree.
+        assert!(selected_target_from(&items).is_none());
+        assert!(selected_target_in(&items.borrow()).is_none());
     }
 
     #[test]
