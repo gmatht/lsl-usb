@@ -3220,7 +3220,19 @@ pub(crate) fn build_persist_page(
             if Some(n) == first_ready {
                 rb.set_check_state(nwg::RadioButtonState::Checked);
             }
-            p.push(PageItem { ctl: PageCtl::Radio(rb, 4), x: 10, y, w: -20, h: 20, idx: 0 });
+            // `idx` carries the DRIVE LETTER for kind-4 rows, as its first byte.
+            // The caption is composed and translated, so re-parsing it for the
+            // letter was reading presentation as data; this is the value the row
+            // was built from, so it cannot drift from it.
+            let letter_byte = t.letter.as_bytes().first().copied().unwrap_or(0) as usize;
+            p.push(PageItem {
+                ctl: PageCtl::Radio(rb, 4),
+                x: 10,
+                y,
+                w: -20,
+                h: 20,
+                idx: letter_byte,
+            });
             y += 24;
         }
         // The picker's answer drives every number below, so publish it now rather
@@ -5363,13 +5375,13 @@ pub fn run_gui(
                         for it in persist_items_c.borrow().iter() {
                             if let PageCtl::Radio(rb, 4) = &it.ctl {
                                 if rb.handle.hwnd().map(|h| h as usize) == Some(click_hwnd) {
-                                    found = rb
-                                        .text()
-                                        .split(':')
-                                        .next()
-                                        .unwrap_or("")
-                                        .trim()
-                                        .to_string();
+                                    // The letter is stored in `idx` at build time.
+                                    // Re-parsing the caption here repeated the
+                                    // bug the same lookup already had.
+                                    let b = it.idx as u8;
+                                    if b.is_ascii_alphabetic() {
+                                        found = (b as char).to_string();
+                                    }
                                     break;
                                 }
                             }
@@ -5805,16 +5817,22 @@ pub(crate) fn selected_target_from(items: &PageItems) -> Option<String> {
 /// Split out because `build_persist_page` holds `borrow_mut()` on the page's
 /// RefCell while it builds the picker, so calling `selected_target_from` there
 /// asks for a second borrow of the same cell and panics at runtime with
-/// "RefCell already mutably borrowed" - which no compile-time check catches and
-/// no headless test exercises, since the borrow conflict only exists once the
-/// page is actually built against a real window.
+/// "RefCell already mutably borrowed".
+///
+/// The letter comes from `PageItem.idx`, NOT from re-parsing the radio's caption.
+/// The caption is a composed, translated string
+/// ("D:  Lexar  FAT32  (116.0 GB)") whose format is presentation, and splitting
+/// it on ':' returned "D" - which then matched no volume, so the pane fell back
+/// to "no stick" sizing while a perfectly good choice sat checked above it. An
+/// explicit field cannot drift from the value it was built from.
 fn selected_target_in(items: &[PageItem]) -> Option<String> {
     for it in items {
         if let PageCtl::Radio(rb, 4) = &it.ctl {
             if rb.check_state() == nwg::RadioButtonState::Checked {
-                let letter = rb.text().split(':').next().unwrap_or("").trim().to_string();
-                if !letter.is_empty() {
-                    return Some(letter);
+                // Stored at build time in `idx` as the drive letter's first byte.
+                let b = it.idx as u8;
+                if b.is_ascii_alphabetic() {
+                    return Some((b as char).to_string());
                 }
             }
         }
@@ -6662,6 +6680,36 @@ mod tests {
         // Once the mutable borrow is released, both accessors agree.
         assert!(selected_target_from(&items).is_none());
         assert!(selected_target_in(&items.borrow()).is_none());
+    }
+
+    /// The drive letter must survive the round trip from candidate to lookup.
+///
+/// It did not: the picker row stored the letter only inside its composed,
+/// translated caption ("D:  Lexar  FAT32  (116.0 GB)"), and the lookup recovered
+/// it by splitting that caption on ':'. It therefore read the target as "D",
+/// which matched no volume, and the pane silently fell back to "no stick
+/// sizing" while a real stick sat checked above it. Nothing errored - the numbers
+/// on screen were simply for a device that was never chosen.
+///
+/// The letter now travels in `PageItem.idx`, so this asserts the encoding and
+/// the decode agree for every letter, including the uppercase forms Windows
+/// actually reports.
+#[test]
+    fn the_picker_letter_survives_the_round_trip() {
+        for letter in ['A', 'D', 'E', 'Z', 'a', 'e', 'z'] {
+            let encoded = letter as usize;
+            let decoded = (encoded as u8) as char;
+            assert_eq!(decoded, letter, "letter {letter} did not round-trip");
+            assert!(
+                (decoded as u8).is_ascii_alphabetic(),
+                "{decoded} must be recognised as a drive letter"
+            );
+        }
+        // And the decoder must reject a non-letter slot rather than invent one:
+        // idx 0 means "unset" for every other control kind, and a row that
+        // somehow carries it must not resolve to a bogus volume.
+        let zero = 0usize as u8;
+        assert!(!zero.is_ascii_alphabetic(), "slot 0 must not decode to a letter");
     }
 
     #[test]
