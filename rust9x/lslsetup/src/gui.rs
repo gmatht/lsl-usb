@@ -4954,8 +4954,12 @@ pub fn run_gui(
     let working_c = working.clone();
     let persist_items_c = persist_items.clone();
     let install_items_c = install_items.clone();
-    let frame_persist_c = frame_persist.clone();
     let persist_content_c = persist_content.clone();
+    let frame_persist_r = frame_persist.clone();
+    // Set when a target radio is clicked, consumed on the NEXT dispatch. See the
+    // call site: rebuilding inside the click handler destroys the controls the
+    // handler is still iterating (0xC0000409).
+    let persist_resize_pending_c = std::rc::Rc::new(std::cell::Cell::new(false));
 
         move |event, data, handle| {
         use nwg::Event;
@@ -4965,6 +4969,26 @@ pub fn run_gui(
         // changes. It only touches the label when the value actually differs, so
         // this costs nothing while the slider is idle.
         sync_persist_readout(&persist_items_c);
+
+        // A target click asked for the pane to be re-sized. Do it HERE, at the
+        // top of a dispatch, where no borrow of persist_items is live - not in
+        // the click handler, which clears that very vector while iterating it and
+        // overruns the stack (0xC0000409).
+        if persist_resize_pending_c.replace(false) {
+            let keep = (
+                checked_persist_backend(&persist_items_c),
+                checked_cache_tmpfs(&persist_items_c),
+            );
+            persist_content_c.set(build_persist_page(
+                &persist_items_c,
+                &frame_persist_r,
+                &iso_arg2,
+            ));
+            // A rebuild resets every control to its default, which would silently
+            // discard the backend the user picked.
+            restore_persist_choices(&persist_items_c, keep.0, keep.1);
+        }
+
         match event {
             // Per-window Ctrl+Alt+B fallback: RegisterHotKey is a single-slot
             // system resource - when another instance (or app) owns the combo,
@@ -5403,16 +5427,22 @@ pub fn run_gui(
                         }
                         // Re-size the persistence page against the new target,
                         // preserving the backend and cache choices.
-                        let keep = (
-                            checked_persist_backend(&persist_items_c),
-                            checked_cache_tmpfs(&persist_items_c),
-                        );
-                        persist_content_c.set(build_persist_page(
-                            &persist_items_c,
-                            &frame_persist_c,
-                            &iso_arg2,
-                        ));
-                        restore_persist_choices(&persist_items_c, keep.0, keep.1);
+                        //
+                        // DEFER the re-size. Rebuilding here - inside the click
+                        // handler, from inside the loop that is walking
+                        // persist_items - clears that vector, destroying every
+                        // control through nwg's Drop, including the radio whose
+                        // click is being processed, while the loop still holds
+                        // a borrow of it. The handler then walks freed controls:
+                        // a stack overflow reported as 0xC0000409
+                        // (STATUS_STACK_BUFFER_OVERRUN, which is __fastfail,
+                        // NOT a Rust panic - those exit 101, which is why there
+                        // was no message to read).
+                        //
+                        // Record the intent instead; the rebuild happens at the
+                        // top of the NEXT dispatch, where no borrow is live.
+                        PERSIST_TARGET.with(|c| *c.borrow_mut() = Some(letter));
+                        persist_resize_pending_c.set(true);
                     }
                     // INSTALL-page BIOS/UEFI checkbox toggle: refresh the
                     // this-machine firmware line for the new selection.
@@ -6710,6 +6740,51 @@ mod tests {
         // somehow carries it must not resolve to a bogus volume.
         let zero = 0usize as u8;
         assert!(!zero.is_ascii_alphabetic(), "slot 0 must not decode to a letter");
+    }
+
+    /// The persistence page must not be rebuilt from inside its own click handler.
+///
+/// Selecting a target radio crashed the installer with 0xC0000409
+/// (STATUS_STACK_BUFFER_OVERRUN). That is `__fastfail`, not a Rust panic - those
+/// exit 101 - so there was no message to read, and the crash surfaced as a
+/// feature ("picking a stick kills it") rather than as a defect.
+///
+/// The cause is re-entrancy: the handler is inside `for it in
+/// persist_items.borrow().iter()`, and `build_persist_page` clears that same
+/// vector. Clearing destroys every control through nwg's Drop - including the
+/// radio whose click is being processed - while the loop still holds a borrow of
+/// it, and the handler then keeps walking freed controls.
+///
+/// The fix is structural: the handler only SETS a flag and the rebuild runs at
+/// the top of the NEXT dispatch, where no borrow is live. This asserts that
+/// invariant, and was verified to fail when the call is put back.
+#[test]
+    fn the_pane_is_not_rebuilt_from_its_own_click_handler() {
+        let src = include_str!("gui.rs");
+        assert!(
+            src.contains("persist_resize_pending_c"),
+            "a target click must DEFER the rebuild via a flag"
+        );
+        assert!(
+            src.contains("restore_persist_choices(&persist_items_c"),
+            "the deferred rebuild must restore the user's backend choice"
+        );
+        // No call to the builder may sit between the target-click region and the
+        // next handler in it.
+        let handler = src
+            .find("PERSISTENCE-page target click")
+            .expect("the target-click region must exist");
+        let region_end = src[handler..]
+            .find("INSTALL-page BIOS/UEFI checkbox toggle")
+            .map(|i| handler + i)
+            .unwrap_or(src.len());
+        let region = &src[handler..region_end];
+        assert!(
+            !region.contains("build_persist_page("),
+            "build_persist_page must NOT be called from the click handler: it \
+             clears persist_items while the handler is iterating it, which \
+             destroys the control being clicked (0xC0000409)"
+        );
     }
 
     #[test]
