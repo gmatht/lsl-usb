@@ -553,6 +553,36 @@ fn stage1_continuation() -> &'static [u8] {
     &GRLDR_MBR[512..]
 }
 
+/// The 16-sector payload written to disk in ONE call: sector 0 (the merged
+/// MBR) followed by the stage1 continuation that fills sectors 1..15.
+///
+/// Assembled here rather than inline in `commit_boot_sectors` so the exact
+/// bytes are a pure function of the two inputs and can be unit-tested without
+/// a disk.
+///
+/// WHY ONE BUFFER, AND NOT TWO WRITES: the previous version seeked to 0, wrote
+/// 512 bytes, seeked to 512, then wrote the remaining 7680. When that second
+/// write failed (ERROR_INVALID_PARAMETER, live on a 116 GB FAT32 stick) the
+/// first had already landed - leaving grub4dos stage1 in the MBR with nothing
+/// behind it. The BIOS loads only sector 0, so the stick booted to "Missing
+/// helper": a boot sector installed without the code it needs, discovered only
+/// at boot and unrecoverable without the backup.
+///
+/// A single write cannot express that state. Either the whole 16 sectors land
+/// or the drive rejects the call and nothing is written; the read-back then
+/// confirms which happened. `sync_all` follows, so a partial write is not left
+/// sitting in the cache either.
+///
+/// Sectors 0..15 exactly: the BIOS hands stage1's continuation to itself from
+/// here, and writing further would risk the partition that validation already
+/// required to start after sector 15.
+pub fn boot_sector_payload(new_mbr: &[u8; 512]) -> [u8; 8192] {
+    let mut buf = [0u8; 8192];
+    buf[..512].copy_from_slice(new_mbr);
+    buf[512..].copy_from_slice(stage1_continuation());
+    buf
+}
+
 /// First partition's start LBA (from the MBR partition table), if any.
 /// Used to refuse targets whose first partition starts inside the sectors
 /// the grub4dos stage1 continuation needs (1..15).
@@ -2859,7 +2889,6 @@ pub struct PendingMbr {
 /// partition table.
 pub fn commit_boot_sectors(p: &PendingMbr) -> Result<(), String> {
     out::step("Committing the boot sectors (final step - all files are in place)...");
-    let cont = stage1_continuation();
     if p.want_bios && (p.mbr_changed || p.cont_changed) {
         let mut disk = std::fs::OpenOptions::new()
             .read(true)
@@ -2880,24 +2909,36 @@ pub fn commit_boot_sectors(p: &PendingMbr) -> Result<(), String> {
         if cur != p.early_mbr {
             return Err("the MBR changed since validation (another tool touched the disk?) - aborting without writing; the files are in place and verified, so re-running re-validates and resumes safely.".into());
         }
+        // ONE write for all 16 sectors. See `boot_sector_payload`: two writes
+        // left the MBR installed without the continuation when the second
+        // failed, which is a stick that boots to "Missing helper".
+        let payload = boot_sector_payload(&p.new_mbr);
         disk.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        disk.write_all(&p.new_mbr).map_err(|e| format!("MBR write failed: {}", e))?;
-        disk.seek(SeekFrom::Start(512)).map_err(|e| e.to_string())?;
-        disk.write_all(cont).map_err(|e| format!("grub4dos stage1 continuation write failed: {}", e))?;
-        disk.sync_all().map_err(|e| format!("MBR flush failed: {}", e))?;
-        // read back + verify
-        let mut back = vec![0u8; 512 + cont.len()];
+        disk.write_all(&payload)
+            .map_err(|e| format!("grub4dos boot sectors (0-15) write failed: {}", e))?;
+        disk.sync_all().map_err(|e| format!("boot sector flush failed: {}", e))?;
+        // read back + verify the WHOLE payload in one read, so a short write is
+        // caught here rather than surfacing at the next boot.
+        let mut back = vec![0u8; payload.len()];
         disk.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         disk.read_exact(&mut back).map_err(|e| e.to_string())?;
-        if back[..512] != p.new_mbr[..] {
+        if back != payload {
+            // Name the half that is wrong: "the MBR landed but the continuation
+            // did not" is a different situation from "neither landed", and the
+            // two need different recovery advice.
+            let mbr_ok = back[..512] == p.new_mbr[..];
             return Err(format!(
-                "MBR read-back mismatch - the write did not stick. Restore with the backup at {}",
-                p.backup_path
-            ));
-        }
-        if &back[512..] != cont {
-            return Err(format!(
-                "grub4dos stage1 continuation read-back mismatch - the write did not stick. Restore with the backup at {}",
+                "grub4dos boot sectors read-back mismatch ({}) - the write did not stick. {}Restore with the backup at {}",
+                if mbr_ok {
+                    "sector 0 landed, sectors 1-15 did NOT - this stick will NOT boot BIOS"
+                } else {
+                    "sector 0 did not stick"
+                },
+                if mbr_ok {
+                    "Do not reboot it expecting BIOS boot. "
+                } else {
+                    ""
+                },
                 p.backup_path
             ));
         }
@@ -4686,6 +4727,100 @@ mod tests {
         assert_eq!(cont, &GRLDR_MBR[512..]);
         // and the MBR part is exactly the boot-code area
         assert_eq!(&GRLDR_MBR[..MBR_CODE_END].len(), &MBR_CODE_END);
+    }
+
+    /// The 16-sector payload must be sector 0 + the continuation, in one buffer.
+    ///
+    /// This is the fix for a real half-written stick: `commit_boot_sectors` used
+    /// to write the MBR and then the continuation separately, and when the
+    /// second write failed (ERROR_INVALID_PARAMETER, seen live) the first had
+    /// already landed. The BIOS loads only sector 0, so the stick then booted to
+    /// "Missing helper" - the bootloader installed without the code it needs,
+    /// visible only at boot and reversible only from the backup.
+    ///
+    /// One buffer makes that state inexpressible, and these assertions pin the
+    /// layout so the two halves cannot silently swap or shift.
+    #[test]
+    fn boot_sector_payload_is_sixteen_contiguous_sectors() {
+        let mut mbr = valid_mbr();
+        // a recognisable marker in the boot code, so a misplaced copy is visible
+        mbr[7] = 0xA5;
+        let p = boot_sector_payload(&mbr);
+
+        // 16 sectors exactly: the BIOS hands stage1's continuation to itself
+        // from here, and anything past sector 15 risks the first partition.
+        assert_eq!(p.len(), 16 * 512);
+        assert_eq!(p.len(), GRLDR_MBR.len());
+
+        // sector 0 is the merged MBR verbatim - partition table and signature
+        // included, since this is what goes on the disk.
+        assert_eq!(&p[..512], &mbr[..]);
+        assert_eq!(&p[510..512], &[0x55, 0xAA]);
+
+        // sectors 1..15 are the continuation verbatim.
+        assert_eq!(&p[512..], stage1_continuation());
+
+        // Explicitly: the continuation must NOT be grub4dos's sector 0. The
+        // live failure was a write that never landed, but the adjacent hazard
+        // is writing the wrong 7680 bytes; this pins the offset.
+        assert_ne!(&p[512..], &GRLDR_MBR[..7680]);
+    }
+
+    /// A payload write must be one `write_all`, not two.
+    ///
+    /// Source-scraped rather than behavioural because the defect is in the
+    /// number of write calls against a raw device - there is no headless way to
+    /// observe that, and the split write is precisely what produced the
+    /// half-written stick. `commit_boot_sectors` must seek once and write once;
+    /// if a second write reappears, this fails.
+    #[test]
+    fn the_boot_sectors_land_in_a_single_write() {
+        let src = include_str!("nofmt.rs");
+        let fn_start = src
+            .find("pub fn commit_boot_sectors(")
+            .expect("commit_boot_sectors must exist");
+        // Bound by BRACE matching, not by "the next `pub fn`": the next
+        // declaration is a private `fn`, so a pub-based boundary silently ran
+        // the scan through ~800 lines and counted an unrelated write_all.
+        let open = src[fn_start..]
+            .find('{')
+            .map(|i| fn_start + i)
+            .expect("function body must open");
+        let mut depth = 0i32;
+        let mut end = src.len();
+        for (i, b) in src.as_bytes()[open..].iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &src[fn_start..end];
+
+        // Exactly one write_all in the whole function.
+        assert_eq!(
+            body.matches("write_all(").count(),
+            1,
+            "commit_boot_sectors must issue ONE write_all. Two writes can \
+             partially succeed: the first lands, the second fails, and the \
+             stick is left with grub4dos stage1 in the MBR and no continuation \
+             behind it (boots to 'Missing helper')."
+        );
+        // ...and it writes the combined payload, not a single sector.
+        assert!(
+            body.contains("boot_sector_payload(&p.new_mbr)"),
+            "the single write must be the combined 16-sector payload"
+        );
+        assert!(
+            !body.contains("SeekFrom::Start(512)"),
+            "no second seek to the continuation: it is part of the one payload"
+        );
     }
 
     #[test]
