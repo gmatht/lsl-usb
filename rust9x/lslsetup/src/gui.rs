@@ -3444,6 +3444,31 @@ FAT filesystem first, which happens at first boot."
         if use_existing {
             tb.set_enabled(false);
         }
+        // The builder's `.pos(...)` does NOT take effect on this target: traced
+        // live pos=1 with range 1..115 and 86 requested - a value well inside the
+        // range, so this is not Win32 clamping the request. nwg applies it as
+        // TBM_SETPOSNOTIFY, which this Win95-era comctl32 discards silently.
+        // Re-apply through TBM_SETPOS, which does work.
+        //
+        // This is the whole "defaults to 1 GB" bug: `persist_gib_bounds` computed
+        // 86 correctly, the control discarded it, and `sync_persist_readout` then
+        // faithfully reported the control's stale 1 - so the displayed number,
+        // the split line and the value Install harvests were all 1 GiB for a
+        // 116 GB stick. Nothing errored; the number on screen was simply wrong.
+        if !use_existing && gib_default > gib_min {
+            if let Some(h) = tb.handle.hwnd() {
+                use winapi::shared::minwindef::LPARAM;
+                use winapi::um::commctrl::TBM_SETPOS;
+                unsafe {
+                    winapi::um::winuser::SendMessageW(
+                        h,
+                        TBM_SETPOS,
+                        1,
+                        gib_default as LPARAM,
+                    );
+                }
+            }
+        }
         p.push(PageItem { ctl: PageCtl::Track(tb, 0), x: 10, y, w: 400, h: 30, idx: 0 });
         // Live readout of the current value.
         //
@@ -7059,6 +7084,62 @@ mod tests {
         let (lo, hi, d) = persist_gib_bounds(116, 3);
         assert_eq!((lo, hi, d), (1, 112, 84), "a 116 GB stick must not size as 1 GB");
         assert!(d > lo, "the default must be a computed value, not the floor");
+    }
+
+    /// The slider must be told its default position explicitly, via TBM_SETPOS.
+    ///
+    /// This is the other half of the "1 GB instead of 3/4 of the stick" bug, and
+    /// the half that survived the pre-check fix above. That fix made
+    /// `persist_gib_bounds` return the right number - (1, 115, 86) for a 116 GB
+    /// stick - so the arithmetic was provably correct while the pane still
+    /// displayed 1.0 GiB.
+    ///
+    /// The builder's `.pos(...)` is applied by nwg as TBM_SETPOSNOTIFY, and the
+    /// Win95-era comctl32 this binary targets discards that call: the control
+    /// stayed at its initial position of 1. Traced directly - range 1..115,
+    /// requested 86, live pos 1 - so this is not Win32 clamping a value that
+    /// fell outside the range. `sync_persist_readout` then read the control's
+    /// stale 1 and faithfully rendered it, and the same value is what Install
+    /// harvests.
+    ///
+    /// Asserted on the source because the failure lives in a Win32 message that
+    /// a headless test cannot observe: there is no way to ask "did this control
+    /// accept its position" without a live trackbar. What is checkable is that
+    /// the pane still does the thing - a `TBM_SETPOS` in the builder's
+    /// neighbourhood - so a refactor that drops it is caught here rather than by
+    /// a user staring at a slider.
+    #[test]
+    fn the_slider_is_told_its_default_position_explicitly() {
+        let src = include_str!("gui.rs");
+        let pane = src
+            .find("pub(crate) fn build_persist_page(")
+            .expect("build_persist_page must exist");
+        // The trackbar builder and the position fix sit close together; bound
+        // the search so a TBM_SETPOS elsewhere in the file cannot satisfy it.
+        let rest = &src[pane..];
+        let end = rest
+            .find("pub fn run_gui(")
+            .map(|i| pane + i)
+            .unwrap_or(src.len());
+        let region = &src[pane..end];
+
+        assert!(
+            region.contains(".pos(Some(gib_default))"),
+            "the builder should still request the computed default"
+        );
+        assert!(
+            region.contains("TBM_SETPOS"),
+            "the builder's position is discarded by this comctl32, so the pane \
+             must re-apply it with TBM_SETPOS. Without this the slider keeps its \
+             initial 1 and the pane reports 1.0 GiB for a 116 GB stick."
+        );
+        // And the value being applied must be the computed default, not a
+        // literal - a hardcoded position would pass the check above while
+        // ignoring the stick entirely.
+        assert!(
+            region.contains("gib_default as LPARAM"),
+            "the applied position must be the computed default"
+        );
     }
 
     /// The INSTALL page must name the selected stick and its usage, not just point

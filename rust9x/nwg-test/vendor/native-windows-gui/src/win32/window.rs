@@ -8,7 +8,7 @@ use winapi::shared::windef::{HWND, HMENU, HBRUSH};
 use winapi::shared::basetsd::{DWORD_PTR, UINT_PTR};
 use winapi::um::winuser::{WNDPROC, NMHDR, IDCANCEL, IDOK};
 use winapi::um::commctrl::{NMTTDISPINFOW, SUBCLASSPROC};
-use super::base_helper::{CUSTOM_ID_BEGIN, to_ansi, from_ansi, to_utf16};
+use super::base_helper::{CUSTOM_ID_BEGIN, from_ansi, to_utf16};
 use super::window_helper::{NOTICE_MESSAGE, NWG_INIT, NWG_TRAY, NWG_TIMER_TICK, NWG_TIMER_STOP};
 use super::high_dpi;
 use crate::controls::ControlHandle;
