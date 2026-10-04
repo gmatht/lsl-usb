@@ -82,6 +82,7 @@ TASK_ORDER = [
     ("wifi", "Stage Wi-Fi"),
     ("network", "Wait for network"),
     ("flatpak", "Install Flatpaks"),
+    ("snap", "Install Snaps"),
     ("packages", "Install packages"),
     ("layer", "Pack USB layer"),
     ("home", "Back up home"),

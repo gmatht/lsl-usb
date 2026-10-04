@@ -36,7 +36,7 @@ TS="$(date +%Y%m%d%H%M%S)"
 # done, and how far through the current task we are. Single source of truth
 # is $STATUS (a small key=value file in /run, world-readable so the user
 # session can poll it). KEEP IN SYNC with misc/lsl-progress-gtk.py TASK_ORDER.
-LSL_TASKS="stick:Find USB stick|wifi:Stage Wi-Fi|network:Wait for network|flatpak:Install Flatpaks|packages:Install packages|layer:Pack USB layer|home:Back up home|done:Finish & reboot"
+LSL_TASKS="stick:Find USB stick|wifi:Stage Wi-Fi|network:Wait for network|flatpak:Install Flatpaks|snap:Install Snaps|packages:Install packages|layer:Pack USB layer|home:Back up home|done:Finish & reboot"
 LSL_PHASE="starting"
 LSL_TASK="stick"
 LSL_DONE=""
@@ -687,6 +687,34 @@ install_flatpaks_fat() {
     log "Flatpak FAT install done (installation 'lsl-fat', backing /cdrom/flatpak)."
 }
 
+# Snaps listed in /cdrom/snaps.txt, installed on demand and cached on the stick.
+#
+# snapd is already installed (squashfs_config.sh removes Mint's nosnap.pref), but
+# its state (/var/lib/snapd, /var/snap) lives on the casper RAM overlay, so every
+# installed snap is gone after a reboot. This step re-installs whatever the list
+# names; lsl-snap-fat.sh keeps each .snap on the stick so later boots install
+# from disk instead of re-downloading.
+#
+# The payload stays on FAT rather than in the squashfs layer for the same reason
+# flatpaks do (see install_flatpaks_fat above): the layer is a single file and
+# would hit the FAT32 4 GiB ceiling. Runs host-side, after the network wait,
+# and is best-effort - a snap failure must never fail the boot.
+ensure_snaps_fat() {
+    [ -r /cdrom/snaps.txt ] || return 0
+    [ "${LSL_SNAP_FAT:-1}" != "0" ] || { log "Snaps disabled by LSL_SNAP_FAT=0."; return 0; }
+    if [ ! -r /cdrom/bin/lsl-snap-fat.sh ]; then
+        log "WARNING: /cdrom/bin/lsl-snap-fat.sh missing - skipping snaps."
+        return 0
+    fi
+    log "Installing the snaps listed in /cdrom/snaps.txt (cached on the stick)..."
+    # Gate on -r and invoke via bash: casper mounts the FAT stick without exec
+    # bits, so direct exec fails even though `bash script` works (same as onboot).
+    bash /cdrom/bin/lsl-snap-fat.sh ensure >>"$LOG" 2>&1 || \
+        log "WARNING: snap install step returned non-zero (continuing)."
+    task_progress 100 "Snaps done"
+    log "Snap step finished."
+}
+
 # Background progress monitor: while uproot runs, the main script is blocked
 # waiting, so this is the sole STATUS writer. It tails the firstboot log for
 # LSL_STEP n/m + LSL_TASK markers (emitted by uproot / squashfs_config.sh)
@@ -844,6 +872,7 @@ monitor_uproot_progress() {
 if [ ! -r "$UPROOT" ]; then
     log "$UPROOT missing - nothing to install/persist. Stamping anyway."
     task_done flatpak 2>/dev/null || true
+    task_done snap 2>/dev/null || true
     task_done packages 2>/dev/null || true
     task_done layer 2>/dev/null || true
     task_begin "done" "Nothing to install — finishing…" 2>/dev/null || true
@@ -856,6 +885,9 @@ fi
 
 install_flatpaks_fat
 task_done flatpak
+task_begin snap "Installing Snaps…"
+ensure_snaps_fat
+task_done snap
 task_begin packages "Starting package install…"
 
 # Every attempt starts with a sane chain: drop corrupt/partial layers from

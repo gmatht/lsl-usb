@@ -101,8 +101,14 @@ case "$ARCH" in
 esac
 
 # Enable snap support: Mint ships /etc/apt/preferences.d/nosnap.pref which blocks
-# snapd. lsl's Windows installer can preload .snap files onto the USB
-# (/cdrom/snaps/), so remove the pin and install snapd to allow offline installs.
+# snapd. Remove the pin and install snapd so `snap install` works.
+#
+# This does NOT preload snaps. The installer writes only the LIST of wanted snap
+# names to /cdrom/snaps.txt; the stick downloads them itself on first boot and
+# caches each .snap under /cdrom/casper/snapcache, so nothing bulky is baked into
+# the squashfs layer (which is one file and would hit the FAT32 4 GiB ceiling).
+# See bin/lsl-snap-fat.sh and misc/lsl-firstboot.sh (ensure_snaps_fat).
+#
 # Set LSL_SNAP_SUPPORT=0 to keep Mint's default (no snaps).
 echo "LSL_STEP 5/9 snap support"
 if [ "$ARCH" = "amd64" ] && [ "${LSL_SNAP_SUPPORT:-1}" != "0" ]; then

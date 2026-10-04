@@ -20,6 +20,9 @@ pub struct Opts {
     pub skip_verify: bool,      // skip the post-copy ISO re-read (default off: faster, less safe)
     pub wsl_vhdx: Vec<String>,
     pub flatpak_apps: Vec<String>,
+    /// Extra snap NAMES (not ids) to stage into snaps.txt. Repeatable. Only
+    /// names are stored - the stick downloads the snaps itself on first boot.
+    pub snap_apps: Vec<String>,
     pub extra_isos: Vec<String>,
     pub skip_iso_download: bool,
     pub skip_rufus: bool,
@@ -86,6 +89,7 @@ impl Default for Opts {
             skip_verify: false,
             wsl_vhdx: Vec::new(),
             flatpak_apps: Vec::new(),
+            snap_apps: Vec::new(),
             extra_isos: Vec::new(),
             // Persistence: empty backend = "leave lsl-usb.env alone", so the
             // headless default does NOT overwrite a hand-edited LSL_PERSIST.
@@ -154,6 +158,11 @@ Options:
   --volume-label <label>     USB volume label to target
   --wsl-vhdx <path>          Extra WSL VHDX path (repeatable)
   --flatpak-apps <id>        Extra flatpak app id (repeatable)
+  --snap-apps <name>         Extra snap NAME (repeatable). Only the names are
+                             written to snaps.txt; the stick downloads each snap
+                             on first boot, keeps it (with its assertion) in its
+                             own cache, and on later boots installs VERIFIED from
+                             that cache with `snap ack` + `--offline`.
   --extra-iso <path>         Extra ISO to add as a loopback-only boot entry
                              (repeatable; no firstboot, no squashfs unpack -
                              the primary --iso-path keeps firstboot)
@@ -231,6 +240,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--skip-verify" => o.skip_verify = true,
             "--wsl-vhdx" => o.wsl_vhdx.push(next()?),
             "--flatpak-apps" => o.flatpak_apps.push(next()?),
+            "--snap-apps" => o.snap_apps.push(next()?),
             "--extra-iso" => o.extra_isos.push(next()?),
             "--skip-iso-download" => o.skip_iso_download = true,
             "--skip-rufus" => o.skip_rufus = true,
@@ -323,6 +333,30 @@ mod tests {
         assert!(o.fast_startup_off);
         assert!(o.preload_rust_tools);
         assert_eq!(o.extra_isos, vec!["D:\\a.iso".to_string(), "D:\\b.iso".to_string()]);
+    }
+
+    #[test]
+    fn snap_apps_flag_is_repeatable_and_defaults_empty() {
+        // Snaps are opt-in: an empty default must not stage a snaps.txt.
+        let o = parse(&args(&[])).unwrap();
+        assert!(o.snap_apps.is_empty());
+        let o = parse(&args(&[
+            "--snap-apps", "spotify", "--snap-apps", "code", "--snap-apps", "vlc",
+        ]))
+        .unwrap();
+        assert_eq!(
+            o.snap_apps,
+            vec!["spotify".to_string(), "code".to_string(), "vlc".to_string()]
+        );
+    }
+
+    #[test]
+    fn snap_apps_values_are_kept_verbatim() {
+        // Snap names are case- and hyphen-sensitive ("obs-studio", not
+        // "OBS Studio"): normalising here would produce a name snapd has never
+        // heard of, and the failure would only surface on the stick.
+        let o = parse(&args(&["--snap-apps", "OBS-Studio"])).unwrap();
+        assert_eq!(o.snap_apps, vec!["OBS-Studio".to_string()]);
     }
 
     #[test]

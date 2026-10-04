@@ -936,6 +936,45 @@ pub fn flatpak_suggestions() -> Vec<(String, String, bool)> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Snap suggestions (Get-SnapSuggestions)
+//
+// Same shape as FLATPAK_MAP on purpose, so the wizard page can render both
+// grids from one loop. Only snaps that actually exist in the Snap Store are
+// listed - unlike flatpak there is no free-text escape hatch here, because
+// `snap install` will just fail on a name the store has never heard of.
+//
+// The snap NAME is what lands in snaps.txt; nothing is downloaded on the
+// Windows side (see DESIGN-SNAP-PERSISTENCE.md and bin/lsl-snap-fat.sh).
+// ---------------------------------------------------------------------------
+pub const SNAP_MAP: &[(&str, &str)] = &[
+    ("Slack", "slack"),
+    ("Discord", "discord"),
+    ("Spotify", "spotify"),
+    ("Visual Studio Code", "code"),
+    ("Telegram", "telegram-desktop"),
+    ("Zoom", "zoom-client"),
+    ("Obsidian", "obsidian"),
+    ("GIMP", "gimp"),
+    ("Inkscape", "inkscape"),
+    ("Blender", "blender"),
+    ("OBS", "obs-studio"),
+    ("VLC", "vlc"),
+    ("Steam", "steam"),
+];
+
+pub fn snap_suggestions() -> Vec<(String, String, bool)> {
+    let installed = crate::detect::installed_app_names();
+    let ilc: Vec<String> = installed.iter().map(|s| s.to_lowercase()).collect();
+    SNAP_MAP
+        .iter()
+        .map(|(m, name)| {
+            let matched = ilc.iter().any(|s| s.contains(&m.to_lowercase()));
+            (m.to_string(), name.to_string(), matched)
+        })
+        .collect()
+}
+
 #[allow(unused)]
 fn unused_out() {
     out::plain("");

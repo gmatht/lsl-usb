@@ -1,11 +1,19 @@
 # DESIGN — Persisting snaps on the stick
 
-**Status:** design only. No code written. Every claim about the tree is
-line-referenced; every claim about snapd's layout is from its own documentation and
-checked against this running system.
+**Status:** IMPLEMENTED, in the on-demand + lazy-cache form. Superseded in part
+by this document's own §9. Every claim about the tree is line-referenced.
 
 **Question:** how do we permanently install snaps on the stick, so they survive a
 reboot?
+
+**Answer (shipped):** the stick stores a small **list** of snap names
+(`/cdrom/snaps.txt`) plus a lazy **cache** of the `.snap` payloads under
+`/cdrom/casper/snapcache/`. `snapd` installs them on first boot from that cache
+(or from the store, once), and each is cached so later boots install from disk
+instead of re-downloading. snapd's own state is deliberately **not** made
+persistent — see §9 for why the FAT objection below is stale and what actually
+blocks it. Making snapd's state persistent remains Option B/F2FS, and is
+machine-local.
 
 **Companion:** `DESIGN-PERSISTENCE-PANE.md` (the wizard page), `DESIGN-F2FS-PERSISTENCE.md`
 (a real persistent filesystem — the only option that scales), `WHY_FAIL.md` (the
@@ -135,13 +143,11 @@ Keep the bulk on a real filesystem and bind it into place before `snapd` starts:
 
 | backing | capacity | survives | notes |
 |---|---|---|---|
-| **FAT (`/cdrom/snapd`)** | stick size | reboot, and travels with the stick | FAT has no permissions/ownership, no symlinks — **snapd stores symlinks and expects ownership**; high risk |
+| **FAT (`/cdrom/snapd`)** | stick size | reboot, and travels with the stick | ~~FAT has no permissions/ownership, no symlinks~~ — **see §9: this objection is stale.** The FUSE meta-layer supplies all of it. Blocked for other reasons. |
 | **F2FS partition** (`DESIGN-F2FS-PERSISTENCE.md`) | partition size | reboot | a real POSIX filesystem; **the only option that is actually correct** |
 
-**FAT is the tempting choice and probably wrong.** snapd's state includes symlinks
-(`/snap/<name>/current`) and files it expects to own. FAT cannot represent either.
-That is a strong argument that snap persistence belongs **after** the F2FS work,
-not before it.
+**FAT is the tempting choice and the reasoning here was wrong** — see §9. snapd's
+state does not belong on FAT, but not for the reason given above.
 
 ### Option B — a btrfs image on the data dir (works today, machine-local)
 
@@ -267,6 +273,100 @@ feature. Everything above is unverified.
 
 ---
 
+## 9. What actually shipped, and the correction to §3/§4
+
+**Status: implemented** (see `bin/lsl-snap-fat.sh`, `misc/lsl-firstboot.sh`
+`ensure_snaps_fat`, `src/lslfiles.rs` `write_snap_list`, `src/hardware.rs`
+`SNAP_MAP`).
+
+### The correction
+
+**The FAT objection in §3/§4 above is stale, and it was wrong.** It rejects FAT
+for snapd's state because "FAT has no permissions/ownership, no symlinks". That
+was true when written. It is no longer true, and the reason it stopped being
+true is *in this same repo*:
+
+`fuse/fat_linux_meta_fs.py` is a FUSE passthrough that stores mode/uid/gid,
+symlinks, hardlinks, FIFOs and device nodes in a sidecar JSON file, because the
+underlying FAT cannot (`fat_linux_meta_fs.py:3, 13-15, 1033, 1057, 1073, 1089,
+1128`). It is what makes the flatpak-on-FAT scheme in §3 work at all. So
+"can this filesystem express it?" has already been answered *yes* for this
+filesystem — the question was asked of bare FAT when the question should have
+been asked of the FUSE layer above it.
+
+The conclusion (don't put snapd's state on FAT) still holds. The reasons are
+different, and they are about *concurrency and mounting*, not representation:
+
+1. **Locking.** `fat_linux_meta_fs.py:886-892` — `lock()` is an intentional
+   no-op: *"Advisory locks are a no-op here... Correct for our single-writer
+   flows (builder fetch, firstboot install): never run two writers against the
+   same backing tree concurrently."* snapd is **not** single-writer — snapd,
+   snap-confine, AppArmor and the store client all touch its state. An unlocked
+   multi-writer on a sidecar-JSON metadata store is corruption, not slowness.
+2. **Loop mounts.** snapd `squashfs`-loop-mounts the `.snap` files out of its
+   state directory on every refresh. The backing file is a FUSE passthrough, and
+   squashfs over a FUSE fd is not a reliable loop source.
+3. **Mount ordering.** `/snap/<name>/current` is a symlink that must resolve
+   *after* the bind, and `snapd.service` must not start first or it will
+   populate a fresh RAM state dir that the bind then shadows. This is the
+   `Before=snapd.service` requirement in §4, still unproven.
+
+So the rule at the end of this document needs a correction of its own: the
+representability question is real, but **it was already answered, and the
+question that actually decides is whether the filesystem can support the
+access pattern the daemon uses** — concurrent writers, loop mounts, mount
+ordering.
+
+### The design that shipped
+
+Not a persistent state dir at all. snapd was **already installed**
+(`bin/squashfs_config.sh:103-112` removes Mint's `nosnap.pref`), so the only
+missing pieces were *which* snaps, and re-applying that list each boot.
+
+| what persists | where | size |
+|---|---|---|
+| the list of wanted snaps | `/cdrom/snaps.txt` | a few hundred bytes |
+| the `.snap` payloads | `/cdrom/casper/snapcache/` | only for snaps actually used, only after first use |
+
+- `/cdrom/casper/`, **not** `/cdrom/` — `onboot.sh:256` remounts `/cdrom`
+  read-only, and on iso-scan boots `/cdrom` is the ISO loop while
+  `/cdrom/casper` is the bind-mounted writable stick. Same reason
+  `lsl-appimages.sh` uses `/cdrom/casper/appimages`.
+- A `.snap` is a plain file, written once and read back. No symlinks, no state
+  dir, no loop mount off FAT. The 4 GiB FAT32 single-file cap does not apply —
+  it applies to the squashfs *layer* (§2), which is why flatpaks and snaps both
+  stay off it.
+- **Lazy**: nothing is written until a snap is actually used, so a fresh stick is
+  still empty, and only the *first* use pays the download.
+- `bin/lsl-snap-fat.sh ensure` is idempotent — it skips anything already in
+  `snap list`, so a snap the user deliberately removed stays removed.
+
+### Costs, honestly
+
+- **Installed snaps live on `/cow/upper`, which is tmpfs** — i.e. RAM, not the
+  stick (`FINDINGS-USB-WRITE-PERFORMANCE.md:81`). 1-2 GB of snaps is 1-2 GB of
+  RAM for the life of the session.
+- A snap is **300-700 MB**, plus base snaps snapd pulls as dependencies. On a
+  cache miss this is download-bound every time the cache is lost.
+- **A cached snap is installed VERIFIED.** `snap ack` registers the cached
+  `<name>_<rev>.snap.assert`, then `snap install --offline` verifies the snap
+  against it — no store contact, full signature checking. Both files come from
+  `snap download --revision=N <name>`, pinned to the revision actually
+  installed, so the pair cannot disagree. (This is why caching re-fetches with
+  `snap download` instead of copying out of `/var/lib/snapd/snaps/`: snapd keeps
+  assertions in a content-hashed DB under `/var/lib/snapd/assertions/` with no
+  name link back to the snap, so the `.assert` is not recoverable from the state
+  dir.) `--dangerous` remains only as a degraded fallback for a cache written
+  before this existed, and says so in the log when it is used.
+
+### Still not done
+
+Option B/F2FS — making snapd's *own* state persistent — is untouched, and is
+still the only answer that survives many snaps without re-downloading anything.
+It is machine-local, which is why it was not done here.
+
+---
+
 ## The rule worth keeping
 
 > **Find the precedent before inventing the mechanism.** Flatpaks had this exact
@@ -277,12 +377,17 @@ feature. Everything above is unverified.
 > solved it first.
 
 > **A comment describing a capability is not the capability.** `squashfs_config.sh:104`
-> says the installer "can preload .snap files onto the USB (`/cdrom/snaps/`)". It
-> cannot — nothing writes that directory, and nothing installs from it. The comment
-> is an intent that was never implemented, and it reads as a description of working
-> code. Verify the thing a comment claims exists.
+> said the installer "can preload .snap files onto the USB (`/cdrom/snaps/`)". It
+> could not — nothing wrote that directory and nothing installed from it. The
+> comment has now been corrected to say what actually happens (a *list* is written;
+> the stick fetches the payloads on first use). Verify the thing a comment claims
+> exists, and fix the comment when you implement or refute it.
 
-> **Check the filesystem can represent what you are storing.** FAT cannot hold
-> symlinks or ownership; snapd's state needs both. The capacity question ("is there
-> room?") is the one people ask; the representability question ("can this filesystem
-> express it?") is the one that decides.
+> **Ask whether the filesystem can express it, and then whether it can support the
+> access pattern — in that order.** The first version of this document rejected
+> FAT on expressibility grounds and was wrong, because a FUSE layer in the same
+> repo had already answered it. The real blockers were concurrency (a no-op
+> `lock()`), loop mounts, and mount ordering — none of which are expressibility
+> questions. Note also that the cheapest answer to "how do we persist X" may be to
+> persist X's *manifest* and let the machine refetch X once, rather than
+> persisting X itself.
