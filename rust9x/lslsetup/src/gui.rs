@@ -132,21 +132,23 @@ pub const PERSIST_DEFAULT: &str = "squashfs";
 /// both fit with any headroom.
 pub const PERSIST_GIB_MIN: usize = 1;
 
-/// Ceiling on the FAT side, GiB — a constraint on the **other** partition, so it
-/// deliberately does NOT appear in the slider's arithmetic.
-///
-/// Windows has historically refused to format FAT32 past 32 GB (Explorer and
-/// every non-Insider build still enforce it), so the stick's FAT partition is at
-/// MOST this. That makes 32 a ceiling on FAT, i.e. a FLOOR of `total - 32` on
-/// persistence — **not a cap on persistence**. Reading it the other way round
-/// (as an earlier draft did) made a 128 GB stick offer at most 96 GB of
-/// persistence and silently wasted the rest of the device.
-///
-/// It binds when the stick is large relative to its image: a 128 GB stick
-/// holding a 3 GB ISO wants only ~4 GB of FAT, well under the ceiling, so the
-/// whole remainder is legitimately available. A stick holding a ~100 GB image
-/// cannot fit FAT at all under this rule, and that is where the ceiling bites.
-pub const FAT_MAX_GIB: u32 = 32;
+// NOTE: Windows has historically refused to format FAT32 past 32 GB (Explorer
+// and every non-Insider build still enforce it), so the stick's FAT partition
+// would be at most that - which makes 32 a FLOOR of `total - 32` on persistence,
+// NOT a cap on persistence. Reading it the other way round (as an earlier draft
+// did) made a 128 GB stick offer at most 96 GB of persistence and silently
+// wasted the rest of the device.
+//
+// This is recorded here rather than as a constant because it is NOT enforced:
+// `persist_gib_bounds` below derives its maximum from the space left after the
+// ISO and kernel, with no FAT ceiling term at all. The consequence is that a
+// large image on a large stick can be offered a persistence size that leaves
+// more than 32 GB of FAT, which Windows then cannot format. That is a real gap
+// in the sizing rule, not a deliberate omission - it needs a decision about
+// where the ceiling belongs (a floor on the slider range, or a check at write
+// time), and no such decision is recorded in the design docs this pane cites.
+// Do not reintroduce it as a `max` on the slider: that is the reading the doc
+// above exists to forbid.
 
 /// Slider bounds and default for a stick of `total_gib` GiB holding an ISO of
 /// `iso_gib` GiB, per the rules the design was corrected to state:
@@ -465,21 +467,23 @@ fn sync_persist_readout(items: &PageItems) {
     }
 }
 
-/// The stick size the split line is computed against.
-///
-/// The pane is rebuilt once the INSTALL page has a target (see rebuild), so the
-/// division shown is that target's size. Until then this is the largest
-/// candidate, which is only used to render a line the user has not chosen yet.
+// The stick size the split line is computed against.
+//
+// The pane is rebuilt once the INSTALL page has a target (see rebuild), so the
+// division shown is that target's size. Until then this is the largest
+// candidate, which is only used to render a line the user has not chosen yet.
+// (`//` not `///`: thread_local! is a macro invocation, and rustdoc does not
+// generate documentation for macro-produced items.)
 thread_local! {
     static PERSIST_SPLIT_TOTAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// The drive letter the persistence pane is sizing against.
-///
-/// Set from the INSTALL page's target radio whenever that page is built or
-/// rebuilt, and read when the persistence pane is (re)built. Both pages are in
-/// one window, so a thread-local is enough to pass the choice between them
-/// without threading it through every builder.
+// The drive letter the persistence pane is sizing against.
+//
+// Set from the INSTALL page's target radio whenever that page is built or
+// rebuilt, and read when the persistence pane is (re)built. Both pages are in
+// one window, so a thread-local is enough to pass the choice between them
+// without threading it through every builder.
 thread_local! {
     static PERSIST_TARGET: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
@@ -799,17 +803,25 @@ pub(crate) fn build_install_page(
     iy += 22;
     // The target radios themselves now live on the PERSISTENCE page (kind 4),
     // because the persistence size is derived from the chosen stick - which the
-    // picker cannot be downstream of. Draw a pointer at their real location, so
-    // the two pages can never disagree about which device is selected.
+    // picker cannot be downstream of.
+    //
+    // So state the SELECTION here rather than just pointing elsewhere: the whole
+    // install writes to this device, and the page that owns the control should
+    // still say which one. The figures are the volume's own total/free, which is
+    // what "39/128 GB used" means - it is NOT the persistence split (that lives
+    // on the persistence page, sized from the same stick).
+    //
+    // Kind 3 marks it as the live target line, rewritten by refresh_target_line()
+    // whenever the target changes.
     {
         let mut ptr: Box<nwg::Label> = Box::default();
         let _ = nwg::Label::builder()
-            .text(&crate::locale::tr("  (chosen on the PERSISTENCE page)"))
+            .text(&target_usage_text(selected_target_from(persist_items).as_deref()))
             .position((26, iy))
-            .size((560, 20))
+            .size((660, 20))
             .parent(frame_install)
             .build(&mut ptr);
-        items.push(PageItem { ctl: PageCtl::Lbl(ptr, 0), x: 26, y: iy, w: -20, h: 20, idx: 0 });
+        items.push(PageItem { ctl: PageCtl::Lbl(ptr, 3), x: 26, y: iy, w: -20, h: 20, idx: 0 });
         iy += 24;
     }
     // write-method radios (kind 3): one group, exactly one checked.
@@ -2024,7 +2036,13 @@ fn relayout(c: &LayoutCtx, cw: i32, ch: i32) {
     c.lbl_sb.set_text(&wrap_text(c.sb_text, sb_per_line));
     c.lbl_sb.set_position(MARGIN, 10);
     c.lbl_sb.set_size(fw as u32, sb_h as u32);
-    for f in [c.frame_hw, c.frame_iso, c.frame_fp, c.frame_sys, c.frame_wifi, c.frame_install] {
+    // frame_persist belongs here too: the PERSISTENCE page is a normal scrollable
+    // page, but it was missing from this list, so on a window resize it kept the
+    // size it was BUILT at while its items were laid out for the new width -
+    // labels clipped against the old frame, and the scrollbar could not fill the
+    // space the other pages got. Its items ARE already laid out here (see the
+    // `pages` array below), so only the frame itself was being left behind.
+    for f in [c.frame_hw, c.frame_iso, c.frame_fp, c.frame_sys, c.frame_persist, c.frame_wifi, c.frame_install] {
         f.set_position(MARGIN, top);
         f.set_size(fw as u32, fh.max(60) as u32);
     }
@@ -3288,7 +3306,7 @@ pub(crate) fn build_persist_page(
         // A local label helper: the system page's `push_lbl` closure is scoped
         // inside that page's own block and captures `frame_sys`, so it cannot be
         // reused here.
-        let mut push_lbl = |items: &mut Vec<PageItem>, text: &str, x: i32, yy: i32, w: i32, h: i32, kind: u8| {
+        let push_lbl = |items: &mut Vec<PageItem>, text: &str, x: i32, yy: i32, w: i32, h: i32, kind: u8| {
             let mut lb: Box<nwg::Label> = Box::default();
             let _ = nwg::Label::builder()
                 .text(text)
@@ -5027,6 +5045,10 @@ pub fn run_gui(
             // A rebuild resets every control to its default, which would silently
             // discard the backend the user picked.
             restore_persist_choices(&persist_items_c, keep.0, keep.1);
+            // The install page names the selected stick and how full it is, so it
+            // has to be re-read after the picker changed - otherwise it keeps
+            // describing the previous device.
+            refresh_target_line(&install_items_c);
         }
 
         match event {
@@ -5937,6 +5959,66 @@ fn reconcile_target(requested: Option<&str>, picked: Option<&str>) -> Option<Str
     match (requested, picked) {
         (Some(r), Some(p)) if r != p => Some(r.to_string()),
         (r, p) => p.or(r).map(str::to_string),
+    }
+}
+
+/// The INSTALL page's line naming the selected target and how full it is:
+/// `D: "Lexar" FAT32 - 39.0/128.0 GB used (89.0 GB free) - choose on the
+/// PERSISTENCE page`.
+///
+/// This replaces a bare "(chosen on the PERSISTENCE page)" pointer. The install
+/// writes to this device, so the page that hosts the write options should still
+/// say which one, and how much room is on it - "39/128 GB used" is the figure
+/// that tells the user whether their image will even fit, and it is the same
+/// total/free the persistence page sizes from, so the two pages cannot disagree.
+///
+/// When no target can be resolved it says so rather than printing a division of
+/// nothing.
+pub fn target_usage_text(letter: Option<&str>) -> String {
+    let Some(letter) = letter else {
+        return "No target USB selected yet - choose one on the PERSISTENCE page.".to_string();
+    };
+    let Some(v) = crate::sys::list_volumes()
+        .into_iter()
+        .find(|v| v.letter.eq_ignore_ascii_case(letter))
+    else {
+        return format!(
+            "{}: selected on the PERSISTENCE page (size unavailable - plug it in again to re-read)",
+            letter.to_uppercase()
+        );
+    };
+    let gb = sys::GB as f64;
+    let total = v.total as f64 / gb;
+    let used = (v.total.saturating_sub(v.free)) as f64 / gb;
+    let free = v.free as f64 / gb;
+    let label = if v.label.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\"{}\" ", v.label.trim())
+    };
+    format!(
+        "{}: {}{} - {:.1}/{:.1} GB used ({:.1} GB free) - change on the PERSISTENCE page",
+        v.letter.to_uppercase(),
+        label,
+        v.fs,
+        used,
+        total,
+        free
+    )
+}
+
+/// Rewrite the INSTALL page's target line (kind 3) for the current selection.
+///
+/// Called after a target click. A static string there went stale the moment the
+/// picker changed, leaving the page claiming a stick the install was not using.
+pub fn refresh_target_line(items: &PageItems) {
+    let text = target_usage_text(selected_target_from(items).as_deref());
+    for it in items.borrow().iter() {
+        if let PageCtl::Lbl(lb, 3) = &it.ctl {
+            if lb.text() != text {
+                lb.set_text(&text);
+            }
+        }
     }
 }
 
@@ -6977,6 +7059,49 @@ mod tests {
         let (lo, hi, d) = persist_gib_bounds(116, 3);
         assert_eq!((lo, hi, d), (1, 112, 84), "a 116 GB stick must not size as 1 GB");
         assert!(d > lo, "the default must be a computed value, not the floor");
+    }
+
+    /// The INSTALL page must name the selected stick and its usage, not just point
+/// at another page.
+///
+/// It used to read "  (chosen on the PERSISTENCE page)", which told the user
+/// nothing about the device the install is about to write to - the one fact they
+/// most need on the page that hosts the write options. It now reads like
+/// `D: "Lexar" FAT32 - 39.0/128.0 GB used (89.0 GB free) - change on the
+/// PERSISTENCE page`.
+///
+/// The figure is the VOLUME's own used/total, not the persistence split: the
+/// split is derived from this same stick but is chosen on the persistence page,
+/// and mixing the two would show a number that looks like a partition that does
+/// not exist yet.
+#[test]
+    fn the_install_page_names_the_target_and_its_usage() {
+        // No target resolved -> say so, never print a division of nothing.
+        let none = target_usage_text(None);
+        assert!(none.contains("No target"), "unresolved target: {none}");
+        assert!(
+            !none.contains('/'),
+            "an unresolved target must not print used/total: {none}"
+        );
+        // A letter no longer present must not be presented as if it were.
+        let gone = target_usage_text(Some("Z"));
+        assert!(gone.contains('Z'), "a missing volume still names its letter: {gone}");
+        assert!(
+            gone.contains("unavailable"),
+            "a missing volume must admit the size is unknown: {gone}"
+        );
+    }
+
+    /// The target line must follow the selection, not go stale like the pointer
+    /// did. `refresh_target_line` exists for that, and the deferred rebuild calls
+    /// it; assert the wiring so a future refactor cannot drop it.
+    #[test]
+    fn the_target_line_is_refreshed_after_the_picker_changes() {
+        let src = include_str!("gui.rs");
+        assert!(
+            src.contains("refresh_target_line(&install_items_c)"),
+            "the install page's target line must be re-read when the picker changes"
+        );
     }
 
     #[test]
