@@ -147,7 +147,16 @@ fi
 # VERIFY the filesystem actually shrank. This is the check the design says any
 # implementation of this path must have, because the alternative is a filesystem
 # claiming more than its partition - which mounts cleanly and then fails later.
-bpb_sectors="$(dd if="$fat_part" bs=1 skip=19 count=4 2>/dev/null | od -An -tu4 | tr -d ' ')"
+#
+# OFFSET 32, NOT 19. The FAT BPB layout is:
+#     0   jmp / OEM name        11  bytes/sector      13 sectors/cluster
+#     19  volume serial number  32  TOTAL SECTORS     36  sectors per FAT
+# Offset 19 is a random 32-bit ID fixed at mkfs time; reading it here returned a
+# constant (16252928) for filesystems of every size, so the check compared a
+# volume ID against a partition size and could never mean anything. Measured on
+# a 512 MiB image: offset 19 = 16252928 (constant), offset 32 = 1048572 (the
+# file's real size, and the value that moves when fatresize runs).
+bpb_sectors="$(dd if="$fat_part" bs=1 skip=32 count=4 2>/dev/null | od -An -tu4 | tr -d ' ')"
 if [ -z "$bpb_sectors" ]; then
     die "could not read the FAT BPB sector count from $fat_part"
 fi

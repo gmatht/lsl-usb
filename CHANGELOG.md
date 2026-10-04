@@ -9,6 +9,143 @@ Four open proposals closed. `FINDINGS-COMPRESSION.md`, `TODO.md` and
 
 ### Added
 
+- **F2FS persistence now actually creates its partition (P1b).** Choosing F2FS
+  on the PERSISTENCE page used to write `LSL_PERSIST=f2fs` and then do nothing:
+  nothing in the tree ever created a partition, so every boot fell back to a
+  RAM upper and `/home` silently did not persist. `bin/lsl-f2fs-resize` had
+  been written for exactly this and had zero callers.
+  - **Windows writes only the intent.** Creating the partition means *shrinking*
+    the stick's FAT partition, and Windows has no API for that (Shrink Volume
+    is greyed out; diskpart refuses), so `lslsetup` cannot do it. Instead it
+    appends `casper/initrd.f2fs.gz` to the boot entry and puts
+    `lsl_f2fs_provision=<GiB>` on the kernel cmdline — the size has to travel
+    there because `lsl-usb.env` lives on the very medium being repartitioned.
+  - **The initrd does the work on first boot.**
+    `initramfs/lsl_f2fs_provision.sh` shrinks the FAT filesystem, shrinks the
+    partition, adds the second and formats it f2fs — then
+    `zz_lsl_f2fs_scrub` (already shipped) cleans it, which is why the two are
+    carried in one initrd and sourced in that order.
+  - **Order is load-bearing and verified twice.** The filesystem must shrink
+    before the partition, or the filesystem outlives its partition: it mounts
+    clean and then fails past the boundary. And `fatresize` was measured to
+    exit 0 while changing nothing, so the BPB is re-read and compared rather
+    than trusting the exit code.
+  - **It refuses rather than guesses.** Before writing a byte it requires the
+    boot medium unmounted, identified *by content* (never by assuming
+    `/dev/sda`), and unpinned by any loopback; and it never reshapes a stick
+    that already has a Linux partition. Every failure is a logged no-op, so
+    the worst case is "no persistence", never a broken stick.
+  - **Tools come from the ISO's own rootfs** (`scripts/extract-f2fs-tools.sh`
+    → `sfdisk`/`fatresize`/`mkfs.f2fs` + `ldd` closure, unpacked to `/run` at
+    boot by `initramfs/lsl-f2fs-tools.sh`). No download, no vendored binary,
+    no version skew with the kernel's f2fs driver. Missing tools degrade to a
+    no-op, never a failed install.
+  - The hook is **inert unless the cmdline flag is present**, and the initrd is
+    only installed when F2FS was chosen — every other backend's boot entries
+    are byte-for-byte unchanged (asserted by a new test).
+  - **Geometry is now MEASURED, and it found two real bugs.** The hook ran
+    end-to-end against a loopback disk (WSL2, util-linux 2.37): a 12 GiB FAT
+    partition was carved to 10 GiB plus a 2 GiB f2fs partition labelled
+    `lsl-persist`, which mounted, accepted an `upper/`, and was left untouched
+    by a second run. Two things that had been assumed turned out to be wrong:
+    - **`sfdisk` `size=` is in SECTORS**, not KiB, in both directions. The
+      hook read the output in sectors and wrote the input in sectors, so its
+      arithmetic was right — but only by luck, and nothing recorded the
+      assumption. The test now asserts the units against measured bytes.
+    - **Partition nodes are not `<disk>N`.** A loop device's first partition
+      is `/dev/loop0p1`. The hook now probes for the node (`lsl_part_node`)
+      instead of concatenating a suffix.
+  - **The loop-pinning check was ineffective.** It used
+    `losetup -a | grep <disk>`, but a loop over an ISO *file on that stick*
+    reports only the file path — never the disk — so the one case that matters
+    most slipped through. It now reads the kernel's `holders/` link, which
+    names whatever actually has the partition open.
+  - **Booted in a real casper under QEMU/KVM — the timing premise holds, and
+    the boot found two blockers.** `tests/qemu-f2fs-provision-test.sh` builds a
+    FAT stick from a real Mint 22.3 ISO, repacks its initrd with the hooks, and
+    boots it under KVM.
+    - **The premise is confirmed.** The hook runs inside `/scripts/nfs-premount`
+      at ~3.4 s and the boot medium is **not mounted** at that point — no
+      `/cdrom` or `vda1` mount precedes it, and casper's own `loop0` appears
+      afterwards (3.82 s). So `casper-premount` really is early enough to
+      repartition the stick. The boot also reached a full Cinnamon desktop,
+      which is the proof that injecting the hook does not break the boot.
+    - **f2fs is a MODULE in the Mint kernel, not builtin.** The first boot
+      logged `no f2fs driver in this kernel` and skipped — the hook never tried
+      to load the module that was sitting in the initrd's `early3` cpio. It now
+      calls `modprobe f2fs` (kmod is present and decompresses the `.ko.zst`
+      itself); a re-run logged `modprobe f2fs: loaded`.
+    - **`fatresize` and `mkfs.f2fs` are NOT on a stock Mint ISO** — not in the
+      rootfs, not in `pool/`. Only `sfdisk` can be staged out of the image.
+      `DESIGN-F2FS-PERSISTENCE.md` §6.1 claimed otherwise, having checked a
+      machine's live root where those packages were installed; that table is
+      corrected. **The feature is therefore safe but not yet functional** — the
+      hook degrades to a logged no-op, and §4.3 records the three ways to
+      source the two missing binaries.
+  - **The tools now come from the Ubuntu archive, and the staging is PROVEN.**
+    `src/f2fstools.rs` resolves each package from the suite's `Packages` index
+    (so a version bump cannot break it), downloads the `.deb`, reads it as an
+    `ar` archive, and extracts the binary plus the six sonames casper's initrd
+    lacks. Proven two ways: `ldd` resolves all 12 of `fatresize`'s dependencies
+    from the staged set plus the initrd's own, and `fatresize --help` runs in a
+    chroot built from **only** those libraries — no host library reachable. No
+    helper binaries are needed (`dmidecode` is probed for the disk's model only
+    and its absence changes nothing).
+  - **The tools ride as cpio members, not a tarball.** casper's initrd has
+    `gzip` and `cpio` but **no `tar`**, and its busybox has no `untar` applet —
+    a run that shipped a tarball logged `tar: not found` and skipped. Each file
+    is now a cpio member at its final path, so the kernel's own unpacker does
+    the work and the hook only exports `PATH` and `LD_LIBRARY_PATH`.
+
+### Fixed
+
+- **The FAT BPB was read at the wrong offset, so the anti-corruption guard
+  never worked.** `bin/lsl-f2fs-resize` read 4 bytes at **offset 19** and
+  compared them against a partition size. Offset 19 is the **volume serial
+  number** — a random 32-bit value fixed at `mkfs` time — not the sector count,
+  which lives at **offset 32**. Measured: offset 19 returned the identical
+  constant `16252928` for filesystems of 512 MiB, 1 GiB and 2 GiB, so the check
+  compared a volume ID against a partition size and could never mean anything.
+  A test now pins offset 32 in both the hook and the operator tool, and pins
+  the guard's ordering (`fatresize` → verify BPB → repartition).
+- **`fatresize` can block the boot on a prompt.** Below the FAT32 cluster limit
+  it offers an `OK/Cancel:` FAT16 conversion; with no tty it takes EOF and
+  aborts (measured: exit 1, filesystem untouched). The hook now answers `no`
+  and refuses any carve that would cross the FAT32 limit, rather than relying
+  on an unanswerable prompt.
+- **The partition scan missed virtio disks.** `/dev/vd*` was absent from the
+  content probe, so under any virtualisation the hook found no medium at all.
+  The wait-for-disk logic also had to come first: measured, the hook runs at
+  ~3.4 s while `virtio_blk` announces the disk at ~12 s, so the probe must wait
+  for the disk and its partition table rather than assume they exist.
+- **`grep … | head -1` silently lost the match.** A diagnostic `grep -c` in the
+  guest reported 1 matching line while `grep … | head -1` printed nothing — head
+  closes the pipe and grep dies on `SIGPIPE` before flushing. Replaced with
+  `sed -n '1p'` throughout, which reads the first line and stops.
+
+- **Firstboot reboot now asks WHERE to land, not just whether.** The
+  end-of-firstboot dialog was `Reboot now` / `Reboot later`, and `Reboot now`
+  was a plain `systemctl reboot` — which falls through to whatever the
+  firmware boot order picks first, normally Windows. That made the one moment
+  a user most wants to go back into lsl-usb the one moment the dialog could
+  not offer it. It now offers **Reboot to lsl-usb** (`efibootmgr -n
+  <BootCurrent>`, the same trick `bin/lsl-shutdown-gui` already uses for its
+  "Reboot to USB" option) / **Firmware boot menu** (`systemctl reboot
+  --firmware-setup=auto`) / **Later**, mirroring the reboot dialog
+  `lslsetup.exe` already shows on the Windows side.
+  - The user session still only *records* the choice (`reboot-target`, next to
+    the existing `reboot-now` / `reboot-cancel`); root stays the reboot
+    authority. `reboot_approval_pending()` is unchanged, so the "dialog
+    reappeared on boot 2" fix is untouched.
+  - The firmware row is only offered when the running systemd knows
+    `--firmware-setup`, so no button is ever rendered dead. Every branch
+    degrades to a plain reboot — no `efibootmgr` (legacy BIOS/CSM), or a
+    systemd that refuses the flag — rather than stranding a user who already
+    approved the reboot.
+  - Dismissing the dialog, or any unrecognised label, defers. It can never
+    reboot on its own.
+  - Not verified on hardware; covered by `misc/test-reboot-choice-smoke.sh`.
+
 - **F2FS persistence, Linux side (`DESIGN-F2FS-PERSISTENCE.md` P1+P2+P3).**
   `/home` can now live on a real F2FS partition instead of a RAM upper that
   vanishes at reboot. Three parts, and all three are needed:
@@ -41,6 +178,32 @@ Four open proposals closed. `FINDINGS-COMPRESSION.md`, `TODO.md` and
   page can repartition or format.
 
 ### Fixed
+
+- **The main UEFI boot entry never carried the HDD-mirror initrd.**
+  `write_efi_bootdir` wrote `grub.cfg` from `uefi_cfg_direct_user` regardless
+  of whether the HDD-mirror initrd had been installed — that template was
+  `#[cfg(test)]`, because the mirror entry was only assembled inline for the
+  extra "Boot to RAM" stanza. So a stick built with "copy the squashfs layers to
+  the HDD" ticked booted from the internal disk on BIOS (grub4dos `menu.lst`
+  had it) and from the **USB** under UEFI (`grub.cfg` did not). Found while
+  wiring the F2FS path, which needed the same entry to carry a second initrd;
+  `uefi_cfg_direct_hddmirror_user` is now a production template and
+  `write_efi_bootdir` picks the right initrd list.
+
+- **The "first boot complete — Reboot now / Reboot later" dialog came back on
+  every later boot.** `reboot_approval_pending()` treated "the flag dir exists and
+  no decision file is in it" as *approval is pending*, but `/run` is tmpfs and
+  `onboot.sh:50` recreates `/run/lsl-firstboot` on **every** boot for the shared
+  telemetry traces. After the first boot finished, the next boot brought the dir
+  back empty — indistinguishable from "firstboot is waiting right now" — so
+  every later login re-showed the end-of-firstboot dialog. An empty flag dir is
+  the *absence* of a decision, which is the normal, permanent state on any boot
+  that never reached the finale. The gate now requires positive evidence:
+  `lsl-firstboot.sh` publishes `$FLAG_DIR/awaiting-approval` while
+  `schedule_reboot_on_approval()` actually blocks, and withdraws it on both
+  exits (reboot and defer), so a fresh login during a genuine wait still gets the
+  dialog. Covered by two new tests (consumer and producer side); the consumer one
+  was confirmed to fail against the old predicate.
 
 - **`uphome` and `lsl-flush-home.sh` would have fought the f2fs backend.** An f2fs
   upper is *already* persistent, so packing the merged home into `home.sfs` would

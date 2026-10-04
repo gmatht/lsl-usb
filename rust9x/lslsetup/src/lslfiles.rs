@@ -1462,6 +1462,101 @@ mod secondary_initrd_order_tests {
         assert_eq!(got, INITRAMFS_LIVE_RAMCLONE.replace("\r\n", "\n").into_bytes());
         assert!(!got.is_empty());
     }
+
+    #[test]
+    fn f2fs_provision_is_sourced_before_the_scrub() {
+        // ORDER IS LOAD-BEARING. The provision hook CREATES the partition; the
+        // scrub then cleans it. Reversed, the scrub finds no partition and
+        // no-ops on exactly the boot that needed it, and the stick keeps an
+        // unscubbed machine identity.
+        let order = String::from_utf8_lossy(CASPER_PREMOUNT_ORDER);
+        let p = order.find("zz_lsl_f2fs_provision \"").expect("provision sourced");
+        let s = order.find("zz_lsl_f2fs_scrub \"").expect("scrub sourced");
+        assert!(
+            p < s,
+            "provision must be sourced BEFORE the scrub (prov @{}, scrub @{}): {}",
+            p,
+            s,
+            order
+        );
+    }
+
+    #[test]
+    fn both_f2fs_hooks_are_in_the_case_skip_list() {
+        // The ORDER loops over /scripts/casper-premount/* and executes each
+        // script as a SUBPROCESS before sourcing our hooks. A hook missing from
+        // the skip list therefore runs twice - once in a subshell where its
+        // return/exports are discarded, once sourced. For the provision hook
+        // that means a repartition attempt in a subshell whose failure is
+        // invisible.
+        let order = String::from_utf8_lossy(CASPER_PREMOUNT_ORDER);
+        let skip = order
+            .lines()
+            .find(|l| l.starts_with("*/ORDER|"))
+            .expect("case skip-list line");
+        assert!(skip.contains("zz_lsl_f2fs_provision"), "skip-list: {}", skip);
+        assert!(skip.contains("zz_lsl_f2fs_scrub"), "skip-list: {}", skip);
+    }
+
+    #[test]
+    fn f2fs_initrd_carries_both_hooks_and_the_tools() {
+        let out = make_f2fs_initrd_with(
+            b"# provision\n",
+            b"# scrub\n",
+            &[
+                ("usr/sbin/mkfs.f2fs".to_string(), vec![1u8, 2, 3], 0o100755),
+                ("usr/lib/libuuid.so.1".to_string(), vec![4u8, 5], 0o100644),
+            ],
+        )
+        .unwrap();
+        let s = String::from_utf8_lossy(&gunzip(&out)).into_owned();
+        assert!(s.contains("scripts/casper-premount/zz_lsl_f2fs_provision"));
+        assert!(s.contains("scripts/casper-premount/zz_lsl_f2fs_scrub"));
+        assert!(s.contains("scripts/casper-premount/ORDER"));
+        // The tools ride as cpio members at their loader paths - the guest has
+        // no tar, so there is nothing to unpack.
+        assert!(s.contains("usr/sbin/mkfs.f2fs"), "{}", s);
+        assert!(s.contains("usr/lib/libuuid.so.1"), "{}", s);
+        // ...and NOT as a tarball, which is what the failed QEMU run shipped.
+        assert!(!s.contains("f2fs-tools.tar.gz"), "{}", s);
+    }
+
+    #[test]
+    fn f2fs_hooks_are_embedded_and_lf_clean() {
+        // Standalone-exe parity: without the embedded copies the f2fs radio
+        // would install an initrd with empty hooks, i.e. silently do nothing.
+        for (name, content) in [
+            ("lsl_f2fs_provision.sh", INITRAMFS_F2FS_PROVISION),
+            ("lsl_f2fs_scrub.sh", INITRAMFS_F2FS_SCRUB),
+        ] {
+            assert!(!content.is_empty(), "{} embedded empty", name);
+            assert!(
+                !content.replace("\r\n", "\n").contains('\r'),
+                "{} contains CR after normalize",
+                name
+            );
+        }
+        // The provision hook must be POSIX sh: the initramfs shell is busybox
+        // ash, and a bash-only construct would fail exactly when it matters.
+        assert!(
+            INITRAMFS_F2FS_PROVISION.starts_with("#!/bin/sh"),
+            "provision hook must be #!/bin/sh, not bash"
+        );
+        // ...and must never bare-exit: run_scripts SOURCES it, so an exit
+        // takes casper's own shell (and the boot) down with it.
+        assert!(
+            !INITRAMFS_F2FS_PROVISION
+                .lines()
+                .any(|l| l.trim_start().starts_with("exit ")),
+            "provision hook contains a bare exit"
+        );
+        // The gate is the cmdline: lsl-usb.env is on the medium being
+        // repartitioned, so it cannot be the channel.
+        assert!(
+            INITRAMFS_F2FS_PROVISION.contains("lsl_f2fs_provision="),
+            "provision hook must read the size off /proc/cmdline"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1667,6 +1762,82 @@ mod cpio_tests {
     }
 
     #[test]
+    /// The initrd must carry the tools as cpio members at their loader paths, and
+    /// the kernel's unpacker must accept them intact.
+    fn f2fs_initrd_carries_a_large_binary_payload_intact() {
+        // ~600 KB of incompressible bytes: the shape of the real fatresize +
+        // libparted closure.
+        let payload: Vec<u8> = (0..600_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let out = make_f2fs_initrd_with(
+            b"#!/bin/sh\n# provision\n",
+            b"#!/bin/sh\n# scrub\n",
+            &[
+                ("usr/sbin/fatresize".to_string(), payload.clone(), 0o100755),
+                ("usr/lib/libparted.so.2".to_string(), payload.clone(), 0o100644),
+            ],
+        )
+        .unwrap();
+
+        // Un-gzip and walk the newc entries the way the kernel does, verifying
+        // every header and that the payload comes back byte-for-byte.
+        let mut d = flate2::read::GzDecoder::new(&out[..]);
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut d, &mut raw).unwrap();
+
+        let mut found_payload = false;
+        let mut i = 0usize;
+        while i + 110 <= raw.len() {
+            if &raw[i..i + 6] != b"070701" {
+                panic!("bad magic at offset {}", i);
+            }
+            let name_len = u32::from_str_radix(
+                std::str::from_utf8(&raw[i + 94..i + 102]).unwrap(),
+                16,
+            )
+            .unwrap() as usize;
+            let size = u32::from_str_radix(
+                std::str::from_utf8(&raw[i + 54..i + 62]).unwrap(),
+                16,
+            )
+            .unwrap() as usize;
+            let name = String::from_utf8_lossy(&raw[i + 110..i + 110 + name_len - 1]).into_owned();
+            let mut data_start = i + 110 + name_len;
+            data_start += (4 - (data_start % 4)) % 4; // name padding
+            if name == "usr/lib/libparted.so.2" || name == "usr/sbin/fatresize" {
+                assert_eq!(size, payload.len(), "payload size corrupted in the header");
+                let data = &raw[data_start..data_start + size];
+                assert_eq!(data, &payload[..], "payload bytes corrupted");
+                found_payload = true;
+            }
+            i = data_start + size;
+            i += (4 - (i % 4)) % 4; // data padding
+        }
+        assert!(found_payload, "the tool members are missing from the initrd");
+    }
+
+    /// The tool payload must be cpio MEMBERS, not a tarball to unpack: casper's
+    /// initrd has gzip and cpio but NO tar, and its busybox has no untar
+    /// applet. A QEMU boot with a tarball logged `tar: not found` and skipped,
+    /// so the libraries now ride at their final paths.
+    #[test]
+    fn f2fs_tools_ride_as_cpio_members_at_loader_paths() {
+        use std::collections::BTreeMap;
+        let mut stage = BTreeMap::new();
+        stage.insert("usr/sbin/mkfs.f2fs".to_string(), vec![1u8, 2, 3]);
+        stage.insert("usr/sbin/fatresize".to_string(), vec![4u8, 5]);
+        stage.insert("lib/libparted.so.2".to_string(), vec![6u8, 7]);
+        let members = crate::f2fstools::stage_f2fs_initrd_members(&stage);
+        let paths: Vec<&str> = members.iter().map(|(p, _, _)| p.as_str()).collect();
+        assert!(paths.contains(&"usr/sbin/mkfs.f2fs"), "{:?}", paths);
+        assert!(paths.contains(&"usr/sbin/fatresize"), "{:?}", paths);
+        // The library must be at a path the dynamic loader searches - both the
+        // generic and the multiarch dir, since the latter varies by distro.
+        assert!(paths.iter().any(|p| p.ends_with("libparted.so.2")), "{:?}", paths);
+        // Executables must be +x or the hook's `command -v` will not see them.
+        let mkfs = members.iter().find(|(p, _, _)| p == "usr/sbin/mkfs.f2fs").unwrap();
+        assert_eq!(mkfs.2, 0o100755, "the tool must be executable");
+    }
+
     fn archive_survives_the_kernel_unpack_rule() {
         let entries: Vec<(String, u32, Vec<u8>)> = vec![
             (
@@ -1953,15 +2124,21 @@ pub fn repack_initrd(initrd_path: &str, hooks: &[(String, Vec<u8>, u32)]) -> Res
 /// SOURCES our hooks, which need their exports/function overrides (LAYERFS_PATH,
 /// get_backing_device) to reach casper's shell. Both hooks self-guard on the
 /// kernel cmdline, so listing both is safe whichever secondary initrd is loaded.
+///
+/// ORDER MATTERS FOR THE TWO F2FS HOOKS: zz_lsl_f2fs_provision CREATES the
+/// persistence partition and zz_lsl_f2fs_scrub then scrubs it, so provision
+/// must be sourced first. Reversed, the scrub would find no partition and no-op
+/// on exactly the boot that needed it.
 const CASPER_PREMOUNT_ORDER: &[u8] =
     b"for f in /scripts/casper-premount/*; do\n\
 case \"$f\" in\n\
-*/ORDER|*/zz_lsl_hdd_mirror|*/zz_lsl_f2fs_scrub|*/9990-live-ramclone) continue ;;\n\
+*/ORDER|*/zz_lsl_hdd_mirror|*/zz_lsl_f2fs_scrub|*/zz_lsl_f2fs_provision|*/9990-live-ramclone) continue ;;\n\
 esac\n\
 [ -x \"$f\" ] && \"$f\" \"$@\" 2>/dev/null || true\n\
 done\n\
 . /scripts/casper-premount/zz_lsl_hdd_mirror \"$@\" 2>/dev/null || true\n\
 . /scripts/casper-premount/9990-live-ramclone \"$@\" 2>/dev/null || true\n\
+. /scripts/casper-premount/zz_lsl_f2fs_provision \"$@\" 2>/dev/null || true\n\
 . /scripts/casper-premount/zz_lsl_f2fs_scrub \"$@\" 2>/dev/null || true\n";
 
 /// ORDER body for scripts/live-premount (Debian live-boot). Same idea:
@@ -2029,6 +2206,11 @@ static INITRAMFS_LIVE_RAMCLONE: &str = include_str!("../../../initramfs/live-ram
 static INITRAMFS_HDD_MIRROR: &str = include_str!("../../../initramfs/lsl_hdd_mirror.sh");
 static INITRAMFS_LIVEBOOT_MIRROR: &str = include_str!("../../../initramfs/lsl_liveboot_mirror.sh");
 static INITRAMFS_F2FS_SCRUB: &str = include_str!("../../../initramfs/lsl_f2fs_scrub.sh");
+/// CREATES the F2FS persistence partition on first boot (P1b of
+/// DESIGN-F2FS-PERSISTENCE.md). Ships in its own initrd, loaded only when the
+/// PERSISTENCE page picked f2fs, because unlike the scrub it REPARTITIONS the
+/// boot medium - it must never ride along on a boot that did not ask for it.
+static INITRAMFS_F2FS_PROVISION: &str = include_str!("../../../initramfs/lsl_f2fs_provision.sh");
 
 /// Hook bytes for a secondary initrd: the bundle file when it exists, else the
 /// embedded copy (LF-normalized - Windows checkouts are CRLF and the guest
@@ -2139,6 +2321,108 @@ pub fn install_hddmirror_initrd(vol_letter: &str, bundle_dir: &str) -> Result<()
     out::info(&format!(
         "hddmirror initrd ready ({} bytes).",
         compressed.len(),
+    ));
+    Ok(())
+}
+
+/// Build the gzip+cpio initrd that CARRIES the F2FS partition creator plus the
+/// partitioning tools it needs.
+///
+/// The tools ride as ordinary cpio MEMBERS at their final paths (usr/sbin/... and
+/// usr/lib/...), because casper's initrd has no `tar` and no busybox `untar`
+/// (measured on the real Mint 22.3 initrd, after a boot logged
+/// `tar: not found`). The kernel unpacks every member for us; the hook only has
+/// to export PATH and LD_LIBRARY_PATH.
+///
+/// Carries the scrub too, deliberately: the provision hook creates the
+/// partition and the scrub cleans it on the SAME boot, so both must be in one
+/// initrd and in the right ORDER (see `CASPER_PREMOUNT_ORDER`). Shipping them
+/// apart would mean a stick whose partition exists but is never scrubbed.
+fn make_f2fs_initrd_with(
+    provision_hook: &[u8],
+    scrub_hook: &[u8],
+    tools: &[(String, Vec<u8>, u32)],
+) -> Result<Vec<u8>, String> {
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&cpio_newc_file(
+        "scripts/casper-premount/zz_lsl_f2fs_provision",
+        provision_hook,
+        0o100755,
+    ));
+    archive.extend_from_slice(&cpio_newc_file(
+        "scripts/casper-premount/zz_lsl_f2fs_scrub",
+        scrub_hook,
+        0o100755,
+    ));
+    archive.extend_from_slice(&cpio_newc_file(
+        "scripts/casper-premount/ORDER",
+        CASPER_PREMOUNT_ORDER,
+        0o100644,
+    ));
+    for (path, data, mode) in tools {
+        archive.extend_from_slice(&cpio_newc_file(path, data, *mode));
+    }
+    archive.extend_from_slice(&cpio_newc_trailer());
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(&archive)
+        .map_err(|e| format!("gzip encode: {}", e))?;
+    encoder.finish().map_err(|e| format!("gzip finish: {}", e))
+}
+
+/// Fetch the F2FS tools from the package archive and return them as cpio-ready
+/// `(path, bytes, mode)` entries.
+///
+/// The suite comes from `iso`, so the binaries match the stick's own release
+/// rather than the build machine's, and the mirror is resolved FROM that
+/// suite - a Debian ISO must not be looked up on Ubuntu's archive.
+pub fn stage_f2fs_tools(
+    vol_letter: &str,
+    _bundle_dir: &str,
+    iso: &str,
+    arch: Option<&str>,
+) -> Result<Vec<(String, Vec<u8>, u32)>, String> {
+    let (mirror, suite) = crate::f2fstools::mirror_for_iso(iso)?;
+    let arch = crate::f2fstools::apt_arch_for(arch);
+    let (stage, report) = crate::f2fstools::fetch_f2fs_tools(vol_letter, &mirror, &suite, arch)?;
+    for line in &report {
+        out::info(&format!("f2fs tools: {}", line));
+    }
+    Ok(crate::f2fstools::stage_f2fs_initrd_members(&stage))
+}
+
+/// Write the F2FS provisioning initrd to the stick. Loaded as a SECOND initrd
+/// on the default boot entry, and ONLY when the PERSISTENCE page chose f2fs -
+/// see `install_from_iso`'s `f2fs_gib` argument.
+///
+/// `iso` is used only to pick the package suite (and hence the archive) for
+/// the tool fetch, and `arch` which index of it to read.
+pub fn install_f2fs_initrd(
+    vol_letter: &str,
+    bundle_dir: &str,
+    iso: &str,
+    arch: Option<&str>,
+) -> Result<(), String> {
+    let provision = hook_bytes(
+        &format!("{}\\initramfs\\lsl_f2fs_provision.sh", bundle_dir),
+        INITRAMFS_F2FS_PROVISION,
+    )?;
+    let scrub = hook_bytes(
+        &format!("{}\\initramfs\\lsl_f2fs_scrub.sh", bundle_dir),
+        INITRAMFS_F2FS_SCRUB,
+    )?;
+    // The tools are REQUIRED: without them the hook no-ops on every boot and
+    // /home silently does not persist, which is the bug this whole path exists
+    // to fix. So a failure here is fatal (the caller reports it) rather than a
+    // warning - the user picked f2fs and must be told now, not at first boot.
+    let tools = stage_f2fs_tools(vol_letter, bundle_dir, iso, arch)?;
+    let compressed = make_f2fs_initrd_with(&provision, &scrub, &tools)?;
+    let dest = format!("{}:\\casper\\initrd.f2fs.gz", vol_letter);
+    std::fs::write(&dest, &compressed).map_err(|e| format!("write f2fs initrd: {}", e))?;
+    out::info(&format!(
+        "f2fs initrd ready ({} bytes, {} tool files).",
+        compressed.len(),
+        tools.len()
     ));
     Ok(())
 }

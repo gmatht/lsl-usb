@@ -1,26 +1,26 @@
 # DESIGN — F2FS persistence with a boot-time identity scrub
 
-**Status: P1 + P2 + P3 IMPLEMENTED (Linux side), 2026-10-01. Not yet run on real
-hardware.** Every claim about casper is quoted from the initrd on the actual stick
+**Status: P1 + P1b + P2 + P3 IMPLEMENTED (Linux side), 2026-10-03. P1b booted
+in a real casper (QEMU/KVM, Mint 22.3); the carve itself has still only run
+against a loopback disk.** Every claim about casper is quoted from the initrd on
+the actual stick
 (`unmkinitramfs /cdrom/_ISO/linuxmint-22.3-cinnamon-64bit/initrd.lz`), and every
 claim about our own code is line-referenced to the tree it is written from.
 
 | part | what | where |
 |---|---|---|
-| **P1** provision | create/format the F2FS partition by label; never repartitions | `bin/lsl-f2fs-provision` |
+| **P1** provision | format an already-present partition by label; never repartitions | `bin/lsl-f2fs-provision` |
+| **P1b** create | shrink the FAT partition and CREATE the F2FS one, on first boot | `initramfs/lsl_f2fs_provision.sh` + `casper/initrd.f2fs.gz` |
 | **P2** scrub | remove identity from the persistent upper before the overlay mounts | `initramfs/lsl_f2fs_scrub.sh`, injected by `build.sh` and `rust9x/lslsetup/src/lslfiles.rs` |
 | **P3** regenerate | rewrite identity for THIS boot after `/home` is up | `bin/lsl-regen-identity`, called from `onboot.sh` |
 
 **What is NOT done**, and is not claimed:
 
-- **Windows-side provisioning** (§8.1). `lslsetup` does not create the partition;
-  only the Linux-side formatter exists. The pane says so where the choice is made.
-- **Verification steps 2-5 of §10.** The QEMU ordering test and the two-machine
-  simulation are not written. Step 1 (the scrub unit test) is
-  `tests/f2fs-scrub.tests.sh`, and its static half runs everywhere; its f2fs half
-  skips without root. **The design's own words: step 1 tests the scrub in
-  isolation and would pass even if the hook never ran at the right moment.** That
-  remains true, so nothing here should be read as "this works on a boot".
+- **The full carve has not run inside casper.** It is proven on a loopback
+  disk (geometry, f2fs format, mount, idempotence — §4.3) and the hook's
+  *timing and injection* are proven in a real casper boot (§4.5), but the two
+  have not been observed in the SAME boot: the QEMU run reached the driver
+  gate before it could carve. §4.5 records exactly how far it got.
 - **The denylist's completeness** (§7, §11). It removes the identity we know
   about, not machine identity. This is unchanged by the implementation and is
   the honest weak point.
@@ -193,10 +193,13 @@ is the working precedent — including its hard-won convention: **sourced, never
       +-- session
 ```
 
-The design has three parts:
+The design has four parts:
 
-- **P1 — Provision**: create the F2FS partition and label it once, at install
-  time (Windows side, plus a Linux-side fallback).
+- **P1 — Provision**: format the F2FS partition by label, once, if one exists
+  (the userspace operator path, `bin/lsl-f2fs-provision`).
+- **P1b — Create**: shrink the stick's FAT partition and CREATE the F2FS one,
+  from the initrd on first boot (§4.3). This is the path that makes f2fs work
+  for an ordinary user, because Windows cannot create the partition at all.
 - **P2 — Scrub**: in the initrd, before the overlay, remove identity paths from
   the persistent upper.
 - **P3 — Regenerate**: in userspace, after `/home` (or `/`) is up, write correct
@@ -240,7 +243,136 @@ ceiling that WHY_FAIL documents for appended layers.
 can test in QEMU, and it makes the scrub (P2) testable immediately. Windows-side
 provisioning is a follow-on gated on the `mkfs.f2fs` question in §8.
 
-### 4.3 Enabling it
+### 4.3 P1b — creating the partition at boot (what actually shipped)
+
+P1 above can only format a partition that already exists, and Windows cannot
+create one: shrinking FAT32 has no API (Disk Management greys out Shrink
+Volume; diskpart refuses). So §8.1's recommendation is what ships — **format on
+first boot from Linux** — and P1b is the path that does it.
+
+```
+install time (Windows)          first boot (initrd)               userspace
+──────────────────────          ────────────────────              ─────────────
+PERSISTENCE page picks f2fs →   casper/initrd.f2fs.gz      →     lsl-mount-home.sh
+  + a size                        zz_lsl_f2fs_provision         mounts lsl-persist
+appends initrd.f2fs.gz           reads lsl_f2fs_provision=<GiB>  lsl-regen-identity
+writes the cmdline flag          repartitions ONCE              rewrites identity
+                                  zz_lsl_f2fs_scrub scrubs
+```
+
+**Why the size travels on the kernel cmdline.** It cannot come from
+`lsl-usb.env`: that file lives on the very medium the hook repartitions, and it
+is read in userspace by `lsl-common.sh`, long after this window. The cmdline is
+the only channel that survives. (`install_from_iso`'s `f2fs_gib` = 0 means
+"not requested", and then every boot entry is byte-for-byte unchanged.)
+
+**Why the hook is inert by default.** It returns immediately unless
+`lsl_f2fs_provision=<GiB>` is present, so shipping it in the initrd is safe for
+every backend — but the initrd is only *installed* when the PERSISTENCE page
+chose f2fs, because this hook repartitions the boot medium and must never ride
+along on a boot that did not ask for it. The scrub rides in the same initrd,
+sourced immediately after the provision hook, because it cleans what provision
+creates.
+
+**The two invariants that are not stylistic.** Both were measured, and both are
+recorded at `bin/lsl-f2fs-resize:16-25`, which remains the userspace operator
+tool for a stick that is already partitioned:
+
+- shrink the **filesystem before the partition**. `sfdisk` will cut the
+  partition while the filesystem still claims the old size; the result mounts
+  with no error and then fails on any access past the boundary.
+- **verify the FAT BPB** after `fatresize`, because `fatresize` was measured to
+  exit 0, print a banner, and leave the BPB untouched.
+
+**The safety gate.** A wrong resize is unrecoverable data loss, so the hook
+requires three independent proofs before writing a byte: the boot medium is
+unmounted, it has been identified *by content* (never by assuming `/dev/sda`),
+and no loopback still pins it. Any failure is a logged no-op. It also refuses a
+stick that already has a Linux partition (§8.2 — never hijack).
+
+Note what the gate does **not** do: it never unmounts the boot medium to "free"
+it. A lazy `umount -l` detaches the namespace while writeback may still be in
+flight, which is exactly how you corrupt the filesystem you are about to shrink;
+and casper needs `/cdrom` *after* this hook, so taking it away would break the
+boot outright. Both outcomes are worse than no persistence, so the hook refuses.
+
+**Tools.** casper's initrd ships `mkfs.ext4` but not `sfdisk`, `fatresize` or
+`mkfs.f2fs`, and the live root does not exist yet at `casper-premount` time. They
+are staged from the ISO's own `casper/filesystem.squashfs` by
+`scripts/extract-f2fs-tools.sh` into `f2fs-tools.tar.gz` (binaries + `ldd`
+closure) and unpacked into `/run` at boot by `initramfs/lsl-f2fs-tools.sh`. No
+download, no vendored binary, no version skew with the kernel's f2fs driver.
+Missing tools degrade to a no-op with a console line, never a failed install.
+
+> **MEASURED (2026-10-03, WSL2 + loopback, util-linux 2.37).** The hook ran
+> end-to-end against a real block device: 12 GiB FAT carved to 10 GiB + a
+> 2 GiB f2fs partition labelled `lsl-persist`, which then mounted and accepted
+> an `upper/`, and a second run changed nothing. `tests/f2fs-provision-hook.tests.sh`
+> asserts all of that, including the corruption check (filesystem smaller than
+> its partition) and idempotence.
+>
+> Three facts that test had to establish, each of which had been assumed:
+>
+> - **`sfdisk` `size=` is in SECTORS**, in both the input we write and the
+>   output we read (`10240` means 5 MiB, not 10). Both directions agreeing is
+>   what makes the hook's arithmetic correct; had one been KiB the carve would
+>   silently produce a filesystem 1024x larger than its partition.
+> - **Partition node naming is not `<disk>N`.** A loop device's first
+>   partition is `/dev/loop0p1`, not `/dev/loop01` — so the hook resolves the
+>   node by probing (`lsl_part_node`) instead of concatenating.
+> - **An f2fs `-o ro` mount does refuse writes.** §8.3's open question is
+>   answered for the clean case: `rm` on an existing file returns non-zero
+>   ("Read-only file system") and the file survives. Only the *dirty*-f2fs
+>   case remains unmeasured.
+
+> **MEASURED, and it moved the goalposts (2026-10-03, QEMU/KVM, Mint 22.3).**
+> A real casper boot with this hook injected proves the TIMING premise and
+> surfaces two things the earlier design had wrong:
+>
+> - **The premise holds.** The hook runs inside `/scripts/nfs-premount` at
+>   ~3.4 s, and at that instant the boot medium is **not mounted**: no `/cdrom`
+>   or `vda1` mount appears before it. casper's own `loop0` (the squashfs) is
+>   created *afterwards* (3.82 s). So `casper-premount` really is early enough
+>   to repartition the stick, and the whole "hook first" decision is sound.
+> - **f2fs is NOT builtin in the Mint kernel — it is a module.** The ISO ships
+>   `boot/grub/*/f2fs.mod` (a builtin filesystem has no `.mod`), and
+>   `f2fs.ko.zst` lives in the initrd's `early3` cpio at
+>   `usr/lib/modules/6.14.0-37-generic/kernel/fs/f2fs/`. The first QEMU boot
+>   logged `no f2fs driver in this kernel` and skipped — the hook had not tried
+>   to load the module sitting right there. It now calls `modprobe f2fs` (kmod
+>   is in the `main` cpio and decompresses the `.zst` itself), and a re-run
+>   logged `modprobe f2fs: loaded`.
+> - **`fatresize` and `mkfs.f2fs` are NOT on the Mint ISO** — not in the rootfs,
+>   not in `pool/`. Only `sfdisk` (util-linux, with its `ldd` closure) can be
+>   staged from the image. `DESIGN-PERSISTENCE-PANE.md` §6.1's tooling table is
+>   **WRONG** on this point: it lists `mkfs.f2fs` as present, having checked the
+>   live root of a machine where `f2fs-tools` had been installed. A stock Mint
+>   ISO does not carry it.
+>
+> **Consequence — the design does not yet work end-to-end.** The boot now loads
+> the driver and stages `sfdisk`, but cannot shrink FAT (no `fatresize`) or
+> format F2FS (no `mkfs.f2fs`). The hook degrades exactly as designed — a logged
+> no-op, boot unaffected — but the feature is not functional until those two
+> binaries are sourced. Options, none free:
+>
+> 1. **Ship the two binaries** in the bundle (adds ~200 KB plus `f2fs-tools`
+>    licensing to check) — contradicts the design's "no shipping a mkfs.f2fs".
+> 2. **`apt-get install` them from the ISO's own `pool/`** — they are not there
+>    either, so this needs network on first boot, which the hook cannot assume.
+> 3. **Pre-install them into the stick** at build time (the z0 layer or
+>    `bin/`), so the initrd mounts them off the medium — but the medium is what
+>    we are about to repartition, so they must be staged to `/run` first.
+>
+> Option 3 keeps "no binaries in git" and needs no network; it is the one the
+> evidence points at. **Do not treat P1b as working until this is resolved.**
+
+> **STILL OPEN: the carve has not run inside casper.** The hook now reaches the
+> tool check in a real boot, but `fatresize`/`mkfs.f2fs` are absent from the ISO
+> so it stops there. The geometry (loopback), the timing and the driver load
+> (QEMU) are each proven; the three have not yet been observed working
+> **together** in one boot. Until they are, P1b is not functional — only safe.
+
+### 4.4 Enabling it
 
 New env knob, following the existing `lsl-usb.env` / `lsl-common.sh:73-81`
 pattern:
@@ -401,13 +533,25 @@ already the reason `/etc/fstab` is the one item in WHYFAIL12 that is safe.
 |---|---|---|
 | `systemd-machine-id-setup` | regenerate `machine-id` | yes — `/usr/bin/`, from `systemd` |
 | `make-ssl-cert` | regenerate snakeoil | yes — `/usr/sbin/` |
-| `mkfs.f2fs` | P1 provisioning (Linux side) | yes — `/usr/sbin/` |
-| kernel `f2fs` driver | mounting the layer | yes — in `/proc/filesystems` on the Mint 22.3 kernel |
+| `mkfs.f2fs` | P1 provisioning (Linux side) | **NO — see the correction below** |
+| `fatresize` | shrinking FAT32 from Linux | **NO — see the correction below** |
+| `sfdisk` | repartitioning | yes — `/usr/sbin/` |
+| kernel `f2fs` driver | mounting the layer | **as a MODULE, not builtin** — `f2fs.ko.zst` in the initrd; needs `modprobe f2fs` |
 
-So P3 needs no new dependencies on the image, and P1's Linux-side path can format
-F2FS without shipping anything. `systemd-machine-id-setup` also takes
-`--root=PATH`, which is useful if the regeneration ever needs to target the
-overlay's root from outside it.
+> **CORRECTION (2026-10-03, measured).** This table was checked against a
+> machine's LIVE ROOT, where `f2fs-tools` and `fatresize` happened to be
+> installed. A **stock Mint 22.3 ISO carries neither**: its rootfs has no
+> `mkfs.f2fs` or `fatresize`, and its `pool/` has no `f2fs-tools` or `fatresize`
+> `.deb` either. Only `sfdisk` (from util-linux) can be staged out of the image.
+> Worse, f2fs is a loadable module rather than builtin — the ISO ships
+> `boot/grub/*/f2fs.mod`, and the `.ko.zst` lives in the initrd, so the hook must
+> `modprobe f2fs` before it can even format. Both facts were found by booting
+> the real initrd, not by reading it.
+
+So P3 needs no new dependencies on the image, but P1's Linux-side path **does**:
+`fatresize` and `mkfs.f2fs` must be sourced from somewhere (see §4.3 for the
+options). `systemd-machine-id-setup` also takes `--root=PATH`, which is useful
+if the regeneration ever needs to target the overlay's root from outside it.
 
 ---
 
@@ -438,6 +582,21 @@ Stated plainly so it is not mistaken for a complete solution:
    a pre-formatted partition from Rufus. **Recommendation: format on first boot
    from Linux**, with the Windows side only creating and labelling the
    partition — which it can already do.
+
+   > **RESOLVED, and the recommendation's last clause was WRONG.** "With the
+   > Windows side only creating and labelling the partition" is not possible:
+   > creating that partition requires *shrinking* the existing FAT partition,
+   > and Windows has no API for that (Shrink Volume is greyed out; diskpart
+   > returns "the volume cannot be shrunken because the file system does not
+   > support it"). So the Windows side creates nothing and labels nothing — it
+   > writes only the INTENT, `lsl_f2fs_provision=<GiB>` on the kernel cmdline,
+   > and `initramfs/lsl_f2fs_provision.sh` does the shrink, the repartition and
+   > the format from the initrd on first boot (§4.3). The installer creates no
+   > partition of its own.
+   >
+   > This also settles the tools question that gated it: there is no need to
+   > ship a Windows `mkfs.f2fs`, because the formatting happens in the initrd,
+   > where `mkfs.f2fs` is taken from the ISO's own rootfs.
 2. **Which label?** `lsl-persist` (ours, option b) vs `writable`/`casper-rw`
    (casper's, option a). Recommendation is (b), but a machine that already has a
    `casper-rw` from another tool must not be hijacked — the hook should refuse
@@ -445,6 +604,15 @@ Stated plainly so it is not mistaken for a complete solution:
 3. **F2FS dirty-state behaviour.** F2FS has no `fsck` equivalent to ext4's
    journal replay, and a `ro` mount of a dirty filesystem may fail. Is `-o ro`
    the right probe? Needs measurement on a power-cut image.
+
+   > **PARTLY ANSWERED (2026-10-03).** On a cleanly-unmounted f2fs, `-o ro`
+   > **does** enforce read-only: `rm` on an existing file fails with "Read-only
+   > file system" and the file survives, so the scrub's inspect-then-remount-rw
+   > pattern is safe here. What is still unmeasured is the DIRTY case — whether
+   > a filesystem that lost power refuses the `ro` mount outright, which would
+   > mean "scrub did not run". That remains the safe direction, and it is
+   > logged rather than silent (`lsl_f2fs_scrub.sh:85`). Reproducing a dirty
+   > f2fs needs a power-cut image, not a loopback test.
 4. **Where does the scrub list live?** Currently duplicated in the heredoc above.
    It is baked into the initrd, so it only changes with a repack — meaning a
    stick built before a list change keeps the old list. Acceptable, but the

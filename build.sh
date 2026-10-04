@@ -19,6 +19,13 @@ DIST="$REPO_ROOT/dist"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
+# The F2FS partitioning tools (sfdisk/fatresize/mkfs.f2fs + libs), staged from
+# an ISO's own rootfs by scripts/extract-f2fs-tools.sh. OPTIONAL: without it the
+# initrd still gets the hooks, they simply no-op, so a missing blob degrades a
+# boot rather than failing the build.
+F2FS_TOOLS_TARBALL="${F2FS_TOOLS_TARBALL:-$REPO_ROOT/rust9x/lslsetup/assets/f2fs-tools.tar.gz}"
+export F2FS_TOOLS_TARBALL
+
 command -v mksquashfs >/dev/null 2>&1 || { echo "ERROR: mksquashfs (squashfs-tools) not found" >&2; exit 1; }
 command -v zip       >/dev/null 2>&1 || { echo "ERROR: zip not found" >&2; exit 1; }
 for f in "$REPO_ROOT"/misc/lsl-firstboot.sh "$REPO_ROOT"/misc/lsl-firstboot.service \
@@ -167,10 +174,14 @@ repack_initrd() {
     local live_hook="$REPO_ROOT/initramfs/lsl_liveboot_mirror.sh"
     local antix_hook="$REPO_ROOT/initramfs/lsl_antix_mirror.sh"
     local f2fs_hook="$REPO_ROOT/initramfs/lsl_f2fs_scrub.sh"
+    local f2fs_prov="$REPO_ROOT/initramfs/lsl_f2fs_provision.sh"
+    local f2fs_tools="$REPO_ROOT/initramfs/lsl-f2fs-tools.sh"
     [ -f "$casper_hook" ] || { echo "ERROR: $casper_hook missing" >&2; rm -rf "$tmp"; return 1; }
     [ -f "$live_hook" ] || { echo "ERROR: $live_hook missing" >&2; rm -rf "$tmp"; return 1; }
     [ -f "$antix_hook" ] || { echo "ERROR: $antix_hook missing" >&2; rm -rf "$tmp"; return 1; }
     [ -f "$f2fs_hook" ] || { echo "ERROR: $f2fs_hook missing" >&2; rm -rf "$tmp"; return 1; }
+    [ -f "$f2fs_prov" ] || { echo "ERROR: $f2fs_prov missing" >&2; rm -rf "$tmp"; return 1; }
+    [ -f "$f2fs_tools" ] || { echo "ERROR: $f2fs_tools missing" >&2; rm -rf "$tmp"; return 1; }
     local injected=0
     for d in "$tmp"/*/; do
         # --- Debian live-boot (also antiX's live-init fork roots) ---
@@ -223,9 +234,7 @@ repack_initrd() {
         fi
         # --- casper (Mint/Ubuntu): F2FS identity scrub (P2 of DESIGN-F2FS) ---
         # Same sourcing requirement as the mirror hook: it uses `return`, which
-        # is only valid sourced, and it must run in casper's shell. Placed AFTER
-        # the mirror hook because the scrub mounts/unmounts a device and the
-        # mirror hook only sets a variable.
+        # is only valid sourced, and it must run in casper's shell.
         if [ -d "${d}scripts/casper-premount" ] && [ ! -f "${d}scripts/casper-premount/zz_lsl_f2fs_scrub" ]; then
             cp "$f2fs_hook" "${d}scripts/casper-premount/zz_lsl_f2fs_scrub"
             chmod +x "${d}scripts/casper-premount/zz_lsl_f2fs_scrub"
@@ -234,6 +243,55 @@ repack_initrd() {
                 printf '. /scripts/casper-premount/zz_lsl_f2fs_scrub "$@"\n' >> "$order"
             fi
             injected=1
+        fi
+        # --- casper (Mint/Ubuntu): F2FS partition CREATION (P1b) ---
+        # ORDER MATTERS: this hook must be sourced BEFORE the scrub, because it
+        # creates the partition the scrub then cleans - and `>>` cannot run
+        # first. Insert the line IMMEDIATELY BEFORE the scrub's rather than at
+        # the top of the file, so casper's own casper-premount scripts keep
+        # running first. That matches the Rust CASPER_PREMOUNT_ORDER exactly
+        # (base scripts, then our hooks, provision before scrub); prepending to
+        # the very top would run a repartitioning hook ahead of casper's own
+        # scripts, which the Rust path does not do.
+        # Inert unless the kernel cmdline carries lsl_f2fs_provision=<GiB>, so
+        # shipping it unconditionally is safe: only an f2fs-selected stick sets
+        # that flag.
+        if [ -d "${d}scripts/casper-premount" ] && [ ! -f "${d}scripts/casper-premount/zz_lsl_f2fs_provision" ]; then
+            cp "$f2fs_prov" "${d}scripts/casper-premount/zz_lsl_f2fs_provision"
+            chmod +x "${d}scripts/casper-premount/zz_lsl_f2fs_provision"
+            order="${d}scripts/casper-premount/ORDER"
+            if [ -f "$order" ] && ! grep -q 'zz_lsl_f2fs_provision' "$order"; then
+                local prov_line='. /scripts/casper-premount/zz_lsl_f2fs_provision "$@"'
+                local order_new="${order}.lsl.$$"
+                if grep -q 'zz_lsl_f2fs_scrub' "$order"; then
+                    # Insert before the scrub line (first occurrence only).
+                    awk -v l="$prov_line" '
+                        !done && /zz_lsl_f2fs_scrub/ { print l; done=1 }
+                        { print }
+                    ' "$order" > "$order_new"
+                else
+                    # No scrub line yet (should not happen - it is injected just
+                    # above): append rather than lose the hook.
+                    { cat "$order"; printf '%s\n' "$prov_line"; } > "$order_new"
+                fi
+                mv -f "$order_new" "$order"
+            fi
+            injected=1
+        fi
+        # The tool unpacker rides along with the hook, and the tarball with that.
+        # Without the tools the hook no-ops and says so - a degraded boot beats
+        # a failed build, and the tools are only needed when the flag is set.
+        if [ ! -f "${d}bin/lsl-f2fs-tools.sh" ]; then
+            mkdir -p "${d}bin"
+            cp "$f2fs_tools" "${d}bin/lsl-f2fs-tools.sh"
+            chmod +x "${d}bin/lsl-f2fs-tools.sh"
+            if [ -f "$F2FS_TOOLS_TARBALL" ]; then
+                mkdir -p "${d}lsl-tools"
+                cp "$F2FS_TOOLS_TARBALL" "${d}lsl-tools/f2fs-tools.tar.gz"
+            else
+                echo "  NOTE: f2fs-tools.tar.gz not built (scripts/extract-f2fs-tools.sh);" >&2
+                echo "        the stick will boot but cannot create its f2fs partition." >&2
+            fi
         fi
     done
     mkdir -p "$DIST/casper"

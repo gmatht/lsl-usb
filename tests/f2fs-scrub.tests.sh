@@ -240,9 +240,21 @@ done < "$src"
 
 # A read-only mount must be refused, not forced: a scrub that cannot write must
 # leave the device alone.
+#
+# The file is (re)created here rather than reused: the scrub assertion above
+# already deleted every identity path, so `rm -rf` on one of them would succeed
+# trivially on a NONEXISTENT path and prove nothing. This test is about the
+# mount refusing a delete of something that EXISTS.
 umount "$MNT"
+if mount -t f2fs "$IMG" "$MNT" 2>/dev/null; then
+    mkdir -p "$MNT/upper/etc"
+    : > "$MNT/upper/etc/hostname"
+    umount "$MNT"
+fi
 mount -t f2fs -o ro "$IMG" "$MNT" 2>/dev/null && {
-    if rm -rf "$MNT/upper/etc/hostname" 2>/dev/null; then
+    if [ ! -e "$MNT/upper/etc/hostname" ]; then
+        bad "the ro mount did not show the file that was just written - test is invalid"
+    elif rm -rf "$MNT/upper/etc/hostname" 2>/dev/null && [ ! -e "$MNT/upper/etc/hostname" ]; then
         bad "a read-only f2fs accepted a delete (the hook would corrupt the read-only probe)"
     else
         ok "a read-only mount refuses writes, so the scrub cannot act on one"

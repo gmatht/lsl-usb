@@ -23,6 +23,7 @@ mod boot;
 mod cli;
 mod detect;
 mod dryrun;
+mod f2fstools;
 mod float_shim;
 mod gui;
 mod hardware;
@@ -528,7 +529,7 @@ fn run() {
                 // hinge on a stale flag).
                 ui.set_active_stage(gui::WorkStage::UsbWrite as usize);
                 ui.set_stage_status(gui::WorkStage::UsbWrite as usize, &crate::locale::tr("writing..."));
-                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some(), opts.skip_verify, &extra_isos, g.ramclone, g.sfs_hdd, &opts.bundle_dir) {
+                match nofmt::install_from_iso(&iso, letter_hint, opts.allow_fixed, &opts.uefi_bootx64, want_bios, want_uefi, Some(ui), g.target_usb.is_some(), opts.skip_verify, &extra_isos, g.ramclone, g.sfs_hdd, f2fs_gib(&g.persist_backend, g.persist_mib), &opts.bundle_dir, g.distro_arch) {
                     Ok((t, metrics, pending)) => {
                         use gui::WorkStage as ST;
                         ui.set_active_stage(ST::UsbWrite as usize);
@@ -969,7 +970,7 @@ fn run() {
             } else {
                 opts.extra_isos.clone()
             };
-            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false, opts.skip_verify, &extra_isos, false, false, &opts.bundle_dir) {
+            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false, opts.skip_verify, &extra_isos, false, false, f2fs_gib(&opts.persist_backend, opts.persist_mib), &opts.bundle_dir, distro_arch) {
                 Ok((t, _metrics, pending)) => {
                     pending_mbr = pending;
                     vol = sys::list_volumes()
@@ -1031,10 +1032,24 @@ fn run() {
     assert_usb_capacity(&vol, &iso_used);
     wait_volume_ready(&vol.letter);
 
-    out::step("Dropping lsl-usb files onto the USB...");
-    if let Err(e) = lslfiles::install_lsl_files(&vol.letter, &opts.bundle_dir) {
-        out::err(&e);
-        std::process::exit(1);
+    // The LSL drop phase is casper-only. `install_lsl_files` unconditionally
+    // creates <USB>:\casper\ and puts the z0 firstboot layer there, which on a
+    // non-casper ISO is a layer with no base to stack on, plus a firstboot
+    // toolkit no initrd will ever run. It would look like a successful install
+    // while doing nothing, so a loopback-only install skips it entirely.
+    let casper_shaped = crate::iso::live_iso_shape(&iso_used)
+        .map(|c| c.casper)
+        .unwrap_or(false);
+    if casper_shaped {
+        out::step("Dropping lsl-usb files onto the USB...");
+        if let Err(e) = lslfiles::install_lsl_files(&vol.letter, &opts.bundle_dir) {
+            out::err(&e);
+            std::process::exit(1);
+        }
+    } else {
+        out::step("Skipping the lsl-usb drop phase (this ISO does not use casper).");
+        out::info("  No first-boot setup, wifi provisioning, Rust tools or Windows-driver staging");
+        out::info("  will be present: those are installed by casper's initrd, which this image does not use.");
     }
 
     if opts.preload_rust_tools || rust_tools {
@@ -1168,9 +1183,9 @@ fn run() {
                 if opts.cache_tmpfs { "1" } else { "0" },
             );
             if opts.persist_backend == "f2fs" {
-                out::warn("f2fs needs a second partition on the stick, formatted with");
-                out::warn("bin/lsl-f2fs-provision on a booted stick. Until then it falls back");
-                out::warn("to a RAM upper and /home will NOT persist.");
+                out::info("F2FS persistence: the second partition is created on the FIRST BOOT.");
+                out::info("Windows cannot shrink FAT32, so casper/initrd.f2fs.gz repartitions");
+                out::info("the stick from the initrd before the overlay mounts.");
             }
         } else {
             out::warn(&format!(
@@ -1414,9 +1429,12 @@ fn append_file(path: &str, text: &str) -> std::io::Result<()> {
 
 fn show_compat_notes() {
     out::step("Compatibility:");
-    out::info("  Supported   : Ubuntu 24.04 based live distros - Linux Mint 22.x, Zorin OS 18.x.");
-    out::info("  NOT supported: Ubuntu 26.04+ (still uses NetworkManager, but its nmcli is broken,");
-    out::info("                so the nmcli-based wifi tooling in onboot.sh / wifi.sh breaks).");
+    out::info("  Full LSL stick  : Ubuntu 24.04 based live distros - Linux Mint 22.x, Zorin OS 18.x.");
+    out::info("                     Layered boot, persistence, first-boot setup, wifi and driver staging.");
+    out::info("  Loopback-only   : Debian 13.x, antiX, Tiny CorePlus - the ISO is copied to the stick and");
+    out::info("                     booted with its own bootloader. BIOS only; no persistence or firstboot.");
+    out::info("  NOT supported   : Ubuntu 26.04+ (still uses NetworkManager, but its nmcli is broken,");
+    out::info("                     so the nmcli-based wifi tooling in onboot.sh / wifi.sh breaks).");
 }
 
 fn assert_admin(opts: &cli::Opts) {
@@ -1527,6 +1545,24 @@ fn select_existing_usb(label: &str) -> Option<sys::Volume> {
         }
     }
     None
+}
+
+/// Size of the F2FS persistence partition to create on first boot, in GiB, or
+/// 0 when f2fs was not chosen.
+///
+/// MiB -> GiB rounds DOWN, and never below 1: the hook shrinks the FAT
+/// partition by this amount, so rounding up could take more than the stick has
+/// free (the hook refuses rather than guess, but a 0 here would silently mean
+/// "no provisioning"). `persist_mib == 0` means the user named f2fs without
+/// sizing it - fall back to the pane's 1 GiB floor so the choice is honoured.
+fn f2fs_gib(persist_backend: &str, persist_mib: u32) -> u32 {
+    if !persist_backend.eq_ignore_ascii_case("f2fs") {
+        return 0;
+    }
+    if persist_mib == 0 {
+        return crate::gui::PERSIST_GIB_MIN as u32;
+    }
+    (persist_mib / 1024).max(crate::gui::PERSIST_GIB_MIN as u32)
 }
 
 /// Multiboot offer (console nofmt flow): other local ISOs ride along as
@@ -1860,9 +1896,9 @@ fn gui_tail_in_dialog(
                 lslfiles::env_file_set(&env_file, "LSL_CACHE_TMPFS", "0");
             }
             if g.persist_backend == "f2fs" {
-                out::info("F2FS needs a second partition on the stick (Rufus persistent-partition");
-                out::info("size, or partition it yourself) formatted with bin/lsl-f2fs-provision.");
-                out::info("Until then it falls back to a RAM upper and /home will NOT persist.");
+                out::info("F2FS persistence: the second partition is created on the FIRST BOOT.");
+                out::info("Windows cannot shrink FAT32, so casper/initrd.f2fs.gz repartitions");
+                out::info("the stick from the initrd before the overlay mounts.");
             }
         } else {
             out::warn("lsl-usb.env not found; persistence settings were NOT written.");
@@ -2472,11 +2508,29 @@ fn find_checksum(sum_text: &str, iso_name: &str) -> Option<String> {
 /// Windows versions; on Win8+ the PS version required Enterprise features).
 fn validate_live_iso(path: &str) -> Result<(), String> {
     out::step(&format!("Validating {} ...", path));
-    let check = crate::iso::check_live_iso(path)?;
+    let check = crate::iso::live_iso_shape(path)?;
     out::info(&format!("Image info: {}", check.info));
     out::info(&format!("dists codenames: {}", check.dists.join(", ")));
     if check.info.contains("26.04") {
         return Err("Ubuntu 26.04+ detected. Not supported: it still uses NetworkManager, but its nmcli is broken, so the nmcli-based wifi tooling breaks. Use an Ubuntu 24.04 based image (Mint 22.x, Zorin 18.x).".into());
+    }
+    if !check.casper {
+        // NOT an error. A non-casper image (Debian live-boot, antiX, Tiny
+        // Core) boots through its OWN bootloader, so the stick can still be
+        // made bootable by copying the ISO on and chainloading it. What is
+        // lost is every casper-initrd mechanism, and the user has to know
+        // that now rather than discover it at first boot.
+        out::warn("Not a casper/Ubuntu-family image (no casper/filesystem.squashfs).");
+        out::warn("  It will be installed LOOPBACK-ONLY: the ISO is copied onto the stick and booted");
+        out::warn("  with its own bootloader. That means BIOS boot only, and NO persistence,");
+        out::warn("  no first-boot setup, no wifi provisioning and no Windows-driver staging -");
+        out::warn("  those all ride inside casper's initrd, which this image does not use.");
+        if check.dists.is_empty() {
+            out::warn("  It also has no dists/ directory, so no package archive can be queried for it");
+            out::warn("  (F2FS persistence is unavailable for it entirely).");
+        }
+        out::info("ISO validation passed (loopback-only install).");
+        return Ok(());
     }
     if check.dists.iter().any(|d| d.eq_ignore_ascii_case("noble")) {
         out::info("Confirmed Ubuntu 24.04 base (dists/noble) - supported.");
@@ -2625,6 +2679,30 @@ fn win95_args() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f2fs_gib_is_zero_unless_f2fs_was_chosen() {
+        // Every other backend must leave the boot entries untouched, which
+        // starts here: 0 means "no initrd, no cmdline flag".
+        for b in ["", "none", "squashfs", "btrfs"] {
+            assert_eq!(f2fs_gib(b, 4096), 0, "backend {:?}", b);
+        }
+        // Case-insensitive, because the CLI accepts what the user types.
+        assert_eq!(f2fs_gib("f2fs", 40 * 1024), 40);
+        assert_eq!(f2fs_gib("F2FS", 40 * 1024), 40);
+    }
+
+    #[test]
+    fn f2fs_gib_rounds_down_and_never_to_zero() {
+        // DOWN, not nearest or up: the hook shrinks the FAT partition by this
+        // many GiB, so rounding up could take more than the stick has free.
+        assert_eq!(f2fs_gib("f2fs", 40 * 1024 + 512), 40);
+        assert_eq!(f2fs_gib("f2fs", 40 * 1024 - 1), 39);
+        // The pane floor is 1 GiB, and 0 would silently mean "no
+        // provisioning" - so a sub-GiB or unsized request still gets 1.
+        assert_eq!(f2fs_gib("f2fs", 512), 1);
+        assert_eq!(f2fs_gib("f2fs", 0), 1);
+    }
 
     #[test]
     fn mint_version_parse() {

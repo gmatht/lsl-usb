@@ -872,6 +872,53 @@ pub fn menu_entry_direct_hddmirror(title: &str, kern_rel: &str, init_rel: &str) 
     menu_entry_direct_hddmirror_user(title, kern_rel, init_rel, "")
 }
 
+/// Normal boot entry with the F2FS provisioning initrd appended, and the
+/// requested size on the kernel cmdline.
+///
+/// Two things travel together and must travel together:
+///   - `initrd {init_rel} /casper/initrd.f2fs.gz` carries the hook that CREATES
+///     the persistence partition;
+///   - `lsl_f2fs_provision=<GiB>` tells it how big to make it.
+///
+/// The flag is on the cmdline rather than read from `lsl-usb.env` because that
+/// file lives on the very medium the hook repartitions, and is read in
+/// userspace long after the hook's window.
+pub fn menu_entry_direct_f2fs(
+    title: &str,
+    kern_rel: &str,
+    init_rel: &str,
+    user_params: &str,
+    f2fs_gib: u32,
+) -> String {
+    format!(
+        "\ntitle {title}\n\
+         find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
+         kernel {kern_rel} boot=casper{user_params} lsl_f2fs_provision={f2fs_gib} rootdelay=15 quiet splash\n\
+         initrd {init_rel} /casper/initrd.f2fs.gz\n\
+         boot\n"
+    )
+}
+
+/// `menu_entry_direct_f2fs` when the HDD-mirror initrd is also in play. The
+/// initrd list is positional, so this is a distinct template rather than a
+/// parameter: both secondary initrds are loaded, each carrying its own
+/// casper-premount ORDER.
+pub fn menu_entry_direct_hddmirror_f2fs(
+    title: &str,
+    kern_rel: &str,
+    init_rel: &str,
+    user_params: &str,
+    f2fs_gib: u32,
+) -> String {
+    format!(
+        "\ntitle {title}\n\
+         find --set-root --ignore-floppies --ignore-cd {kern_rel}\n\
+         kernel {kern_rel} boot=casper{user_params} lsl_f2fs_provision={f2fs_gib} rootdelay=15 quiet splash\n\
+         initrd {init_rel} /casper/initrd.hddmirror.gz /casper/initrd.f2fs.gz\n\
+         boot\n"
+    )
+}
+
 /// `menu_entry_direct_hddmirror` with the live-session user parameters.
 pub fn menu_entry_direct_hddmirror_user(
     title: &str,
@@ -1875,6 +1922,13 @@ fn verify_assets() -> Result<(), String> {
 /// be true when the user already picked this exact target in the GUI
 /// (INSTALL-page radio + Install click): raw-sector writes must never hinge
 /// on a stale flag, so every other path keeps the console gate.
+///
+/// `f2fs_gib` is the size of the F2FS persistence partition to create, in GiB,
+/// or 0 for "not requested". Non-zero installs `casper/initrd.f2fs.gz` and puts
+/// `lsl_f2fs_provision=<f2fs_gib>` on the kernel cmdline; the initrd's hook
+/// repartitions the stick on FIRST BOOT, because Windows cannot shrink FAT32
+/// (see DESIGN-F2FS-PERSISTENCE.md P1b / §8.1). 0 leaves every boot entry
+/// byte-for-byte as it was.
 pub fn install_from_iso(
     iso: &str,
     letter_hint: &str,
@@ -1888,7 +1942,9 @@ pub fn install_from_iso(
     extra_isos: &[String],
     ramclone: bool,
     hddmirror: bool,
+    f2fs_gib: u32,
     bundle_dir: &str,
+    iso_arch: Option<&str>,
 ) -> Result<(UsbTarget, WriteMetrics, Option<PendingMbr>), String> {
     if !want_bios && !want_uefi {
         // Say WHY, not just that: the GUI greys out unsupported paths (the
@@ -1964,7 +2020,7 @@ pub fn install_from_iso(
         }
     }
 
-    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, active_uefi_loader(), ui, skip_verify, extra_isos, ramclone, hddmirror, bundle_dir)?;
+    let (metrics, pending) = install_on_target(&target, iso, uefi_bootx64, want_bios, want_uefi, active_uefi_loader(), ui, skip_verify, extra_isos, ramclone, hddmirror, f2fs_gib, bundle_dir, iso_arch)?;
     Ok((target, metrics, pending))
 }
 
@@ -2198,15 +2254,32 @@ fn extract_base_squashfs(iso_path: &str, casper_dir_fs: &str, ui: Option<&dyn Wr
     }
 }
 
+/// What `write_menu_entries` put in the boot menu for the primary ISO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MainEntries {
+    /// Title to show in the "will it boot" summary.
+    pub title: String,
+    /// `None` when no kernel was extracted and the entry chainloads the ISO
+    /// file instead. Every consumer of the kernel/initrd paths must skip in
+    /// that case - a `grub.cfg` naming a kernel that was never extracted boots
+    /// to nothing.
+    pub kernel: Option<(String, String)>,
+}
+
 /// File-less main entries: the direct-kernel stanza (BIOS + UEFI
 /// grub4dos) from the kernel/initrd extracted out of the SOURCE iso, plus
-/// the base squashfs beside z0 for casper's stack. Returns (direct title,
-/// kernel rel, initrd rel) for the UEFI side. There is deliberately NO
+/// the base squashfs beside z0 for casper's stack. There is deliberately NO
 /// main loopback entry (no ISO file to chainload); stale main-loopback
 /// stanzas from pre-conversion sticks are removed so they can't boot into
-/// "file not found". Hard-errors when the ISO has no casper kernel -
-/// without extracts a file-less main cannot boot, and the Rufus flow
-/// covers non-casper ISOs.
+/// "file not found".
+///
+/// NON-CASPER ISOs: falls back to the loopback entry rather than failing.
+/// The chainloaded image boots through its OWN bootloader, so it needs no
+/// casper kernel - what it does without is persistence, firstboot and every
+/// other casper-initrd mechanism. That is a smaller stick than the file-less
+/// path produces, not a failed install, and the caller is told which it got
+/// via `kernel == None` so it does not write UEFI files pointing at a kernel
+/// that was never extracted.
 fn write_menu_entries(
     root: &str,
     iso_src: &str,
@@ -2215,7 +2288,8 @@ fn write_menu_entries(
     uefi: bool,
     ui: Option<&dyn WriteUi>,
     hddmirror: bool,
-) -> Result<(String, String, String), String> {
+    f2fs_gib: u32,
+) -> Result<MainEntries, String> {
     let stem = safe_name.trim_end_matches(".iso");
     let ltitle = format!("{} (loopback ISO)", iso_name.trim_end_matches(".iso"));
     let menu_path = format!("{}menu.lst", root);
@@ -2231,14 +2305,47 @@ fn write_menu_entries(
     let boot_dir_fs = format!("{}_ISO\\{}", root, stem);
     let boot_dir_rel = format!("/_ISO/{}", stem);
     let dtitle = format!("{} (direct kernel)", iso_name.trim_end_matches(".iso"));
-    let (kern_rel, init_rel) = match extract_casper_boot(iso_src, &boot_dir_fs, &boot_dir_rel, ui) {
-        Some(v) => v,
-        None => {
-            return Err(format!(
-                "{} has no casper kernel/initrd - the file-less main needs them (BIOS + UEFI boot the extracted kernel). Use the Rufus flow for non-casper ISOs, or add this ISO as an extra file on an existing stick.",
+    // A non-casper ISO has no casper/vmlinuz to extract. Fall back to the
+    // loopback chainload - the image boots its own bootloader, so this is a
+    // working stick, just one without persistence or firstboot.
+    let Some((kern_rel, init_rel)) = extract_casper_boot(iso_src, &boot_dir_fs, &boot_dir_rel, ui)
+    else {
+        out::warn(&format!(
+            "{} has no casper kernel/initrd - installing it LOOPBACK-ONLY (the ISO file is copied to the stick and booted with its own bootloader).",
                 iso_name
             ));
+        out::warn("  Consequence: BIOS boot only, and no persistence, first-boot setup, wifi provisioning or driver staging.");
+        if f2fs_gib > 0 || hddmirror {
+            return Err(format!(
+                "{} does not use casper, so the {} persistence hook cannot be attached to it. Choose a different persistence backend (or no persistence), or use a casper-based image (Mint 22.x, Zorin OS 18.x, Lubuntu/Xubuntu 24.04).",
+                iso_name,
+                if f2fs_gib > 0 { "F2FS" } else { "HDD-mirror" }
+            ));
         }
+        // Chainload the ISO file itself. `big_iso` drops the `map` for a
+        // >=2 GiB image: a BIOS int13h read cannot address past it that way.
+        let big_iso = sys::file_size(iso_src).unwrap_or(u64::MAX) >= 2 * sys::GB;
+        let lentry = menu_entry(&ltitle, &format!("/_ISO/{}", safe_name), big_iso);
+        let (m, added) = refresh_menu_entry(&menu, &ltitle, &lentry);
+        menu = m;
+        dirty |= added;
+        if added {
+            out::info(&format!("menu.lst entry '{}' (loopback ISO)", ltitle));
+        } else {
+            out::info(&format!("menu.lst already contains an entry titled '{}'", ltitle));
+        }
+        let (m, usb_added) = ensure_usb_init(&menu);
+        menu = m;
+        dirty |= usb_added;
+        if dirty {
+            std::fs::write(&menu_path, menu).map_err(|e| format!("write menu.lst: {}", e))?;
+            out::info(&format!("{} menu.lst.", if existed { "Updated" } else { "Created" }));
+        }
+        // The UEFI mirror is deliberately NOT written: `uefi_cfg_loopback_*`
+        // emits `boot=casper` + `iso-scan/filename=`, which is casper's own
+        // init. Naming a boot=casper entry for an image with no casper initrd
+        // would boot and then fail. BIOS chainload is the honest limit.
+        return Ok(MainEntries { title: ltitle, kernel: None });
     };
     // Reproduce the distro's OWN GRUB kernel cmdline for the live user.
     // casper defaults to USERNAME/HOST "ubuntu" (/etc/casper.conf), and Mint
@@ -2252,11 +2359,23 @@ fn write_menu_entries(
             user_params
         ));
     }
-    let dentry = if hddmirror {
+    let dentry = if f2fs_gib > 0 {
+        if hddmirror {
+            menu_entry_direct_hddmirror_f2fs(&dtitle, &kern_rel, &init_rel, &user_params, f2fs_gib)
+        } else {
+            menu_entry_direct_f2fs(&dtitle, &kern_rel, &init_rel, &user_params, f2fs_gib)
+        }
+    } else if hddmirror {
         menu_entry_direct_hddmirror_user(&dtitle, &kern_rel, &init_rel, &user_params)
     } else {
         menu_entry_direct_user(&dtitle, &kern_rel, &init_rel, &user_params)
     };
+    if f2fs_gib > 0 {
+        out::info(&format!(
+            "menu.lst entry '{}' with F2FS provisioning ({} GiB, initrd.f2fs.gz)",
+            dtitle, f2fs_gib
+        ));
+    }
     let (m, added) = refresh_menu_entry(&menu, &dtitle, &dentry);
     menu = m;
     if added {
@@ -2329,7 +2448,10 @@ fn write_menu_entries(
             out::info("efi\\grub\\menu.lst already has the entries (grub4dos-for-UEFI menu up to date).");
         }
     }
-    Ok((dtitle, kern_rel, init_rel))
+    Ok(MainEntries {
+        title: dtitle,
+        kernel: Some((kern_rel, init_rel)),
+    })
 }
 
 /// grub4dos menu block for a Boot-to-RAM entry. `extra` is appended to the
@@ -2658,11 +2780,23 @@ fn write_efi_bootdir(
     kern_rel: &str,
     init_rel: &str,
     iso_name: &str,
+    hddmirror: bool,
+    f2fs_gib: u32,
 ) -> Result<(), String> {
     let bootdir = format!("{}EFI\\BOOT", root);
     // The signed-chain GRUB2 entry must carry the same live-session identity
     // as the grub4dos menu (see live_session_username).
     let user_params = live_session_kernel_params(iso_name);
+    // The same initrd list and F2FS cmdline flag the grub4dos menu got. Without
+    // this the stick silently loses persistence on a UEFI-only machine, because
+    // the signed chain reads grub.cfg and never menu.lst - and equally silently
+    // loses the HDD-mirror hook, which has its own initrd.
+    let entry = match (f2fs_gib > 0, hddmirror) {
+        (true, true) => uefi_cfg_direct_hddmirror_f2fs(title, kern_rel, init_rel, &user_params, f2fs_gib),
+        (true, false) => uefi_cfg_direct_f2fs(title, kern_rel, init_rel, &user_params, f2fs_gib),
+        (false, true) => uefi_cfg_direct_hddmirror_user(title, kern_rel, init_rel, &user_params),
+        (false, false) => uefi_cfg_direct_user(title, kern_rel, init_rel, &user_params),
+    };
     sys::create_dir_all(&bootdir);
     std::fs::write(format!("{}\\BOOTX64.EFI", bootdir), bootx64)
         .map_err(|e| format!("write BOOTX64.EFI: {}", e))?;
@@ -2678,20 +2812,13 @@ fn write_efi_bootdir(
             // Fresh file: header + the file-less direct entry.
             std::fs::write(
                 &cfg_path,
-                format!(
-                    "set timeout=5\n{}",
-                    uefi_cfg_direct_user(title, kern_rel, init_rel, &user_params)
-                ),
+                format!("set timeout=5\n{}", entry),
             )
             .map_err(|e| format!("write grub.cfg: {}", e))?;
             out::info(&format!("Created grub.cfg entry '{}'.", title));
         }
         Ok(existing) => {
-            let (cfg, added) = upsert_grub_entry(
-                &existing,
-                title,
-                &uefi_cfg_direct_user(title, kern_rel, init_rel, &user_params),
-            );
+            let (cfg, added) = upsert_grub_entry(&existing, title, &entry);
             if added {
                 std::fs::write(&cfg_path, cfg).map_err(|e| format!("write grub.cfg: {}", e))?;
                 out::info(&format!("Updated grub.cfg entry '{}' (multiboot-safe upsert).", title));
@@ -2716,24 +2843,26 @@ fn install_uefi_resolved(
     iso_name: &str,
     uefi_bootx64: &str,
     loader: UefiLoader,
+    hddmirror: bool,
+    f2fs_gib: u32,
 ) -> Result<bool, String> {
     match resolve_uefi(loader, uefi_bootx64) {
         ResolvedUefi::Signed => {
             let (shim, grub, mm) = bundled_signed().expect("resolve said Signed but the chain is gone");
-            write_efi_bootdir(root, shim, Some((grub, mm)), title, kern_rel, init_rel, iso_name)?;
+            write_efi_bootdir(root, shim, Some((grub, mm)), title, kern_rel, init_rel, iso_name, hddmirror, f2fs_gib)?;
             out::info("UEFI: signed shim -> GRUB2 chain installed (Secure Boot ON works too).");
             Ok(true)
         }
         ResolvedUefi::Grub4dos => {
             let bytes = bundled_uefi().expect("resolve said Grub4dos but nothing is bundled");
-            write_efi_bootdir(root, bytes, None, title, kern_rel, init_rel, iso_name)?;
+            write_efi_bootdir(root, bytes, None, title, kern_rel, init_rel, iso_name, hddmirror, f2fs_gib)?;
             out::info("UEFI: grub4dos-for-UEFI BOOTX64.EFI installed (Secure Boot must be OFF).");
             Ok(true)
         }
         ResolvedUefi::Custom => {
             let bytes =
                 std::fs::read(uefi_bootx64).map_err(|e| format!("read {}: {}", uefi_bootx64, e))?;
-            write_efi_bootdir(root, &bytes, None, title, kern_rel, init_rel, iso_name)?;
+            write_efi_bootdir(root, &bytes, None, title, kern_rel, init_rel, iso_name, hddmirror, f2fs_gib)?;
             out::info(&format!(
                 "UEFI: BOOTX64.EFI (--uefi-bootx64 {}) + grub.cfg installed.",
                 uefi_bootx64
@@ -2771,7 +2900,9 @@ fn install_files(
     extra_isos: &[String],
     ramclone: bool,
     hddmirror: bool,
+    f2fs_gib: u32,
     bundle_dir: &str,
+    iso_arch: Option<&str>,
 ) -> Result<(String, bool, WriteMetrics), String> {
     let root = format!("{}:\\", t.letter);
     // Resolve the UEFI loader up front: the menu-mirror decision depends on
@@ -2836,8 +2967,47 @@ fn install_files(
     } else {
         false
     };
-    let (title, kern_rel, init_rel) =
-        write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui, hddmirror_ok)?;
+    // The F2FS provisioning initrd. Written BEFORE the menus, because the boot
+    // entries reference it - a menu pointing at a missing initrd boots and then
+    // fails with no explanation.
+    //
+    // A failure here is FATAL when f2fs was chosen. The alternative is a stick
+    // that boots, shows no error, and silently keeps a RAM upper - the exact
+    // bug this path was built to fix, and one the user would only discover
+    // when their /home did not survive a reboot. Better to stop now and say why.
+    let f2fs_ok = if f2fs_gib > 0 {
+        crate::lslfiles::install_f2fs_initrd(&t.letter, bundle_dir, iso, iso_arch).map_err(|e| {
+            format!(
+                "F2FS persistence was selected but its boot-time tools could not be prepared ({}).\n  \
+                 The stick needs fatresize + mkfs.f2fs inside casper/initrd.f2fs.gz, and they are\n  \
+                 fetched from the ISO's own package archive (chosen from its dists/ suite - see the\n  \
+                 'archive' line above). Check network access to that archive, or pre-build\n  \
+                 rust9x/lslsetup/assets/f2fs-tools.tar.gz (scripts/extract-f2fs-tools.sh).\n  \
+                 Continuing would give a stick that boots but never persists /home.",
+                e
+            )
+        })?;
+        true
+    } else {
+        false
+    };
+    // If the initrd could not be written, do NOT advertise the flag: an entry
+    // carrying lsl_f2fs_provision=N with no initrd would boot a system that
+    // silently never gets persistence - the exact bug this fixes.
+    let f2fs_effective = if f2fs_ok { f2fs_gib } else { 0 };
+    let main = write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui, hddmirror_ok, f2fs_effective)?;
+    let title = main.title.clone();
+    // No kernel extracted => loopback-only install. The UEFI side-load and the
+    // Boot-to-RAM entry both name a kernel path; writing them here would point
+    // at a file that does not exist and boot to nothing.
+    let (kern_rel, init_rel) = match main.kernel.clone() {
+        Some(k) => k,
+        None => {
+            out::info("Loopback-only install: UEFI files and Boot-to-RAM entries skipped (they need an extracted kernel).");
+            install_extra_isos(&root, &validated_extra, uefi_res.mirror_menu(), ui, skip_verify, &mut metrics)?;
+            return Ok((title, false, metrics));
+        }
+    };
     // UEFI side-load (files only; FAT32 stick). Signed shim -> GRUB2 works
     // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need
     // Secure Boot OFF (see assets/SIGNED-UEFI.txt). This MUST run before
@@ -2845,7 +3015,7 @@ fn install_files(
     // install_uefi_resolved creates - on a fresh stick the read would fail and
     // the "Boot to RAM" grub.cfg entry would be silently dropped (the entry
     // showed on BIOS/grub4dos but never under the signed-GRUB2 UEFI chain).
-    let uefi_ok = install_uefi_resolved(&root, &title, &kern_rel, &init_rel, &iso_name, uefi_bootx64, uefi_loader)?;
+    let uefi_ok = install_uefi_resolved(&root, &title, &kern_rel, &init_rel, &iso_name, uefi_bootx64, uefi_loader, hddmirror_ok, f2fs_effective)?;
     if ramclone {
         if let Err(e) = crate::lslfiles::install_ramclone_initrd(&t.letter, bundle_dir) {
             out::warn(&format!("ramclone initrd not created ({}); Boot to RAM entry skipped.", e));
@@ -3188,7 +3358,7 @@ fn main_extract_bytes(iso_path: &str) -> u64 {
     need
 }
 
-fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool, extra_isos: &[String], ramclone: bool, hddmirror: bool, bundle_dir: &str) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
+fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bool, want_uefi: bool, uefi_loader: UefiLoader, ui: Option<&dyn WriteUi>, skip_verify: bool, extra_isos: &[String], ramclone: bool, hddmirror: bool, f2fs_gib: u32, bundle_dir: &str, iso_arch: Option<&str>) -> Result<(WriteMetrics, Option<PendingMbr>), String> {
     let fs_uc = t.fs.to_ascii_uppercase();
     // grub4dos reads FAT12/16/32 and NTFS only. exFAT (the default on many
     // large sticks) is NOT readable by grub4dos, so a stick left exFAT cannot
@@ -3297,7 +3467,7 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         }
         out::step("GPT stick: files-only UEFI install (no raw sectors touched).");
         report_board(false, true);
-        let (title, uefi_ok, metrics) = install_files(t, iso, uefi_bootx64, false, true, uefi_loader, ui, skip_verify, extra_isos, ramclone, hddmirror, bundle_dir)?;
+        let (title, uefi_ok, metrics) = install_files(t, iso, uefi_bootx64, false, true, uefi_loader, ui, skip_verify, extra_isos, ramclone, hddmirror, f2fs_gib, bundle_dir, iso_arch)?;
         report_bootability(false, "GPT stick - grub4dos BIOS stage1 has nowhere to live (sectors 1-15 are the GPT header/table)", uefi_ok, &title);
         return Ok((metrics, None));
     }
@@ -3484,15 +3654,72 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
     } else {
         false
     };
-    let (title, kern_rel, init_rel) =
-        write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui, hddmirror_ok)?;
+    // Fatal on failure, as in install_files: a stick that boots without its
+    // persistence tools is worse than a failed install.
+    let f2fs_ok = if f2fs_gib > 0 {
+        crate::lslfiles::install_f2fs_initrd(&t.letter, bundle_dir, iso, iso_arch).map_err(|e| {
+            format!(
+                "F2FS persistence was selected but its boot-time tools could not be prepared ({}).\n  \
+                 The stick needs fatresize + mkfs.f2fs inside casper/initrd.f2fs.gz, fetched from\n  \
+                 the ISO's own package archive (chosen from its dists/ suite - see the 'archive'\n  \
+                 line above). Check network access to that archive, or pre-build\n  \
+                 rust9x/lslsetup/assets/f2fs-tools.tar.gz (scripts/extract-f2fs-tools.sh).",
+                e
+            )
+        })?;
+        true
+    } else {
+        false
+    };
+    let f2fs_effective = if f2fs_ok { f2fs_gib } else { 0 };
+    let main = write_menu_entries(&root, iso, &safe_name, &iso_name, uefi_res.mirror_menu(), ui, hddmirror_ok, f2fs_effective)?;
+    let title = main.title.clone();
+    // Loopback-only (no kernel extracted): the menu entry chainloads the ISO
+    // FILE, so that file has to actually be on the stick. Copy it with the
+    // same verified-copy helper the extras use rather than reimplementing it.
+    if main.kernel.is_none() {
+        sys::create_dir_all(&format!("{}_ISO", root));
+        let iso_dst = format!("{}_ISO\\{}", root, safe_name);
+        let len = sys::file_size(iso).unwrap_or(0);
+        let (_s, m) = copy_and_verify_iso(iso, &iso_dst, len, ui, skip_verify)?;
+        metrics.bytes_copied += m.bytes_copied;
+        metrics.bytes_verified += m.bytes_verified;
+        out::info(&format!("{} copied to the stick for the loopback boot entry.", iso_name));
+    }
+    let (kern_rel, init_rel) = match main.kernel.clone() {
+        Some(k) => k,
+        None => {
+            // Loopback-only: the menu chainloads the ISO file, so it boots
+            // through the SAME grub4dos stage1 the casper path uses. The MBR
+            // commit must still happen - returning here without it would
+            // leave a stick with a menu and no boot code.
+            out::info("Loopback-only install: UEFI files and Boot-to-RAM entries skipped (they need an extracted kernel).");
+            out::info("  The stick will boot this ISO through its own bootloader (BIOS only).");
+            out::info("  No persistence, first-boot setup, wifi provisioning or driver staging will be present.");
+            install_extra_isos(&root, &validated_extra, uefi_res.mirror_menu(), ui, skip_verify, &mut metrics)?;
+            report_bootability(true, "grub4dos MBR stage1 + menu.lst loopback chainload", false, &title);
+            let pending = PendingMbr {
+                phys_path: phys_path.clone(),
+                new_mbr,
+                early_mbr: mbr,
+                mbr_changed,
+                cont_changed,
+                backup_path,
+                want_bios,
+                want_uefi: false,
+                title,
+                uefi_ok: false,
+            };
+            return Ok((metrics, Some(pending)));
+        }
+    };
     // UEFI side-load (files only; FAT32 stick). Signed shim -> GRUB2 works
     // with Secure Boot ON; grub4dos-for-UEFI and --uefi-bootx64 files need
     // Secure Boot OFF. Skipped when UEFI boot is unchecked. Written before
     // add_ramclone_boot_entries so that entry's grub.cfg append finds the file
     // (see install_files - otherwise the Boot to RAM entry never shows UEFI).
     if want_uefi {
-        install_uefi_resolved(&root, &title, &kern_rel, &init_rel, &iso_name, uefi_bootx64, uefi_loader)?;
+        install_uefi_resolved(&root, &title, &kern_rel, &init_rel, &iso_name, uefi_bootx64, uefi_loader, hddmirror_ok, f2fs_effective)?;
     } else {
         out::info("UEFI boot not selected - EFI files skipped.");
     }
@@ -3573,6 +3800,44 @@ fn uefi_cfg_direct_user(
     )
 }
 
+/// GRUB2 (signed shim -> grubx64.efi) equivalent of `menu_entry_direct_f2fs`.
+///
+/// Needed as its own template because the signed chain reads `grub.cfg` and
+/// nothing else - without this the stick would only get F2FS persistence when
+/// booted through grub4dos, i.e. silently lose it on any UEFI-only machine.
+fn uefi_cfg_direct_f2fs(
+    title: &str,
+    kern_rel: &str,
+    init_rel: &str,
+    user_params: &str,
+    f2fs_gib: u32,
+) -> String {
+    format!(
+        "menuentry \"{title}\" {{\n\
+         \x20   search --no-floppy --set=root --file {kern_rel}\n\
+         \x20   linux {kern_rel} boot=casper{user_params} lsl_f2fs_provision={f2fs_gib} rootdelay=15 quiet splash\n\
+         \x20   initrd {init_rel} /casper/initrd.f2fs.gz\n\
+         }}\n"
+    )
+}
+
+/// `uefi_cfg_direct_f2fs` with the HDD-mirror initrd also loaded.
+fn uefi_cfg_direct_hddmirror_f2fs(
+    title: &str,
+    kern_rel: &str,
+    init_rel: &str,
+    user_params: &str,
+    f2fs_gib: u32,
+) -> String {
+    format!(
+        "menuentry \"{title}\" {{\n\
+         \x20   search --no-floppy --set=root --file {kern_rel}\n\
+         \x20   linux {kern_rel} boot=casper{user_params} lsl_f2fs_provision={f2fs_gib} rootdelay=15 quiet splash\n\
+         \x20   initrd {init_rel} /casper/initrd.hddmirror.gz /casper/initrd.f2fs.gz\n\
+         }}\n"
+    )
+}
+
 /// `#[cfg(test)]`: test-only no-parameter wrapper (see `menu_entry_direct`).
 #[cfg(test)]
 fn uefi_cfg_direct_ramclone(title: &str, kern_rel: &str, init_rel: &str) -> String {
@@ -3609,9 +3874,11 @@ fn uefi_cfg_direct_hddmirror(title: &str, kern_rel: &str, init_rel: &str) -> Str
 
 /// `uefi_cfg_direct_hddmirror` with the live-session user parameters.
 ///
-/// `#[cfg(test)]`: the hddmirror grub.cfg entry is assembled inline in
-/// `add_ramclone_boot_entries` (its `hddmirror` branch), not here.
-#[cfg(test)]
+/// No longer `#[cfg(test)]`: `write_efi_bootdir` picks this for the main
+/// grub.cfg entry when the HDD-mirror initrd is in play. It used to be
+/// assembled inline in `add_ramclone_boot_entries`, which meant the MAIN entry
+/// never carried the mirror initrd - only the extra "Boot to RAM" one did, so a
+/// stick booted normally silently ignored its HDD mirror.
 fn uefi_cfg_direct_hddmirror_user(
     title: &str,
     kern_rel: &str,
@@ -4335,6 +4602,63 @@ mod tests {
         let plain = menu_entry_direct("X (direct kernel)", "/_ISO/x/vmlinuz", "/_ISO/x/initrd");
         assert!(plain.contains("boot=casper rootdelay=15"), "{}", plain);
         assert!(!plain.contains("username="), "{}", plain);
+    }
+
+    #[test]
+    fn f2fs_entries_carry_the_initrd_and_the_size_together() {
+        // The two halves must travel together: the initrd carries the hook, the
+        // cmdline carries the size. An entry with one and not the other is the
+        // silent-no-persistence bug (flag without initrd = nothing runs; initrd
+        // without flag = hook reads 0 and returns).
+        let p = live_session_kernel_params("linuxmint-22.3-cinnamon-64bit.iso");
+        let f2fs = menu_entry_direct_f2fs("Mint", "/_ISO/m/vmlinuz", "/_ISO/m/initrd", &p, 42);
+        assert!(f2fs.contains("lsl_f2fs_provision=42"), "{}", f2fs);
+        assert!(f2fs.contains("/casper/initrd.f2fs.gz"), "{}", f2fs);
+        // The live-session identity must survive alongside the new flag.
+        assert!(
+            f2fs.contains("boot=casper username=mint hostname=mint lsl_f2fs_provision=42"),
+            "{}",
+            f2fs
+        );
+
+        // The UEFI (grub.cfg) side needs it too: the signed chain reads
+        // grub.cfg and never menu.lst, so without this the stick loses
+        // persistence on any UEFI-only machine.
+        let uefi = uefi_cfg_direct_f2fs("Mint", "/_ISO/m/vmlinuz", "/_ISO/m/initrd", &p, 42);
+        assert!(uefi.contains("lsl_f2fs_provision=42"), "{}", uefi);
+        assert!(uefi.contains("/casper/initrd.f2fs.gz"), "{}", uefi);
+
+        // Combined with the HDD mirror, both initrds load, in that order.
+        let both = menu_entry_direct_hddmirror_f2fs("Mint", "/_ISO/m/vmlinuz", "/_ISO/m/initrd", &p, 7);
+        assert!(both.contains("lsl_f2fs_provision=7"), "{}", both);
+        assert!(
+            both.contains("/casper/initrd.hddmirror.gz /casper/initrd.f2fs.gz"),
+            "{}",
+            both
+        );
+        let uboth = uefi_cfg_direct_hddmirror_f2fs("Mint", "/_ISO/m/vmlinuz", "/_ISO/m/initrd", &p, 7);
+        assert!(
+            uboth.contains("/casper/initrd.hddmirror.gz /casper/initrd.f2fs.gz"),
+            "{}",
+            uboth
+        );
+    }
+
+    #[test]
+    fn no_f2fs_means_the_entries_are_untouched() {
+        // The regression guard for every non-f2fs stick: choosing any other
+        // backend must produce byte-identical boot entries - no stray flag, no
+        // reference to an initrd that was never written.
+        let p = live_session_kernel_params("linuxmint-22.3-cinnamon-64bit.iso");
+        for e in [
+            menu_entry_direct_user("M", "/vmlinuz", "/initrd", &p),
+            menu_entry_direct_hddmirror_user("M", "/vmlinuz", "/initrd", &p),
+            uefi_cfg_direct_user("M", "/vmlinuz", "/initrd", &p),
+            uefi_cfg_direct_hddmirror_user("M", "/vmlinuz", "/initrd", &p),
+        ] {
+            assert!(!e.contains("lsl_f2fs_provision"), "{}", e);
+            assert!(!e.contains("initrd.f2fs.gz"), "{}", e);
+        }
     }
 
     fn valid_mbr() -> [u8; 512] {
@@ -5136,9 +5460,9 @@ mod tests {
         )
         .unwrap();
         // UEFI install: direct entry in BOTH menus, base beside casper.
-        let (t, kern, init) =
-            write_menu_entries(&root, &iso, "casper.iso", "casper.iso", true, None, false).unwrap();
-        assert_eq!(t, "casper (direct kernel)");
+        let main = write_menu_entries(&root, &iso, "casper.iso", "casper.iso", true, None, false, 0).unwrap();
+        assert_eq!(main.title, "casper (direct kernel)");
+        let (kern, init) = main.kernel.expect("casper ISO must extract a kernel");
         assert!(kern.ends_with("/vmlinuz"), "unexpected {}", kern);
         assert!(init.ends_with("initrd.lz"), "unexpected {}", init);
         let root_menu = std::fs::read_to_string(format!("{}menu.lst", root)).unwrap();
@@ -5158,21 +5482,67 @@ mod tests {
             uefi_menu.lines().collect::<Vec<_>>()
         );
         // Re-running is idempotent: no duplicate titles, identical bytes.
-        write_menu_entries(&root, &iso, "casper.iso", "casper.iso", true, None, false).unwrap();
+        write_menu_entries(&root, &iso, "casper.iso", "casper.iso", true, None, false, 0).unwrap();
         assert_eq!(std::fs::read_to_string(format!("{}menu.lst", root)).unwrap(), root_menu);
         assert_eq!(std::fs::read_to_string(format!("{}efi\\grub\\menu.lst", root)).unwrap(), uefi_menu);
         // BIOS-only install: the mirror must not exist at all.
         let _ = std::fs::remove_dir_all(format!("{}efi", root));
-        write_menu_entries(&root, &iso, "casper.iso", "casper.iso", false, None, false).unwrap();
+        write_menu_entries(&root, &iso, "casper.iso", "casper.iso", false, None, false, 0).unwrap();
         assert!(
             !std::path::Path::new(&format!("{}efi\\grub\\menu.lst", root)).exists(),
             "efi\\grub\\menu.lst must not be created for a BIOS-only install"
         );
-        // Non-casper ISO is a hard error now (file-less main needs the
-        // kernel; loopback needs the file, which no longer ships).
-        let bad = format!("{}\\plain.iso", flat);
+        // Non-casper ISO: LOOPBACK FALLBACK, not a hard error. This replaces the
+        // old assertion that it must fail - a chainloaded image boots through
+        // its own bootloader, so the ISO file becomes the thing to chainload.
+        // `kernel == None` is what tells the caller not to write UEFI files
+        // naming a kernel that was never extracted.
+        // A FRESH directory: the assertions above ran the casper path on `root`,
+        // which legitimately creates casper\. "loopback creates nothing that
+        // needs a casper init" has to be checked on a stick that never had a
+        // casper install on it.
+        let lb = std::env::temp_dir().join(format!("lslsetup-loopback-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&lb); // stale run from an earlier crash
+        std::fs::create_dir_all(&lb).unwrap();
+        let lb_root = {
+            let s = lb.to_string_lossy().replace('/', "\\");
+            if s.ends_with('\\') { s } else { format!("{}\\", s) }
+        };
+        let bad = format!("{}\\_ISO\\bad.iso", lb_root);
+        std::fs::create_dir_all(format!("{}\\_ISO", lb_root)).unwrap();
         std::fs::write(&bad, b"not a real iso - no casper kernel").unwrap();
-        assert!(write_menu_entries(&root, &bad, "plain", "plain.iso", false, None, false).is_err());
+        let lm = write_menu_entries(&lb_root, &bad, "bad.iso", "bad.iso", false, None, false, 0).unwrap();
+        assert_eq!(lm.title, "bad (loopback ISO)");
+        assert!(
+            lm.kernel.is_none(),
+            "a non-casper ISO has no extracted kernel - UEFI files must be skipped"
+        );
+        let lm_menu = std::fs::read_to_string(format!("{}menu.lst", lb_root)).unwrap();
+        assert!(lm_menu.contains("title bad (loopback ISO)"), "loopback entry missing: {}", lm_menu);
+        assert!(lm_menu.contains("/_ISO/bad.iso"), "entry must chainload the ISO file: {}", lm_menu);
+        // Nothing that needs a casper init may be created.
+        assert!(
+            !std::path::Path::new(&format!("{}casper", lb_root)).exists(),
+            "loopback install must not create casper\\: {}",
+            lm_menu
+        );
+        assert!(
+            !std::path::Path::new(&format!("{}efi", lb_root)).exists(),
+            "loopback install must not create an EFI tree"
+        );
+        // And the loopback entry is idempotent, like every other entry here.
+        let lm2 = write_menu_entries(&lb_root, &bad, "bad.iso", "bad.iso", false, None, false, 0).unwrap();
+        assert_eq!(lm2.title, lm.title);
+        assert_eq!(std::fs::read_to_string(format!("{}menu.lst", lb_root)).unwrap(), lm_menu);
+        // A persistence backend that rides in casper's initrd cannot be
+        // honoured here, and must be refused rather than silently dropped -
+        // a stick that boots but never persists is the bug this all guards.
+        for (f2fs, hdd, what) in [(1u32, false, "F2FS"), (0, true, "HDD-mirror")] {
+            let e = write_menu_entries(&lb_root, &bad, "bad.iso", "bad.iso", false, None, hdd, f2fs)
+                .unwrap_err();
+            assert!(e.contains(what), "error must name the backend: {}", e);
+        }
+        let _ = std::fs::remove_dir_all(&lb);
         let _ = std::fs::remove_dir_all(&d);
     }
 
