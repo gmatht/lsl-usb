@@ -397,28 +397,44 @@ pub fn persist_split_text(total_gib: u32, persist_mib: u32) -> String {
 /// number Install writes was not the number on screen. This is called at the top
 /// of every event dispatch and only writes when the text actually changes.
 fn sync_persist_readout(items: &PageItems) {
+    // MUST be non-panicking under re-entry.
+    //
+    // This runs at the top of EVERY dispatch, including dispatches that nwg
+    // makes from INSIDE this one. Building or laying out the page calls
+    // SetWindowPos/SetWindowText, which send real messages to the child
+    // controls; nwg subclasses every child, so each of those messages runs
+    // process_events -> our handler again, right now, while the outer frame is
+    // still holding persist_items borrowed (borrow_mut in
+    // build_persist_page, borrow in layout_page).
+    //
+    // An unconditional borrow() here therefore aborts the process with
+    // "already mutably borrowed" the moment the user selects a stick - the
+    // deferred rebuild at the top of a dispatch creates controls, whose
+    // creation immediately re-enters this handler. That is exactly the
+    // hazard the in_relayout guard exists for; the same reasoning applies here.
+    //
+    // try_borrow, not borrow: this is a display refresh, so skipping one while
+    // the page is mid-rebuild or mid-layout is harmless - the next dispatch
+    // that is not nested refreshes it, and by then the new controls are in
+    // place. Panicking would abort an installer over a cosmetic label.
+    let Ok(b) = items.try_borrow() else {
+        return;
+    };
     let mut track: Option<usize> = None;
     let mut label: Option<usize> = None;
     let mut split: Option<usize> = None;
-    // Collect indices in a SCOPED borrow. Holding `items.borrow()` in the `for`
-    // expression keeps that Ref alive until the end of the enclosing statement,
-    // so a second borrow() inside it panics with "already mutably borrowed".
-    {
-        let b = items.borrow();
-        for (i, it) in b.iter().enumerate() {
-            match &it.ctl {
-                PageCtl::Track(_, 0) => track = Some(i),
-                PageCtl::Lbl(_, 1) => label = Some(i),
-                PageCtl::Lbl(_, 2) => split = Some(i),
-                _ => {}
-            }
+    for (i, it) in b.iter().enumerate() {
+        match &it.ctl {
+            PageCtl::Track(_, 0) => track = Some(i),
+            PageCtl::Lbl(_, 1) => label = Some(i),
+            PageCtl::Lbl(_, 2) => split = Some(i),
+            _ => {}
         }
     }
     let (Some(ti), Some(li)) = (track, label) else {
         return;
     };
-    let items_ref = items.borrow();
-    let mib = match &items_ref[ti].ctl {
+    let mib = match &b[ti].ctl {
             // Clamp to the control's OWN minimum rather than a global constant: the
             // range is derived per-target (persist_gib_bounds), so a stale constant
             // here could scale a position that is already below the minimum to zero.
@@ -428,7 +444,7 @@ fn sync_persist_readout(items: &PageItems) {
             }
             _ => return,
         };
-    if let PageCtl::Lbl(lb, _) = &items_ref[li].ctl {
+    if let PageCtl::Lbl(lb, _) = &b[li].ctl {
         let want = persist_gib_text(mib);
         if lb.text() != want {
             lb.set_text(&want);
@@ -439,7 +455,7 @@ fn sync_persist_readout(items: &PageItems) {
     // a plausible-looking but stale division of the stick on screen - the same
     // defect as the size readout, one label further along.
     if let Some(si) = split {
-        if let PageCtl::Lbl(lb, _) = &items_ref[si].ctl {
+        if let PageCtl::Lbl(lb, _) = &b[si].ctl {
             let stick_gib = PERSIST_SPLIT_TOTAL.with(|c| c.get());
             let want = persist_split_text(stick_gib, mib);
             if lb.text() != want {
@@ -3189,9 +3205,20 @@ pub(crate) fn build_persist_page(
             p.push(PageItem { ctl: PageCtl::Lbl(none, 0), x: 26, y, w: -20, h: 20, idx: 0 });
             y += 24;
         }
-        let first_ready = cands
-            .iter()
-            .position(|c| matches!(c.status, crate::nofmt::CandidateStatus::Ready));
+        // Pre-check the first SELECTABLE candidate, not the first "Ready" one.
+        //
+        // `Ready` excludes a fixed/non-USB stick, which is what a "check contents
+        // first" target is - and refusing to pre-check those left the group with
+        // NOTHING checked, so `selected_target_in` returned None, `persist_target_gib`
+        // matched no volume, and the pane sized itself from 0: the 1 GiB minimum.
+        // That is exactly the reported symptom, on a perfectly good 116 GB stick,
+        // purely because it was a fixed drive rather than a removable one.
+        //
+        // Selecting is not the same as approving: a "check contents" pick still
+        // goes through the content gate and the backup offer at install time, so
+        // pre-checking it grants nothing - it only says which stick the numbers
+        // describe. Refused candidates were already filtered out above.
+        let first_ready = Some(0);
         for (n, c) in cands.iter().enumerate() {
             let t = c.target.as_ref().unwrap();
             let size_gb = t.total as f64 / crate::sys::GB as f64;
@@ -3242,7 +3269,20 @@ pub(crate) fn build_persist_page(
         // `p` is a live borrow_mut of persist_items' RefCell, so the latter would
         // request a second borrow and panic with "RefCell already mutably
         // borrowed" the moment the persistence page is built.
-        PERSIST_TARGET.with(|c| *c.borrow_mut() = selected_target_in(&p));
+        //
+        // Take the letter from the radio the USER checked, and let an explicitly
+        // requested target override it. The two disagree in exactly one case -
+        // the re-size that follows a target click. The picker was just rebuilt,
+        // and a `check_state()` read in that window can still see the OLD control
+        // being torn down, so this read is not reliable here; the click handler
+        // already recorded the letter the user actually picked, and that is the
+        // authoritative answer. Overwriting it here is what made the pane size
+        // itself against "the largest candidate" - 235 GB, the system disk - and
+        // render "235 GB FAT / 1 GB persistence" for a 116 GB stick.
+        let picked = selected_target_in(&p);
+        let requested = PERSIST_TARGET.with(|c| c.borrow().clone());
+        let target = reconcile_target(requested.as_deref(), picked.as_deref());
+        PERSIST_TARGET.with(|c| *c.borrow_mut() = target.clone());
         y += 8;
 
         // A local label helper: the system page's `push_lbl` closure is scoped
@@ -3305,11 +3345,11 @@ pub(crate) fn build_persist_page(
         //
         // Bounds and default come from the target's size and the selected ISO.
         //
-        // `target` is the INSTALL page's chosen drive letter when there is one.
-        // Sizing from "the largest candidate on the machine" instead is what made
-        // the pane report 1 GB while a 128 GB stick sat in D:, and made the split
-        // line describe a device the user never picked.
-        let target = PERSIST_TARGET.with(|c| c.borrow().clone());
+        // `target` is the reconciled letter resolved above: the radio the user
+        // checked, or the one a target click explicitly requested. Sizing from
+        // "the largest candidate on the machine" instead is what made the pane
+        // report 1 GB while a 128 GB stick sat in D:, and made the split line
+        // describe a device the user never picked.
         let stick_gib = persist_target_gib(target.as_deref());
         let iso_gib = iso_size_gib(iso_arg);
 
@@ -5433,14 +5473,22 @@ pub fn run_gui(
                         // persist_items - clears that vector, destroying every
                         // control through nwg's Drop, including the radio whose
                         // click is being processed, while the loop still holds
-                        // a borrow of it. The handler then walks freed controls:
-                        // a stack overflow reported as 0xC0000409
-                        // (STATUS_STACK_BUFFER_OVERRUN, which is __fastfail,
-                        // NOT a Rust panic - those exit 101, which is why there
-                        // was no message to read).
+                        // a borrow of it. The handler then walks freed controls.
                         //
                         // Record the intent instead; the rebuild happens at the
-                        // top of the NEXT dispatch, where no borrow is live.
+                        // top of the NEXT dispatch, where no borrow of this
+                        // vector is live.
+                        //
+                        // Deferring is necessary but NOT sufficient, and the gap
+                        // cost this pane a crash: the rebuild runs inside a
+                        // dispatch, and building controls makes nwg re-enter
+                        // this same handler, where sync_persist_readout used to
+                        // borrow the page that build_persist_page already held
+                        // mutably. That aborts just as hard. See
+                        // sync_persist_readout. (Both profiles set
+                        // panic = "abort", so that panic exits 0xC0000409 -
+                        // indistinguishable from a stack smash, which is why
+                        // this was misdiagnosed twice.)
                         PERSIST_TARGET.with(|c| *c.borrow_mut() = Some(letter));
                         persist_resize_pending_c.set(true);
                     }
@@ -5868,6 +5916,28 @@ fn selected_target_in(items: &[PageItem]) -> Option<String> {
         }
     }
     None
+}
+
+/// The letter the persistence pane must size itself against.
+///
+/// Two sources, and they disagree in exactly one case: a target click stores the
+/// letter the user picked (`requested`) and then rebuilds the pane, and the pane's
+/// own read of the freshly-built picker (`picked`) can still be looking at the
+/// control that is being torn down. The clicked letter is authoritative.
+///
+/// Letting the picker overwrite it instead is what made the pane fall back to
+/// "the largest candidate" - on a machine with a 236 GB system disk and a 116 GB
+/// stick it rendered "235 GB FAT / 1 GB persistence" for the stick the user had
+/// just selected.
+///
+/// When only one source has an answer, it wins; when they agree, nothing changes;
+/// when neither does, the pane reports that it cannot be sized yet rather than
+/// guessing at a device.
+fn reconcile_target(requested: Option<&str>, picked: Option<&str>) -> Option<String> {
+    match (requested, picked) {
+        (Some(r), Some(p)) if r != p => Some(r.to_string()),
+        (r, p) => p.or(r).map(str::to_string),
+    }
 }
 
 /// Harvest the wizard's choices into `GuiResult`. Runs inside the Install-click
@@ -6742,22 +6812,100 @@ mod tests {
         assert!(!zero.is_ascii_alphabetic(), "slot 0 must not decode to a letter");
     }
 
+    /// `sync_persist_readout` runs at the top of EVERY dispatch and must survive
+    /// being re-entered while the page is already borrowed.
+    ///
+    /// Selecting a target radio aborted the installer:
+    /// `panicked at src/gui.rs:407` - the `items.borrow()` at the top of
+    /// `sync_persist_readout`. Both profiles set `panic = "abort"`, so that
+    /// panic surfaces as exit code 0xC0000409, indistinguishable from the
+    /// stack-smash the previous fix chased. Only `RUST_BACKTRACE` +
+    /// redirected stderr shows a file and line.
+    ///
+    /// The mechanism is re-entrancy, and it is structural: nwg subclasses every
+    /// child, so a `SetWindowPos`/`SetWindowText` issued while the page is
+    /// borrowed (build_persist_page's `borrow_mut`, layout_page's `borrow`)
+    /// re-enters this handler synchronously. A second `borrow()` there is a hard
+    /// panic.
+    ///
+    /// `catch_unwind` cannot express this (RefCell's borrow flag is not
+    /// UnwindSafe), so the test holds the borrow and calls the function: with an
+    /// unconditional `borrow()` that panicked, which aborts the whole test
+    /// binary (`panic = "abort"` is a profile setting, not a test setting, so a
+    /// panic here fails the run loudly rather than being caught).
+    ///
+    /// No `Track`/`Lbl` rows are pushed: `PageCtl::Track(Box::default(), 0)`
+    /// has no HWND, and reaching the `range_min()` call would panic inside nwg's
+    /// `check_hwnd` for a different reason. The borrow is what is under test -
+    /// it is taken on line 1 of the function, before any control is touched - so
+    /// the bare page exercises exactly the statement that aborted the installer.
+    #[test]
+    fn the_readout_survives_a_reentrant_dispatch() {
+        let items: PageItems = Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            // The outer frame's state: the page is mid-rebuild or mid-layout.
+            let _held = items.borrow_mut();
+            // A nested dispatch now runs the same code the handler runs.
+            sync_persist_readout(&items);
+        }
+        // And with no borrow held it still does its real job.
+        sync_persist_readout(&items);
+    }
+
+    /// The letter the click handler recorded must WIN over the picker's own
+    /// read at build time.
+    ///
+    /// The builder used to overwrite `PERSIST_TARGET` with `selected_target_in`,
+    /// which discards the letter a target click had just stored. `persist_target_gib`
+    /// then fell back to "the largest candidate", and on a machine with a 236 GB
+    /// system disk and a 116 GB stick the pane rendered
+    /// "235 GB FAT / 1 GB persistence" for the 116 GB stick the user picked -
+    /// a division of a device that was never chosen.
+    ///
+    /// Asserted against the real `reconcile_target`, not a copy of it.
+    #[test]
+    fn a_clicked_target_wins_over_the_pickers_stale_read() {
+        // The re-size case: the handler knows D:, the picker still reports the
+        // stick it had checked before the rebuild.
+        assert_eq!(
+            reconcile_target(Some("D"), Some("E")).as_deref(),
+            Some("D"),
+            "the explicitly requested letter must win"
+        );
+        // First build: nothing requested yet, so the picker decides.
+        assert_eq!(reconcile_target(None, Some("E")).as_deref(), Some("E"));
+        // Nothing chosen at all: no target, which the pane renders as
+        // "cannot be sized yet" rather than guessing.
+        assert_eq!(reconcile_target(None, None), None);
+        // Agreement is not a conflict - the picker's answer stands.
+        assert_eq!(reconcile_target(Some("D"), Some("D")).as_deref(), Some("D"));
+        // A request with no readable picker behind it still stands: that is the
+        // "the picker is mid-rebuild" state, and losing the letter there is
+        // exactly the regression.
+        assert_eq!(reconcile_target(Some("D"), None).as_deref(), Some("D"));
+    }
+
     /// The persistence page must not be rebuilt from inside its own click handler.
 ///
-/// Selecting a target radio crashed the installer with 0xC0000409
-/// (STATUS_STACK_BUFFER_OVERRUN). That is `__fastfail`, not a Rust panic - those
-/// exit 101 - so there was no message to read, and the crash surfaced as a
-/// feature ("picking a stick kills it") rather than as a defect.
+/// Deferring the re-size is correct and still asserted below, but the diagnosis
+/// attached to it was WRONG and the comment is corrected rather than deleted,
+/// because "a Rust panic cannot print a message here" is the belief that sent
+/// the next hour down a dead end.
 ///
-/// The cause is re-entrancy: the handler is inside `for it in
-/// persist_items.borrow().iter()`, and `build_persist_page` clears that same
-/// vector. Clearing destroys every control through nwg's Drop - including the
-/// radio whose click is being processed - while the loop still holds a borrow of
-/// it, and the handler then keeps walking freed controls.
+/// The claim was that 0xC0000409 is `__fastfail` and not a Rust panic "those
+/// exit 101". Both cargo profiles set `panic = "abort"` (see Cargo.toml), so a
+/// Rust panic calls `abort()` too and exits 0xC0000409 - identical to a stack
+/// buffer overrun, with the message on stderr rather than in the exit code. The
+/// abort at `gui.rs:407` really was a panic ("RefCell already mutably borrowed"
+/// in sync_persist_readout), reachable through a different re-entrancy path:
+/// nwg re-dispatches the handler from inside control creation, so deferring the
+/// rebuild moved the crash rather than removing it.
+/// See the_readout_survives_a_reentrant_dispatch for the real one.
 ///
-/// The fix is structural: the handler only SETS a flag and the rebuild runs at
-/// the top of the NEXT dispatch, where no borrow is live. This asserts that
-/// invariant, and was verified to fail when the call is put back.
+/// Deferring the rebuild is still right on its own terms: calling the builder
+/// from inside the loop that walks persist_items clears that vector and
+/// destroys the control being clicked. This asserts that invariant, and was
+/// verified to fail when the call is put back.
 #[test]
     fn the_pane_is_not_rebuilt_from_its_own_click_handler() {
         let src = include_str!("gui.rs");
@@ -6785,6 +6933,50 @@ mod tests {
              clears persist_items while the handler is iterating it, which \
              destroys the control being clicked (0xC0000409)"
         );
+    }
+
+    /// The picker must pre-check a candidate that is not `Ready`.
+///
+/// This is the "1 GB instead of 3/4 of the stick" bug. `first_ready` was
+/// `position(|c| matches!(c.status, Ready))`, and a fixed drive is classified
+/// `NeedsContentCheck` - so on a machine whose only candidate was a 116 GB FIXED
+/// stick, NOTHING in the radio group was checked. `selected_target_in` then
+/// returned None, `persist_target_gib` matched no volume, `total_gib` arrived as
+/// 0, and `persist_gib_bounds(0, _)` returns (1, 1, 1) - the 1 GiB floor,
+/// presented as if it were the computed default.
+///
+/// The invariant: the first SELECTABLE candidate is pre-checked even when its
+/// status is `NeedsContentCheck`. Selecting is not approving - the content gate
+/// and backup offer still run at install - so this grants nothing; it only tells
+/// the pane which stick the numbers describe.
+#[test]
+    fn a_fixed_drive_is_still_pre_checked_so_the_size_is_real() {
+        // The candidate list is filtered to `target.is_some() && !Refused`, so
+        // index 0 of that list is always selectable. Assert the pre-check does
+        // not depend on the Ready classification.
+        let src = include_str!("gui.rs");
+        // Find the PICKER's pre-check, not this test's own `find` call, which
+        // contains the same literal. The picker is the occurrence inside
+        // build_persist_page, so search from there.
+        let pane = src
+            .find("pub(crate) fn build_persist_page(")
+            .expect("build_persist_page must exist");
+        let start = src[pane..]
+            .find("let first_ready =")
+            .map(|i| pane + i)
+            .expect("the pre-check must exist");
+        let region = &src[start..start + 200];
+        assert!(
+            region.contains("Some(0)"),
+            "the first selectable candidate must be pre-checked; filtering on \
+             Ready leaves a fixed drive unchecked and the pane sizes from 0. \
+             region was: {:?}",
+            &region[..region.len().min(160)]
+        );
+        // ...and the sizing must still produce a real number for a fixed stick.
+        let (lo, hi, d) = persist_gib_bounds(116, 3);
+        assert_eq!((lo, hi, d), (1, 112, 84), "a 116 GB stick must not size as 1 GB");
+        assert!(d > lo, "the default must be a computed value, not the floor");
     }
 
     #[test]
