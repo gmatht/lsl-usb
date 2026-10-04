@@ -9,6 +9,15 @@
 // Test builds keep the normal Rust entry so libtest's harness main is
 // generated and `cargo test` actually runs the #[test]s.
 #![cfg_attr(not(test), no_main)]
+// Because that removes main() from the test binary, dead-code analysis sees no
+// reference at all to the whole production call tree and flags every function
+// main() reaches (~390 of them) as unused. They are not unused - they are
+// merely unreachable FROM THE TEST HARNESS, which is exactly what a test binary
+// is. Suppressed for `cfg(test)` only, so `cargo build` (which is where the
+// signal is worth having) still reports dead code; that check is what surfaced
+// the unused FAT_MAX_GIB, the unread frame_persist layout field and the
+// uncalled initrd-repack cluster.
+#![cfg_attr(test, allow(dead_code))]
 
 mod boot;
 mod cli;
@@ -324,6 +333,7 @@ fn run() {
 
     let mut iso_path = opts.iso_path.clone();
     let mut flatpak_apps = opts.flatpak_apps.clone();
+    let mut snap_apps = opts.snap_apps.clone();
     let mut wsl_vhdx = opts.wsl_vhdx.clone();
     // defaults come from the CLI flags; the GUI (when used) overrides them
     let mut data_dir = opts.data_dir.clone();
@@ -750,6 +760,7 @@ fn run() {
         let Some((g, w)) = gui::run_gui(
             &wsl_vhdx,
             &flatpak_apps,
+            &snap_apps,
             &iso_path,
             &opts.mint_version,
             &opts.download_dir,
@@ -769,6 +780,7 @@ fn run() {
         work = Some(w);
         iso_path = g.iso_path;
         flatpak_apps = [g.flatpak_ids, flatpak_apps].concat();
+        snap_apps = [g.snap_ids, snap_apps].concat();
         wsl_vhdx = g.wsl_vhdx;
         data_dir = g.data_dir;
         copy_wifi = g.wifi;
@@ -1197,6 +1209,17 @@ fn run() {
 
     out::step("Preloading flatpak refs for apps you have on Windows...");
     lslfiles::write_flatpak_refs(&vol.letter, &flatpak_apps);
+
+    out::step("Staging the snap list (installed on first boot, then cached on the stick)...");
+    {
+        let mut snaps = crate::hardware::snap_suggestions()
+            .into_iter()
+            .filter(|(_, _, m)| *m)
+            .map(|(_, n, _)| n)
+            .collect::<Vec<String>>();
+        snaps.extend(snap_apps.iter().cloned());
+        lslfiles::write_snap_list(&vol.letter, &snaps);
+    }
 
     if install_everything && lslfiles::everything_path().is_empty() {
         out::step("Everything (voidtools) not found - installing the portable version...");
@@ -1867,6 +1890,12 @@ fn gui_tail_in_dialog(
         apps.extend(opts.flatpak_apps.clone());
         lslfiles::write_flatpak_refs(vol_letter, &apps);
     }
+    fin_tick(ui, "Writing snap list...");
+    {
+        let mut snaps = g.snap_ids.clone();
+        snaps.extend(opts.snap_apps.clone());
+        lslfiles::write_snap_list(vol_letter, &snaps);
+    }
     fin_tick(ui, "Checking Everything index...");
     {
         if lslfiles::everything_path().is_empty() {
@@ -2029,6 +2058,22 @@ fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str, metr
             })
             .collect();
         lines.push(format!("  - flatpaks: {}", names.join(", ")));
+    }
+    if !g.snap_ids.is_empty() {
+        // Same reverse-map as flatpaks: friendly name when it is one of ours,
+        // raw snap name for an extra so nothing is hidden.
+        let names: Vec<String> = g
+            .snap_ids
+            .iter()
+            .map(|n| {
+                crate::hardware::SNAP_MAP
+                    .iter()
+                    .find(|(_, s)| *s == n)
+                    .map(|(disp, _)| disp.to_string())
+                    .unwrap_or_else(|| n.clone())
+            })
+            .collect();
+        lines.push(format!("  - snaps (installed on first boot, then verified from the stick): {}", names.join(", ")));
     }
     if !g.wsl_vhdx.is_empty() {
         lines.push(format!("  - {} WSL VHDX path(s)", g.wsl_vhdx.len()));

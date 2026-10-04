@@ -519,6 +519,10 @@ pub fn wait_usb_ready(label: &str, rufus: Option<Child>, known: &[String], timeo
 }
 
 // re-export for tests
+//
+// `#[cfg(test)]`: production reaches `json_strings` through the asset-fetch
+// callers; this wrapper exists only so the test module can call the private one.
+#[cfg(test)]
 pub fn json_strings_for_tests(json: &str, key: &str) -> Vec<String> {
     json_strings(json, key)
 }

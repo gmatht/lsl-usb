@@ -142,6 +142,9 @@ static FIRSTBOOT_TOOLKIT: &[(&str, &str)] = &[
     ("bin\\lsl-common.sh", include_str!("../../../bin/lsl-common.sh")),
     ("bin\\persist-wifi.sh", include_str!("../../../bin/persist-wifi.sh")),
     ("bin\\lsl-flatpak-fat.sh", include_str!("../../../bin/lsl-flatpak-fat.sh")),
+    // Snap installer: installs the names in /cdrom/snaps.txt on first boot and
+    // caches each .snap on the stick so later boots do not re-download.
+    ("bin\\lsl-snap-fat.sh", include_str!("../../../bin/lsl-snap-fat.sh")),
     // Boot telemetry: /etc/xdg/autostart/lsl-boot-time.desktop (z0 layer)
     // execs /cdrom/bin/lsl-boot-time.sh --desktop; shipping it was the
     // missing half of the "boot telemetry" work - without it the autostart
@@ -854,6 +857,58 @@ pub fn write_flatpak_refs(vol_letter: &str, extra: &[String]) {
 }
 
 // ---------------------------------------------------------------------------
+// Write-SnapList
+// ---------------------------------------------------------------------------
+
+/// Build the snaps.txt body (one snap name per line, no trailing blank line).
+///
+/// Split out from the file write so it can be unit tested without a volume: the
+/// dedup/trim/order rules are where the bugs live.
+pub fn snap_list_body(names: &[String]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for n in names {
+        let t = n.trim();
+        if t.is_empty() || seen.contains(&t) {
+            continue;
+        }
+        seen.push(t);
+    }
+    if seen.is_empty() {
+        return String::new();
+    }
+    let mut s = seen.join("\n");
+    s.push('\n');
+    s
+}
+
+/// Write `<vol>:\snaps.txt`, the list the stick installs at boot.
+///
+/// Deliberately only NAMES: nothing is downloaded on the Windows side. snapd is
+/// already installed by squashfs_config.sh, so the stick can fetch each snap
+/// itself on first use and cache it under `/cdrom/casper/snapcache` - which
+/// keeps this a few hundred bytes instead of gigabytes, and lets first boot work
+/// on whatever network the stick finds rather than the network of the machine
+/// that built it.
+pub fn write_snap_list(vol_letter: &str, names: &[String]) {
+    let body = snap_list_body(names);
+    if body.is_empty() {
+        out::info("No snaps selected - not writing snaps.txt (snaps stay opt-in).");
+        return;
+    }
+    let path = format!("{}:\\snaps.txt", vol_letter);
+    if let Err(e) = std::fs::write(&path, &body) {
+        out::warn(&format!("Could not write {}: {}", path, e));
+        return;
+    }
+    let n = body.lines().count();
+    out::info(&format!(
+        "Wrote {} snap(s) to {}. They are installed on first boot and cached on \
+         the stick, so later boots install locally instead of re-downloading.",
+        n, path
+    ));
+}
+
+// ---------------------------------------------------------------------------
 // Everything (voidtools) integration
 // ---------------------------------------------------------------------------
 pub fn everything_path() -> String {
@@ -1052,6 +1107,48 @@ pub fn find_local_isos() -> Vec<String> {
     // the simple name ordering and cap at 20 like the PS version.
     hits.sort_by(|a, b| a.0.cmp(&b.0));
     hits.into_iter().map(|(p, _)| p).take(20).collect()
+}
+
+#[cfg(test)]
+mod snap_list_tests {
+    use super::*;
+
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_list_writes_nothing() {
+        // An empty body is the signal not to create snaps.txt at all: a sticky
+        // empty file on the stick would look like "the user chose none" on the
+        // next install and silently drop previously chosen snaps.
+        assert_eq!(snap_list_body(&[]), "");
+        assert_eq!(snap_list_body(&v(&["", "   "])), "");
+    }
+
+    #[test]
+    fn one_name_per_line_with_single_trailing_newline() {
+        assert_eq!(snap_list_body(&v(&["spotify"])), "spotify\n");
+        assert_eq!(snap_list_body(&v(&["a", "b"])), "a\nb\n");
+        // No blank final line: the shell reader would otherwise see an empty
+        // entry and try to `snap install ""`.
+        assert!(!snap_list_body(&v(&["a"])).ends_with("\n\n"));
+    }
+
+    #[test]
+    fn entries_are_trimmed_and_deduped_preserving_order() {
+        // The GUI merges checked-box names with --snap-apps, so the same snap
+        // can arrive twice; a duplicate would be installed twice.
+        assert_eq!(snap_list_body(&v(&[" a ", "b", "a"])), "a\nb\n");
+        assert_eq!(snap_list_body(&v(&["code", "code", "code"])), "code\n");
+    }
+
+    #[test]
+    fn snap_names_survive_verbatim() {
+        // Dashes and digits are meaningful in snap names (obs-studio, code-2).
+        let names = v(&["obs-studio", "telegram-desktop", "code"]);
+        assert_eq!(snap_list_body(&names), "obs-studio\ntelegram-desktop\ncode\n");
+    }
 }
 
 #[cfg(test)]
@@ -1426,10 +1523,28 @@ fn cpio_newc_trailer() -> Vec<u8> {
 
 // ---------------------------------------------------------------------------
 // Cpio newc parser (for initrd repacking).
+//
+// `#[cfg(test)]` on every item below, and that is a DELIBERATE record of a real
+// state of the tree, not a silencing of noise: `repack_initrd` - the only
+// production-shaped entry point here - has NO caller. The live ramclone and
+// hddmirror paths go through `make_*_initrd_with` (used by
+// `install_ramclone_initrd` / `install_hddmirror_initrd`, which nofmt.rs does
+// call), not through the repack path.
+//
+// So this cluster is a complete, tested, working capability that nothing
+// currently invokes. The alternatives were to delete it (losing ~250 lines
+// that the tests still pin down, and any intent to hook injection into the live
+// paths later) or to keep it buildable and let it warn. Gating on `cfg(test)`
+// keeps it compilable and tested while making the state explicit: the warning
+// can no longer mislead someone into thinking these are wired up.
+//
+// `split_initrd` and friends are still reachable from each other, so the gate
+// has to cover the whole cluster rather than just the entry point.
 // ---------------------------------------------------------------------------
 
 /// Parse a cpio newc archive into a filename -> (mode, data) map.
 /// Returns Err if the archive is malformed.
+#[cfg(test)]
 fn parse_cpio_newc(data: &[u8]) -> Result<Vec<(String, u32, Vec<u8>)>, String> {
     let mut out = Vec::new();
     let mut pos = 0usize;
@@ -1480,6 +1595,7 @@ fn parse_cpio_newc(data: &[u8]) -> Result<Vec<(String, u32, Vec<u8>)>, String> {
 }
 
 /// Build a cpio newc archive from a list of (name, mode, data) entries.
+#[cfg(test)]
 fn build_cpio_newc(entries: &[(String, u32, Vec<u8>)]) -> Vec<u8> {
     let mut out = Vec::new();
     for (name, mode, data) in entries {
@@ -1496,6 +1612,7 @@ fn build_cpio_newc(entries: &[(String, u32, Vec<u8>)]) -> Vec<u8> {
 /// happily "passes" an archive the kernel silently truncates.
 ///
 /// Returns the names walked (including TRAILER!!!) or the offset it stopped at.
+#[cfg(test)]
 fn kernel_unpack_names(data: &[u8]) -> Result<Vec<String>, usize> {
     let mut names = Vec::new();
     let mut pos = 0usize;
@@ -1633,6 +1750,7 @@ mod cpio_tests {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 enum InitrdCompression {
     None,
     Gzip,
@@ -1640,6 +1758,7 @@ enum InitrdCompression {
     Lz4,
 }
 
+#[cfg(test)]
 fn detect_compression(data: &[u8]) -> InitrdCompression {
     if data.len() >= 4 && data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
         InitrdCompression::Zstd
@@ -1654,6 +1773,7 @@ fn detect_compression(data: &[u8]) -> InitrdCompression {
     }
 }
 
+#[cfg(test)]
 fn decompress_initrd(data: &[u8], comp: InitrdCompression) -> Result<Vec<u8>, String> {
     match comp {
         InitrdCompression::None => Ok(data.to_vec()),
@@ -1680,6 +1800,7 @@ fn decompress_initrd(data: &[u8], comp: InitrdCompression) -> Result<Vec<u8>, St
     }
 }
 
+#[cfg(test)]
 fn compress_initrd(data: &[u8], comp: InitrdCompression) -> Result<Vec<u8>, String> {
     match comp {
         InitrdCompression::None => Ok(data.to_vec()),
@@ -1705,6 +1826,7 @@ fn compress_initrd(data: &[u8], comp: InitrdCompression) -> Result<Vec<u8>, Stri
 
 /// Find the start of the compressed/initrd payload after any microcode cpio prefix.
 /// Returns (prefix_bytes, payload_bytes, compression).
+#[cfg(test)]
 fn split_initrd(data: &[u8]) -> Result<(&[u8], &[u8], InitrdCompression), String> {
     let mut pos = 0usize;
     // Scan for cpio trailers (microcode prefix uses plain cpio newc).
@@ -1750,6 +1872,10 @@ fn split_initrd(data: &[u8]) -> Result<(&[u8], &[u8], InitrdCompression), String
 /// `hooks` is a list of (cpio_path, file_data, mode) to inject.
 /// ORDER files at scripts/casper-premount/ORDER and scripts/live-premount/ORDER
 /// are automatically extended with entries for any hooks in those directories.
+///
+/// `#[cfg(test)]`: no production caller - see the section note above the cpio
+/// parser. The live initrd writers are `make_*_initrd_with`.
+#[cfg(test)]
 pub fn repack_initrd(initrd_path: &str, hooks: &[(String, Vec<u8>, u32)]) -> Result<Vec<u8>, String> {
     let data = std::fs::read(initrd_path).map_err(|e| format!("read initrd: {}", e))?;
     let (prefix, payload, comp) = split_initrd(&data)?;
@@ -1853,6 +1979,9 @@ done\n\
 /// casper-premount. The hook is placed at scripts/casper-premount/ together
 /// with an ORDER file that casper's run_scripts sources. The ORDER line
 /// guards the HDD-mirror hook (zz_lsl_hdd_mirror) so both can coexist.
+/// `#[cfg(test)]`: no production caller - the live path always passes the F2FS
+/// scrub hook via `make_ramclone_initrd_with`.
+#[cfg(test)]
 pub fn make_ramclone_initrd(hook_bytes: &[u8]) -> Result<Vec<u8>, String> {
     make_ramclone_initrd_with(hook_bytes, None)
 }
@@ -1935,6 +2064,10 @@ pub fn install_ramclone_initrd(vol_letter: &str, bundle_dir: &str) -> Result<(),
 /// Create a gzip-compressed cpio initrd containing the HDD-mirror hooks.
 /// Includes both casper-premount and live-boot-premount variants, plus
 /// ORDER files so each framework sources the hook.
+///
+/// `#[cfg(test)]`: no production caller - the live path always passes the F2FS
+/// scrub hook via `make_hddmirror_initrd_with`.
+#[cfg(test)]
 pub fn make_hddmirror_initrd(casper_hook: &[u8], live_hook: &[u8]) -> Result<Vec<u8>, String> {
     make_hddmirror_initrd_with(casper_hook, live_hook, None)
 }

@@ -491,14 +491,16 @@ pub fn parse_mbr_parts(mbr: &[u8; 512]) -> Option<Vec<MbrPart>> {
 }
 
 /// What the persistence page found on the selected stick.
+///
+/// Only `persist` is carried out of `read_partitions`. `fat` and `all` were
+/// fields here for diagnostics that nothing ever read, and an unread field is
+/// worse than an absent one: it looks like a caller depends on it. `fat` is
+/// still computed inside `read_partitions` because the "existing persistence"
+/// test needs it - it is simply local to that function now.
 #[derive(Clone, Debug, Default)]
 pub struct StickPartitions {
     /// A second, non-FAT partition already present (an F2FS/ Linux area).
     pub persist: Option<MbrPart>,
-    /// The FAT partition the image will be written to.
-    pub fat: Option<MbrPart>,
-    /// Every entry, for diagnostics.
-    pub all: Vec<MbrPart>,
 }
 
 /// Parse the partition table of the stick behind `letter`.
@@ -520,7 +522,7 @@ pub fn read_partitions(letter: &str) -> Option<StickPartitions> {
         .iter()
         .copied()
         .find(|p| p.is_lsl_persist() && Some(p.start_lba) != fat.map(|f| f.start_lba));
-    Some(StickPartitions { persist, fat, all })
+    Some(StickPartitions { persist })
 }
 
 /// Read the first two sectors of the physical disk behind `letter`.
@@ -769,6 +771,10 @@ const CASPER_INITRD_CANDIDATES: &[&str] = &[
 /// filesystem.squashfs (base) < filesystem_z0_firstboot.squashfs (stub) <
 /// filesystem_z<ts>.squashfs (appends, newest last). No layerfs-path= is
 /// passed, so casper takes its default *.squashfs glob branch.
+///
+/// `#[cfg(test)]`: test-only no-parameter wrapper - production builds every
+/// entry with live-session user parameters via `menu_entry_direct_user`.
+#[cfg(test)]
 pub fn menu_entry_direct(title: &str, kern_rel: &str, init_rel: &str) -> String {
     menu_entry_direct_user(title, kern_rel, init_rel, "")
 }
@@ -792,11 +798,23 @@ pub fn menu_entry_direct_user(
 }
 
 /// Same as menu_entry_direct but adds the ramclone kernel flag.
+///
+/// `#[cfg(test)]`: production always goes through the `_user` variant with real
+/// live-session parameters, so this no-parameter wrapper exists only for the
+/// tests that assert the default shape of an entry. Gated so dead-code analysis
+/// does not report it (it cannot see the `#[cfg(test)]` call sites).
+#[cfg(test)]
 pub fn menu_entry_direct_ramclone(title: &str, kern_rel: &str, init_rel: &str) -> String {
     menu_entry_direct_ramclone_user(title, kern_rel, init_rel, "")
 }
 
 /// `menu_entry_direct_ramclone` with the live-session user parameters.
+///
+/// `#[cfg(test)]`: the BIOS ramclone entry is written by
+/// `add_ramclone_boot_entries` (a caller of the grub4dos writer), which does not
+/// go through this helper. Only the tests build a ramclone menu.lst entry with
+/// it, so gating it keeps dead-code analysis honest about that.
+#[cfg(test)]
 pub fn menu_entry_direct_ramclone_user(
     title: &str,
     kern_rel: &str,
@@ -817,6 +835,9 @@ pub fn menu_entry_direct_ramclone_user(
 /// instead of executing the directory), which is also why the secondary
 /// initrd's ORDER must re-run the base's own casper-premount scripts - simply
 /// overwriting ORDER with the hook name would silently disable them.
+///
+/// `#[cfg(test)]`: test-only no-parameter wrapper (see the ramclone one above).
+#[cfg(test)]
 pub fn menu_entry_direct_hddmirror(title: &str, kern_rel: &str, init_rel: &str) -> String {
     menu_entry_direct_hddmirror_user(title, kern_rel, init_rel, "")
 }
@@ -3487,6 +3508,9 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
 /// and boot it with the base+z0 stack. No loopback (no ISO file), no
 /// iso-scan - casper's device scan finds /casper on the stick, and
 /// /cdrom IS the stick here, so the layer path points at /cdrom.
+///
+/// `#[cfg(test)]`: test-only no-parameter wrapper (see `menu_entry_direct`).
+#[cfg(test)]
 fn uefi_cfg_direct(title: &str, kern_rel: &str, init_rel: &str) -> String {
     uefi_cfg_direct_user(title, kern_rel, init_rel, "")
 }
@@ -3508,11 +3532,17 @@ fn uefi_cfg_direct_user(
     )
 }
 
+/// `#[cfg(test)]`: test-only no-parameter wrapper (see `menu_entry_direct`).
+#[cfg(test)]
 fn uefi_cfg_direct_ramclone(title: &str, kern_rel: &str, init_rel: &str) -> String {
     uefi_cfg_direct_ramclone_user(title, kern_rel, init_rel, "")
 }
 
 /// `uefi_cfg_direct_ramclone` with the live-session user parameters.
+///
+/// `#[cfg(test)]`: no production caller - the ramclone grub.cfg entry is
+/// assembled inline in `add_ramclone_boot_entries`, not here.
+#[cfg(test)]
 fn uefi_cfg_direct_ramclone_user(
     title: &str,
     kern_rel: &str,
@@ -3529,11 +3559,18 @@ fn uefi_cfg_direct_ramclone_user(
 }
 
 /// GRUB2 entry with HDD-mirror initrd appended.
+///
+/// `#[cfg(test)]`: test-only no-parameter wrapper (see `menu_entry_direct`).
+#[cfg(test)]
 fn uefi_cfg_direct_hddmirror(title: &str, kern_rel: &str, init_rel: &str) -> String {
     uefi_cfg_direct_hddmirror_user(title, kern_rel, init_rel, "")
 }
 
 /// `uefi_cfg_direct_hddmirror` with the live-session user parameters.
+///
+/// `#[cfg(test)]`: the hddmirror grub.cfg entry is assembled inline in
+/// `add_ramclone_boot_entries` (its `hddmirror` branch), not here.
+#[cfg(test)]
 fn uefi_cfg_direct_hddmirror_user(
     title: &str,
     kern_rel: &str,
@@ -3557,6 +3594,8 @@ fn uefi_cfg_direct_hddmirror_user(
 /// not fire lsl-firstboot.service against the wrong base.)
 /// Non-casper ISOs get no grub.cfg entry at all (their kernel lives
 /// outside casper/).
+/// `#[cfg(test)]`: test-only no-parameter wrapper (see `menu_entry_direct`).
+#[cfg(test)]
 fn uefi_cfg_loopback(title: &str, iso_rel: &str) -> String {
     uefi_cfg_loopback_user(title, iso_rel, "")
 }
