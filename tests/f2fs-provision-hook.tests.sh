@@ -189,6 +189,220 @@ else
     bad "no FAT32 floor - a carve below it triggers the unanswerable prompt"
 fi
 
+# ---- park instead of panicking ----------------------------------------------
+# This hook is SOURCED into casper's init shell, and that shell becomes PID 1.
+# PID 1 exiting IS the kernel panic ("Attempted to kill init"), so an
+# unanticipated unwind inside the destructive window must not reach the shell's
+# own exit - it has to park: dump why, take a shell if there is one, sleep if not.
+if grep -q 'lsl_park' "$HOOK"; then
+    ok "has a park path for an unanticipated failure"
+else
+    bad "no park path - an unwind here takes PID 1 down and panics the kernel"
+fi
+if grep -qE 'trap[[:space:]]+lsl_park_on_exit[[:space:]]+EXIT' "$HOOK"; then
+    ok "installs an EXIT trap that parks while the guard is armed"
+else
+    bad "no EXIT trap - the shell still unwinds and panics"
+fi
+# ...and it must not be left behind. A trap set in a SOURCED file belongs to the
+# caller, so without a restore the hook keeps handling casper's own exit.
+if grep -q 'lsl_park_trap_restore' "$HOOK" && grep -qE 'trap[[:space:]]+-[[:space:]]+EXIT' "$HOOK"; then
+    ok "restores casper's own EXIT trap on the way out (no leak into the caller)"
+else
+    bad "the EXIT trap is never removed - the hook would keep handling casper's exit"
+fi
+if sed 's/#.*$//' "$HOOK" | grep -qE '^[[:space:]]*while[[:space:]]+true.*sleep'; then
+    ok "parks with an unbounded sleep rather than exiting"
+else
+    bad "the park path can still exit - it must sleep instead"
+fi
+# Diagnostics, not just a nap: a parked boot with no explanation is unusable.
+for field in cmdline LSL_STICK_DEV disk_size_sectors fat_start bpb_sectors; do
+    if sed 's/#.*$//' "$HOOK" | grep -q "$field"; then
+        ok "park diagnostics report $field"
+    else
+        bad "park diagnostics omit $field - a parked boot would say nothing"
+    fi
+done
+# A shell first, sleep as the fallback: a parked-but-dead console is nearly as
+# useless as a panic.
+if sed 's/#.*$//' "$HOOK" | grep -qE 'busybox|\bsh\b' && sed 's/#.*$//' "$HOOK" | grep -q 'dev/console'; then
+    ok "tries to hand the user a shell on the console before sleeping"
+else
+    bad "the park path sleeps without offering a shell"
+fi
+# The guard must be armed for the DESTRUCTIVE window and disarmed on every
+# designed no-op. A refusal that forgets to disarm would park a healthy boot -
+# strictly worse than the condition it was reporting.
+if grep -q 'lsl_park_arm' "$HOOK" && grep -q 'lsl_park_disarm' "$HOOK"; then
+    ok "arms the guard for the destructive window and disarms on designed no-ops"
+else
+    bad "guard is not armed/disarmed symmetrically"
+fi
+arm_line="$(grep -n 'lsl_park_arm$' "$HOOK" | head -1 | cut -d: -f1)"
+sfdisk_line="$(grep -n 'sfdisk --no-reread' "$HOOK" | head -1 | cut -d: -f1)"
+if [ -n "$arm_line" ] && [ -n "$sfdisk_line" ] && [ "$arm_line" -lt "$sfdisk_line" ]; then
+    ok "guard goes live (L$arm_line) before the first write (L$sfdisk_line)"
+else
+    bad "guard armed L${arm_line:-?} is not before the partition rewrite L${sfdisk_line:-?}"
+fi
+# Every `return` inside the armed window must be preceded by a disarm, or the
+# intended no-op parks instead. Count them and compare.
+# The window ends at the hook's FINAL `lsl_park_disarm` (its success path), not
+# the first `LSL_PARK_ARMED=0` - that one lives in the helper definitions, well
+# above the window, and using it made this check compare nonsense.
+window_start="$arm_line"
+window_end="$(grep -n '^lsl_park_disarm$' "$HOOK" | tail -1 | cut -d: -f1)"
+if [ -n "$window_start" ] && [ -n "$window_end" ] && [ "$window_start" -lt "$window_end" ]; then
+    rets="$(sed -n "${window_start},${window_end}p" "$HOOK" \
+            | grep -cE '^[[:space:]]*return 0 2>/dev/null|\|[[:space:]]*return 0 2>/dev/null')"
+    # Each of those returns belongs to either a lsl_refuse block (which disarms
+    # inside lsl_refuse itself) or an explicit lsl_park_disarm. Only the returns
+    # with NEITHER nearby are the bug this guards against.
+    bare="$(sed -n "${window_start},${window_end}p" "$HOOK" \
+            | grep -B4 -E '^[[:space:]]*return 0 2>/dev/null|\|[[:space:]]*return 0 2>/dev/null' \
+            | grep -cE 'lsl_refuse|lsl_park_disarm')"
+    if [ "$rets" -gt 0 ] && [ "$rets" -le "$bare" ]; then
+        ok "every early return in the armed window is a refusal (which disarms) - $rets return(s), $bare disarm site(s)"
+    else
+        bad "$rets early return(s) in the armed window but only $bare disarm site(s) - one would park a healthy boot"
+    fi
+else
+    bad "cannot locate the armed window (arm L${window_start:-?}, end L${window_end:-?})"
+fi
+
+echo
+echo "== part 1b: park guard behaviour (exercises the real functions) =="
+
+# The static checks above can only see that the code is PRESENT. These drive it.
+# The hook's park helpers are sourced by taking its PREFIX - everything up to
+# the opt-out gates - because on a normal boot the hook returns at the first
+# gate and never defines anything below it.
+# mktemp -d, not $TMP: $TMP belongs to the root-only part 2 below, and this
+# part runs unprivileged with `set -u`.
+prefix="$(mktemp -d)"
+sed -n '1,/^# ---- opt-out gates/p' "$HOOK" > "$prefix/defs.sh"
+
+# An inert boot must return to the caller, not park.
+if out="$(sh -c "LSL_PROV_LOG=0 LSL_PROV_LOGDIR=/tmp . '$prefix/defs.sh' >/dev/null 2>&1; echo RETURNED" 2>/dev/null)"; then
+    case "$out" in
+        *RETURNED*) ok "defining the park helpers does not park an inert boot" ;;
+        *) bad "sourcing the hook's prefix did not return" ;;
+    esac
+else
+    bad "sourcing the hook's prefix exited non-zero"
+fi
+
+# A refusal stands the guard down - otherwise a HEALTHY boot (no f2fs driver, a
+# foreign Linux partition) would be parked, which is worse than the no-op it was
+# reporting.
+out="$(sh -c "LSL_PROV_LOG=0 LSL_PROV_LOGDIR=/tmp
+    . '$prefix/defs.sh' >/dev/null 2>&1
+    lsl_park_arm
+    lsl_refuse 'simulated designed refusal'
+    echo \"ARMED=\$LSL_PARK_ARMED\"" 2>/dev/null)"
+case "$out" in
+    *ARMED=0*) ok "lsl_refuse stands the guard down (a refusal never parks)" ;;
+    *) bad "lsl_refuse left the guard armed - a designed refusal would park a good boot" ;;
+esac
+
+# lsl_park must not return: if it did, the shell would keep unwinding and panic.
+if command -v timeout >/dev/null 2>&1; then
+    sh -c "LSL_PROV_LOG=0 LSL_PROV_LOGDIR=/tmp
+        . '$prefix/defs.sh' >/dev/null 2>&1
+        lsl_park" >/dev/null 2>&1 &
+    park_pid=$!
+    sleep 3
+    if kill -0 "$park_pid" 2>/dev/null; then
+        ok "lsl_park blocks instead of returning (alive after 3s)"
+        kill -9 "$park_pid" 2>/dev/null
+    else
+        bad "lsl_park returned - the shell would go on to panic"
+    fi
+    wait "$park_pid" 2>/dev/null || true
+else
+    skip "no timeout(1) to bound the lsl_park check"
+fi
+
+# THE panic scenario: a bare `exit` while the guard is armed must park. A plain
+# exit would unwind the shell and return its status; parking means the process
+# is still alive when the timeout fires (rc 124).
+if command -v timeout >/dev/null 2>&1; then
+    out="$(timeout 10 sh -c "LSL_PROV_LOG=1 LSL_PROV_LOGDIR='$prefix'
+        mkdir -p '$prefix'
+        . '$prefix/defs.sh' >/dev/null 2>&1
+        LSL_PARK_STEP='shrink-filesystem'
+        lsl_park_arm
+        exit 1" 2>&1)"
+    rc=$?
+    case "$out" in
+        *STOPPED*at*) ok "an armed bare exit prints the park banner naming the step" ;;
+        *) bad "no park banner on an armed bare exit (rc=$rc)" ;;
+    esac
+    case "$rc" in
+        124) ok "an armed bare exit did not unwind the shell (still parked at timeout)" ;;
+        *) bad "armed bare exit unwound with rc=$rc - that is the panic" ;;
+    esac
+    # The status must be printable. dash hands an EXIT trap an EMPTY argument,
+    # which once rendered as "status )" - a diagnostic that says nothing.
+    case "$out" in
+        *"status unknown"*|*"status "[0-9]*) ok "the park banner reports a usable exit status" ;;
+        *) bad "the park banner does not report an exit status" ;;
+    esac
+else
+    skip "no timeout(1) to bound the armed-exit check"
+fi
+
+# ---- the guard must not leak into casper's shell ---------------------------
+# A trap set inside a SOURCED file belongs to the CALLING shell. Measured: it
+# does survive the hook's `return` and does fire on the caller's own exit. Left
+# installed, the hook would park casper's exit whenever the guard were armed -
+# reaching into a shell it does not own. So arming installs the trap and every
+# way out of the armed window must hand it back.
+#
+# The probe lives in its own FILE rather than inline: the check has to compare a
+# trap name containing quotes, and nesting that inside the harness's own `sh -c`
+# inside a `case` mangles it into a false failure. Keeping it in a script is the
+# only way the comparison survives.
+cat > "$prefix/probe.sh" <<'PROBE'
+#!/bin/sh
+set -u
+LSL_PROV_LOG=0
+LSL_PROV_LOGDIR=/tmp
+# shellcheck source=/dev/null
+. "$1" >/dev/null 2>&1
+lsl_park_arm
+if [ "${2:-disarm}" = "refuse" ]; then
+    lsl_refuse 'probe'
+else
+    lsl_park_disarm
+fi
+# A CLEARLED trap still prints back, as `trap -- - EXIT`, so compare the whole
+# printed line: our handler name appearing anywhere means it is still installed.
+now="$(trap -p EXIT 2>/dev/null)"
+case "$now" in
+    *lsl_park_on_exit*) echo TRAP_LEAKED ;;
+    *)                  echo TRAP_CLEAN ;;
+esac
+PROBE
+chmod +x "$prefix/probe.sh" 2>/dev/null || true
+
+for mode in disarm refuse; do
+    got="$(sh "$prefix/probe.sh" "$prefix/defs.sh" "$mode" 2>/dev/null)"
+    case "$got" in
+        *TRAP_CLEAN*)
+            if [ "$mode" = disarm ]; then
+                ok "disarming the guard removes the EXIT trap (no leak into casper)"
+            else
+                ok "a refusal also hands casper's EXIT trap back"
+            fi
+            ;;
+        *) bad "the guard's EXIT trap survives '$mode' - it leaks into casper's shell (got [$got])" ;;
+    esac
+done
+
+rm -rf "$prefix"
+
 echo
 echo "== part 2: geometry against a real loopback image (needs root) =="
 

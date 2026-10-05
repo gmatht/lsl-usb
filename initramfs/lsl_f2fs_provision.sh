@@ -51,10 +51,205 @@ lsl_prov_log() {
     return 0
 }
 
+# ---- park on an unanticipated failure ----------------------------------------
+# PID 1 quitting is the kernel panic. This hook is SOURCED into casper's init
+# shell, and casper's shell is what ends up as PID 1 - so if anything unwinds
+# that shell (a `set -e` abort, a syntax error, a command not found on a
+# command-not-found trap, a subshell failure), the kernel panics with "Attempted
+# to kill init" and there is no log, no shell, and no machine to debug on.
+#
+# So an unanticipated exit inside this file parks: dump the state that explains
+# it, take a shell if the initrd has one, and sleep forever if it does not. A
+# live boot that cannot make progress is strictly better than a panic - the user
+# can read the screen, or power off, and the diagnostics name the cause.
+#
+# WHAT IS *NOT* TREATED AS FATAL: every `lsl_refuse` path. Those are DESIGNED
+# outcomes ("a Linux partition is already there", "no f2fs driver in this
+# kernel") and the whole safety policy of this file is that each of them
+# degrades to a no-op so the boot continues. Parking on those would wedge a
+# perfectly healthy boot, which is a worse failure than the one they describe.
+# The trap below is therefore armed only for the DESTRUCTIVE WINDOW - from the
+# first write to the medium until it has been verified - and lsl_refuse
+# disarms it again.
+LSL_PARK_STEP="start"
+# Set only for real faults. lsl_refuse uses lsl_prov_log, not this.
+LSL_PARK_ARMED=0
+
+lsl_park_banner() {
+    lsl_prov_dbg ""
+    lsl_prov_dbg "=============================================================="
+    lsl_prov_dbg "lsl-f2fs-provision STOPPED at step '$LSL_PARK_STEP'"
+    lsl_prov_dbg "  cmdline    : $(cat /proc/cmdline 2>/dev/null)"
+    lsl_prov_dbg "  wanted     : ${LSL_WANT_GIB:-?} GiB, label '${LSL_PERSIST_LABEL:-?}'"
+    lsl_prov_dbg "  stick dev  : ${LSL_STICK_DEV:-<not identified>}"
+    lsl_prov_dbg "  stick part : ${LSL_STICK_PART:-<not identified>}"
+    lsl_prov_dbg "  disk size  : ${disk_size_sectors:-?} sectors"
+    lsl_prov_dbg "  fat        : start=${fat_start:-?} size=${fat_sectors:-?}"
+    lsl_prov_dbg "  new layout : fat=${new_fat_sectors:-?} persist=${want_sectors:-?}"
+    lsl_prov_dbg "  block devs : $(ls /dev/sd* /dev/vd* /dev/nvme*n* /dev/mmcblk* 2>/dev/null | tr '\n' ' ')"
+    lsl_prov_dbg "  mounts     : $(grep -E ' /cdrom | /isodevice | / ' /proc/mounts 2>/dev/null | tr '\n' ' ')"
+    lsl_prov_dbg "  holders    : $(ls /sys/class/block/"$(basename "${LSL_STICK_PART:-x}")"/holders/ 2>/dev/null | tr '\n' ' ')"
+    lsl_prov_dbg "  log        : $LSL_PROV_LOGDIR/provision.log"
+    lsl_prov_dbg "=============================================================="
+    return 0
+}
+
+# Run the shell BEFORE sleeping, so the boot is still interactive. The initrd
+# usually has no shell at all (Mint's casper initrd carries busybox, which has no
+# sh applet) - hence the loop that tries each in turn and the unconditional
+# sleep afterwards. `set +e` is deliberate: a missing shell must not, itself,
+# unwind the very shell we are trying to protect.
+lsl_park() {
+    LSL_PARK_ARMED=0
+    # Remove our own EXIT handler FIRST. We are running *inside* that handler;
+    # leaving it installed risks re-entering this function, and casper's shell
+    # must not keep a park handler after this hook returns either.
+    lsl_park_trap_restore
+    lsl_park_banner
+    sync 2>/dev/null || true
+    set +e
+    _lsl_shell=""
+    for _lsl_c in sh bash busybox dash; do
+        if command -v "$_lsl_c" >/dev/null 2>&1; then
+            _lsl_shell="$_lsl_c"
+            break
+        fi
+    done
+    if [ -n "$_lsl_shell" ]; then
+        echo "lsl-f2fs-provision: dropping to a shell ($_lsl_shell); type 'poweroff' to shut down." > /dev/console 2>/dev/null || true
+        # Only busybox needs the applet named explicitly.
+        case "$_lsl_shell" in busybox) "$_lsl_shell" sh </dev/console >/dev/console 2>&1 ;; esac
+        case "$_lsl_shell" in sh|bash|dash) "$_lsl_shell" </dev/console >/dev/console 2>&1 ;; esac
+    else
+        lsl_prov_dbg "no shell in this initrd; parking (the boot is alive, the console shows why)."
+    fi
+    # Never reach here by accident, and never exit - exiting is the panic.
+    while true; do sleep 3600; done
+}
+
+# Arm the guard for the destructive window only. Set AFTER every read-only gate
+# has passed, so the designed refusals above are unaffected.
+lsl_park_arm() {
+    LSL_PARK_ARMED=1
+    # Install the trap HERE, not at definition time: everything between the
+    # opt-out gates and this point is a designed no-op that must leave casper's
+    # shell exactly as it found it.
+    lsl_park_trap_save
+    return 0
+}
+
+# Stand the guard down: this is a DESIGNED no-op and the boot must continue.
+# Every non-fatal exit from the destructive window has to call this - a path
+# that returns without disarming would park a perfectly good boot, which is a
+# worse outcome than the condition it was reporting.
+# Restoring the trap belongs here too, for the same reason: this function is the
+# one guaranteed to be on the way OUT of the armed window.
+lsl_park_disarm() {
+    LSL_PARK_ARMED=0
+    lsl_park_trap_restore
+    return 0
+}
+
+# One-time diagnostics for the designed refusals. A refusal is NOT fatal - it
+# degrades to a no-op - but it is the last thing this hook does on that boot, so
+# this is the one place worth recording the state that led to it. Bounded and
+# best-effort: it must never be the reason the boot fails.
+lsl_refuse_dump() {
+    _lsl_ref_dev="${LSL_STICK_DEV:-}"
+    _lsl_ref_part="${LSL_STICK_PART:-}"
+    _lsl_ref_size=""
+    [ -n "$_lsl_ref_dev" ] && _lsl_ref_size="$(blockdev --getsz "$_lsl_ref_dev" 2>/dev/null)"
+    lsl_prov_log "refused (not fatal, boot continues): disk=${_lsl_ref_dev:-<none>} size=${_lsl_ref_size:-?} sectors part=${_lsl_ref_part:-<none>}"
+    lsl_prov_dbg "  cmdline   : $(cat /proc/cmdline 2>/dev/null)"
+    lsl_prov_dbg "  block devs: $(ls /dev/sd* /dev/vd* /dev/nvme*n* /dev/mmcblk* 2>/dev/null | tr '\n' ' ')"
+    return 0
+}
+
+# The refusal helper and the park guard, together, because every gate between
+# here and the first write can call one or the other.
+#
+# A refusal is a DESIGNED no-op - "a Linux partition is already there", "no f2fs
+# driver in this kernel" - and the whole safety policy of this file is that each
+# degrades to a no-op so the boot continues. It therefore records the state that
+# led to it and stands the guard down.
+lsl_refuse() {
+    lsl_prov_log "REFUSING: $1"
+    LSL_PARK_ARMED=0
+    # Give casper's shell its own EXIT trap back before returning: a refusal can
+    # happen while the guard is armed, and casper must not inherit our handler.
+    lsl_park_trap_restore
+    lsl_refuse_dump
+    return 0 2>/dev/null || exit 0
+}
+
+# The guard itself. Armed by lsl_park_arm for the destructive window; when
+# something unwinds casper's shell while it is armed, park instead. lsl_park
+# never returns, which is the point: PID 1 stays alive.
+lsl_park_on_exit() {
+    _lsl_rc="$1"
+    case "$_lsl_rc" in
+        ''|*[!0-9]*) _lsl_rc="unknown" ;;   # dash passes the EXIT status EMPTY
+    esac
+    if [ "${LSL_PARK_ARMED:-0}" = "1" ]; then
+        LSL_PARK_STEP="${LSL_PARK_STEP} (shell unwound, status $_lsl_rc)"
+        lsl_park
+    fi
+    return 0
+}
+
+# A trap set inside a SOURCED file belongs to the CALLING shell, and casper then
+# keeps running for the rest of the boot. Left installed, this hook's handler
+# would fire on casper's own exit - a hook reaching into a shell it does not own,
+# and one that would PARK casper's exit if the guard were still armed.
+# (Measured: the trap does survive the hook's `return`, and does fire on the
+# caller's exit. It does not rewrite the exit status, but that is not the point -
+# it must not be there at all.)
+#
+# So install ours at arm time and remove it on the way out.
+#
+# A compound handler (anything more than a bare command name) is deliberately
+# NOT reconstructed on restore. `trap -p` is not portable - dash prints
+# `trap -- 'h' EXIT`, quoting the action AND appending the signal name, so naive
+# parsing yields `'h' EXIT` and re-installing that fails and leaves the original
+# trap in place. Getting this right across busybox ash, dash and bash from inside
+# an initramfs is not worth it, and getting it wrong is worse than not trying.
+# Clearing EXIT is safe here because casper sets no EXIT handler of its own (it
+# sources every ORDER entry into one long-lived shell that is never reaped by an
+# exit trap), so there is nothing to preserve. The save is kept only for the
+# simple, unambiguous single-command case.
+lsl_park_installed=0
+
+lsl_park_trap_save() {
+    LSL_PARK_SAVED=""
+    _lsl_saved_raw="$(trap -p EXIT 2>/dev/null | head -n 1)"
+    # Accept only `trap -- NAME EXIT` with an unquoted, plain command name.
+    _lsl_saved_name="$(printf '%s\n' "$_lsl_saved_raw" \
+        | sed -n "s/^trap -- \\([A-Za-z_][A-Za-z0-9_]*\\) EXIT\$/\\1/p")"
+    LSL_PARK_SAVED="$_lsl_saved_name"
+    trap lsl_park_on_exit EXIT
+    lsl_park_installed=1
+    return 0
+}
+
+lsl_park_trap_restore() {
+    [ "${lsl_park_installed:-0}" = "1" ] || return 0
+    lsl_park_installed=0
+    case "$LSL_PARK_SAVED" in
+        '') trap - EXIT 2>/dev/null || : ;;
+        # A single command name, split on purpose: `trap NAME EXIT`.
+        # shellcheck disable=SC2086
+        *)  trap $LSL_PARK_SAVED EXIT 2>/dev/null || trap - EXIT 2>/dev/null || : ;;
+    esac
+    return 0
+}
+
 # ---- opt-out gates -----------------------------------------------------------
 # The `if` form, not `[ ... ] && return 0 || exit 0`: in the latter the || fires
 # whenever the condition is FALSE (the normal case), and because run_scripts
 # SOURCES this hook that would exit casper's own shell and kill the boot.
+# All of lsl_park*/lsl_refuse* are DEFINED ABOVE this point: every one of these
+# gates can return early, so anything used further down has to be in scope
+# already or a boot that exits here would fail with "command not found".
 if grep -qw lsl_no_f2fs_provision /proc/cmdline 2>/dev/null; then
     lsl_prov_dbg "DISABLED via lsl_no_f2fs_provision"
     return 0 2>/dev/null || exit 0
@@ -144,10 +339,7 @@ lsl_prov_log "tools ready: sfdisk/fatresize/mkfs.f2fs on PATH"
 #   (b) we know which disk it is (by mount, not by guess),
 #   (c) the kernel agrees the stick has no loopback pinning it.
 # Any failure => no-op. Never a partial attempt.
-lsl_refuse() {
-    lsl_prov_log "REFUSING: $1"
-    return 0 2>/dev/null || exit 0
-}
+# (lsl_refuse itself, and the park guard, are defined above the opt-out gates.)
 
 # The kernel's partition node for N on disk DISK. Naming is NOT "<disk>N" for
 # every transport: /dev/sdb1 and /dev/mmcblk0p1 both exist, and loop devices
@@ -312,6 +504,12 @@ if [ -e "/sys/class/block/$(basename "$LSL_STICK_DEV")/partition" ]; then
 fi
 
 # ---- read the on-disk layout ------------------------------------------------
+# The guard goes live HERE: every gate above is read-only and a refusal there
+# must leave the boot alone, but from this point on we are about to rewrite a
+# partition table. An unwind inside this window would be both the most likely
+# to happen and the most expensive - so park instead of dying.
+LSL_PARK_STEP="read-layout"
+lsl_park_arm
 # UNITS (measured, util-linux 2.37): `sfdisk` uses SECTORS for `size=` in BOTH
 # directions - the input we write below and the `-d` output we read here
 # (`10240` means 5 MiB, not 10). That agreement is what makes the arithmetic in
@@ -336,6 +534,7 @@ lsl_prov_log "layout of $LSL_STICK_DEV (${disk_size_sectors} sectors): $(printf 
 # applies). lsl-f2fs-resize exits 2 here; we treat it as "nothing to do".
 if printf '%s\n' "$table" | grep -qiE 'Linux|0x83'; then
     lsl_prov_dbg "$LSL_STICK_DEV already has a Linux partition; not ours to reshape"
+    lsl_park_disarm
     return 0 2>/dev/null || exit 0
 fi
 
@@ -400,6 +599,7 @@ case "$fat_start$fat_sectors" in
 esac
 
 fat_end=$(( fat_start + fat_sectors ))
+LSL_PARK_STEP="check-fat-size"
 fat_min_sectors=$(( LSL_FAT_MIN_MIB * 1024 * 1024 / SECTOR_SIZE ))
 [ "$fat_sectors" -ge "$fat_min_sectors" ] || {
     lsl_refuse "the FAT partition is only $(( fat_sectors * SECTOR_SIZE / 1024 / 1024 )) MiB; it must stay at ${LSL_FAT_MIN_MIB} MiB to hold the image. Not touching the disk."
@@ -450,6 +650,23 @@ if [ "$new_fat_sectors" -lt "$lsl_fat32_min_sectors" ]; then
 fi
 
 persist_mib=$(( want_sectors * SECTOR_SIZE / 1024 / 1024 ))
+LSL_PARK_STEP="shrink-filesystem"
+
+# LAST gate before the first write, and the only one that treats an
+# inconsistency as FATAL rather than as a refusal. Everything above it is a
+# legitimate "this stick is not ours to reshape" outcome. This is different:
+# the numbers came from THIS file's own arithmetic, so an impossible layout
+# here means the arithmetic is wrong (a unit confusion between sectors and
+# bytes, or a truncated sfdisk read). Writing that to a partition table is
+# unrecoverable, and every guard further down assumes the geometry is sane.
+# Park with the numbers on the console rather than reshape a stick on a figure
+# we know to be self-contradictory.
+if [ "$fat_start" -lt 1 ] || [ "$want_sectors" -lt 1 ] || [ "$disk_size_sectors" -lt 1 ] \
+   || [ "$fat_end" -ge "$disk_size_sectors" ] || [ "$(( fat_end + want_sectors ))" -gt "$disk_size_sectors" ]; then
+    lsl_prov_log "FATAL: computed layout does not fit the disk"
+    lsl_park
+fi
+
 lsl_prov_log "shrink FAT $(( fat_sectors * SECTOR_SIZE / 1024 / 1024 )) -> $(( new_fat_sectors * SECTOR_SIZE / 1024 / 1024 )) MiB, add ${persist_mib} MiB f2fs"
 
 # ---- 1. shrink the FILESYSTEM first -----------------------------------------
@@ -500,6 +717,7 @@ fi
 # hexdump, no xxd, and busybox carries no such applet either (all measured in
 # the running guest). Without it this returns nothing and the guard is dead.
 bpb_sectors="$(dd if="$fat_part" bs=1 skip=32 count=4 2>/dev/null | od -An -tu4 | tr -d ' ')"
+LSL_PARK_STEP="verify-fs-geometry"
 case "$bpb_sectors" in
     ''|*[!0-9]*)
         # The partition node can still be missing here even though the content
@@ -516,6 +734,9 @@ fi
 lsl_prov_log "filesystem verified at $bpb_sectors sectors (target $new_fat_sectors)"
 
 # ---- 2. now shrink the partition and add the second one ---------------------
+# First write to the medium. If anything unwinds from here, the stick may be
+# half-reshaped - which is exactly the case where dying is least acceptable.
+LSL_PARK_STEP="rewrite-partition-table"
 printf 'label: dos\n1 : start=%s, size=%s, type=0c\n2 : start=%s, size=%s, type=83\n' \
     "$fat_start" "$new_fat_sectors" "$fat_end" "$want_sectors" \
     | sfdisk --no-reread --force "$LSL_STICK_DEV" >/dev/null 2>&1 || {
@@ -529,10 +750,12 @@ udevadm settle 2>/dev/null || sleep 1
 persist_part="$(lsl_part_node "$LSL_STICK_DEV" 2)"
 if [ ! -b "$persist_part" ]; then
     lsl_prov_log "partition 2 did not appear after the repartition (the kernel may need a re-read). The FAT partition is intact; persistence will be available after a reboot."
+    lsl_park_disarm
     return 0 2>/dev/null || exit 0
 fi
 
 # ---- 3. format it f2fs, by label ---------------------------------------------
+LSL_PARK_STEP="format-f2fs"
 if mkfs.f2fs -q -l "$LSL_PERSIST_LABEL" "$persist_part" 2>/dev/null; then
     sync 2>/dev/null
     lsl_prov_log "done: $persist_part is f2fs, label '$LSL_PERSIST_LABEL', ${persist_mib} MiB"
@@ -547,4 +770,7 @@ fi
 # not persist even though the partition is right there.
 udevadm settle 2>/dev/null || true
 sync 2>/dev/null
+# Done: stand the guard down and hand casper its EXIT trap back, so the caller's
+# own exit unwinds its shell exactly as it did before this hook existed.
+lsl_park_disarm
 return 0 2>/dev/null || exit 0
