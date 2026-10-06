@@ -274,6 +274,7 @@ pub fn capture_disk(disk_no: u32) -> Result<DiskRecord, String> {
         entries,
         fs_size_sectors,
         head_sectors_hex: hex_encode(&head[..HEAD_SECTORS * SECTOR as usize]),
+        serial_number: crate::nofmt::disk_serial_number(disk_no),
     })
 }
 
@@ -351,6 +352,48 @@ pub struct DiskRecord {
     /// 1..15), so a record without them is not restorable on this stick.
     #[serde(default)]
     pub head_sectors_hex: String,
+    /// Disk serial number from the firmware (STORAGE_DEVICE_DESCRIPTOR).
+    /// Used for KeyVal keys; best-effort.
+    #[serde(default)]
+    pub serial_number: Option<String>,
+}
+
+impl DiskRecord {
+    /// Concise JSON for KeyVal storage (<300 chars). Omits bootable, label,
+    /// index, and head_sectors_hex to stay within the limit.
+    pub fn concise_json(&self) -> String {
+        let pt: Vec<String> = self.entries.iter().map(|e| {
+            format!(
+                "{{\"s\":{},\"n\":{},\"t\":\"{}\"}}",
+                e.start_sectors, e.size_sectors, e.type_id
+            )
+        }).collect();
+        let fs = match self.fs_size_sectors {
+            Some(f) => format!(",\"fs\":{}", f),
+            None => String::new(),
+        };
+        format!(
+            "{{\"sz\":{},\"sc\":\"{}\",\"pt\":[{}]{} }}",
+            self.size_sectors, self.scheme, pt.join(","), fs
+        )
+    }
+}
+
+/// Human-readable disk size from sector count, e.g. `128G`, `32G`, `500M`.
+///
+/// Rounds to the nearest whole unit that fits in 3-4 characters so the KeyVal
+/// key stays short. Used in the key path `DISK_SERIAL-SIZE`.
+pub fn human_size(sectors: u64) -> String {
+    let bytes = sectors * 512;
+    if bytes >= 1_000_000_000_000 {
+        format!("{}T", bytes / 1_000_000_000_000)
+    } else if bytes >= 1_000_000_000 {
+        format!("{}G", (bytes + 500_000_000) / 1_000_000_000)
+    } else if bytes >= 1_000_000 {
+        format!("{}M", (bytes + 500_000) / 1_000_000)
+    } else {
+        format!("{}K", (bytes + 500) / 1000)
+    }
 }
 
 /// Which side of the repartition this record was taken from.
@@ -585,7 +628,7 @@ pub fn machine_guid() -> String {
 /// Best-effort, and it never fails the install: this is a safety net, so its own
 /// failure must not be the thing that breaks a working stick. A disk we cannot
 /// open produces a named skip, not an abort.
-pub fn take_pre_record(vol_letter: &str) -> Result<(String, Vec<CaptureFailure>), String> {
+pub fn take_pre_record(vol_letter: &str) -> Result<(String, Vec<CaptureFailure>, BackupRecord), String> {
     let (disks, fails) = capture_all_disks();
     if disks.is_empty() {
         return Err("no disk could be read".into());
@@ -612,7 +655,126 @@ pub fn take_pre_record(vol_letter: &str) -> Result<(String, Vec<CaptureFailure>)
         Phase::Pre,
     );
     let path = write_local(vol_letter, &key, &rec)?;
-    Ok((format!("{key} -> {path}"), fails))
+    Ok((format!("{key} -> {path}"), fails, rec))
+}
+
+/// Upload each disk's layout to the online KeyVal store.
+///
+/// Key format: `<mobo_serial>/<N>/<disk_serial>-<size>/<stage>` where N is the
+/// per-machine run counter (incremented on each F2FS install).  Size is
+/// human-readable (`128G`, `32G`, …).
+///
+/// Also uploads `<mobo_serial>/<N>//disks` — a JSON array listing each disk's
+/// serial and human-readable size so a reader can discover which disks belong
+/// to a run without enumerating the key space.
+///
+/// Best-effort: a network failure is logged but never aborts the install.
+/// Opt-out: respects `telemetry::partition_upload_allowed()`.
+pub fn upload_to_keyval(rec: &BackupRecord) {
+    if !crate::telemetry::partition_upload_allowed() {
+        return;
+    }
+    let run_n = crate::telemetry::increment_partition_run_count();
+    let mobo = motherboard_serial();
+    let phase = rec.phase.as_str();
+
+    // Upload each disk's layout.
+    for disk in &rec.disks {
+        let serial = disk.serial_number.as_deref().unwrap_or("NOSN");
+        let sz = human_size(disk.size_sectors);
+        let key = format!("{}/{}/{}-{}/{}", mobo, run_n, serial, sz, phase);
+        let value = disk.concise_json();
+        put_kv(&key, &value);
+    }
+
+    // Upload the disks index for this run.
+    let entries: Vec<String> = rec.disks.iter().map(|d| {
+        let s = d.serial_number.as_deref().unwrap_or("NOSN");
+        format!("\"{}-{}\"", s, human_size(d.size_sectors))
+    }).collect();
+    let disks_key = format!("{}/{}/disks", mobo, run_n);
+    put_kv(&disks_key, &format!("[{}]", entries.join(",")));
+}
+
+/// PUT a key-value pair to the KeyVal store. Best-effort, silent on failure.
+fn put_kv(key: &str, value: &str) {
+    let headers = format!(
+        "X-Lsl-Token: {}\r\nX-Key: {}\r\n",
+        crate::telemetry::WORKER_TOKEN, key
+    );
+    let _ = crate::net::put(
+        crate::telemetry::KV_URL,
+        crate::net::user_agent(),
+        value.as_bytes(),
+        &headers,
+    );
+}
+
+/// GET a value from the KeyVal store. Returns None on any failure.
+fn get_kv(key: &str) -> Option<String> {
+    let url = format!("{}?key={}", crate::telemetry::KV_URL, key);
+    match crate::net::get(&url, crate::net::user_agent()) {
+        Ok(res) if res.status == 200 => {
+            Some(String::from_utf8_lossy(&res.body).into_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Fetch partition layout history from the online KeyVal store for this machine.
+///
+/// Returns a human-readable multi-line string showing all recorded runs and
+/// their disk layouts, or an explanation of why nothing could be fetched.
+pub fn fetch_past_layouts() -> String {
+    let mobo = motherboard_serial();
+    let run_n = crate::telemetry::partition_run_count();
+
+    if run_n == 0 {
+        return format!(
+            "No partition layouts recorded for this machine ({mobo}) yet.\n\
+             Layouts are uploaded when an F2FS persistence install runs."
+        );
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("Partition layouts for {}:\n\n", mobo));
+
+    // Walk runs from newest to oldest. Stop at the first run where we cannot
+    // read the disks index (it may not have been uploaded yet).
+    let mut found_any = false;
+    for n in (1..=run_n).rev() {
+        let disks_key = format!("{}/{}/disks", mobo, n);
+        let disks_json = match get_kv(&disks_key) {
+            Some(j) => j,
+            None => continue,
+        };
+
+        // Parse the simple JSON array: ["serial-size","serial-size",...]
+        let disk_ids: Vec<String> = disks_json
+            .trim_matches(|c| c == '[' || c == ']')
+            .split(',')
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        found_any = true;
+        out.push_str(&format!("Run {}:\n", n));
+        for disk_id in &disk_ids {
+            out.push_str(&format!("  Disk {}\n", disk_id));
+            for stage in &["init", "pre", "post"] {
+                let layout_key = format!("{}/{}/{}/{}", mobo, n, disk_id, stage);
+                if let Some(val) = get_kv(&layout_key) {
+                    out.push_str(&format!("    {}: {}\n", stage, val));
+                }
+            }
+        }
+        out.push('\n');
+    }
+
+    if !found_any {
+        out.push_str("(No layouts could be retrieved from the online store.)\n");
+    }
+    out
 }
 
 /// Keys of runs already recorded on this stick, for the uniqueness enumeration.
@@ -673,6 +835,34 @@ pub fn motherboard_identity() -> String {
         (Some(m), None) => m,
         (None, None) => String::new(),
     }
+}
+
+/// The board's own serial number, for KeyVal keys.
+///
+/// Read from the BIOS registry. Falls back to the FNV hash of the full
+/// motherboard identity (manufacturer + product) so the key is still stable
+/// and short when no serial is published.
+pub fn motherboard_serial() -> String {
+    const PATH: &str = "HARDWARE\\DESCRIPTION\\System\\BIOS";
+    if let Some(s) = sys::RegKey::open(sys::hklm(), PATH)
+        .and_then(|k| k.value("BaseBoardSerialNumber"))
+    {
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    // Fallback: hash the identity string the same way machine_id does.
+    let ident = motherboard_identity();
+    if ident.is_empty() {
+        return "UNK".to_string();
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in ident.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("S{:08X}", h)
 }
 
 /// Everything a record needs from the running system, without touching a disk.
@@ -1050,6 +1240,7 @@ mod tests {
                 }],
                 fs_size_sectors: Some(24_575_999),
                 head_sectors_hex: hex_encode(&[0xEB, 0x3C, 0x90]),
+                serial_number: None,
             }],
         };
         let json = serde_json::to_string(&rec).expect("serialize");
@@ -1186,6 +1377,7 @@ mod tests {
                 entries: vec![],
                 fs_size_sectors: Some(100),
                 head_sectors_hex: hex_encode(&[0u8; 16]),
+                serial_number: None,
             }],
             1_791_210_181,
             "ASUS X570".into(),
@@ -1236,6 +1428,7 @@ mod tests {
                 }],
                 fs_size_sectors: Some(24_575_999),
                 head_sectors_hex: hex_encode(&[0xABu8; 16]),
+                serial_number: None,
             }],
             1_791_210_181,
             "ASUS X570".into(),
@@ -1340,5 +1533,44 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
         assert!(text.contains("MBR"));
         // And it must be readable enough to act on.
         assert!(text.contains("261005:142301"));
+    }
+
+    #[test]
+    fn concise_json_fits_in_300_chars_for_a_typical_record() {
+        // A realistic MBR disk with one FAT partition. The KeyVal value limit
+        // is 300 chars; head_sectors_hex (8192 chars) and bootable/label/index
+        // are omitted to stay within it.
+        let rec = DiskRecord {
+            size_sectors: 62_914_560,
+            scheme: "mbr".into(),
+            entries: vec![PartitionEntry {
+                index: 1,
+                start_sectors: 2048,
+                size_sectors: 24_576_000,
+                type_id: "0c".into(),
+                bootable: true,
+                label: "LSLUSB".into(),
+            }],
+            fs_size_sectors: Some(24_575_999),
+            head_sectors_hex: hex_encode(&[0xEB, 0x3C, 0x90]),
+            serial_number: Some("WD123456".into()),
+        };
+        let j = rec.concise_json();
+        assert!(
+            j.len() <= 300,
+            "concise_json too long ({} chars): {}",
+            j.len(),
+            j
+        );
+        // Must contain the essential geometry.
+        assert!(j.contains("\"sz\":62914560"));
+        assert!(j.contains("\"sc\":\"mbr\""));
+        assert!(j.contains("\"s\":2048"));
+        assert!(j.contains("\"n\":24576000"));
+        assert!(j.contains("\"t\":\"0c\""));
+        assert!(j.contains("\"fs\":24575999"));
+        // Must NOT contain the bootable/label/index fields.
+        assert!(!j.contains("bootable"));
+        assert!(!j.contains("LSLUSB"));
     }
 }

@@ -981,7 +981,11 @@ fn run() {
             } else {
                 opts.extra_isos.clone()
             };
-            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false, opts.skip_verify, &extra_isos, false, false, f2fs_gib(&opts.persist_backend, opts.persist_mib), &opts.bundle_dir, distro_arch) {
+            // The console flow's Boot-to-RAM choice: the GUI collects
+            // it from the INSTALL-page checkbox, the console from
+            // --boot-to-ram (it used to be hardcoded off here, so a
+            // headless run could neither add nor remove the entries).
+            match nofmt::install_from_iso(&iso, &opts.usb_letter, opts.allow_fixed, &opts.uefi_bootx64, opts.bios_boot, opts.uefi_boot, None, false, opts.skip_verify, &extra_isos, opts.boot_to_ram, false, f2fs_gib(&opts.persist_backend, opts.persist_mib), &opts.bundle_dir, distro_arch) {
                 Ok((t, _metrics, pending)) => {
                     pending_mbr = pending;
                     vol = sys::list_volumes()
@@ -2246,6 +2250,9 @@ fn summary_for(g: &gui::GuiResult, opts: &cli::Opts, iso: &str, mode: &str, metr
     }
     if g.sfs_hdd {
         a.push("--sfs-hdd-cache".into());
+    }
+    if g.ramclone {
+        a.push("--boot-to-ram".into());
     }
     if g.reclaim_win_swap {
         a.push("--reclaim-win-swap".into());

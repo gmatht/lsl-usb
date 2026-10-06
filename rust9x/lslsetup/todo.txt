@@ -9,6 +9,38 @@ No format install by default?
 Support F2FS?
 Support repartition?
 
-(initranfs/0 stdin: invalid argument
-File system layers are missing:\n '/cdrom/casper/filesystem/z0.20260928025844.20260928142919.squasfs' doesn't exist,\n '/cdrom/casper/file
-system.z0.20260928025844.squashfs' doen't exist.)
+MOTHERBOARD_SERIAL/N/DISK_SERIAL
+
+
+  Why the first two fix attempts failed
+
+  1. 539da00 (park guard): Correct idea, wrong region. The EXIT trap is armed at "read-layout" (line 512 in
+  the hook). lsl_wait_for_boot_disk runs at line 429 - before the guard exists. A trap armed later does not
+  protect earlier code.
+
+  1. 7abc7ed (scan + diagnostics): Focused on the scan ambiguity and park guard improvements. Never examined
+   lsl_wait_for_boot_disk's shell syntax. The same buggy one-liner survived.
+  2. e114257 (actual fix): Changed && return ... || exit to the if form. Added a static ban on the pattern
+  and a behavioral test that drives the function at mknod'd block devices. Reproduced in QEMU.
+
+
+Resume this session with:
+cmdc --resume 6c699a7c-0eb9-4459-b34b-93365e7223a1
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Actually make that: MOTHERBOARD_SERIAL/N/DISK_SERIAL-SIZE/{init,pre,post} (SIZE in human readible format) and add
+  MOTHERBOARD_SERIAL/N//disks, which lists the serial numbers and sizes in human readible format (e.g. 128G) Then add
+  a Past Layouts button to the first pane that allows the user to browse the partition layouts stored to KeyVal.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+cmdc --resume b8076b75-3294-4aa0-9f40-ac68c282ffe5
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ If partitioning option is greyed out, give a tooltip saying why. If F2FS is not selected, grey out the Persistance
+  space slider too. Explain why Use existing partition is greyed out even when F2FS is selected. If F2FS is not
+  selected Use Existing Partition should be checked (as well as greyed out).
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Resume this session with:
+cmdc --resume a43fecb7-3013-4f15-8a8e-6724463d39d1

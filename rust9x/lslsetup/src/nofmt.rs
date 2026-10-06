@@ -998,17 +998,58 @@ pub fn remove_menu_entry(existing: &str, title: &str) -> (String, bool) {
     (out, true)
 }
 
+/// Replace the `title {title}` block with `entry` AT ITS EXISTING
+/// POSITION. The drift fix must not reorder the menu: the old
+/// remove-and-append sank a drifted entry below every later one, so a
+/// template change to the direct-kernel entry let the Boot-to-RAM
+/// entries float to the TOP of the menu - where grub4dos `default 0`
+/// (and GRUB2's first-entry default) boots them by accident.
+/// Returns (menu, replaced).
+fn replace_menu_entry_in_place(existing: &str, title: &str, entry: &str) -> (String, bool) {
+    let want = format!("title {}", title);
+    let lines: Vec<&str> = existing.lines().collect();
+    let start = match lines.iter().position(|l| l.trim() == want) {
+        Some(i) => i,
+        None => return (existing.to_string(), false),
+    };
+    // The block runs to the next real `title ` line (commented example
+    // titles never end a block - same rule as remove_menu_entry).
+    let mut end = start + 1;
+    while end < lines.len() {
+        let t = lines[end].trim_start();
+        if t.starts_with("title ") && !t.starts_with('#') {
+            break;
+        }
+        end += 1;
+    }
+    // `entry` renders as "\ntitle ...\n...\nboot\n": the leading blank
+    // is the block's own separator (already present above `start`) and
+    // the trailing newline is the join, so take the trimmed core and
+    // re-add one blank line of separation when a later entry follows.
+    let core: Vec<&str> = entry.trim().lines().collect();
+    let mut out: Vec<&str> = lines[..start].to_vec();
+    out.extend_from_slice(&core);
+    if end < lines.len() {
+        out.push("");
+    }
+    out.extend_from_slice(&lines[end..]);
+    let mut joined = out.join("\n");
+    if !joined.is_empty() {
+        joined.push('\n');
+    }
+    (joined, true)
+}
+
 /// Upsert with template-drift replacement: identical body renders the menu
 /// untouched; a same-title entry with a drifted body (template changed
-/// since install) is replaced so fixes propagate instead of fossilizing.
-/// Returns (menu, changed).
+/// since install) is replaced IN PLACE so fixes propagate without
+/// reordering the menu. Returns (menu, changed).
 pub fn refresh_menu_entry(existing: &str, title: &str, entry: &str) -> (String, bool) {
     let (m, added) = upsert_menu(existing, title, entry);
     if added || m.contains(entry.trim()) {
         return (m, added);
     }
-    let (stripped, _) = remove_menu_entry(&m, title);
-    upsert_menu(&stripped, title, entry)
+    replace_menu_entry_in_place(&m, title, entry)
 }
 
 /// Ensure the BIOS root menu initializes the USB stack before `find` runs:
@@ -1237,6 +1278,48 @@ fn device_property(path: &str) -> Option<(u8, String)> {
         name.push_str(&p);
     }
     Some((bus, name))
+}
+
+/// Extract the serial number string from `PhysicalDriveN` via
+/// `IOCTL_STORAGE_QUERY_PROPERTY` / `STORAGE_DEVICE_DESCRIPTOR`.
+///
+/// Returns `None` when the IOCTL is unsupported, the descriptor is too short,
+/// or the serial number field is empty. Best-effort: not every disk firmware
+/// populates this field.
+pub fn disk_serial_number(disk_no: u32) -> Option<String> {
+    let path = format!(r"\\.\PhysicalDrive{}", disk_no);
+    let f = std::fs::File::open(path).ok()?;
+    use winapi::um::ioapiset::DeviceIoControl;
+    use winapi::um::winioctl::IOCTL_STORAGE_QUERY_PROPERTY;
+    let mut q = StoragePropertyQuery {
+        property_id: 0,
+        query_type: 0,
+        additional_parameters: [0],
+    };
+    let mut outbuf = vec![0u8; 4096];
+    let mut got = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            f.as_raw_handle() as *mut winapi::ctypes::c_void,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            &mut q as *mut StoragePropertyQuery as *mut winapi::ctypes::c_void,
+            std::mem::size_of::<StoragePropertyQuery>() as u32,
+            outbuf.as_mut_ptr() as *mut _,
+            outbuf.len() as u32,
+            &mut got,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let buf = &outbuf[..got as usize];
+    if buf.len() < VERSION_AND_BUS_END {
+        return None;
+    }
+    let d: &StorageDeviceDescriptor =
+        unsafe { &*(buf.as_ptr() as *const StorageDeviceDescriptor) };
+    ansi_at(buf, d.serial_number_offset)
 }
 
 /// The `PhysicalDriveN` number behind a volume letter.
@@ -2718,6 +2801,77 @@ pub fn add_ramclone_boot_entries(
     Ok(())
 }
 
+/// Remove the "Boot to RAM" entries `add_ramclone_boot_entries`
+/// wrote, from every menu it wrote them to. Called when the option
+/// is OFF, so the checkbox is a real configuration in BOTH
+/// directions: unticking it takes the entries off a stick that
+/// already has them. (The old code only ever ADDED them, so a
+/// stale Boot-to-RAM entry survived every re-run - and once the
+/// direct-kernel entry above it drifted, the drift fix sank that
+/// entry to the bottom and left Boot to RAM at the top of the
+/// menu.) No-op on a stick that never had them.
+pub fn remove_ramclone_boot_entries(root: &str, title: &str, uefi: bool) -> Result<(), String> {
+    let base = title.trim_end_matches(" (direct kernel)");
+    let variants = [
+        format!("{base} (Boot to RAM)"),
+        format!("{base} (Boot to RAM, no persistence)"),
+    ];
+    // BIOS menu (grub4dos)
+    let menu_path = format!("{}menu.lst", root);
+    if let Ok(mut menu) = std::fs::read_to_string(&menu_path) {
+        let mut changed = false;
+        for rtitle in &variants {
+            let (m, removed) = remove_menu_entry(&menu, rtitle);
+            menu = m;
+            if removed {
+                changed = true;
+                out::info(&format!("menu.lst entry '{}' removed (Boot to RAM off)", rtitle));
+            }
+        }
+        if changed {
+            std::fs::write(&menu_path, menu).map_err(|e| format!("write menu.lst: {}", e))?;
+        }
+    }
+    // UEFI grub4dos mirror
+    if uefi {
+        let uefi_menu_path = format!("{}efi\\grub\\menu.lst", root);
+        if let Ok(mut um) = std::fs::read_to_string(&uefi_menu_path) {
+            let mut changed = false;
+            for rtitle in &variants {
+                let (m, removed) = remove_menu_entry(&um, rtitle);
+                um = m;
+                if removed {
+                    changed = true;
+                    out::info(&format!(
+                        "efi\\grub\\menu.lst entry '{}' removed (Boot to RAM off)",
+                        rtitle
+                    ));
+                }
+            }
+            if changed {
+                std::fs::write(&uefi_menu_path, um).map_err(|e| format!("write efi\\grub\\menu.lst: {}", e))?;
+            }
+        }
+    }
+    // GRUB2 cfg
+    let grub_cfg = format!("{}EFI\\BOOT\\grub.cfg", root);
+    if let Ok(mut cfg) = std::fs::read_to_string(&grub_cfg) {
+        let mut changed = false;
+        for rtitle in &variants {
+            let (c, removed) = remove_grub_entry(&cfg, rtitle);
+            cfg = c;
+            if removed {
+                changed = true;
+                out::info(&format!("grub.cfg entry '{}' removed (Boot to RAM off)", rtitle));
+            }
+        }
+        if changed {
+            std::fs::write(&grub_cfg, cfg).map_err(|e| format!("write grub.cfg: {}", e))?;
+        }
+    }
+    Ok(())
+}
+
 /// Same-path comparison for ISO dedupe (Windows: case-insensitive,
 /// slash-insensitive). Pure so the multiboot offer logic is unit-testable.
 fn is_same_iso(a: &str, b: &str) -> bool {
@@ -3173,6 +3327,8 @@ fn install_files(
         } else if let Err(e) = add_ramclone_boot_entries(&root, &title, &kern_rel, &init_rel, uefi_res.mirror_menu(), hddmirror_ok, &iso_name) {
             out::warn(&format!("ramclone boot entries not added ({}).", e));
         }
+    } else if let Err(e) = remove_ramclone_boot_entries(&root, &title, uefi_res.mirror_menu()) {
+        out::warn(&format!("ramclone boot entries not removed ({}).", e));
     }
     // Extra loopback-only ISOs (no firstboot, no extraction) ride along
     // after the primary's UEFI files, so their grub.cfg entries land in an
@@ -3305,7 +3461,7 @@ pub fn commit_boot_sectors(p: &PendingMbr) -> Result<(), String> {
     // correct at this point, so a failure here is logged and the install ends.
     if p.record_partition_layout {
         match crate::partitionbackup::take_pre_record(&p.vol_letter) {
-            Ok((where_, fails)) => {
+            Ok((where_, fails, rec)) => {
                 out::info(&format!("Recorded the pre-repartition layout: {}", where_));
                 for f in &fails {
                     out::warn(&format!(
@@ -3313,6 +3469,7 @@ pub fn commit_boot_sectors(p: &PendingMbr) -> Result<(), String> {
                         f.disk, f.reason
                     ));
                 }
+                crate::partitionbackup::upload_to_keyval(&rec);
             }
             Err(e) => out::warn(&format!(
                 "Could not record the partition layout ({}). The install is unaffected, but there is no \
@@ -3924,6 +4081,8 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         } else if let Err(e) = add_ramclone_boot_entries(&root, &title, &kern_rel, &init_rel, uefi_res.mirror_menu(), hddmirror_ok, &iso_name) {
             out::warn(&format!("ramclone boot entries not added ({}).", e));
         }
+    } else if let Err(e) = remove_ramclone_boot_entries(&root, &title, uefi_res.mirror_menu()) {
+        out::warn(&format!("ramclone boot entries not removed ({}).", e));
     }
 
     // First-boot toolkit (bin/uproot et al.): without it the first boot can
@@ -4122,16 +4281,61 @@ fn uefi_cfg_loopback_user(title: &str, iso_rel: &str, user_params: &str) -> Stri
     )
 }
 
+/// Replace the `menuentry "{title}" { ... }` block with `entry`
+/// at its existing position. Same contract as
+/// `replace_menu_entry_in_place`: re-appending a drifted entry
+/// reorders the GRUB2 menu and can float a Boot-to-RAM entry to
+/// the top, where GRUB2's first-entry default boots it by
+/// accident. Returns (content, replaced).
+fn replace_grub_entry_in_place(existing: &str, title: &str, entry: &str) -> (String, bool) {
+    let want = format!("menuentry \"{}\"", title);
+    fn is_header(line: &str, want: &str) -> bool {
+        let t = line.trim_start();
+        t.starts_with(want) && matches!(t[want.len()..].trim_start().chars().next(), None | Some('{'))
+    }
+    let lines: Vec<&str> = existing.lines().collect();
+    let start = match lines.iter().position(|l| is_header(l, &want)) {
+        Some(i) => i,
+        None => return (existing.to_string(), false),
+    };
+    // The block runs to its closing brace line (ours is a bare `}`).
+    let mut end = start + 1;
+    while end < lines.len() && lines[end].trim() != "}" {
+        end += 1;
+    }
+    if end < lines.len() {
+        end += 1; // include the closing brace
+    }
+    let core: Vec<&str> = entry.trim().lines().collect();
+    let mut out: Vec<&str> = lines[..start].to_vec();
+    out.extend_from_slice(&core);
+    out.extend_from_slice(&lines[end..]);
+    let mut joined = out.join("\n");
+    if !joined.is_empty() {
+        joined.push('\n');
+    }
+    (joined, true)
+}
+
 /// Upsert a `menuentry "TITLE" { ... }` block in a grub.cfg. Same contract
 /// as `upsert_menu` (per-title idempotence, drift replacement), but for
 /// brace-delimited GRUB blocks instead of `title `-led grub4dos stanzas.
+/// A drifted body is replaced IN PLACE (not re-appended) so the menu
+/// order - and therefore the default boot entry - never changes.
 /// Returns (new content, whether it was added or replaced).
 fn upsert_grub_entry(existing: &str, title: &str, entry: &str) -> (String, bool) {
     if existing.contains(entry.trim()) {
         return (existing.to_string(), false);
     }
-    let (stripped, _) = remove_grub_entry(existing, title);
-    let mut out = stripped;
+    // Same title with a drifted body: replace it where it sits. The old
+    // remove-and-append moved the entry to the bottom, which is how a
+    // Boot-to-RAM entry came to sit at the top of the menu.
+    let (replaced, did) = replace_grub_entry_in_place(existing, title, entry);
+    if did {
+        return (replaced, true);
+    }
+    // Fresh title: append after the `set timeout=` header.
+    let mut out = existing.to_string();
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
@@ -5734,6 +5938,132 @@ mod tests {
         let (m3, changed2) = refresh_menu_entry(&m2, "M (loopback ISO)", &new);
         assert!(!changed2);
         assert_eq!(m3, m2);
+    }
+
+    #[test]
+    fn drift_replacement_keeps_menu_order() {
+        // The bug that put "Boot to RAM" at the top of the menu:
+        // the old drift fix removed the drifted entry and re-appended
+        // it, so a template change to the direct-kernel entry sank it
+        // below the Boot-to-RAM entries - and grub4dos `default 0`
+        // (GRUB2's first-entry default) then booted to RAM by accident.
+        let kern = "/_ISO/mint/vmlinuz";
+        let init = "/_ISO/mint/initrd.lz";
+        let initrd_line = format!("{} /casper/initrd.ramclone.gz", init);
+        let direct_old = menu_entry_direct("Mint (direct kernel)", kern, init);
+        let ram = ramclone_menu_entry("Mint (Boot to RAM)", kern, &initrd_line, "");
+        let (m, _) = upsert_menu(&default_menu(), "Mint (direct kernel)", &direct_old);
+        let (m, _) = upsert_menu(&m, "Mint (Boot to RAM)", &ram);
+        // Template drift on the direct entry (live-session params added).
+        let direct_new =
+            menu_entry_direct_user("Mint (direct kernel)", kern, init, " username=mint hostname=mint");
+        let (m2, changed) = refresh_menu_entry(&m, "Mint (direct kernel)", &direct_new);
+        assert!(changed);
+        assert!(m2.contains("username=mint hostname=mint"));
+        let pos = |s: &str, t: &str| {
+            s.lines().position(|l| l.trim() == format!("title {}", t)).unwrap()
+        };
+        // The direct entry stays ABOVE the Boot-to-RAM entry.
+        assert!(
+            pos(&m2, "Mint (direct kernel)") < pos(&m2, "Mint (Boot to RAM)"),
+            "drifted direct entry must not sink below Boot to RAM:\n{}",
+            m2
+        );
+        // The Boot-to-RAM entry is byte-for-byte what was written.
+        assert!(m2.contains(ram.trim()));
+    }
+
+    #[test]
+    fn grub_drift_replacement_keeps_order() {
+        // The GRUB2 (signed UEFI chain) twin: grub.cfg entries are
+        // brace-delimited, and the same remove-and-append drift fix
+        // reordered them. A drifted direct entry must stay first.
+        let kern = "/_ISO/mint/vmlinuz";
+        let init = "/_ISO/mint/initrd.lz";
+        let initrd_line = format!("{} /casper/initrd.ramclone.gz", init);
+        let direct = uefi_cfg_direct("Mint (direct kernel)", kern, init);
+        let ram = ramclone_grub_entry("Mint (Boot to RAM)", kern, &initrd_line, "");
+        let cfg = format!("set timeout=5\n{}{}", direct, ram);
+        let direct_new = uefi_cfg_direct_user(
+            "Mint (direct kernel)",
+            kern,
+            init,
+            " username=mint hostname=mint",
+        );
+        let (c2, changed) = upsert_grub_entry(&cfg, "Mint (direct kernel)", &direct_new);
+        assert!(changed);
+        assert!(c2.contains("username=mint hostname=mint"));
+        let pos = |s: &str, t: &str| {
+            s.lines()
+                .position(|l| l.trim_start().starts_with(&format!("menuentry \"{}\"", t)))
+                .unwrap()
+        };
+        assert!(
+            pos(&c2, "Mint (direct kernel)") < pos(&c2, "Mint (Boot to RAM)"),
+            "drifted direct entry must not sink below Boot to RAM:\n{}",
+            c2
+        );
+        assert!(c2.contains(ram.trim()));
+    }
+
+    #[test]
+    fn remove_ramclone_boot_entries_cleans_every_menu() {
+        // Unticking "Boot to RAM" must take the entries back off a
+        // stick that already has them - from all three menus the
+        // installer wrote them to - while leaving the direct entry.
+        let tmp = std::env::temp_dir().join(format!("lsl-ramrm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = format!("{}\\", tmp.to_string_lossy());
+        std::fs::create_dir_all(format!("{}efi\\grub", root)).unwrap();
+        std::fs::create_dir_all(format!("{}EFI\\BOOT", root)).unwrap();
+        let kern = "/_ISO/mint/vmlinuz";
+        let init = "/_ISO/mint/initrd.lz";
+        let initrd_line = format!("{} /casper/initrd.ramclone.gz", init);
+        let direct = menu_entry_direct("Mint (direct kernel)", kern, init);
+        let ram = ramclone_menu_entry("Mint (Boot to RAM)", kern, &initrd_line, "");
+        let ram_np = ramclone_menu_entry(
+            "Mint (Boot to RAM, no persistence)",
+            kern,
+            &initrd_line,
+            " lsl_home=tmpfs",
+        );
+        let mut menu = default_menu();
+        let (m, _) = upsert_menu(&menu, "Mint (direct kernel)", &direct);
+        menu = m;
+        let (m, _) = upsert_menu(&menu, "Mint (Boot to RAM)", &ram);
+        menu = m;
+        let (m, _) = upsert_menu(&menu, "Mint (Boot to RAM, no persistence)", &ram_np);
+        menu = m;
+        std::fs::write(format!("{}menu.lst", root), &menu).unwrap();
+        std::fs::write(format!("{}efi\\grub\\menu.lst", root), &menu).unwrap();
+        let g_direct = uefi_cfg_direct("Mint (direct kernel)", kern, init);
+        let g_ram = ramclone_grub_entry("Mint (Boot to RAM)", kern, &initrd_line, "");
+        let g_ram_np =
+            ramclone_grub_entry("Mint (Boot to RAM, no persistence)", kern, &initrd_line, " lsl_home=tmpfs");
+        let cfg = format!("set timeout=5\n{}{}{}", g_direct, g_ram, g_ram_np);
+        std::fs::write(format!("{}EFI\\BOOT\\grub.cfg", root), &cfg).unwrap();
+
+        remove_ramclone_boot_entries(&root, "Mint (direct kernel)", true).unwrap();
+
+        let mut menu_after = String::new();
+        for f in ["menu.lst", "efi\\grub\\menu.lst"] {
+            let s = std::fs::read_to_string(format!("{}{}", root, f)).unwrap();
+            assert!(!s.contains("title Mint (Boot to RAM)"), "{} still has RAM entry:\n{}", f, s);
+            assert!(s.contains("title Mint (direct kernel)"), "{} lost the direct entry", f);
+            if f == "menu.lst" {
+                menu_after = s;
+            }
+        }
+        let cfg2 = std::fs::read_to_string(format!("{}EFI\\BOOT\\grub.cfg", root)).unwrap();
+        assert!(!cfg2.contains("menuentry \"Mint (Boot to RAM)"), "grub.cfg still has RAM entry:\n{}", cfg2);
+        assert!(cfg2.contains("menuentry \"Mint (direct kernel)"), "grub.cfg lost the direct entry");
+
+        // Second run is a no-op: nothing left to remove, bytes unchanged.
+        remove_ramclone_boot_entries(&root, "Mint (direct kernel)", true).unwrap();
+        assert_eq!(std::fs::read_to_string(format!("{}menu.lst", root)).unwrap(), menu_after);
+        assert_eq!(std::fs::read_to_string(format!("{}EFI\\BOOT\\grub.cfg", root)).unwrap(), cfg2);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

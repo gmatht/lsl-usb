@@ -1990,6 +1990,7 @@ struct LayoutCtx<'a> {
     btn_next: &'a nwg::Button,
     btn_cancel: &'a nwg::Button,
     btn_reboot: &'a nwg::Button,
+    btn_past_layouts: &'a nwg::Button,
     lbl_dl: &'a nwg::Label,
     pb_dl: &'a nwg::ProgressBar,
     iso: &'a PageItems,
@@ -2060,7 +2061,9 @@ fn relayout(c: &LayoutCtx, cw: i32, ch: i32) {
     c.btn_back.set_size(90, 28);
     c.btn_reboot.set_position(8, ny);
     c.btn_reboot.set_size(90, 28);
-    c.btn_cancel.set_position(106, ny);
+    c.btn_past_layouts.set_position(106, ny);
+    c.btn_past_layouts.set_size(100, 28);
+    c.btn_cancel.set_position(214, ny);
     c.btn_cancel.set_size(90, 28);
 
     // persistent download progress ("Downloading {}-..." label + bar):
@@ -2071,7 +2074,7 @@ fn relayout(c: &LayoutCtx, cw: i32, ch: i32) {
     // the button row in the free middle between Cancel (left) and Back.
     c.lbl_dl.set_position(MARGIN, label_y);
     c.lbl_dl.set_size(fw as u32, label_h as u32);
-    let bar_x0 = 106 + 90 + 12;
+    let bar_x0 = 214 + 90 + 12;
     let bar_x1 = cw - MARGIN - 96 - 96 - 10;
     // MIN_CW guarantees room, but clamp anyway so a sub-minimum window
     // can only clip the bar, never push it under a button.
@@ -3183,6 +3186,7 @@ pub(crate) fn build_persist_page(
     persist_items: &PageItems,
     frame: &nwg::Frame,
     iso_arg: &str,
+    persist_tt: &nwg::Tooltip,
 ) -> i32 {
     persist_items.borrow_mut().clear();
     // ---- page 4: PERSISTENCE ----
@@ -3374,15 +3378,14 @@ pub(crate) fn build_persist_page(
         let stick_gib = persist_target_gib(target.as_deref());
         let iso_gib = iso_size_gib(iso_arg);
 
-        // "Use existing partitioning": when the stick ALREADY has a second,
-        // non-FAT partition there is nothing to size - it exists, and its size is
-        // a fact rather than a choice. The checkbox is then ticked by default,
-        // the slider is greyed and pinned to that partition's real size, and the
-        // page says which partition it found. Ticking it off hands sizing back to
-        // the slider (and, at install, to the shrink-then-repartition path).
-        let existing = existing_persist_partition(target.as_deref());
-        let use_existing = existing.is_some();
-
+        // "Use existing partitioning": only the F2FS backend consumes a
+        // second partition, so the option starts greyed out - a fresh
+        // build always rests on the squashfs default. The state for the
+        // backend actually selected is derived by
+        // `apply_persist_backend_caps`, which runs after every build and
+        // on every backend click, and which re-reads the stick's
+        // partition table so the pin follows the device, not a
+        // build-time memory.
         {
             let mut cb: Box<nwg::CheckBox> = Box::default();
             let _ = nwg::CheckBox::builder()
@@ -3392,43 +3395,43 @@ pub(crate) fn build_persist_page(
                 .size((780, 22))
                 .parent(frame)
                 .build(&mut cb);
-            if use_existing {
-                cb.set_check_state(nwg::CheckBoxState::Checked);
-            }
+            cb.set_enabled(false);
+            // Registered per build: a rebuild destroys this control,
+            // and comctl32 drops the tool with it. The build rests on
+            // the squashfs default, so the box starts greyed out;
+            // `apply_persist_backend_caps` (run right after every
+            // build) rewrites the text for the backend actually
+            // selected.
+            persist_tt.register(
+                cb.handle,
+                &crate::locale::tr(
+                    "A second partition is used by the F2FS backend only - squashfs and btrfs keep persistence in a file.",
+                ),
+            );
             p.push(PageItem { ctl: PageCtl::Check(cb, 1), x: 10, y, w: -20, h: 22, idx: 0 });
             y += 26;
+            // Kind 3 marks the partitioning note, which
+            // `apply_persist_backend_caps` rewrites per backend.
             push_lbl(
                 &mut p,
-                &match existing {
-                    Some(gib) => format!(
-                        "Found a {} GB non-FAT partition on this stick; persistence uses it as-is.",
-                        gib
-                    ),
-                    None => "No second partition found - sizing one requires shrinking the \
-FAT filesystem first, which happens at first boot."
-                        .to_string(),
-                },
+                "Only the F2FS backend uses a second partition - the other backends keep persistence in a file.",
                 20,
                 y,
                 -30,
                 34,
-                0,
+                3,
             );
             y += 40;
         }
 
         push_lbl(&mut p, &crate::locale::tr("Persistence space:"), 10, y, -20, 18, 0);
         y += 20;
-        // When honouring an existing partition the slider is PINNED to that
-        // partition's size and disabled: it is not a choice, and offering a range
-        // here would suggest the size can still be edited.
-        let (gib_min, gib_max, gib_default) = match existing {
-            Some(gib) => {
-                let g = gib.max(PERSIST_GIB_MIN as u32) as usize;
-                (g, g, g)
-            }
-            None => persist_gib_bounds(stick_gib, iso_gib),
-        };
+        // The slider is free at build time. The pin (range collapsed to a
+        // measured partition size, control disabled) is applied by
+        // `apply_persist_backend_caps` when the F2FS backend is selected
+        // AND the stick already carries a second partition - the only
+        // situation in which the size is a fact rather than a choice.
+        let (gib_min, gib_max, gib_default) = persist_gib_bounds(stick_gib, iso_gib);
         // Range AND position go through the BUILDER, in that order, rather than
         // via set_range_min/set_range_max/set_pos after the build. Calling them
         // afterwards sends TBM_SETRANGEMIN, TBM_SETRANGEMAX and TBM_SETPOSNOTIFY
@@ -3444,9 +3447,6 @@ FAT filesystem first, which happens at first boot."
             .pos(Some(gib_default))
             .parent(frame)
             .build(&mut tb);
-        if use_existing {
-            tb.set_enabled(false);
-        }
         // The builder's `.pos(...)` does NOT take effect on this target: traced
         // live pos=1 with range 1..115 and 86 requested - a value well inside the
         // range, so this is not Win32 clamping the request. nwg applies it as
@@ -3458,7 +3458,7 @@ FAT filesystem first, which happens at first boot."
         // faithfully reported the control's stale 1 - so the displayed number,
         // the split line and the value Install harvests were all 1 GiB for a
         // 116 GB stick. Nothing errored; the number on screen was simply wrong.
-        if !use_existing && gib_default > gib_min {
+        if gib_default > gib_min {
             if let Some(h) = tb.handle.hwnd() {
                 use winapi::shared::minwindef::LPARAM;
                 use winapi::um::commctrl::TBM_SETPOS;
@@ -3472,6 +3472,15 @@ FAT filesystem first, which happens at first boot."
                 }
             }
         }
+        // Registered per build like the partitioning box above;
+        // the slider is greyed out for every backend but F2FS,
+        // so it carries the same "why" via the tooltip manager.
+        persist_tt.register(
+            tb.handle,
+            &crate::locale::tr(
+                "Persistence space sizes the F2FS partition, so it is active only with the F2FS backend.",
+            ),
+        );
         p.push(PageItem { ctl: PageCtl::Track(tb, 0), x: 10, y, w: 400, h: 30, idx: 0 });
         // Live readout of the current value.
         //
@@ -3652,6 +3661,7 @@ pub fn run_gui(
     let mut btn_back: nwg::Button = Default::default();
     let mut btn_next: nwg::Button = Default::default();
     let mut btn_cancel: nwg::Button = Default::default();
+    let mut btn_past_layouts: nwg::Button = Default::default();
 
     // ---- window + shared labels ----
     // NOTE: no VISIBLE flag - the window is created hidden so the user never
@@ -3771,6 +3781,14 @@ pub fn run_gui(
         .build(&mut btn_reboot);
     btn_reboot.set_visible(true);
     let btn_reboot = Rc::new(btn_reboot);
+    let _ = nwg::Button::builder()
+        .text(&crate::locale::tr("Past Layouts"))
+        .position((204, 706))
+        .size((100, 28))
+        .parent(&window)
+        .build(&mut btn_past_layouts);
+    btn_past_layouts.set_visible(true);
+    let btn_past_layouts = Rc::new(btn_past_layouts);
 
     // ---- page 1: ISO selection (all checkboxes, one column, scrollbar) ----
     let _ = nwg::Frame::builder()
@@ -4513,6 +4531,15 @@ pub fn run_gui(
     let mut __uefi_tt: nwg::Tooltip = Default::default();
     let _ = nwg::Tooltip::builder().build(&mut __uefi_tt);
     let uefi_tt = Rc::new(__uefi_tt);
+    // The PERSISTENCE page's own tooltip manager: every greyed-out
+    // state the pane can reach (the partitioning option for any
+    // backend but F2FS, the slider alongside it, the option when
+    // F2FS is selected but the stick carries no second partition)
+    // explains itself here, per the pane's never-a-disabled-control-
+    // without-a-reason rule.
+    let mut __persist_tt: nwg::Tooltip = Default::default();
+    let _ = nwg::Tooltip::builder().build(&mut __persist_tt);
+    let persist_tt = Rc::new(__persist_tt);
     let _ = nwg::Frame::builder()
         .position((MARGIN, 88))
         .size((DEF_CW - 2 * MARGIN, DEF_CH - 88 - NAV_H))
@@ -4528,7 +4555,16 @@ pub fn run_gui(
         &persist_items,
         &frame_persist,
         iso_arg,
+        &persist_tt,
     )));
+    // The pane's tools are now registered; activate the tooltip
+    // so comctl32 shows the tips on hover (TTM_ACTIVATE).
+    persist_tt.set_enabled(true);
+    // The build rests on the squashfs default, so the partitioning
+    // option starts greyed out; re-derive it for the backend that is
+    // actually checked (the default here, but the wiring is what keeps
+    // the two derivations from drifting apart).
+    apply_persist_backend_caps(&persist_items, iso_arg, &persist_tt);
     let install_content = Rc::new(Cell::new(build_install_page(
         &install_items,
         &persist_items,
@@ -4734,6 +4770,7 @@ pub fn run_gui(
             btn_next: &*btn_next,
             btn_cancel: &*btn_cancel,
             btn_reboot: &*btn_reboot,
+            btn_past_layouts: &*btn_past_layouts,
             lbl_dl: &lbl_dl,
             pb_dl: &pb_dl,
             iso: &iso_items,
@@ -5010,6 +5047,7 @@ pub fn run_gui(
         let install_off = install_off.clone();
         let bios_tt_c = bios_tt.clone();
         let uefi_tt_c = uefi_tt.clone();
+        let persist_tt_c = persist_tt.clone();
         let iso_geom = iso_geom.clone();
         let fp_geom = fp_geom.clone();
         let sys_geom = sys_geom.clone();
@@ -5037,6 +5075,7 @@ pub fn run_gui(
     let btn_cancel_c = btn_cancel.clone();
     let btn_everything_c = btn_everything.clone();
     let btn_reboot_c = btn_reboot.clone();
+    let btn_past_layouts_c = btn_past_layouts.clone();
     let working_c = working.clone();
     let persist_items_c = persist_items.clone();
     let install_items_c = install_items.clone();
@@ -5069,10 +5108,14 @@ pub fn run_gui(
                 &persist_items_c,
                 &frame_persist_r,
                 &iso_arg2,
+                &persist_tt_c,
             ));
             // A rebuild resets every control to its default, which would silently
             // discard the backend the user picked.
             restore_persist_choices(&persist_items_c, keep.0, keep.1);
+            // ...and the partitioning option's gating follows the
+            // restored backend, not the build's default.
+            apply_persist_backend_caps(&persist_items_c, &iso_arg2, &persist_tt_c);
             // The install page names the selected stick and how full it is, so it
             // has to be re-read after the picker changed - otherwise it keeps
             // describing the previous device.
@@ -5139,6 +5182,7 @@ pub fn run_gui(
                         btn_next: &*btn_next_c,
                         btn_cancel: &*btn_cancel_c,
                         btn_reboot: &*btn_reboot_c,
+                        btn_past_layouts: &*btn_past_layouts_c,
                         lbl_dl: &lbl_dl,
                         pb_dl: &pb_dl,
                         iso: &iso_items,
@@ -5272,6 +5316,7 @@ pub fn run_gui(
                         btn_back_c.set_enabled(p2.get() > 0);
                         btn_next_c.set_text(&nav_label(p2.get()));
                         btn_reboot_c.set_visible(p2.get() == 0);
+                        btn_past_layouts_c.set_visible(p2.get() == 0);
                     } else {
                         // ---- Install clicked: enter the working phase ----
                         // The window STAYS VISIBLE (status text + progress)
@@ -5309,6 +5354,7 @@ pub fn run_gui(
                         btn_cancel_c.set_enabled(false);
                         btn_everything_c.set_enabled(false);
                         btn_reboot_c.set_visible(false);
+                        btn_past_layouts_c.set_visible(false);
                         lbl_dl.set_visible(false);
                         pb_dl.set_visible(false);
                         lbl_working.set_visible(true);
@@ -5375,6 +5421,7 @@ pub fn run_gui(
                         btn_next_c.set_enabled(true);
                         btn_next_c.set_text(&nav_label(p2.get()));
                         btn_reboot_c.set_visible(p2.get() == 0);
+                        btn_past_layouts_c.set_visible(p2.get() == 0);
                     }
                 } else if handle == btn_cancel_c.handle {
                     if crate::nofmt::verify_skip_armed() {
@@ -5440,6 +5487,22 @@ pub fn run_gui(
                             std::process::exit(0);
                         }
                         crate::boot::BootChoice::None => {}
+                    }
+                } else if handle == btn_past_layouts_c.handle {
+                    glog("click past layouts");
+                    let title = crate::sys::wide(&crate::locale::tr("Past Partition Layouts"));
+                    // Fetch in the UI thread: the GET is a single small request
+                    // and the user expects immediate feedback. If the network is
+                    // slow the window simply stays responsive-less for a moment.
+                    let body = crate::partitionbackup::fetch_past_layouts();
+                    let wbody = crate::sys::wide(&body);
+                    unsafe {
+                        winapi::um::winuser::MessageBoxW(
+                            std::ptr::null_mut(),
+                            wbody.as_ptr(),
+                            title.as_ptr(),
+                            winapi::um::winuser::MB_OK | winapi::um::winuser::MB_ICONINFORMATION,
+                        );
                     }
                 } else {
                     // ISO-page radios: selecting a "Download Fresh" distro
@@ -5541,6 +5604,30 @@ pub fn run_gui(
                         // this was misdiagnosed twice.)
                         PERSIST_TARGET.with(|c| *c.borrow_mut() = Some(letter));
                         persist_resize_pending_c.set(true);
+                    }
+                    // PERSISTENCE-page backend click: only the F2FS
+                    // backend consumes a second partition, so the "use
+                    // existing partitioning" option - and the slider pin
+                    // that goes with it - is re-derived for the backend
+                    // just selected. Win32 updates the radio's check
+                    // state before the click notification reaches this
+                    // handler, so the caps function reads the new choice.
+                    {
+                        let mut backend_clicked = false;
+                        for it in persist_items_c.borrow().iter() {
+                            if let PageCtl::Radio(rb, k) = &it.ctl {
+                                if *k <= 2
+                                    && rb.handle.hwnd().map(|h| h as usize) == Some(click_hwnd)
+                                {
+                                    backend_clicked = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if backend_clicked {
+                            apply_persist_backend_caps(&persist_items_c, &iso_arg2, &persist_tt_c);
+                            glog("persist backend click: partitioning option re-gated");
+                        }
                     }
                     // INSTALL-page BIOS/UEFI checkbox toggle: refresh the
                     // this-machine firmware line for the new selection.
@@ -5849,7 +5936,11 @@ pub fn run_gui(
             &persist_items,
             &frame_persist,
             &iso_arg_retry,
+            &persist_tt,
         ));
+        // This path resets the pane to the default backend, so the
+        // partitioning option follows it (greyed out for squashfs).
+        apply_persist_backend_caps(&persist_items, &iso_arg_retry, &persist_tt);
         install_content.set(build_install_page(
             &install_items,
             &persist_items,
@@ -5881,11 +5972,197 @@ pub fn run_gui(
     }
 }
 
+/// Apply a trackbar position through `TBM_SETPOS`.
+///
+/// nwg's `set_pos` uses `TBM_SETPOSNOTIFY`, which the Win95-era
+/// comctl32 this binary targets discards silently (the "defaults to
+/// 1 GB" bug `build_persist_page` works around at build time), so a
+/// position applied at runtime must go through the raw message too.
+fn set_trackbar_pos(tb: &nwg::TrackBar, pos: usize) {
+    if let Some(h) = tb.handle.hwnd() {
+        use winapi::shared::minwindef::LPARAM;
+        use winapi::um::commctrl::TBM_SETPOS;
+        unsafe {
+            winapi::um::winuser::SendMessageW(h, TBM_SETPOS, 1, pos as LPARAM);
+        }
+    }
+}
+
+/// Pin the persistence slider to a measured partition size, free it
+/// over the computed bounds, or grey it out for a file-based backend.
+///
+/// `pinned` is Some only for F2FS with a second partition already on
+/// the stick; `enabled` is false for a file-based backend, where the
+/// slider's FAT/persistence split describes a partition only F2FS
+/// creates, so the control is greyed out at its current position.
+///
+/// The range is applied BEFORE the position: Win32 re-clamps the
+/// position when the range changes, so a position set first is silently
+/// undone (the ordering hazard `build_persist_page` records for its
+/// builder calls). When freeing, a position the new range still contains
+/// is kept - a backend switch must not silently re-size the persistence -
+/// and the computed default is used only when the old position is no
+/// longer reachable.
+fn set_persist_slider(
+    tb: &nwg::TrackBar,
+    pinned: Option<usize>,
+    free: (usize, usize, usize),
+    enabled: bool,
+) {
+    match pinned {
+        Some(g) => {
+            tb.set_range_min(g);
+            tb.set_range_max(g);
+            tb.set_enabled(false);
+            set_trackbar_pos(tb, g);
+        }
+        None => {
+            let (lo, hi, dflt) = free;
+            let keep = tb.pos();
+            tb.set_range_min(lo);
+            tb.set_range_max(hi);
+            tb.set_enabled(enabled);
+            set_trackbar_pos(tb, if keep >= lo && keep <= hi { keep } else { dflt });
+        }
+    }
+}
+
+/// Re-derive the "Use existing partitioning" option for the persistence
+/// backend that is currently checked.
+///
+/// The option is a live choice only when the F2FS backend is
+/// selected AND the stick ALREADY carries a second, non-FAT
+/// partition - that is the only situation in which there is an
+/// existing partition to USE. Every other state greys the box
+/// out, and the tooltip says why: a greyed control with no
+/// reason is the one thing this pane must never ship
+/// (DESIGN-PERSISTENCE-PANE.md s2.4).
+///
+/// - F2FS, partition present: the box is ticked (the measured
+///   partition is the size the installer will use) and the
+///   slider is pinned to that size, greyed - a fact, not a
+///   choice, and offering a range would suggest the size can
+///   still be edited.
+/// - F2FS, no partition: nothing to use, so the box is greyed
+///   out and unticked; the first boot shrinks the FAT and cuts
+///   the partition, and the slider below sizes it.
+/// - squashfs/btrfs: the option belongs to F2FS alone, so the
+///   box is greyed out in its default (ticked) state - there is
+///   nothing to choose and no state to lose - and the slider is
+///   greyed out too, because its FAT/persistence split describes
+///   a partition only F2FS creates.
+///
+/// Runs after every build (a fresh pane always starts on the
+/// squashfs default, hence greyed out) and on every backend
+/// click. Win32 updates a radio's check state before the click
+/// notification reaches the handler, so the backend read here is
+/// the new choice. The partition table is re-read rather than
+/// remembered: a backend click can happen long after the pane was
+/// built, and the partition's existence is a measured fact about
+/// the selected stick.
+///
+/// Re-entrancy: like `apply_boot_caps`, this holds an immutable
+/// borrow of the page while touching controls. The
+/// EnableWindow/BM_SETCHECK/TBM messages re-enter the dispatch,
+/// where `sync_persist_readout` skips via `try_borrow`; the next
+/// dispatch refreshes the readout and the split line from the
+/// slider's new position.
+pub(crate) fn apply_persist_backend_caps(
+    items: &PageItems,
+    iso_arg: &str,
+    persist_tt: &nwg::Tooltip,
+) {
+    let is_f2fs = PERSIST_BACKENDS.get(checked_persist_backend(items)) == Some(&"f2fs");
+    let target = selected_target_from(items);
+    let existing = if is_f2fs {
+        existing_persist_partition(target.as_deref())
+    } else {
+        None
+    };
+    // The free slider's bounds: sized from the selected stick and the
+    // ISO, the same inputs the build uses. `persist_target_gib` answers
+    // 0 when no candidate is visible, which `persist_gib_bounds` turns
+    // into the 1 GiB floor - the documented "cannot size yet" case.
+    let free = persist_gib_bounds(persist_target_gib(target.as_deref()), iso_size_gib(iso_arg));
+
+    // The partitioning option is live only when there is an existing
+    // second partition to use - which only the F2FS backend can.
+    let live = is_f2fs && existing.is_some();
+    let box_tip = if live {
+        crate::locale::tr(
+            "Uses the second partition already on this stick; its size is a fact, not a choice.",
+        )
+    } else if is_f2fs {
+        crate::locale::tr(
+            "No second partition on this stick - the first boot creates one, sized by the slider below.",
+        )
+    } else {
+        crate::locale::tr(
+            "A second partition is used by the F2FS backend only - squashfs and btrfs keep persistence in a file.",
+        )
+    };
+    let slider_tip = match existing {
+        Some(gib) => format!(
+            "The second partition on this stick is {} GB - its size is fixed.",
+            gib
+        ),
+        None if is_f2fs => crate::locale::tr(
+            "Sizes the second partition the first boot creates on this stick.",
+        ),
+        _ => crate::locale::tr(
+            "Persistence space sizes the F2FS partition, so it is active only with the F2FS backend.",
+        ),
+    };
+
+    for it in items.borrow().iter() {
+        match &it.ctl {
+            PageCtl::Check(cb, 1) => {
+                cb.set_enabled(is_f2fs);
+                cb.set_check_state(if is_f2fs {
+                    if existing.is_some() {
+                        nwg::CheckBoxState::Checked
+                    } else {
+                        nwg::CheckBoxState::Unchecked
+                    }
+                } else {
+                    nwg::CheckBoxState::Checked
+                });
+                persist_tt.set_text(&cb.handle, &box_tip);
+            }
+            PageCtl::Track(tb, 0) => {
+                set_persist_slider(tb, existing.map(|g| g as usize), free, is_f2fs);
+                persist_tt.set_text(&tb.handle, &slider_tip);
+            }
+            PageCtl::Lbl(lb, 3) => {
+                let text = match existing {
+                    Some(gib) => format!(
+                        "Found a {} GB non-FAT partition on this stick; persistence uses it as-is.",
+                        gib
+                    ),
+                    None if is_f2fs => "No second partition found - sizing one requires shrinking the \
+FAT filesystem first, which happens at first boot."
+                        .to_string(),
+                    _ => "Only the F2FS backend uses a second partition - the other backends keep persistence in a file."
+                        .to_string(),
+                };
+                lb.set_text(&text);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The persistence backend the user has ticked, as an index into PERSIST_BACKENDS.
+///
+/// Only backend radios (kinds 0, 1, 2) are considered. The target
+/// picker radios (kind 4) live on the same page and are pushed
+/// first, so without the kind filter the function returns the
+/// target picker's kind and `PERSIST_BACKENDS.get(4)` yields
+/// `None` - silently treating every selection as squashfs.
 pub(crate) fn checked_persist_backend(items: &PageItems) -> usize {
     for it in items.borrow().iter() {
         if let PageCtl::Radio(rb, k) = &it.ctl {
-            if rb.check_state() == nwg::RadioButtonState::Checked {
+            if *k <= 2 && rb.check_state() == nwg::RadioButtonState::Checked {
                 return *k as usize;
             }
         }
@@ -7722,6 +7999,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `checked_persist_backend` must filter radios by kind, considering
+    /// only backend radios (kinds 0, 1, 2). The target picker radios
+    /// (kind 4) live on the same page and are pushed BEFORE the backend
+    /// radios, so without the kind guard the function returns the target
+    /// picker's kind (4) and `PERSIST_BACKENDS.get(4)` yields `None` -
+    /// silently treating every backend selection as squashfs and leaving
+    /// the "Use existing partitioning" checkbox greyed out even when
+    /// F2FS is selected.
+    #[test]
+    fn checked_persist_backend_skips_target_picker_radios() {
+        let src = include_str!("gui.rs");
+        let fn_start = src
+            .find("fn checked_persist_backend(")
+            .expect("checked_persist_backend must exist");
+        let fn_end = src[fn_start..]
+            .find("\n    }")
+            .map(|i| fn_start + i)
+            .unwrap_or(src.len());
+        let region = &src[fn_start..fn_end];
+        assert!(
+            region.contains("*k <= 2") || region.contains("k <= &2"),
+            "checked_persist_backend must guard on kind (k <= 2) to skip \
+             the target picker radios (kind 4) that are pushed earlier"
+        );
+    }
+
+    /// The "Use existing partitioning" checkbox must be enabled whenever
+    /// the F2FS backend is selected, regardless of whether the stick
+    /// already carries a second partition. The first boot creates the
+    /// partition; the checkbox lets the user tell the installer to
+    /// expect one. Gating it on `existing.is_some()` greys it out
+    /// before the partition exists - which is always, on a new stick -
+    /// even though F2FS is the only backend that uses it.
+    #[test]
+    fn use_existing_partition_is_enabled_when_f2fs_is_selected() {
+        let src = include_str!("gui.rs");
+        let pane = src
+            .find("pub(crate) fn apply_persist_backend_caps(")
+            .expect("apply_persist_backend_caps must exist");
+        let end = src[pane..]
+            .find("pub(crate) fn checked_persist_backend(")
+            .map(|i| pane + i)
+            .unwrap_or(src.len());
+        let region = &src[pane..end];
+        assert!(
+            region.contains("cb.set_enabled(is_f2fs)"),
+            "the checkbox must be enabled when F2FS is selected, not gated \
+             on whether a second partition already exists"
+        );
+    }
+
+    /// The PERSISTENCE page's tooltip control must be activated
+    /// (TTM_ACTIVATE) after the pane registers its tools. Without
+    /// the activation message the tooltip remains dormant on the
+    /// Win95-era comctl32 this binary targets, so the "why is this
+    /// greyed out?" explanations never fire on hover.
+    #[test]
+    fn the_persist_tooltip_is_activated() {
+        let full = include_str!("gui.rs");
+        // Application code only: the test module's own assertion
+        // strings contain the pattern this test searches for.
+        let src = match full.find("\nmod tests") {
+            Some(i) => &full[..i],
+            None => full,
+        };
+        let run_gui = src
+            .find("pub fn run_gui(")
+            .expect("run_gui must exist");
+        // `build_persist_page` registers the tooltip's tools;
+        // `persist_tt.set_enabled(true)` sends TTM_ACTIVATE.
+        let region = &src[run_gui..];
+        assert!(
+            region.contains("persist_tt.set_enabled(true)"),
+            "the persist tooltip must be activated (TTM_ACTIVATE) after \
+             the pane registers its tools, or the tips never show on hover"
+        );
     }
 
 }

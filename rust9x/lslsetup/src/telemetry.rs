@@ -17,7 +17,8 @@ const RESULT_EXT: &str = ".result.txt";
 // Cloudflare Worker endpoint for anonymous hardware-report submission.
 // Replace with your own worker URL after deploying.
 const WORKER_URL: &str = "https://lsl-usb-reports-api.gmatht.workers.dev/report";
-const WORKER_TOKEN: &str = "lsl-usb-v1";
+pub const KV_URL: &str = "https://lsl-usb-reports-api.gmatht.workers.dev/kv";
+pub(crate) const WORKER_TOKEN: &str = "lsl-usb-v1";
 
 /// Data written by Windows before reboot.
 #[derive(Debug, Clone)]
@@ -427,6 +428,38 @@ fn set_auto_upload(enabled: bool) {
     if let Some(key) = sys::RegKey::create(sys::hkcu(), PREFS_KEY) {
         key.set_value_string(PREFS_AUTO_UPLOAD, if enabled { "1" } else { "0" });
     }
+}
+
+/// Whether partition data should be uploaded. Default (no pref set) is true
+/// (opt-out model): the partition layout is minimal, non-personal data.
+pub fn partition_upload_allowed() -> bool {
+    let key = match sys::RegKey::open(sys::hkcu(), PREFS_KEY) {
+        Some(k) => k,
+        None => return true, // no pref set -> opt-out default is "allowed"
+    };
+    key.value(PREFS_AUTO_UPLOAD).map(|s| s != "0").unwrap_or(true)
+}
+
+const PREFS_RUN_COUNT: &str = "partition_run_count";
+
+/// Read the per-machine F2FS install counter. Starts at 0 (never run).
+pub fn partition_run_count() -> u32 {
+    let key = match sys::RegKey::open(sys::hkcu(), PREFS_KEY) {
+        Some(k) => k,
+        None => return 0,
+    };
+    key.value(PREFS_RUN_COUNT)
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Increment and return the per-machine F2FS install counter.
+pub fn increment_partition_run_count() -> u32 {
+    let next = partition_run_count() + 1;
+    if let Some(key) = sys::RegKey::create(sys::hkcu(), PREFS_KEY) {
+        key.set_value_string(PREFS_RUN_COUNT, &next.to_string());
+    }
+    next
 }
 
 /// Describe what was attempted and what the outcome was.

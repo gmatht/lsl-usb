@@ -58,6 +58,11 @@ pub struct Opts {
     pub drivers: bool,          // stage network drivers (default on)
     pub pkgs: bool,             // stage boot-critical hivex .debs (default on)
     pub sfs_hdd: bool,          // copy squashfs to the HDD cache
+    /// Hydrate the squashfs layers into RAM at boot (the "Boot to
+    /// RAM" INSTALL-page checkbox). The console flow previously had
+    /// no way to set this - it was hardcoded off - so a headless run
+    /// could neither add nor remove the entries. Default off.
+    pub boot_to_ram: bool,
     pub reclaim_win_swap: bool, // reclaim the Windows swapfile
     pub fast_startup_off: bool, // powercfg /h off (WHYFAIL6 §5)
 }
@@ -122,6 +127,7 @@ impl Default for Opts {
             drivers: true,
             pkgs: true,
             sfs_hdd: false,
+            boot_to_ram: false,
             reclaim_win_swap: false,
             fast_startup_off: false,
         }
@@ -206,6 +212,9 @@ Options:
   --no-pkgs                   Do not stage the boot-critical hivex .debs
                              (without them /home is not persistent)
   --sfs-hdd-cache             Copy the squashfs to the HDD cache
+  --boot-to-ram / --no-boot-to-ram
+                              Add the Boot-to-RAM menu entries (hydrate
+                              the squashfs into RAM; off by default)
   --reclaim-win-swap          Reclaim the Windows swapfile
   --fast-startup-off          Turn off Fast Startup/hibernate (powercfg /h off)
   --version                   Print the version and git revision, then exit
@@ -325,6 +334,8 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--no-drivers" => o.drivers = false,
             "--no-pkgs" => o.pkgs = false,
             "--sfs-hdd-cache" => o.sfs_hdd = true,
+            "--boot-to-ram" => o.boot_to_ram = true,
+            "--no-boot-to-ram" => o.boot_to_ram = false,
             "--reclaim-win-swap" => o.reclaim_win_swap = true,
             "--fast-startup-off" => o.fast_startup_off = true,
             "--help" | "-h" => return Err(USAGE.to_string()),
