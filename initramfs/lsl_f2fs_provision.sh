@@ -435,6 +435,15 @@ if ! mkdir -p "$LSL_SCAN_MNT" 2>/dev/null; then
 fi
 LSL_STICK_DEV=""
 LSL_STICK_PART=""
+# EVERY match, not just the first. The scan used to `break` on the first hit,
+# which meant it never knew it was ambiguous: with two lsl sticks plugged in (the
+# user with a spare, the spare being the common case) first-match-wins picks one
+# arbitrarily and repartitions it. Collecting all candidates and requiring
+# EXACTLY ONE turns that coin flip into a refusal that names the ambiguity.
+# The probe is cheap - a read-only mount of an already-present path - so
+# scanning the rest costs a few ms and buys certainty we otherwise do not have.
+LSL_STICK_DEV_ALL=""
+LSL_STICK_PART_ALL=""
 # /dev/vd* (virtio) MATTERS: that is what QEMU presents, and also what many
 # VMs and some real controllers use. A QEMU boot scanned sd*/mmcblk*/nvme* only,
 # found nothing, and refused - so the scan lists every transport the kernel
@@ -453,15 +462,24 @@ for _lsl_dev in ${LSL_PARTS:-/dev/sd? /dev/sd?? /dev/vd? /dev/vd?? \
     if mount -o ro,noexec,nosuid,nodev "$_lsl_dev" "$LSL_SCAN_MNT/$_lsl_name" 2>/dev/null; then
         for _lsl_probe in casper/filesystem.squashfs sfs/manifest.txt casper/initrd.lz; do
             if [ -e "$LSL_SCAN_MNT/$_lsl_name/$_lsl_probe" ]; then
-                LSL_STICK_PART="$_lsl_dev"
+                _lsl_hit_disk=""
                 # Whole disk = the partition node minus its trailing pN/sdN.
                 # NOT ${dev%[0-9]}, which strips a single character and would
                 # turn /dev/sdb1 into /dev/sdb (fine) but /dev/nvme0n1p2 into
                 # /dev/nvme0n1p (a device that does not exist).
                 case "$_lsl_name" in
-                    *[0-9]p[0-9]) LSL_STICK_DEV="/dev/${_lsl_name%p[0-9]}" ;;
-                    *[0-9])       LSL_STICK_DEV="/dev/${_lsl_name%[0-9]}" ;;
-                    *)            LSL_STICK_DEV="$_lsl_dev" ;;
+                    *[0-9]p[0-9]) _lsl_hit_disk="/dev/${_lsl_name%p[0-9]}" ;;
+                    *[0-9])       _lsl_hit_disk="/dev/${_lsl_name%[0-9]}" ;;
+                    *)            _lsl_hit_disk="$_lsl_dev" ;;
+                esac
+                # Accumulate, never break. Two PARTITIONS of ONE disk both
+                # carrying the payload count once - deduped below - but two
+                # different DISKS are two genuinely different mediums, and
+                # that is the case this whole check exists for.
+                case " $LSL_STICK_DEV_ALL " in
+                    *" $_lsl_hit_disk "*) ;;
+                    *) LSL_STICK_DEV_ALL="${LSL_STICK_DEV_ALL:+${LSL_STICK_DEV_ALL} }${_lsl_hit_disk}"
+                       LSL_STICK_PART_ALL="${LSL_STICK_PART_ALL:+${LSL_STICK_PART_ALL} }$_lsl_dev" ;;
                 esac
                 break
             fi
@@ -469,14 +487,44 @@ for _lsl_dev in ${LSL_PARTS:-/dev/sd? /dev/sd?? /dev/vd? /dev/vd?? \
         umount "$LSL_SCAN_MNT/$_lsl_name" 2>/dev/null || true
     fi
     rmdir "$LSL_SCAN_MNT/$_lsl_name" 2>/dev/null || true
-    [ -n "$LSL_STICK_DEV" ] && break
 done
 rmdir "$LSL_SCAN_MNT" 2>/dev/null || true
 
-if [ -z "$LSL_STICK_DEV" ]; then
-    lsl_refuse "could not identify the boot medium by content; refusing to guess which disk to shrink."
-    return 0 2>/dev/null || exit 0
-fi
+# Count the distinct disks that carried the payload. Whitespace-splitting a
+# space-separated list is exactly what the kernel's own cmdline split does
+# above, and the values here are kernel-provided device nodes - never user
+# input - so no quoting subtlety is involved.
+_lsl_match_count=0
+for _lsl_cand in $LSL_STICK_DEV_ALL; do
+    _lsl_match_count=$((_lsl_match_count + 1))
+done
+
+case "$_lsl_match_count" in
+    0)
+        lsl_refuse "could not identify the boot medium by content; refusing to guess which disk to shrink."
+        return 0 2>/dev/null || exit 0
+        ;;
+    1)
+        LSL_STICK_DEV="$LSL_STICK_DEV_ALL"
+        LSL_STICK_PART="$LSL_STICK_PART_ALL"
+        ;;
+    *)
+        # AMBIGUOUS. Two or more distinct disks carry the lsl payload, so
+        # "which one did Windows mean?" has no answer available here - the
+        # cmdline carries only the SIZE, never an identity (see the
+        # disk-signature handshake: until that exists this is the only
+        # defence). Repartitioning one of them on a guess is precisely the
+        # data loss this hook exists to prevent, so refuse and say what was
+        # found. The operator can pull the spare stick, or set
+        # lsl_no_f2fs_provision and provision by hand.
+        # `tr`, NOT `${var// /, }`: that substitution is a bash/ksh extension,
+        # and this file is POSIX sh because the initramfs shell is busybox ash
+        # (see the header). `tr` is already used by lsl_prov_log and
+        # lsl_refuse_dump below, so this adds no new dependency.
+        lsl_refuse "the lsl payload is present on ${_lsl_match_count} different disks ($(printf '%s' "$LSL_STICK_DEV_ALL" | tr ' ' ',')) - which one to reshape cannot be determined from the boot alone, and guessing could repartition the wrong one. Unplug the extra stick(s) and boot again, or add lsl_no_f2fs_provision to the kernel command line to skip provisioning."
+        return 0 2>/dev/null || exit 0
+        ;;
+esac
 lsl_prov_log "boot medium: ${LSL_STICK_PART} on ${LSL_STICK_DEV}"
 
 # (c) nothing may still be holding the FAT partition: an ISO loop from an
@@ -770,6 +818,92 @@ fi
 # not persist even though the partition is right there.
 udevadm settle 2>/dev/null || true
 sync 2>/dev/null
+
+# ---- 4. write the `post` receipt --------------------------------------------
+# A RECEIPT, not a backup: the pre-repartition state no longer exists on this
+# medium (the shrink and the table rewrite above have both landed), so this
+# cannot recover anything. What it is good for is telling a human what actually
+# happened - "partition 1 went 12 GiB -> 10 GiB, partition 2 was created" - so a
+# manual recovery is informed rather than guesswork. The RESTORABLE geometry is
+# in the `pre` record lslsetup wrote.
+#
+# It goes to partition 1 (the FAT stick), never to the fresh lsl-persist: that
+# partition is brand-new and empty by definition, and the first thing it will
+# hold is the user's /home.
+#
+# Written with a temporary name and renamed into place, so a reader (or a crash)
+# never sees a half-written JSON file - which would parse as corrupt and be
+# discarded, losing the receipt.
+#
+# EVERY failure here is swallowed. This runs after the repartition succeeded and
+# the boot is otherwise fine; a receipt that cannot be written must never be the
+# thing that breaks it. The guard is already disarmed above.
+lsl_write_post_record() {
+    local mnt=/mnt/lsl-post-record
+    local dir="$mnt/lsl-partition-backup"
+    local stamp ts file tmp
+    mkdir -p "$mnt" 2>/dev/null || return 0
+    # Read-write: this is where the record has to go. Same medium casper mounts
+    # as /cdrom a moment later, and we unmount before returning.
+    mount "$fat_part" "$mnt" 2>/dev/null || { lsl_prov_log "post-record: could not mount $fat_part; no receipt written"; return 0; }
+    if mkdir -p "$dir" 2>/dev/null; then
+        ts="$(date -u '+%y%m%d:%H%M%S' 2>/dev/null)"
+        case "$ts" in
+            ''|*[!0-9:]*) lsl_prov_log "post-record: date unavailable; no receipt written"; umount "$mnt" 2>/dev/null; return 0 ;;
+        esac
+        # The machine prefix is a stable hash of the motherboard identity. The
+        # hook has no WMI, so use the DMI id if it is readable and fall back to
+        # a marker; the restore tool reads the full geometry from the value, so
+        # a coarse prefix costs nothing but a slightly longer key.
+        local mid="UNK"
+        if [ -r /sys/class/dmi/id/board_name ]; then
+            mid="$(cat /sys/class/dmi/id/board_name 2>/dev/null | tr -cd 'A-Za-z0-9' | cut -c1-6 | tr 'a-z' 'A-Z')"
+            [ -n "$mid" ] || mid="UNK"
+        fi
+        file="$dir/${mid}${ts}.json"
+        tmp="$file.tmp"
+        # Hand-rolled JSON rather than a tool: the initrd has no jq, and the
+        # values are integers and hex we produced ourselves, so nothing here can
+        # contain a quote or a backslash that needs escaping. Every numeric
+        # field is a variable this file has already validated as digits.
+        if cat > "$tmp" 2>/dev/null <<EOF
+{
+  "timestamp": "${ts}",
+  "phase": "post",
+  "vol_letter": "",
+  "lslsetup_version": "",
+  "motherboard": "${mid}",
+  "windows_version": "",
+  "disks": [
+    {
+      "size_sectors": ${disk_size_sectors},
+      "scheme": "mbr",
+      "entries": [
+        { "index": 1, "start_sectors": ${fat_start}, "size_sectors": ${new_fat_sectors}, "type_id": "0c", "bootable": true, "label": "" },
+        { "index": 2, "start_sectors": ${fat_end}, "size_sectors": ${want_sectors}, "type_id": "83", "bootable": false, "label": "${LSL_PERSIST_LABEL}" }
+      ],
+      "fs_size_sectors": ${bpb_sectors},
+      "head_sectors_hex": ""
+    }
+  ]
+}
+EOF
+        then
+            mv -f "$tmp" "$file" 2>/dev/null && lsl_prov_log "post-record: wrote $file"
+            rm -f "$tmp" 2>/dev/null || true
+        else
+            lsl_prov_log "post-record: write failed; no receipt"
+        fi
+    else
+        lsl_prov_log "post-record: could not create $dir; no receipt written"
+    fi
+    sync 2>/dev/null || true
+    umount "$mnt" 2>/dev/null || true
+    rmdir "$mnt" 2>/dev/null || true
+    return 0
+}
+lsl_write_post_record
+
 # Done: stand the guard down and hand casper its EXIT trap back, so the caller's
 # own exit unwinds its shell exactly as it did before this hook existed.
 lsl_park_disarm

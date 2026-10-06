@@ -363,6 +363,35 @@ setup_firstboot() {
     [ ! -e "$TMPDIR_TEST/reboot.log" ]
 }
 
+@test "lsl-firstboot: awaiting-approval marker is published while waiting, cleared on decision" {
+    # The producer half of the "reboot dialog reappeared on the second boot"
+    # fix: lsl-firstboot-progress.sh gates the dialog on this marker alone.
+    # It must be present exactly while schedule_reboot_on_approval() blocks,
+    # and gone once the user decides - otherwise either the dialog never
+    # shows on a genuine fresh login, or it shows forever after.
+    setup_firstboot
+    printf '#!/bin/bash\nexit 0\n' > "$LSL_FIRSTBOOT_UPROOT"
+    chmod +x "$LSL_FIRSTBOOT_UPROOT"
+    printf '#!/bin/bash\necho "systemctl $*" >> "$TMPDIR_TEST/reboot.log"\n' > "$TMPDIR_TEST/bin/systemctl"
+    chmod +x "$TMPDIR_TEST/bin/systemctl"
+    export LSL_FIRSTBOOT_REBOOT=1 LSL_FIRSTBOOT_REBOOT_TIMEOUT=60
+    mkdir -p "$LSL_FIRSTBOOT_FLAG_DIR"
+    bash misc/lsl-firstboot.sh >"$TMPDIR_TEST/out.log" 2>&1 &
+    srv=$!
+    for _ in $(seq 1 200); do
+        grep -q "Waiting for you to approve" "$TMPDIR_TEST/logs"/*.log 2>/dev/null && break
+        sleep 0.1
+    done
+    # While blocked: a fresh login must see the approval dialog.
+    [ -e "$LSL_FIRSTBOOT_FLAG_DIR/awaiting-approval" ]
+    touch "$LSL_FIRSTBOOT_FLAG_DIR/reboot-cancel"
+    wait "$srv"
+    [ "$?" -eq 0 ]
+    # Decision recorded: the marker is withdrawn, so no later login re-shows it.
+    [ ! -e "$LSL_FIRSTBOOT_FLAG_DIR/awaiting-approval" ]
+    [ -e "$LSL_FIRSTBOOT_FLAG_DIR/reboot-cancel" ]
+}
+
 @test "lsl-firstboot: reboot approval honors reboot-now written while waiting" {
     setup_firstboot
     printf '#!/bin/bash\nexit 0\n' > "$LSL_FIRSTBOOT_UPROOT"
@@ -1359,6 +1388,9 @@ mock_losetup() {
     CD="$TMPDIR_TEST/cdrom"
     mkdir -p "$CD/casper" "$TMPDIR_TEST/flags"
     touch "$CD/casper/lsl-firstboot.done"
+    # awaiting-approval is what says firstboot is WAITING on this boot (see
+    # the later-boot regression test below - the flag dir alone does not).
+    touch "$TMPDIR_TEST/flags/awaiting-approval"
     printf '#!/bin/bash\necho "$@" > "$TMPDIR_TEST/reboot-args"\n' > "$TMPDIR_TEST/reboot-mock.sh"
     chmod +x "$TMPDIR_TEST/reboot-mock.sh"
     cp misc/lsl-firstboot-progress.sh "$TMPDIR_TEST/progress.sh"
@@ -1385,10 +1417,34 @@ mock_losetup() {
     [ ! -e "$TMPDIR_TEST/reboot-args" ]
 }
 
+@test "lsl-firstboot-progress: no approval dialog on a later boot (empty flag dir)" {
+    # REGRESSION: onboot.sh recreates /run/lsl-firstboot (tmpfs) on EVERY boot,
+    # so after the first boot completed and the user rebooted, the flag dir
+    # existed and was empty - no reboot-now, no reboot-cancel. The pending
+    # check was "dir exists AND neither decision recorded", so a fresh login
+    # on the SECOND boot matched it and re-showed "Setup finished…".
+    # The dialog must require positive evidence that firstboot is actually
+    # waiting: the awaiting-approval marker lsl-firstboot.sh writes while it
+    # blocks in schedule_reboot_on_approval().
+    CD="$TMPDIR_TEST/cdrom"
+    mkdir -p "$CD/casper" "$TMPDIR_TEST/flags"
+    touch "$CD/casper/lsl-firstboot.done"
+    printf '#!/bin/bash\necho CALLED > "$TMPDIR_TEST/reboot-args"\n' > "$TMPDIR_TEST/reboot-mock.sh"
+    chmod +x "$TMPDIR_TEST/reboot-mock.sh"
+    cp misc/lsl-firstboot-progress.sh "$TMPDIR_TEST/progress.sh"
+    sed -i "s|/cdrom|$CD|g" "$TMPDIR_TEST/progress.sh"
+    # Flag dir present and empty - exactly what a second boot looks like.
+    run env LSL_FIRSTBOOT_FLAG_DIR="$TMPDIR_TEST/flags" LSL_FIRSTBOOT_REBOOT_SH="$TMPDIR_TEST/reboot-mock.sh" \
+        bash "$TMPDIR_TEST/progress.sh"
+    [ "$status" -eq 0 ]
+    [ ! -e "$TMPDIR_TEST/reboot-args" ]
+}
+
 @test "lsl-firstboot-progress: stays silent once decided, shows dialog while pending" {
     CD="$TMPDIR_TEST/cdrom"
     mkdir -p "$CD/casper" "$TMPDIR_TEST/flags"
     touch "$CD/casper/lsl-firstboot.done"
+    touch "$TMPDIR_TEST/flags/awaiting-approval"
     printf '#!/bin/bash\necho CALLED > "$TMPDIR_TEST/reboot-args"\n' > "$TMPDIR_TEST/reboot-mock.sh"
     chmod +x "$TMPDIR_TEST/reboot-mock.sh"
     cp misc/lsl-firstboot-progress.sh "$TMPDIR_TEST/progress.sh"

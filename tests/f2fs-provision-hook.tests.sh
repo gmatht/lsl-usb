@@ -353,6 +353,68 @@ else
     skip "no timeout(1) to bound the armed-exit check"
 fi
 
+echo
+echo "== part 1c: the scan must detect AMBIGUITY, not pick a winner =="
+
+# The scan used to `break` on the first match, so with two lsl sticks plugged in
+# (the user with a spare) it silently repartitioned whichever the glob reached
+# first. Collecting every match and requiring EXACTLY ONE turns that coin flip
+# into a refusal - the only defence available while the cmdline carries a SIZE
+# and no identity at all.
+
+# Static: the first-match break must be GONE, and a uniqueness count must exist.
+if sed -n '/^for _lsl_dev in/,/^rmdir "\$LSL_SCAN_MNT"/p' "$HOOK" \
+     | grep -qE '^\s*\[ -n "\$LSL_STICK_DEV" \] && break'; then
+    bad "the scan still breaks on the first match - two sticks mean a coin flip"
+else
+    ok "the scan no longer breaks on the first match"
+fi
+if grep -q 'LSL_STICK_DEV_ALL=' "$HOOK"; then
+    ok "the scan accumulates every candidate disk"
+else
+    bad "the scan does not collect all candidates"
+fi
+if grep -q '_lsl_match_count' "$HOOK"; then
+    ok "the scan counts distinct matching disks"
+else
+    bad "no distinct-disk count - ambiguity cannot be detected without it"
+fi
+
+# Two PARTITIONS of ONE disk must count once, or a normal multi-partition stick
+# would refuse itself.
+out="$(sh -c 'LSL_STICK_DEV_ALL="/dev/sdb"; for c in $LSL_STICK_DEV_ALL; do n=$((n+1)); done; echo "N=$n"' 2>/dev/null)"
+case "$out" in
+    *N=1*) ok "one disk counted once (the dedup case)" ;;
+    *) bad "counting a single disk gave $out" ;;
+esac
+out="$(sh -c 'LSL_STICK_DEV_ALL="/dev/sdb /dev/sdc"; for c in $LSL_STICK_DEV_ALL; do n=$((n+1)); done; echo "N=$n"' 2>/dev/null)"
+case "$out" in
+    *N=2*) ok "two disks counted twice (the ambiguous case)" ;;
+    *) bad "counting two disks gave $out" ;;
+esac
+
+# The refusal must be a REFUSAL (no disk touched, boot continues), not a park:
+# two sticks plugged in is an operator-fixable condition, and parking would wedge
+# a perfectly healthy boot - the same reasoning lsl_refuse already encodes.
+if grep -q 'lsl_refuse "the lsl payload is present on' "$HOOK"; then
+    ok "ambiguity is a refusal, not a park (an operator can fix it by unplugging)"
+else
+    bad "ambiguity does not go through lsl_refuse - it may park a healthy boot"
+fi
+# ...and the message must name the disks, so the operator knows which to pull.
+if grep -q 'the lsl payload is present on .*different disks' "$HOOK" \
+   && grep -q "tr ' ' ','" "$HOOK"; then
+    ok "the ambiguity refusal names every disk it found"
+else
+    bad "the ambiguity refusal does not name the disks found"
+fi
+# POSIX only: `${var// /, }` is a bashism and the initramfs shell is busybox ash.
+if grep -q '\${LSL_STICK_DEV_ALL//' "$HOOK"; then
+    bad "uses \${var//...} - a bashism that breaks under busybox ash"
+else
+    ok "uses POSIX expansion only (no bashism in the refusal path)"
+fi
+
 # ---- the guard must not leak into casper's shell ---------------------------
 # A trap set inside a SOURCED file belongs to the CALLING shell. Measured: it
 # does survive the hook's `return` and does fire on the caller's own exit. Left

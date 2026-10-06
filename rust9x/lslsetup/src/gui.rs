@@ -1006,14 +1006,17 @@ const DISTRO_OPTIONS: &[(&str, &str)] = &[
         "Xubuntu 24.04 (64-bit, light-ish)  (1GB/2GB)",
         "https://cdimage.ubuntu.com/xubuntu/releases/24.04/release/",
     ),
-    ("antiX 26 (i386 / 32-bit)  (0.25GB/1GB)", "https://antixlinux.com/download/"),
+    (
+        "antiX 26 (i386 / 32-bit)  (0.25GB/1GB)  (loopback, BIOS only)",
+        "https://antixlinux.com/download/",
+    ),
     ("Zorin OS (64-bit)  (2GB/4GB)", "https://zorin.com/os/download/"),
     (
-        "Debian 13.6 live XFCE (64-bit)  (1GB/2GB)",
+        "Debian 13.6 live XFCE (64-bit)  (1GB/2GB)  (loopback, BIOS only)",
         "https://cdimage.debian.org/cdimage/release/13.6.0-live/amd64/iso-hybrid/debian-live-13.6.0-amd64-xfce.iso",
     ),
     (
-        "Tiny CorePlus (32-bit, tiny)  (46MB/128MB)",
+        "Tiny CorePlus (32-bit, tiny)  (46MB/128MB)  (loopback, BIOS only)",
         "http://www.tinycorelinux.net/16.x/x86/release/CorePlus-current.iso",
     ),
 ];
@@ -6645,6 +6648,71 @@ pub fn test_boot_page() -> crate::boot::BootChoice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distro_labels_are_unique_on_the_token_the_harvest_matches() {
+        // The harvest resolves the picked row to a DISTRO_OPTIONS index by
+        // `text.starts_with(name.split(' ').next())` (see harvest_gui_result),
+        // so it matches the FIRST WORD ONLY. Two labels sharing a first word
+        // means the picker silently downloads and sizes the wrong distro - no
+        // error, just the wrong ISO. The "(loopback, BIOS only)" suffixes
+        // added to the non-casper entries are safe because they are beyond the
+        // first token; this test is what keeps that true if a label is edited.
+        let mut seen: Vec<(String, &str)> = Vec::new();
+        for (name, _url) in DISTRO_OPTIONS {
+            let tok = name.split(' ').next().unwrap_or("");
+            assert!(!tok.is_empty(), "empty first token in {}", name);
+            for (prev_tok, prev_name) in &seen {
+                assert_ne!(
+                    tok, prev_tok.as_str(),
+                    "'{}' and '{}' share the first token '{}' - the harvest would pick the wrong row",
+                    name, prev_name, tok
+                );
+            }
+            seen.push((tok.to_string(), name));
+        }
+    }
+
+    #[test]
+    fn every_distro_label_is_resolvable_by_its_own_first_token() {
+        // The exact production expression, run over the real table, plus the
+        // rows it must NOT match. A label that matches nothing would leave
+        // distro_arch unset and no download started.
+        for (i, (name, _url)) in DISTRO_OPTIONS.iter().enumerate() {
+            let mut hits: Vec<usize> = Vec::new();
+            for (j, (other, _u)) in DISTRO_OPTIONS.iter().enumerate() {
+                let other_tok = other.split(' ').next().unwrap_or("");
+                if name.starts_with(other_tok) {
+                    hits.push(j);
+                }
+            }
+            assert!(
+                hits.contains(&i),
+                "{} matches no DISTRO_OPTIONS row by first token",
+                name
+            );
+            assert_eq!(hits.len(), 1, "{} ambiguously matches rows {:?}", name, hits);
+        }
+    }
+
+    #[test]
+    fn the_32_bit_distros_are_labelled_so_the_arch_harvest_finds_them() {
+        // `distro_arch` is derived from the NAME containing "i386" or
+        // "32-bit", which decides the apt index architecture. If a 32-bit
+        // distro's label lost that marker, the f2fs tools would be fetched as
+        // amd64 and could not run on the stick.
+        for (name, _url) in DISTRO_OPTIONS {
+            let is_32 = name.contains("i386") || name.contains("32-bit");
+            let is_antix = name.starts_with("antiX");
+            let is_tiny = name.starts_with("Tiny");
+            assert_eq!(
+                is_32,
+                is_antix || is_tiny,
+                "{} must keep its 32-bit marker or the apt index arch is wrong",
+                name
+            );
+        }
+    }
 
     #[test]
     fn iso_source_kinds_are_exactly_the_three_main_sections() {

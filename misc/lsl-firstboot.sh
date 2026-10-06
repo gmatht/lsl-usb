@@ -13,7 +13,8 @@
 #   3) backs up /home to its permanent location (USB: /cdrom/home.sfs via
 #      uphome; HDD: btrfs sync), stamps /cdrom/casper/lsl-firstboot.done,
 #      and waits for the user to approve the reboot (desktop dialog with
-#      Reboot now / Reboot later - no timer, never reboots on its own)
+#      Reboot to lsl-usb / Firmware boot menu / Later - no timer, never
+#      reboots on its own)
 #
 # The recipe on the FAT partition (/cdrom/bin/squashfs_config.sh) is editable
 # from Windows before first boot to change what gets installed.
@@ -275,15 +276,90 @@ flush_home_final() {
 }
 
 # End-of-firstboot reboot approval: the service NEVER reboots on its own.
-# A dialog in each graphical session offers "Reboot now" / "Reboot later"
-# and this function waits indefinitely until the user chooses. Reboot later
-# is safe - the stamp already exists, so the new layer is picked up on the
-# next manual boot anyway.
+# A dialog in each graphical session offers "Reboot to lsl-usb" / "Firmware
+# boot menu" / "Later" and this function waits indefinitely until the user
+# chooses. Later is safe - the stamp already exists, so the new layer is
+# picked up on the next manual boot anyway.
 # Env: LSL_FIRSTBOOT_REBOOT (1/0, default 1),
 # LSL_FIRSTBOOT_REBOOT_TIMEOUT (compat only: 0 = reboot immediately without
 # asking; any other value waits for approval - there is no timer),
 # LSL_FIRSTBOOT_FLAG_DIR (default /run/lsl-firstboot - tmpfs, so flags
 # vanish on reboot).
+
+# Execute the reboot the user approved, honouring the TARGET the desktop
+# dialog recorded in $FLAG_DIR/reboot-target (usb | fw | empty).
+#
+# The user session only records the choice; this is the reboot authority.
+# Split out of schedule_reboot_on_approval() so it can be unit-tested
+# without root (every side effect goes through $LSL_REBOOT_CMD, a test hook).
+#
+#   usb  -> one-time re-boot of the entry we booted from, via efibootmgr -n.
+#           Same trick bin/lsl-shutdown-gui uses for its "Reboot to USB"
+#           option, so a post-firstboot reboot behaves like that one.
+#   fw   -> straight into the firmware's own boot menu (systemd 254+).
+#   ""   -> plain reboot; the firmware boot order decides, exactly as before.
+#
+# Every branch is best-effort: if efibootmgr is missing (BIOS/CSM) or refuses,
+# fall through to the plain reboot rather than stranding the user in a boot
+# approval loop they already approved.
+LSL_REBOOT_CMD="systemctl reboot"
+LSL_EFIBOOTMGR_CMD="efibootmgr"
+
+# The command vars are intentionally UNQUOTED at the call sites: each holds
+# a command with words in it ("systemctl reboot"), and shellcheck cannot
+# verify a word-split command name, so they are set only by this file's own
+# defaults (or by a test), never from user input.
+lsl_firstboot_reboot_now() {
+    local target="${1:-}"
+
+    case "$target" in
+        usb)
+            # -n sets BootNext for ONE boot only, so the machine returns to
+            # its normal boot order (usually Windows) the following time.
+            if command -v "$LSL_EFIBOOTMGR_CMD" >/dev/null 2>&1; then
+                local current
+                current="$("$LSL_EFIBOOTMGR_CMD" 2>/dev/null | awk '/^BootCurrent:/ {print $2; exit}' || true)"
+                if [ -n "$current" ]; then
+                    log "Reboot target 'usb': setting BootNext=$current."
+                    if "$LSL_EFIBOOTMGR_CMD" -n "$current" >/dev/null 2>&1; then
+                        log "BootNext set; rebooting back into lsl-usb."
+                        # shellcheck disable=SC2086
+                        $LSL_REBOOT_CMD
+                        return $?
+                    fi
+                    log "efibootmgr -n failed; falling back to a plain reboot."
+                else
+                    log "Could not read BootCurrent; falling back to a plain reboot."
+                fi
+            else
+                log "efibootmgr not available (legacy BIOS/CSM?); falling back to a plain reboot."
+            fi
+            # shellcheck disable=SC2086
+            $LSL_REBOOT_CMD
+            return $?
+            ;;
+        fw)
+            log "Reboot target 'fw': entering the firmware boot menu."
+            # shellcheck disable=SC2086
+            if $LSL_REBOOT_CMD --firmware-setup=auto >/dev/null 2>&1; then
+                return 0
+            fi
+            # Old systemd, or it refused: a plain reboot still hands the
+            # machine over cleanly rather than failing the approval.
+            log "systemctl --firmware-setup refused; falling back to a plain reboot."
+            # shellcheck disable=SC2086
+            $LSL_REBOOT_CMD
+            return $?
+            ;;
+        *)
+            log "Reboot target unset; plain reboot (firmware boot order decides)."
+            # shellcheck disable=SC2086
+            $LSL_REBOOT_CMD
+            return $?
+            ;;
+    esac
+}
+
 schedule_reboot_on_approval() {
     if [ "${LSL_FIRSTBOOT_REBOOT:-1}" != "1" ]; then
         log "LSL_FIRSTBOOT_REBOOT=0: reboot manually when ready."
@@ -300,8 +376,17 @@ schedule_reboot_on_approval() {
     # user's choice; sticky bit so users cannot remove each other's flags.
     mkdir -p "$flagdir" 2>/dev/null || true
     chmod 1777 "$flagdir" 2>/dev/null || true
-    rm -f "$flagdir/reboot-cancel" "$flagdir/reboot-now" "$flagdir/deadline" 2>/dev/null || true
-    log "Setup complete. Waiting for you to approve the reboot - Reboot now or Reboot later in the desktop dialog…"
+    rm -f "$flagdir/reboot-cancel" "$flagdir/reboot-now" "$flagdir/reboot-target" "$flagdir/deadline" 2>/dev/null || true
+    # Positive evidence that THIS boot is waiting for approval. onboot.sh
+    # recreates the flag dir on every boot (tmpfs /run), so its existence -
+    # or the absence of a decision file - says nothing on a later boot: an
+    # empty dir on boot 2 is what made the "first boot complete" dialog
+    # reappear for every later login. lsl-firstboot-progress.sh gates the
+    # dialog on this file alone, so it must be written before the dialog is
+    # announced and removed on BOTH exits below (reboot and defer).
+    : >>"$flagdir/awaiting-approval" 2>/dev/null || true
+    chmod 666 "$flagdir/awaiting-approval" 2>/dev/null || true
+    log "Setup complete. Waiting for you to approve the reboot - pick a reboot target in the desktop dialog…"
     # Dialogs run per-session in the background; this loop is the reboot
     # authority (the user session cannot reboot the machine itself).
     # No deadline and no timeout: a fresh login re-shows the same approval
@@ -311,18 +396,25 @@ schedule_reboot_on_approval() {
         if [ -e "$flagdir/reboot-cancel" ]; then
             log "Reboot deferred by the user; the new layer activates on the next boot."
             set_phase 'done - reboot deferred by user'
+            rm -f "$flagdir/awaiting-approval" 2>/dev/null || true
             return 0
         fi
         if [ -e "$flagdir/reboot-now" ]; then
             log "Reboot approved by the user."
+            rm -f "$flagdir/awaiting-approval" 2>/dev/null || true
             break
         fi
         sleep 2
-        task_progress 100 "Waiting for reboot approval — Reboot now or Reboot later in the dialog…"
+        task_progress 100 "Waiting for reboot approval — pick a reboot target in the dialog…"
     done
     set_phase 'done - rebooting'
     sync
-    systemctl reboot
+    # The dialog recorded WHERE the user wants to land, alongside the
+    # approval itself; a stale/empty target degrades to the old plain
+    # reboot, which is exactly what this did before the target existed.
+    reboot_target=""
+    [ -r "$flagdir/reboot-target" ] && reboot_target="$(head -n1 "$flagdir/reboot-target" 2>/dev/null | tr -d '\r\n')"
+    lsl_firstboot_reboot_now "$reboot_target"
 }
 
 # Flush the RAM-side dialog/boot telemetry to the stick. /tmp, the journal

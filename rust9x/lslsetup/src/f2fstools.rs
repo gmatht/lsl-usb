@@ -83,12 +83,37 @@ const UBUNTU_SUITES: &[&str] = &[
     "bionic", "xenial", "artful", "disco", "eoan", "groovy", "hirsute", "impish",
 ];
 
+/// Map a suite name onto the spelling the apt archive actually serves.
+///
+/// ISO9660 directory names are UPPERCASE by spec, so `suite_from_iso` on a
+/// Mint or Zorin image really returns `NOBLE`, not `noble`. The tables below
+/// are lowercase, and the suite is interpolated straight into the index URL
+/// (`resolve_pool_path`), which the archive serves lowercase-only - MEASURED
+/// against archive.ubuntu.com: `/dists/noble/...` is HTTP 200,
+/// `/dists/NOBLE/...` is HTTP 404. So the name has to be canonicalised
+/// *before* it is used as a URL, not merely matched case-insensitively;
+/// folding only in the matcher would trade a legible refusal for a silent
+/// 404.
+///
+/// Case folding does NOT widen the accepted set: the result is still one of
+/// the exact table entries, so an unrecognised suite is still refused rather
+/// than guessed at.
+pub fn canonical_suite(suite: &str) -> Option<&'static str> {
+    let lower = suite.trim().to_ascii_lowercase();
+    DEBIAN_SUITES
+        .iter()
+        .chain(UBUNTU_SUITES.iter())
+        .find(|known| **known == lower)
+        .copied()
+}
+
 /// Debian codename -> mirror. `None` for anything unknown, so the caller can
 /// refuse rather than guess.
 pub fn mirror_for_suite(suite: &str) -> Option<Mirror> {
-    if DEBIAN_SUITES.contains(&suite) {
+    let canon = canonical_suite(suite)?;
+    if DEBIAN_SUITES.contains(&canon) {
         Some(DEBIAN_MIRROR)
-    } else if UBUNTU_SUITES.contains(&suite) {
+    } else if UBUNTU_SUITES.contains(&canon) {
         Some(UBUNTU_MIRROR)
     } else {
         None
@@ -202,7 +227,7 @@ pub fn suite_from_iso(iso: &str) -> Option<String> {
 /// `Err` names the suite, so the message tells the user which archive was
 /// considered and why it was rejected rather than surfacing a bare 404.
 pub fn mirror_for_iso(iso: &str) -> Result<(Mirror, String), String> {
-    let Some(suite) = suite_from_iso(iso) else {
+    let Some(raw) = suite_from_iso(iso) else {
         return Err(format!(
             "{} has no dists/ directory, so no apt suite can be resolved. Its binaries cannot be fetched from a package archive.",
             std::path::Path::new(iso)
@@ -211,15 +236,22 @@ pub fn mirror_for_iso(iso: &str) -> Result<(Mirror, String), String> {
                 .unwrap_or_else(|| iso.to_string())
         ));
     };
-    let mirror = mirror_for_suite(&suite).ok_or_else(|| {
+    // The returned suite is the CANONICAL one, not the ISO's spelling: it is
+    // interpolated into the index URL, and the archive serves lowercase only
+    // (an ISO9660 name is uppercase, so returning `raw` here is what produced
+    // "NOBLE is not a suite this build knows how to query"). The refusal names
+    // the ISO's own spelling, which is the one the user can recognise.
+    let canonical = canonical_suite(&raw).ok_or_else(|| {
         format!(
             "'{}' is not a suite this build knows how to query (Debian: {}; Ubuntu: {}). Refusing to guess an archive.",
-            suite,
+            raw,
             DEBIAN_SUITES.join(", "),
             UBUNTU_SUITES.join(", ")
         )
     })?;
-    Ok((mirror, suite))
+    // `canonical` is by construction one of the two tables, so this is total.
+    let mirror = mirror_for_suite(canonical).expect("canonical suite is always in a table");
+    Ok((mirror, canonical.to_string()))
 }
 
 /// Find `pkg`'s `Filename:` in the suite's Packages index on `mirror`.
@@ -476,9 +508,23 @@ fn cmp_versions(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-/// Stage `wanted_files` (by basename) plus every soname in `LIBS` from
-/// `files`, writing each under `lib/` (libraries) or `bin/` (executables).
+/// Stage `wanted_files` (by basename) plus every soname in `LIBS` that
+/// `pkg` PROVIDES, writing each under `lib/` (libraries) or `bin/`
+/// (executables).
+///
+/// `pkg` scopes the library pass on purpose. This used to iterate the whole
+/// `LIBS` table, so staging `fatresize`'s binary also demanded
+/// libparted.so.2 / libcap.so.2 / libpcre2-8.so.0 from fatresize's own file
+/// list - libraries of six other packages, which it does not ship (MEASURED:
+/// the noble deb's data.tar holds exactly ./usr/sbin/ and ./usr/sbin/fatresize).
+/// That aborted the install with "libparted.so.2 not found in the package".
+/// The library closure is fetched per-provider by `fetch_f2fs_tools`, so a
+/// binary-only package must contribute binaries only.
+///
+/// `LIBS` is `(soname, providing package)`, so the filter is an exact package
+/// match - a package never picks up a neighbour's soname.
 fn stage_from(
+    pkg: &str,
     files: &[(String, Vec<u8>)],
     wanted_files: &[&str],
     stage: &mut BTreeMap<String, Vec<u8>>,
@@ -501,9 +547,9 @@ fn stage_from(
         stage.insert(dest, data.clone());
         n += 1;
     }
-    for (soname, _pkg) in LIBS {
+    for (soname, _provider) in LIBS.iter().filter(|(_, p)| *p == pkg) {
         let Some(idx) = pick_by_soname(files, soname) else {
-            return Err(format!("{} not found in the package", soname));
+            return Err(format!("{} missing from {}", soname, pkg));
         };
         // Keep the payload under the SONAME, not its versioned real name: the
         // loader asks for `libfoo.so.2`, and a symlink is not worth carrying.
@@ -543,20 +589,23 @@ pub fn fetch_f2fs_tools(
         report.push(format!("  {} ({} bytes)", pkg, deb.len()));
         let files = read_tar_files(&tar)?;
         let bins = wanted_binaries(pkg);
-        stage_from(&files, bins, &mut stage)?;
+        // `pkg` scopes the library half to whatever THIS package provides.
+        stage_from(pkg, &files, bins, &mut stage)?;
     }
 
     // 2. The library closure fatresize needs and casper's initrd lacks.
-    for (_soname, pkg) in LIBS {
+    //    Each soname is fetched from the package the table names, so a
+    //    provider's data.tar yields its own soname and nothing else.
+    for (soname, pkg) in LIBS {
         let (_deb, _name, tar) = fetch_data_tar(pkg, mirror, suite, arch)?;
         let files = read_tar_files(&tar)?;
-        // Only the one library this entry is for.
-        for (soname, _p) in LIBS.iter().filter(|(_, p)| p == pkg) {
-            let Some(idx) = pick_by_soname(&files, soname) else {
-                return Err(format!("{} missing from {}", soname, pkg));
-            };
-            stage.insert(format!("lib/{}", soname), files[idx].1.clone());
-        }
+        let Some(idx) = pick_by_soname(&files, soname) else {
+            return Err(format!(
+                "{} missing from {} - the provider no longer ships it",
+                soname, pkg
+            ));
+        };
+        stage.insert(format!("lib/{}", soname), files[idx].1.clone());
     }
 
     // 3. Sanity: the staged set must contain every tool the hook calls by
@@ -647,6 +696,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn staging_a_binary_package_never_asks_it_for_libraries() {
+        // BUG (observed 2026-10-03: "libparted.so.2 not found in the
+        // package", immediately after the suite-name fix let resolution
+        // proceed as far as the archive).
+        //
+        // `stage_from` is called once per WANTED package with that package's
+        // files, but its library loop iterated the WHOLE `LIBS` table:
+        //
+        //     for (soname, _pkg) in LIBS { pick_by_soname(files, soname) ... }
+        //
+        // So `fatresize`'s file list was asked for libparted.so.2,
+        // libcap.so.2, libpcre2-8.so.0 - libraries belonging to six other
+        // packages. MEASURED against the real noble deb
+        // (fatresize_1.1.0-2build2_amd64.deb, 11136 bytes): its data.tar
+        // contains EXACTLY two entries, ./usr/sbin/ and ./usr/sbin/fatresize.
+        // It ships no shared library at all - they are dependencies, not
+        // members - so the lookup failed and the whole install aborted with
+        // an error naming a library fatresize was never going to contain.
+        //
+        // The provider table is already correct (MEASURED: each soname is in
+        // the deb the table names - libparted.so.2.0.5 in libparted2t64,
+        // libcap.so.2.66 in libcap2, and so on); the loop just asked the
+        // wrong package. The fix is to stage the binaries and nothing else,
+        // leaving the library closure to the per-library pass in
+        // `fetch_f2fs_tools`, which already fetches each provider itself.
+        let fatresize_files = vec![
+            ("usr/sbin/".to_string(), Vec::new()),
+            ("usr/sbin/fatresize".to_string(), vec![0x7f, b'E', b'L', b'F']),
+        ];
+        let mut stage = BTreeMap::new();
+        stage_from("fatresize", &fatresize_files, &["fatresize"], &mut stage)
+            .expect("a binary-only package must stage cleanly");
+        assert_eq!(
+            stage.keys().cloned().collect::<Vec<_>>(),
+            vec!["usr/sbin/fatresize".to_string()],
+            "only the binary may be staged"
+        );
+
+        // The converse still has to hold: a library package DOES yield its
+        // sonames, resolved through the versioned real file (Debian ships
+        // `libfoo.so.2` as a symlink, and read_tar_files skips symlinks).
+        let parted_files = vec![
+            ("usr/lib/x86_64-linux-gnu/libparted.so.2.0.5".to_string(), vec![0x7f, b'E', b'L', b'F', b'D']),
+        ];
+        let mut stage2 = BTreeMap::new();
+        let n = stage_from("libparted2t64", &parted_files, &[], &mut stage2)
+            .expect("provider must yield its soname");
+        assert!(stage2.contains_key("lib/libparted.so.2"), "got {:?}", stage2.keys().collect::<Vec<_>>());
+        assert_eq!(n, 1);
+
+        // And a package that genuinely lacks the soname still fails loudly -
+        // the guard must not become a silent skip.
+        let mut stage3 = BTreeMap::new();
+        let e = stage_from("libparted2t64", &parted_files, &["mkfs.f2fs"], &mut stage3)
+            .expect_err("a missing binary must stay an error");
+        assert!(e.contains("mkfs.f2fs"), "error must name the file: {}", e);
+    }
+
+#[test]
     fn ar_parses_a_real_deb_layout() {
         // Build a synthetic ar archive the way dpkg does: 60-byte headers,
         // even-offset padding.
@@ -847,6 +955,81 @@ mod tests {
     }
 
     #[test]
+    fn an_iso9660_uppercase_suite_resolves_and_produces_a_lowercase_url() {
+        // BUG (observed 2026-10-03: "F2FS persistence was selected but its
+        // boot-time tools could not be prepared ('NOBLE' is not a suite this
+        // build knows how to query)").
+        //
+        // `suite_from_iso` returns the name straight out of the ISO's ISO9660
+        // directory record, and ISO9660 names are UPPERCASE by spec: a Mint /
+        // Zorin image really does yield "NOBLE", not "noble". The resolver's
+        // tables are lowercase, and `contains(&suite)` is an exact match, so
+        // every uppercase suite fell through to the "refusing to guess"
+        // error - while `main.rs`'s ISO check compared with
+        // `eq_ignore_ascii_case` and happily confirmed the very same image as
+        // "Ubuntu 24.04 based, supported". Two modules disagreed about the
+        // same string.
+        //
+        // Canonicalisation must happen at RESOLUTION time, not only in the
+        // matcher: the archive serves `dists/noble/...` and 404s on
+        // `dists/NOBLE/...` (MEASURED against archive.ubuntu.com: lowercase
+        // HTTP 200, uppercase HTTP 404), and the suite is interpolated
+        // straight into that URL by resolve_pool_path. Matching case-
+        // insensitively while keeping the uppercase name would turn the
+        // refusal into a silent 404 instead.
+        let canon = canonical_suite("NOBLE").expect("ISO9660 uppercase must canonicalise");
+        assert_eq!(canon, "noble", "the URL must carry the lowercase suite");
+        assert_eq!(
+            mirror_for_suite(&canon).map(|m| m.root),
+            Some("http://archive.ubuntu.com/ubuntu"),
+            "NOBLE must reach the Ubuntu archive, not be refused"
+        );
+        // Every recognised suite, in the casing an ISO actually stores.
+        for suite in ["noble", "jammy", "focal", "mantic", "oracular", "plucky", "questing", "devel"] {
+            let up = suite.to_ascii_uppercase();
+            assert_eq!(
+                canonical_suite(&up).as_deref(),
+                Some(suite),
+                "{} must canonicalise to {}",
+                up,
+                suite
+            );
+        }
+        for suite in ["bookworm", "trixie", "forky"] {
+            let up = suite.to_ascii_uppercase();
+            assert_eq!(canonical_suite(&up).as_deref(), Some(suite), "{}", up);
+            assert_eq!(
+                mirror_for_suite(&canonical_suite(&up).unwrap()).map(|m| m.root),
+                Some("https://deb.debian.org/debian"),
+                "{} must reach Debian, not Ubuntu",
+                up
+            );
+        }
+        // Canonicalisation must not widen the accepted set: the whole point
+        // of the explicit tables is that an unknown suite is refused.
+        for bad in ["TRIXIE-BACKPORTS", "NOBLE-UPDATES", "NOT-A-SUITE", ""] {
+            assert!(
+                canonical_suite(bad).is_none(),
+                "{} must stay refused - case folding must not smuggle it in",
+                bad
+            );
+        }
+        // The URL built by resolve_pool_path must be lowercase even when the
+        // name came from the ISO uppercase.
+        let m = mirror_for_suite("NOBLE").expect("matcher itself must accept the ISO casing");
+        let url = format!(
+            "{}/dists/{}/main/binary-amd64/Packages.gz",
+            m.root,
+            canonical_suite("NOBLE").unwrap()
+        );
+        assert!(
+            url.contains("/dists/noble/"),
+            "URL must be the one the archive serves, got {}",
+            url
+        );
+    }
+
+    #[test]
     fn the_index_url_can_only_ever_name_its_own_mirrors_suite() {
         // Build the URL the way resolve_pool_path does and assert the
         // cross-distro combination is unreachable: a Debian suite under the
@@ -877,15 +1060,10 @@ mod tests {
                 assert_ne!(keys[i], keys[j], "cache key collision: {}", keys[i]);
             }
         }
-<<<<<<< Updated upstream
-        assert!(keys[0].contains("archive.ubuntu.com"));
-        assert!(keys[1].contains("deb.debian.org"));
-=======
-        // The host is reduced to [a-z0-9-] so it is a legal filename on a
+// The host is reduced to [a-z0-9-] so it is a legal filename on a
         // case-insensitive volume; assert the DISTINCTION, not a literal dot.
-        assert!(keys[0].contains("archive-ubuntu-com"), "{}", keys[0]);
+        assert!(keys[0].contains("archive-ubuntu-com"), "{}", keys[0]);
         assert!(keys[1].contains("deb-debian-org"), "{}", keys[1]);
->>>>>>> Stashed changes
     }
 
     #[test]

@@ -97,8 +97,91 @@ Four open proposals closed. `FINDINGS-COMPRESSION.md`, `TODO.md` and
     is now a cpio member at its final path, so the kernel's own unpacker does
     the work and the hook only exports `PATH` and `LD_LIBRARY_PATH`.
 
+### Changed
+
+- **A USB stick no longer needs `--allow-fixed`, and no longer reports as a
+  fixed drive.** A USB flash disk legitimately reports `DRIVE_FIXED` — and its
+  descriptor `RemovableMedia` agrees (measured `0` on a real Lexar), because it
+  is a disk behind a USB controller, not removable media. Both signals are
+  *correct*; the gate was demanding the wrong one, so the tool excluded the very
+  hardware it installs onto and the only way through was a flag. A **confirmed
+  USB bus is now sufficient on its own** (`classify_status`,
+  `content_check_reason`).
+
+  The hard refuses are unchanged and still run first: `PhysicalDrive0` and the
+  Windows volume are refused whatever bus they claim, so this cannot green-light
+  a system disk. A fixed volume whose bus is **unknown** still gets the contents
+  check, and its reason now says the bus is the missing signal rather than
+  implying nothing is known about it.
+
+  **Verified on hardware**: `D:` (Lexar, was
+  `check contents (fixed drive (not removable))`) is now `[ready]`, while `C:`
+  stays refused as the system disk.
+
 ### Fixed
 
+- **The USB-bus safety check had never run, on any machine.** Two independent
+  bugs, stacked, each hiding the other:
+  1. **`STORAGE_PROPERTY_QUERY` was 8 bytes instead of 12** — the struct omitted
+     `AdditionalParameters[1]`, so `size_of` was short and Windows rejected every
+     call with `ERROR_BAD_LENGTH` (win32=24, *"the program issued a command but the
+     command length is incorrect"*). Measured on this machine: `\\.\D:`,
+     `\\.\PhysicalDrive1`, `\\.\C:` and `\\.\PhysicalDrive0` **all** failed
+     identically, so `bus_is_usb` was `None` for every volume and the removable
+     flag — which many USB sticks get wrong — decided alone.
+  2. **`BusType` was read from the wrong offset.** The descriptor struct
+     invented five padding fields (`reads_cap9`, `writes_cap9`, `seek_cap9`,
+     `writes_cap16`, `reads_cap16`) that pushed `BusType` out to 32; per
+     `winioctl.h` it is at **28**, and offset 32 is `RawPropertiesLength`. The
+     caller read `desc[32]`, so even on success it was reading the raw-properties
+     length and labelling it a bus type — hence every volume printing
+     `[unknown]`. `RemovableMedia` was likewise declared at 9 instead of 10, and
+     never read.
+
+  Both structs now match the published layouts and are read through their own
+  types (`repr(C)`) instead of hand-computed byte indexes. `--dry-run` also
+  prints the inputs behind each verdict (`decision inputs:`), because the verdict
+  is a function of two inputs that routinely disagree and was otherwise
+  unanswerable from the log.
+
+  **Verified on hardware**: `D:` now reports `[USB Lexar USB Flash Drive]`
+  (`Some(true)=USB`) and `C:` reports `[NVMe KXG60ZNV256G KIOXIA]`
+  (`Some(false)=not-USB`), independently confirmed by a separate
+  8-byte-vs-12-byte A/B probe. Note `RemovableMedia` reads **0** even for the USB
+  stick, so `GetDriveType` is right about that one and the descriptor's flag
+  would not have helped.
+
+- **`libparted.so.2 not found in the package`** — the f2fs tool fetcher asked
+  the wrong package for each library. `stage_from` is called once per package
+  with *that package's* file list, but its library loop iterated the **whole**
+  `LIBS` table, so staging `fatresize`'s binary also demanded
+  `libparted.so.2` / `libcap.so.2` / `libpcre2-8.so.0` from fatresize's own
+  files. Measured against the real noble deb
+  (`fatresize_1.1.0-2build2_amd64.deb`, 11 136 bytes): its `data.tar` contains
+  exactly `./usr/sbin/` and `./usr/sbin/fatresize` — it ships **no** shared
+  library at all, because they are dependencies, not members. The provider
+  table was already correct (each soname verified present in the deb it names:
+  `libparted.so.2.0.5` in `libparted2t64`, `libcap.so.2.66` in `libcap2`, …);
+  the loop simply asked the wrong package. `stage_from` now takes the package
+  name and scopes its library pass to what that package **provides**, leaving
+  the closure to the per-provider pass that already fetches each one.
+
+- **F2FS persistence could never stage its boot-time tools** ("'NOBLE' is not a
+  suite this build knows how to query … Refusing to guess an archive"). `suite_from_iso`
+  returns the name straight out of the ISO's ISO9660 directory record, and **ISO9660
+  names are uppercase by spec** — a Mint/Zorin image really yields `NOBLE`. The
+  resolver's tables are lowercase and `contains(&suite)` is an exact match, so *every*
+  ISO hit the refusal. Meanwhile `main.rs`'s ISO check compared that same string with
+  `eq_ignore_ascii_case` and confirmed the very image as "Ubuntu 24.04 based,
+  supported" — two modules disagreeing about one string.
+  New `canonical_suite()` folds the name onto the exact spelling the archive serves
+  **at resolution time, not only in the matcher**: `archive.ubuntu.com` serves
+  `/dists/noble/...` (measured HTTP 200) and 404s `/dists/NOBLE/...`, and the suite is
+  interpolated straight into that URL — folding only in the matcher would have traded a
+  legible refusal for a silent 404. `mirror_for_iso` now returns the canonical name
+  while the refusal still quotes the ISO's own spelling. Case folding does **not** widen
+  the accepted set: the result is still an exact table entry, so unknown suites stay
+  refused rather than guessed at.
 - **The FAT BPB was read at the wrong offset, so the anti-corruption guard
   never worked.** `bin/lsl-f2fs-resize` read 4 bytes at **offset 19** and
   compared them against a partition size. Offset 19 is the **volume serial

@@ -54,12 +54,25 @@ stamp_present() {
 # Reboot approval may still be pending (the finale stamps first, then waits
 # indefinitely for the user to approve the reboot): a fresh login with no
 # decision recorded yet should see the approval dialog instead of nothing.
-# Returns 0 when a dialog is due: the flag dir exists and neither
-# reboot-now nor reboot-cancel is recorded. There is no deadline and no
-# timer - a stale deadline file from an older layer is ignored.
+# Returns 0 when a dialog is due.
+#
+# The marker - NOT the flag dir's mere existence - is what says "firstboot is
+# actually waiting right now". lsl-firstboot.sh writes it while it blocks in
+# schedule_reboot_on_approval() and removes it on either decision.
+#
+# BUG (observed 2026-10-03, "the Reboot dialog reappeared on the second
+# boot"): this used to be "flag dir exists AND neither reboot-now nor
+# reboot-cancel recorded". /run is tmpfs, but onboot.sh recreates
+# /run/lsl-firstboot on EVERY boot for the shared telemetry trace files
+# (onboot.sh:50), so after the first boot finished and the machine rebooted
+# the dir was back and empty - indistinguishable from "firstboot is waiting".
+# Every later login therefore re-showed "Setup finished and your home folder
+# is backed up…". An empty flag dir is the ABSENCE of a decision, which on a
+# boot that never reached the finale is the normal, permanent state; only the
+# marker can tell the two apart.
 reboot_approval_pending() {
     local dir="${LSL_FIRSTBOOT_FLAG_DIR:-/run/lsl-firstboot}"
-    [ -d "$dir" ] || return 1
+    [ -e "$dir/awaiting-approval" ] || return 1
     [ -e "$dir/reboot-cancel" ] && return 1
     [ -e "$dir/reboot-now" ] && return 1
     return 0

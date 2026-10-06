@@ -25,10 +25,14 @@
 //! after an explicit warning prompt when it exists and differs).
 //!
 //! Safety gates (this writes raw sectors, so be paranoid):
-//!   - the target MUST be a removable drive AND on the USB bus
-//!     (GetDriveTypeW == DRIVE_REMOVABLE + IOCTL_STORAGE_QUERY_PROPERTY
-//!     BusType == BusTypeUsb), unless --allow-fixed is passed explicitly;
-//!   - PhysicalDrive0 is refused unconditionally (system disk tripwire);
+//!   - the target MUST be on the USB bus (IOCTL_STORAGE_QUERY_PROPERTY
+//!     BusType == BusTypeUsb) OR report DRIVE_REMOVABLE. Either signal alone
+//!     is enough; --allow-fixed is no longer required, because a USB stick is
+//!     legitimately DRIVE_FIXED (it is a disk behind a USB controller, and its
+//!     descriptor RemovableMedia reads 0 too) and requiring the flag excluded
+//!     the very devices this installs onto;
+//!   - PhysicalDrive0 and the Windows volume are refused unconditionally,
+//!     whatever bus they claim (system disk tripwire);
 //!   - MBR must have a valid 0x55AA signature, a non-empty partition
 //!     table, and must not be GPT (GPT = "EFI PART" magic at LBA1 plus a
 //!     0xEE protective-MBR entry; a stale "EFI PART" header alone does not
@@ -1048,7 +1052,34 @@ fn sanitize_iso_name(name: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// STORAGE_DEVICE_DESCRIPTOR (winapi 0.3.9 does not ship it).
-/// Only the fields up to BusType matter here.
+///
+/// Field offsets are NOT hand-computed: they must match `winioctl.h`
+/// exactly, because the buffer this describes is raw and every offset is a
+/// byte position read by index elsewhere. The layout is (MSDN, verified 2026-10):
+///
+/// ```text
+///   0  u32  Version
+///   4  u32  Size
+///   8  u8   DeviceType
+///   9  u8   DeviceTypeModifier
+///  10  u8   RemovableMedia      (BOOLEAN)
+///  11  u8   CommandQueueing     (BOOLEAN)
+///  12  u32  VendorIdOffset
+///  16  u32  ProductIdOffset
+///  20  u32  ProductRevisionOffset
+///  24  u32  SerialNumberOffset
+///  28  u32  BusType             (STORAGE_BUS_TYPE enum)
+///  32  u32  RawPropertiesLength
+///  36  ...  RawDeviceProperties
+/// ```
+///
+/// The previous version of this struct invented five padding fields
+/// (`reads_cap9`, `writes_cap9`, `seek_cap9`, `writes_cap16`, `reads_cap16`)
+/// to push BusType out to 32, and put `removable_media` at 9. Both are wrong:
+/// BusType is at **28** and offset 32 is `RawPropertiesLength`. The caller read
+/// `desc[32]`, so it was reading RawPropertiesLength and calling it a bus type -
+/// which is why every volume printed `[unknown]` and why the USB check could
+/// never confirm a stick.
 #[repr(C)]
 #[allow(dead_code)]
 struct StorageDeviceDescriptor {
@@ -1057,23 +1088,47 @@ struct StorageDeviceDescriptor {
     device_type: u8,
     device_type_modifier: u8,
     removable_media: u8,
-    reads_cap9: u8,
-    writes_cap9: u8,
-    seek_cap9: u8,
-    writes_cap16: u8,
-    reads_cap16: u8,
+    command_queueing: u8,
     vendor_id_offset: u32,
     product_id_offset: u32,
     product_revision_offset: u32,
     serial_number_offset: u32,
-    bus_type: u8,
+    bus_type: u32,
+    raw_properties_length: u32,
 }
 
+/// STORAGE_PROPERTY_QUERY (winapi 0.3.9 does not ship it).
+///
+/// ```text
+///   0  u32  PropertyId            (STORAGE_PROPERTY_ID: 0 = StorageDeviceProperty)
+///   4  u32  QueryType             (STORAGE_QUERY_TYPE:  0 = PropertyStandardQuery)
+///   8  u8   AdditionalParameters[1]
+/// ```
+///
+/// `AdditionalParameters` is what makes this **12 bytes, not 8** — and that
+/// byte was missing here. `DeviceIoControl` rejects a short input buffer with
+/// `ERROR_BAD_LENGTH` (win32=24, "the program issued a command but the command
+/// length is incorrect"), which is what
+/// `device_property` saw on every handle: MEASURED 2026-10 on
+/// `\\.\D:`, `\\.\PhysicalDrive1`, `\\.\C:` and `\\.\PhysicalDrive0` alike.
+/// So the USB-bus check had never run on any machine — every volume folded to
+/// `None` and the removable flag decided alone. An 8-byte struct is the kind of
+/// omission that reads as correct in review (the two fields you set are both
+/// there) and is only caught by a real call.
 #[repr(C)]
 struct StoragePropertyQuery {
-    property_id: u32, // StorageDeviceProperty = 0
-    query_type: u32,  // PropertyStandardQuery = 0
+    property_id: u32,           // StorageDeviceProperty = 0
+    query_type: u32,            // PropertyStandardQuery = 0
+    additional_parameters: [u8; 1],
 }
+
+/// Minimum descriptor length that still contains `bus_type`.
+///
+/// Derived from the struct rather than written as a literal, so a field being
+/// added cannot leave the bound silently too small. 36 bytes on any target:
+/// Version..RawPropertiesLength inclusive, excluding the flexible
+/// RawDeviceProperties array.
+const VERSION_AND_BUS_END: usize = std::mem::size_of::<StorageDeviceDescriptor>();
 
 fn bus_name(b: u8) -> &'static str {
     match b {
@@ -1133,6 +1188,7 @@ fn device_property(path: &str) -> Option<(u8, String)> {
     let mut q = StoragePropertyQuery {
         property_id: 0,
         query_type: 0,
+        additional_parameters: [0],
     };
     let mut outbuf = vec![0u8; 4096];
     let mut got = 0u32;
@@ -1148,20 +1204,28 @@ fn device_property(path: &str) -> Option<(u8, String)> {
             std::ptr::null_mut(),
         )
     };
-    // The descriptor header alone is 8 bytes; BusType lives at offset 32.
-    if ok == 0 || (got as usize) <= 32 {
+    // A descriptor shorter than the fixed header (through RawPropertiesLength)
+    // carries no readable BusType. 36 is `size_of::<StorageDeviceDescriptor>()`:
+    // Version..RawPropertiesLength inclusive, before the flexible
+    // RawDeviceProperties array.
+    if ok == 0 {
         return None;
     }
     let buf = &outbuf[..got as usize];
-    // Descriptor header: version u32 @0, size u32 @4. BusType sits at offset 32
-    // of the descriptor (see StorageDeviceDescriptor above).
-    if buf.len() <= 32 {
+    if buf.len() < VERSION_AND_BUS_END {
         return None;
     }
-    let desc = buf; // offsets below are absolute within the returned buffer
-    let bus = desc[32];
-    let vendor = ansi_at(desc, u32::from_le_bytes([desc[16], desc[17], desc[18], desc[19]]));
-    let product = ansi_at(desc, u32::from_le_bytes([desc[20], desc[21], desc[22], desc[23]]));
+    // Read the descriptor through its own type instead of indexing raw bytes:
+    // `repr(C)` makes the field positions the winioctl.h offsets, so this
+    // cannot drift from the layout the way the previous hand-computed
+    // constants did (it read RawPropertiesLength at 32 and called it a bus
+    // type, which is why every volume printed `[unknown]`).
+    // SAFETY: length-checked immediately above.
+    let d: &StorageDeviceDescriptor =
+        unsafe { &*(buf.as_ptr() as *const StorageDeviceDescriptor) };
+    let bus = d.bus_type as u8;
+    let vendor = ansi_at(buf, d.vendor_id_offset);
+    let product = ansi_at(buf, d.product_id_offset);
     let mut name = String::new();
     if let Some(v) = vendor {
         name.push_str(&v);
@@ -1175,7 +1239,15 @@ fn device_property(path: &str) -> Option<(u8, String)> {
     Some((bus, name))
 }
 
-/// Map a drive letter to its \\.\PhysicalDriveN number.
+/// The `PhysicalDriveN` number behind a volume letter.
+///
+/// `pub` because the partition-backup capture enumerates every disk this way:
+/// it needs the same resolve `read_head` already does, and duplicating the
+/// IOCTL would mean two places to keep in step with the Win9x fallback.
+pub fn physical_drive_number(letter: &str) -> Result<u32, String> {
+    device_number(letter)
+}
+
 fn device_number(letter: &str) -> Result<u32, String> {
     use winapi::um::ioapiset::DeviceIoControl;
     use winapi::um::winioctl::{IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER};
@@ -1426,20 +1498,97 @@ impl Candidate {
         }
     }
 }
+/// Human-readable explanation of WHY a volume got the status it got, naming
+/// every input and which rule fired. Pure (no IO), so it is unit-tested.
+///
+/// Exists because the decision depends on `removable` AND `bus_is_usb`, and
+/// those two routinely disagree: plenty of USB sticks report
+/// `DRIVE_REMOVABLE` as *fixed* (telemetry.rs says so explicitly), while a
+/// failed IOCTL makes `bus_is_usb` None for EVERY volume. Reporting the
+/// verdict without its inputs makes "why was my stick not ready?" unanswer-
+/// able from the log alone.
+///
+/// The `bus_is_usb` spelling is deliberate: `Some(true)`/`Some(false)`/`None`
+/// map to the three states `classify_status` actually distinguishes, and None
+/// is called out as "query failed or BusTypeUnknown" because that is the case
+/// where the USB check cannot vouch for anything and the removable flag is all
+/// that is left.
+pub fn explain_classification(
+    removable: bool,
+    bus_is_usb: Option<bool>,
+    phys: u32,
+    is_system: bool,
+    bus: &str,
+    allow_fixed: bool,
+) -> String {
+    let tri = match bus_is_usb {
+        Some(true) => "Some(true)=USB",
+        Some(false) => "Some(false)=not-USB",
+        None => "None=query failed/BusTypeUnknown (USB check cannot vouch)",
+    };
+    let _ = allow_fixed; // inert now; the rule names the bus instead
+    let flag = if removable { "removable" } else { "fixed(not removable)" };
+    let rule = if is_system || phys == 0 {
+        "RULE system-disk: refused unconditionally"
+    } else if bus_is_usb == Some(true) {
+        // Reached with or without the removable flag: the bus alone suffices.
+        "RULE confirmed USB bus -> ready (no --allow-fixed needed)"
+    } else if removable && !matches!(bus_is_usb, Some(false)) {
+        "RULE removable-and-not-known-non-USB -> ready"
+    } else if bus_is_usb == None {
+        "RULE bus query gave no answer, so the removable flag decided alone"
+    } else {
+        "RULE fixed and/or known non-USB -> contents check + backup offer"
+    };
+    format!(
+        "{} | {} | phys={} bus={} | {}",
+        flag,
+        tri,
+        phys,
+        if bus.is_empty() { "unknown" } else { bus },
+        rule
+    )
+}
 /// Pure triage (no IO, unit-tested).
+///
+/// `allow_fixed` is no longer consulted: a confirmed USB bus is sufficient on
+/// its own (see below), so the flag cannot change any outcome here. It stays in
+/// the signature because it is still a documented CLI flag.
 fn classify_status(removable: bool, bus_is_usb: Option<bool>, phys: u32, is_system: bool, bus: &str, allow_fixed: bool) -> CandidateStatus {
+    let _ = allow_fixed;
     if is_system || phys == 0 {
         return CandidateStatus::Refused("maps to the system disk (PhysicalDrive0 or the Windows volume) - never a target".into());
     }
     if removable && !matches!(bus_is_usb, Some(false)) {
         return CandidateStatus::Ready;
     }
-    if allow_fixed && bus_is_usb == Some(true) {
+    // A CONFIRMED USB bus is sufficient on its own, with no --allow-fixed.
+    //
+    // `GetDriveType` reports DRIVE_FIXED for a USB-attached flash disk, and
+    // the descriptor's own RemovableMedia agrees (measured 0 on a real Lexar
+    // stick) - both are correct, because such a device is a disk behind a USB
+    // controller, not removable media. So requiring `removable` excluded the
+    // very sticks this tool exists to install onto, and the only way through
+    // was a flag. The bus is the signal that actually distinguishes them.
+    //
+    // The hard refuses above still run first and unconditionally: PhysicalDrive0
+    // and the Windows volume are refused whatever bus they claim, so this can
+    // never green-light a system disk.
+    if bus_is_usb == Some(true) {
         return CandidateStatus::Ready;
     }
     let mut why = Vec::new();
     if !removable {
-        why.push("fixed drive (not removable)".to_string());
+        // Say WHICH signal is missing. A USB stick that reports DRIVE_FIXED and
+        // whose bus query failed used to be described as only "fixed (not
+        // removable)", which reads as though we knew nothing about the bus and
+        // hides the one thing that would clear it. `Some(true)` cannot reach
+        // here (it returned Ready above), so only the unknown case needs saying.
+        why.push(if bus_is_usb == None {
+            "reports fixed (not removable); USB bus could not be confirmed".to_string()
+        } else {
+            "fixed drive (not removable)".to_string()
+        });
     }
     if bus_is_usb == Some(false) {
         why.push(format!("on the {} bus, not USB", bus));
@@ -1584,9 +1733,10 @@ pub fn choose_target(letter_hint: &str, allow_fixed: bool) -> Result<UsbTarget, 
 
 /// Content-check reason for an already-chosen target: None = Ready (no
 /// gate), Some(reason) = run confirm_fixed_volume first. Mirrors
-/// classify_status so GUI (preconfirmed) and CLI share one rule.
-/// allow_fixed keeps its classic meaning: fixed+USB is Ready (no
-/// double-prompt); everything else fixed and/or known-non-USB gates.
+/// classify_status so GUI (preconfirmed) and CLI share one rule — including
+/// the rule that a CONFIRMED USB bus clears the gate on its own, with no
+/// --allow-fixed (a USB stick legitimately reports DRIVE_FIXED, so requiring
+/// the removable flag excluded the very devices this installs onto).
 pub fn content_check_reason(t: &UsbTarget, allow_fixed: bool) -> Option<String> {
     if t.phys == 0 || sys::is_system_volume(&t.letter) {
         return None;
@@ -1596,7 +1746,8 @@ pub fn content_check_reason(t: &UsbTarget, allow_fixed: bool) -> Option<String> 
     if removable && !matches!(t.bus_is_usb, Some(false)) {
         return None;
     }
-    if allow_fixed && t.bus_is_usb == Some(true) {
+    let _ = allow_fixed; // kept in the signature: still a documented CLI flag
+    if t.bus_is_usb == Some(true) {
         return None;
     }
     let mut why = Vec::new();
@@ -3048,6 +3199,15 @@ pub struct PendingMbr {
     pub want_uefi: bool,
     pub title: String,
     pub uefi_ok: bool,
+    /// Volume letter of the target stick, for the partition-layout record.
+    pub vol_letter: String,
+    /// Take a `pre` partition-layout record at the end of the install.
+    ///
+    /// Set only when F2FS persistence was chosen: that is the only path where
+    /// the initrd hook repartitions anything, so it is the only one where a
+    /// restorable geometry is worth recording. A run that writes no record must
+    /// be a run where no record was needed, not one where it was dropped.
+    pub record_partition_layout: bool,
 }
 
 /// Final step of the non-destructive install, run AFTER every file drop
@@ -3130,6 +3290,37 @@ pub fn commit_boot_sectors(p: &PendingMbr) -> Result<(), String> {
         p.uefi_ok,
         &p.title,
     );
+
+    // ---- partition-layout record (the F2FS safety net) ---------------------
+    // LAST, and deliberately so. lslsetup rewrites sectors 0..15 just above, so
+    // a record taken any earlier is already stale for exactly the bytes the
+    // hook's restore depends on most. This is the first moment the medium's
+    // state is final.
+    //
+    // Only when f2fs was chosen: that is the only path where a repartition
+    // happens at all, so it is the only one where a record is worth writing.
+    //
+    // Best-effort and NEVER fatal. This is a safety net; a net that fails the
+    // install it is protecting would be worse than no net. The stick is already
+    // correct at this point, so a failure here is logged and the install ends.
+    if p.record_partition_layout {
+        match crate::partitionbackup::take_pre_record(&p.vol_letter) {
+            Ok((where_, fails)) => {
+                out::info(&format!("Recorded the pre-repartition layout: {}", where_));
+                for f in &fails {
+                    out::warn(&format!(
+                        "Partition layout: disk {} could not be read ({}); it has no record.",
+                        f.disk, f.reason
+                    ));
+                }
+            }
+            Err(e) => out::warn(&format!(
+                "Could not record the partition layout ({}). The install is unaffected, but there is no \
+                 recorded geometry to restore from if the F2FS step goes wrong.",
+                e
+            )),
+        }
+    }
     out::step("Done - nothing was formatted; existing files were untouched.");
     out::info("Safely eject the stick, then boot from it via the firmware boot menu.");
     if p.want_bios {
@@ -3709,6 +3900,10 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
                 want_uefi: false,
                 title,
                 uefi_ok: false,
+                vol_letter: t.letter.clone(),
+                // Loopback-only: no direct-kernel entry, so no F2FS initrd and
+                // nothing the provisioning hook could repartition. No record.
+                record_partition_layout: false,
             };
             return Ok((metrics, Some(pending)));
         }
@@ -3768,6 +3963,8 @@ fn install_on_target(t: &UsbTarget, iso: &str, uefi_bootx64: &str, want_bios: bo
         want_uefi,
         title,
         uefi_ok: want_uefi && uefi_installed,
+        vol_letter: t.letter.clone(),
+        record_partition_layout: f2fs_gib > 0,
     };
     Ok((metrics, Some(pending)))
 }
@@ -5260,6 +5457,188 @@ mod tests {
     }
 
     #[test]
+    fn the_storage_property_query_is_twelve_bytes_not_eight() {
+        // THE defect: the struct omitted `AdditionalParameters`, so
+        // size_of was 8 and every DeviceIoControl was rejected with
+        // ERROR_BAD_LENGTH (win32=24). MEASURED 2026-10: all four handles
+        // (\\.\D:, \\.\PhysicalDrive1, \\.\C:, \\.\PhysicalDrive0) failed
+        // identically, so the bus check had never run anywhere - every
+        // volume folded to None and the removable flag decided alone.
+        //
+        // Pin the SIZE, not just the field values: both of the fields the old
+        // struct set were correct, which is exactly why the omission survived
+        // review and why asserting values alone proves nothing here.
+        assert_eq!(
+            std::mem::size_of::<StoragePropertyQuery>(),
+            12,
+            "STORAGE_PROPERTY_QUERY is 12 bytes; 8 is rejected with ERROR_BAD_LENGTH"
+        );
+        // And the field positions, so a reorder cannot reintroduce it.
+        let q = StoragePropertyQuery {
+            property_id: 0,
+            query_type: 0,
+            additional_parameters: [0],
+        };
+        let base = &q as *const _ as usize;
+        // SAFETY: address-of for offset only.
+        unsafe {
+            let sq = &q as *const StoragePropertyQuery as *mut StoragePropertyQuery;
+            assert_eq!(std::ptr::addr_of!((*sq).property_id) as usize - base, 0);
+            assert_eq!(std::ptr::addr_of!((*sq).query_type) as usize - base, 4);
+            assert_eq!(std::ptr::addr_of!((*sq).additional_parameters) as usize - base, 8);
+        }
+        // The value actually sent: PropertyId=StorageDeviceProperty(0),
+        // QueryType=PropertyStandardQuery(0), trailing byte zero.
+        assert_eq!(q.property_id, 0);
+        assert_eq!(q.query_type, 0);
+        assert_eq!(q.additional_parameters, [0u8]);
+    }
+
+#[test]
+    fn the_storage_descriptor_layout_matches_winioctl_h() {
+        // The bus check silently did nothing because the struct's offsets were
+        // invented rather than taken from winioctl.h: five phantom padding
+        // fields pushed BusType to 32 (it is 28), and the caller read
+        // desc[32] - RawPropertiesLength - as the bus type. Every volume then
+        // reported `[unknown]`. Pin every offset against the published
+        // layout so this cannot silently drift again.
+        let d = StorageDeviceDescriptor {
+            version: 0,
+            size: 0,
+            device_type: 0,
+            device_type_modifier: 0,
+            removable_media: 0,
+            command_queueing: 0,
+            vendor_id_offset: 0,
+            product_id_offset: 0,
+            product_revision_offset: 0,
+            serial_number_offset: 0,
+            bus_type: 0,
+            raw_properties_length: 0,
+        };
+        let base = &d as *const _ as usize;
+        let at = |p: *const u8| p as usize - base;
+
+        // SAFETY: reading the address of a field for its offset only.
+        unsafe {
+            let sd = &d as *const StorageDeviceDescriptor as *mut StorageDeviceDescriptor;
+            assert_eq!(std::ptr::addr_of!((*sd).version) as usize - base, 0);
+            assert_eq!(std::ptr::addr_of!((*sd).size) as usize - base, 4);
+            assert_eq!(std::ptr::addr_of!((*sd).device_type) as usize - base, 8);
+            assert_eq!(std::ptr::addr_of!((*sd).device_type_modifier) as usize - base, 9);
+            assert_eq!(std::ptr::addr_of!((*sd).removable_media) as usize - base, 10);
+            assert_eq!(std::ptr::addr_of!((*sd).command_queueing) as usize - base, 11);
+            assert_eq!(std::ptr::addr_of!((*sd).vendor_id_offset) as usize - base, 12);
+            assert_eq!(std::ptr::addr_of!((*sd).product_id_offset) as usize - base, 16);
+            assert_eq!(std::ptr::addr_of!((*sd).product_revision_offset) as usize - base, 20);
+            assert_eq!(std::ptr::addr_of!((*sd).serial_number_offset) as usize - base, 24);
+            assert_eq!(std::ptr::addr_of!((*sd).bus_type) as usize - base, 28);
+            assert_eq!(std::ptr::addr_of!((*sd).raw_properties_length) as usize - base, 32);
+        }
+        let _ = at;
+        // The fixed header ends after RawPropertiesLength; the flexible
+        // RawDeviceProperties array follows it.
+        assert_eq!(VERSION_AND_BUS_END, 36);
+        // BusType must NOT be at 32 - that was the whole bug.
+        assert_ne!(VERSION_AND_BUS_END, 28);
+    }
+
+    /// A synthetic descriptor laid out exactly as winioctl.h specifies must
+    /// yield the bus type and the vendor/product strings the code reads. This
+    /// is the round trip the old offsets failed: the same bytes gave "unknown".
+    #[test]
+    fn a_synthetic_descriptor_decodes_the_bus_and_strings() {
+        let mut buf = vec![0u8; 128];
+        let put32 = |b: &mut Vec<u8>, off: usize, v: u32| {
+            b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        put32(&mut buf, 0, 1); // Version
+        put32(&mut buf, 4, 44); // Size
+        buf[8] = 0x00;  // DeviceType
+        buf[9] = 0x00;  // DeviceTypeModifier
+        buf[10] = 0x01; // RemovableMedia = TRUE
+        buf[11] = 0x00; // CommandQueueing
+        put32(&mut buf, 12, 40); // VendorIdOffset
+        put32(&mut buf, 16, 48); // ProductIdOffset
+        put32(&mut buf, 20, 0);  // ProductRevisionOffset
+        put32(&mut buf, 24, 0);  // SerialNumberOffset
+        put32(&mut buf, 28, 0x07); // BusType = USB
+        put32(&mut buf, 32, 0);  // RawPropertiesLength
+        buf[40..45].copy_from_slice(b"Lexar");
+        buf[48..57].copy_from_slice(b"USB Flash");
+
+        // SAFETY: length-checked by the caller before the cast; this mirrors it.
+        let d: &StorageDeviceDescriptor =
+            unsafe { &*(buf.as_ptr() as *const StorageDeviceDescriptor) };
+        assert_eq!(d.bus_type as u8, 0x07);
+        assert_eq!(bus_name(d.bus_type as u8), "USB");
+        assert_eq!(bus_is_usb_tri(d.bus_type as u8), Some(true));
+        assert_eq!(d.removable_media, 1, "the sticky bit nobody read");
+        assert_eq!(ansi_at(&buf, d.vendor_id_offset).as_deref(), Some("Lexar"));
+        assert_eq!(ansi_at(&buf, d.product_id_offset).as_deref(), Some("USB Flash"));
+    }
+
+#[test]
+    fn the_classification_explanation_names_every_input_and_the_rule_that_fired() {
+        // The user-visible question is "why is my stick not ready?", and the
+        // answer depends on TWO inputs that routinely disagree. The report
+        // must therefore carry both, plus which rule decided - not just the
+        // verdict, which is what made this unanswerable from the log.
+        let tri = |s: Option<bool>| match s {
+            Some(true) => "Some(true)",
+            Some(false) => "Some(false)",
+            None => "None",
+        };
+
+        // The case that started this: a USB stick reporting itself FIXED.
+        // Note `allow_fixed=false` here: a confirmed USB bus is now sufficient
+        // on its own, so this must report the bus rule, NOT the flag.
+        let e = explain_classification(false, Some(true), 1, false, "USB", false);
+        assert!(e.contains("fixed"), "{}", e);
+        assert!(e.contains("Some(true)"), "{}", e);
+        assert!(e.contains("ready"), "a confirmed USB bus must clear the gate: {}", e);
+        assert!(
+            !e.contains("RULE allow-fixed"),
+            "the flag is inert now and must not be the reason: {}",
+            e
+        );
+
+        // The degraded case the IOCTL failure produces: bus unknown, so the
+        // removable flag is the only evidence left - and must be SAY so.
+        let e = explain_classification(false, None, 1, false, "unknown", false);
+        assert!(e.contains("fixed"), "{}", e);
+        assert!(e.contains("None"), "{}", e);
+        assert!(
+            e.contains("removable flag decided alone"),
+            "a silent fallback is exactly the defect: {}",
+            e
+        );
+
+        // The genuinely removable stick, and the known non-USB refusal.
+        let e = explain_classification(true, Some(true), 2, false, "USB", false);
+        assert!(e.contains("removable") && e.contains("ready"), "{}", e);
+        let e = explain_classification(true, Some(false), 2, false, "SATA", false);
+        assert!(e.contains("Some(false)") && e.contains("contents check"), "{}", e);
+
+        // PhysicalDrive0 / the Windows volume: refused, and the report must
+        // say the refusal is unconditional rather than implying a rule missed.
+        let e = explain_classification(true, Some(true), 0, true, "USB", true);
+        assert!(e.contains("system-disk"), "{}", e);
+
+        // The tri-state must never be conflated: Some(true) is USB,
+        // Some(false) is a known non-USB answer, None is no answer at all.
+        assert_ne!(tri(Some(true)), tri(Some(false)));
+        assert_ne!(tri(Some(true)), tri(None));
+        assert_ne!(tri(Some(false)), tri(None));
+
+        // phys and bus are carried through, since a wrong letter->disk
+        // mapping is another way a good stick looks wrong.
+        let e = explain_classification(true, None, 7, false, "", false);
+        assert!(e.contains("phys=7"), "{}", e);
+        assert!(e.contains("bus=unknown"), "an empty bus name must read as unknown: {}", e);
+    }
+
+#[test]
     fn unknown_bus_is_not_a_refusal() {
         // BusTypeUnknown carries no information: it must fold to None
         // (unknown -> included for removable) rather than Some(false),
@@ -5604,16 +5983,33 @@ mod tests {
         assert!(matches!(classify_status(true, Some(true), 0, false, "USB", false), CandidateStatus::Refused(_)));
         assert!(matches!(classify_status(true, Some(true), 1, true, "USB", false), CandidateStatus::Refused(_)));
         assert!(matches!(classify_status(false, Some(true), 0, false, "USB", true), CandidateStatus::Refused(_)));
-        // fixed USB HDD: needs check by default, ready with --allow-fixed
-        assert!(matches!(classify_status(false, Some(true), 1, false, "USB", false), CandidateStatus::NeedsContentCheck(_)));
+        // A USB stick that reports FIXED is ready, with no --allow-fixed.
+        // This is the real device: a Lexar on the USB bus whose GetDriveType
+        // says DRIVE_FIXED and whose descriptor RemovableMedia is 0. Requiring
+        // the removable flag excluded exactly the hardware this installs onto.
+        assert!(matches!(classify_status(false, Some(true), 1, false, "USB", false), CandidateStatus::Ready));
+        // ...and it stays ready when the flag IS passed (the flag is now inert).
         assert!(matches!(classify_status(false, Some(true), 1, false, "USB", true), CandidateStatus::Ready));
-        // fixed non-USB: needs check even WITH --allow-fixed (contents decide)
-        match classify_status(false, Some(false), 1, false, "SATA", true) {
-            CandidateStatus::NeedsContentCheck(w) => {
-                assert!(w.contains("fixed"), "unexpected: {w}");
-                assert!(w.contains("SATA"), "unexpected: {w}");
+        // A confirmed USB bus must NOT rescue the system disk.
+        assert!(matches!(classify_status(false, Some(true), 0, false, "USB", false), CandidateStatus::Refused(_)));
+        assert!(matches!(classify_status(false, Some(true), 1, true, "USB", false), CandidateStatus::Refused(_)));
+        // fixed non-USB: needs check, WITH or WITHOUT the flag (contents decide)
+        for allow in [false, true] {
+            match classify_status(false, Some(false), 1, false, "SATA", allow) {
+                CandidateStatus::NeedsContentCheck(w) => {
+                    assert!(w.contains("fixed"), "unexpected: {w}");
+                    assert!(w.contains("SATA"), "unexpected: {w}");
+                }
+                other => panic!("fixed SATA must need a check, got {:?}", other),
             }
-            other => panic!("fixed SATA must need a check, got {:?}", other),
+        }
+        // fixed + bus UNKNOWN: needs check, and must SAY the bus is the missing
+        // signal - otherwise the reason implies we know nothing about the bus.
+        match classify_status(false, None, 1, false, "unknown", false) {
+            CandidateStatus::NeedsContentCheck(w) => {
+                assert!(w.contains("could not be confirmed"), "unexpected: {w}");
+            }
+            other => panic!("unknown bus must need a check, got {:?}", other),
         }
         // removable but known non-USB (e.g. SD on a non-USB bus): check, not hide
         assert!(matches!(classify_status(true, Some(false), 1, false, "SD", false), CandidateStatus::NeedsContentCheck(_)));

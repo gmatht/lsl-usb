@@ -32,6 +32,7 @@ mod locale;
 mod lslfiles;
 mod net;
 mod nofmt;
+mod partitionbackup;
 mod rufus;
 mod sys;
 mod telemetry;
@@ -275,6 +276,16 @@ fn run() {
     if opts.gui_test_modal_clicks {
         let ok = gui::test_modal_clicks();
         out::plain(if ok { "modal-clicks: CLICK-OK" } else { "modal-clicks: CLICK-DEAD" });
+        std::process::exit(0);
+    }
+
+    // --show-partition-records: print the recorded partition geometry for a
+    // manual F2FS recovery, then exit. Read-only and unprivileged, and placed
+    // BEFORE the admin check on purpose: the whole point is to be usable when a
+    // stick will not boot, which is exactly when the wizard cannot run and
+    // elevating would only add a failure mode.
+    if let Some(letter) = opts.show_partition_records.clone() {
+        out::plain(&partitionbackup::render_all(&letter));
         std::process::exit(0);
     }
 

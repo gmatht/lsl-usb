@@ -11,7 +11,7 @@ pub struct Opts {
     pub write_mode: String,     // "nofmt" (default, non-destructive grub4dos) | "rufus"
     pub write_mode_set: bool,   // --write-mode was passed explicitly
     pub usb_letter: String,     // --usb-letter <X>: pick the nofmt target
-    pub allow_fixed: bool,      // --allow-fixed: override removable+USB checks
+    pub allow_fixed: bool,      // --allow-fixed: accepted, but no longer changes the gate (a confirmed USB bus suffices)
     pub uefi_bootx64: String,   // optional BOOTX64.EFI for the nofmt stick
     pub uefi_loader: String,    // nofmt UEFI loader: auto|signed|grub4dos (also applied via nofmt::set_uefi_loader_override)
     pub bios_boot: bool,        // nofmt: install the grub4dos BIOS path (default on)
@@ -36,6 +36,11 @@ pub struct Opts {
     pub gui_test_modal_clicks: bool,
     pub gui_test_boot_page: bool,
     pub auto_upload: bool,
+    /// Print the partition-layout records on a stick and exit. `Some(letter)`
+    /// overrides the default `D:`. Read-only: no writes, no Administrator, no
+    /// install - it exists so the geometry a manual F2FS recovery needs can be
+    /// read off a stick that will not boot (where the GUI cannot run).
+    pub show_partition_records: Option<String>,
     // settings the GUI also collects, exposed as flags so a FINISHED-page
     // command line can reproduce the exact wizard choices headlessly
     pub data_dir: String,
@@ -109,6 +114,7 @@ impl Default for Opts {
             gui_test_modal_clicks: false,
             gui_test_boot_page: false,
             auto_upload: false,
+            show_partition_records: None,
             data_dir: String::new(),
             wifi: true,
             wifi_networks: Vec::new(),
@@ -137,7 +143,9 @@ Options:
                              menu.lst + BOOTX64.EFI/grub.cfg for UEFI (BIOS + UEFI);
                              the stick must already be FAT32/NTFS)
   --usb-letter <X>           Drive letter for the nofmt target (else a picker)
-  --allow-fixed              Allow non-removable targets in nofmt mode
+  --allow-fixed              Accepted but no longer needed: a volume on the
+                             USB bus is ready on its own, because a USB stick
+                             reports DRIVE_FIXED legitimately
   --uefi-bootx64 <path>      Optional custom BOOTX64.EFI for nofmt UEFI
                              booting (installed as-is; wins over the loader
                              picked below)
@@ -176,6 +184,11 @@ Options:
   --gui-test-modal-clicks    (test) headless modal-loop click probe, print CLICK-OK/CLICK-DEAD
   --gui-test-boot-page       (test) real wizard boot page (no install), print the clicked choice, exit
   --auto-upload              Check for pending boot telemetry and prompt to upload; then exit
+  --show-partition-records [letter]
+                             List the partition-layout records on a stick
+                             (default D:) and print the geometry needed for a
+                             manual F2FS recovery; then exit. Writes nothing and
+                             needs no Administrator.
   --preload-rust-tools       Download fd/bat/zoxide onto <USB>:\\bin
   --data-dir <path>           LSL_DATA_DIR to write into lsl-usb.env
   --persist <backend>         Persistence backend for lsl-usb.env:
@@ -198,6 +211,21 @@ Options:
   --version                   Print the version and git revision, then exit
   --help                     This text
 ";
+
+/// Does this token look like a drive letter - `D:`, `D:\`, `d`?
+///
+/// Used by the optional-value flag above so `--show-partition-records F:` takes
+/// its target while `--show-partition-records --dry-run` does not swallow the
+/// next flag. Deliberately strict: one ASCII letter then a colon, which no other
+/// flag value in this parser resembles.
+fn is_volume_letter(s: &str) -> bool {
+    let t = s.trim_end_matches(['\\', '/']);
+    let mut cs = t.chars();
+    match (cs.next(), cs.next()) {
+        (Some(c), Some(':')) if c.is_ascii_alphabetic() => cs.next().is_none(),
+        _ => false,
+    }
+}
 
 pub fn parse(args: &[String]) -> Result<Opts, String> {
     let mut o = Opts::default();
@@ -254,6 +282,20 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--gui-test-modal-clicks" => o.gui_test_modal_clicks = true,
             "--gui-test-boot-page" => o.gui_test_boot_page = true,
             "--auto-upload" => o.auto_upload = true,
+            // The letter is OPTIONAL: `--show-partition-records` alone must
+            // work, because the moment someone needs it they are on a machine
+            // where guessing a flag's arity is a nuisance. A following token
+            // that looks like a drive letter is taken as the target; anything
+            // else is left for the next flag.
+            "--show-partition-records" => {
+                o.show_partition_records = match it.clone().next() {
+                    Some(v) if is_volume_letter(&v) => {
+                        it.next();
+                        Some(v.trim_end_matches(['\\', '/']).to_string())
+                    }
+                    _ => Some("D:".to_string()),
+                };
+            }
             "--data-dir" => o.data_dir = next()?,
             "--persist" => {
                 let v = next()?.to_ascii_lowercase();
@@ -333,6 +375,41 @@ mod tests {
         assert!(o.fast_startup_off);
         assert!(o.preload_rust_tools);
         assert_eq!(o.extra_isos, vec!["D:\\a.iso".to_string(), "D:\\b.iso".to_string()]);
+    }
+
+    #[test]
+    fn the_records_flag_takes_an_optional_volume_letter() {
+        // Both spellings must work. The bare flag is the common case: someone
+        // recovering a stick should not have to remember which letter it was,
+        // and `--show-partition-records --dry-run` must not eat the next flag.
+        let o = parse(&args(&["--show-partition-records"])).unwrap();
+        assert_eq!(o.show_partition_records.as_deref(), Some("D:"));
+
+        let o = parse(&args(&["--show-partition-records", "F:"])).unwrap();
+        assert_eq!(o.show_partition_records.as_deref(), Some("F:"));
+
+        let o = parse(&args(&["--show-partition-records", "E:\\"])).unwrap();
+        assert_eq!(o.show_partition_records.as_deref(), Some("E:"));
+
+        // A following flag is NOT a volume letter and must survive parsing.
+        let o = parse(&args(&["--show-partition-records", "--dry-run"])).unwrap();
+        assert_eq!(o.show_partition_records.as_deref(), Some("D:"));
+        assert!(o.dry_run);
+
+        // Absent by default: nothing prints records unless asked.
+        assert!(parse(&args(&[])).unwrap().show_partition_records.is_none());
+    }
+
+    #[test]
+    fn only_a_real_drive_letter_is_read_as_a_volume() {
+        // The whole point of the strict test: these must NOT be taken as the
+        // target, or the flag would swallow a legitimate argument.
+        for s in ["D", "DD:", "--dry-run", "data", "1:", ":", "D:extra"] {
+            assert!(!is_volume_letter(s), "{s} must not read as a volume letter");
+        }
+        for s in ["D:", "d:", "Z:\\", "e:/"] {
+            assert!(is_volume_letter(s), "{s} should read as a volume letter");
+        }
     }
 
     #[test]

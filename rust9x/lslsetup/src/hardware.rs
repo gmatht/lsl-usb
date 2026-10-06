@@ -304,17 +304,24 @@ pub fn resolve_driver_needs(hw: &[Device]) -> Vec<(Device, &'static DriverEntry)
 
 /// Get-UbuntuPackageUrl: resolve the exact .deb URL by parsing the archive's
 /// Packages index (cached in %TEMP%).
+///
+/// The mirror is resolved from `suite` rather than hardcoded. The driver
+/// table pins every entry to `noble`, so in practice this always lands on the
+/// Ubuntu archive - but the two share a cache key namespace with the f2fs
+/// tool fetcher, and a key that omits the mirror host silently serves one
+/// distro's index for another's. `apt_cache_name` puts the host in the key.
 fn ubuntu_package_url(pkg: &str, suite: &str, component: &str) -> Option<String> {
+    let mirror = crate::f2fstools::mirror_for_suite(suite)?;
+    let arch = crate::f2fstools::apt_arch_for(None);
     let cache = format!(
-        "{}\\lsl-apt-{}-{}-Packages.gz",
+        "{}\\{}",
         crate::sys::temp_dir(),
-        suite,
-        component
+        crate::f2fstools::apt_cache_name(&mirror, suite, component, arch)
     );
     if !path_exists(&cache) {
         let url = format!(
-            "http://archive.ubuntu.com/ubuntu/dists/{}/{}/binary-amd64/Packages.gz",
-            suite, component
+            "{}/dists/{}/{}/binary-{}/Packages.gz",
+            mirror.root, suite, component, arch
         );
         let dest = cache.clone();
         let r = crate::net::download_to_file(&url, &dest, crate::net::user_agent(), &mut |_| {});
@@ -334,7 +341,7 @@ fn ubuntu_package_url(pkg: &str, suite: &str, component: &str) -> Option<String>
         }
         if in_block {
             if let Some(fn_part) = line.strip_prefix("Filename: ") {
-                return Some(format!("http://archive.ubuntu.com/ubuntu/{}", fn_part.trim()));
+                return Some(format!("{}/{}", mirror.root, fn_part.trim()));
             }
             if line.is_empty() {
                 in_block = false;

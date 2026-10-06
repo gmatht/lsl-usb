@@ -115,6 +115,22 @@ pub fn show_dry_run_report(opts: &crate::cli::Opts) {
             for c in &showable {
                 let t = c.target.as_ref().unwrap();
                 out::info(&format!("  candidate: {}  [{}]", t.describe(), c.status_tag()));
+                // The verdict alone cannot answer "why is my stick not ready?":
+                // it depends on `removable` AND bus_is_usb, which disagree on
+                // real hardware (USB sticks often report fixed; a failed
+                // IOCTL makes bus_is_usb None for every volume). Print the
+                // inputs and the rule that fired so the answer is in the log.
+                out::info(&format!(
+                    "      decision inputs: {}",
+                    crate::nofmt::explain_classification(
+                        c.volume.removable,
+                        t.bus_is_usb,
+                        t.phys,
+                        crate::sys::is_system_volume(&t.letter),
+                        &t.bus,
+                        opts.allow_fixed,
+                    )
+                ));
                 if let Some(snap) = crate::nofmt::snapshot_volume(&t.letter) {
                     for line in crate::nofmt::describe_snapshot(&snap).split('\n') {
                         out::info(&format!("      {}", line));

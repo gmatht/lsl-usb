@@ -16,11 +16,13 @@ cargo +rust9x build --target i686-rust9x-windows-msvc
 Everything the PS script does is implemented:
 
 - ISO resolve: existing ISO picker (Everything CLI + filesystem scan), fresh
-  download (Mint 22.x by default, plus Lubuntu/Xubuntu/antiX/Zorin/Debian
-  options from the GUI), SHA-256 verification against the official
-  `sha256sum.txt`
+  download (Mint 22.x by default, plus Lubuntu/Xubuntu/Zorin for a full LSL
+  stick, and antiX/Tiny CorePlus/Debian as loopback-only — see below), SHA-256
+  verification against the official `sha256sum.txt`
 - ISO validation (`Test-LiveIso`): casper layout, `.disk/info`, `dists`
-  codenames, Ubuntu 26.04+ refusal
+  codenames, Ubuntu 26.04+ refusal. A non-casper image is NOT rejected — it is
+  accepted as a loopback-only install (see "Non-casper images install
+  loopback-only" under the non-destructive write bullet)
 - Rufus: locate / auto-download from GitHub releases / Authenticode
   verification ("Akeo Consulting") / elevated launch / wait-for-USB with the
   stable-squashfs-size heuristic and prefer-fresh-volume logic
@@ -79,12 +81,25 @@ Everything the PS script does is implemented:
     partitions it warns that grub4dos may boot a different one.
   - **First partition must start after sector 15** — the grub4dos stage1
     continuation occupies sectors 1..15.
+  - **Non-casper images install loopback-only** — an image with no
+    `casper/` directory (Debian live-boot, antiX, Tiny CorePlus) cannot have
+    a kernel extracted from it, so the ISO is copied to `_ISO\` and chainloaded
+    through its **own** bootloader instead. That is a working, bootable stick,
+    but a smaller one than an LSL stick: **BIOS only**, and none of the
+    casper-initrd features apply — no layered squashfs, no persistence, no
+    first-boot setup, no wifi provisioning, no Windows-driver staging, no
+    Rust CLI tools. The whole lsl file-drop phase is skipped for these, so no
+    inert `casper\` directory is left behind. Selecting F2FS or HDD-mirror
+    persistence on such an image is refused with the reason, never silently
+    written as a boot entry that would boot and never persist.
 - lsl file drop (layer, bin/, systemd/, initramfs/, onboot.sh, lsl-usb.env,
   initrd.lz), build stamp, safe-boot GRUB + ISOLINUX entries
 - Wifi: `netsh` profile/key extraction → `wifi.sh` (nmcli lines)
 - Network driver staging: curated out-of-tree table (RTL8812AU/8814AU/8188EU/
-  8723BU, BCM43142/4360/4352/4313), Ubuntu Packages.gz .deb URL resolution,
-  GitHub DKMS tarballs, `lsl-drivers.txt`
+  8723BU, BCM43142/4360/4352/4313), apt Packages.gz .deb URL resolution against
+  the archive that serves the selected ISO's suite (archive.ubuntu.com for
+  Ubuntu suites, deb.debian.org for Debian; an unrecognised suite is refused,
+  not guessed), GitHub DKMS tarballs, `lsl-drivers.txt`
 - linux-hardware.org LKDDb rating (A/C/D/U) with per-user + bundle caches and
   robots.txt crawl-delay politeness
 - WSL VHDX detection (registry Lxss HKCU/HKLM + Packages scan), flatpak ref

@@ -586,14 +586,27 @@ impl Iso {
 pub struct LiveIsoCheck {
     pub info: String,
     pub dists: Vec<String>,
+    /// Whether the image carries Ubuntu `casper` layout (casper/vmlinuz +
+    /// casper/initrd + casper/filesystem.squashfs).
+    ///
+    /// False for Debian live-boot (`live/…`), antiX (`linuxfs`) and Tiny Core.
+    /// Not an error condition on its own - such an ISO can still be put on a
+    /// stick and chainloaded by its own bootloader. It does mean every
+    /// casper-specific mechanism (layered squashfs, firstboot, persistence
+    /// initrds) does not apply to it.
+    pub casper: bool,
 }
 
-/// Test-LiveIso equivalent (no mount needed).
-pub fn check_live_iso(path: &str) -> Result<LiveIsoCheck, String> {
+/// Inspect a live ISO without deciding whether it is usable.
+///
+/// `check_live_iso` conflates "can I read this" with "is it casper-shaped",
+/// so a caller that merely needed to know the shape had no way to ask without
+/// tripping the squashfs requirement. `live_iso_shape` answers the question
+/// and leaves the judgement to the caller; `check_live_iso` stays strict for
+/// the callers that genuinely need casper.
+pub fn live_iso_shape(path: &str) -> Result<LiveIsoCheck, String> {
     let mut iso = Iso::open(path).map_err(|e| format!("{}: {}", path, e))?;
-    // validates the squashfs exists (its size is not needed downstream)
-    iso.file_size("casper/filesystem.squashfs")
-        .ok_or_else(|| "Not a casper/Ubuntu-family live image (no casper\\filesystem.squashfs).".to_string())?;
+    let casper = iso.file_size("casper/filesystem.squashfs").is_some();
     let info = String::from_utf8_lossy(
         &iso.read_file(".disk/info", 4096).unwrap_or_default(),
     )
@@ -603,7 +616,21 @@ pub fn check_live_iso(path: &str) -> Result<LiveIsoCheck, String> {
         .list_dir("dists")
         .map(|v| v.into_iter().filter(|(_, d)| *d).map(|(n, _)| n).collect())
         .unwrap_or_default();
-    Ok(LiveIsoCheck { info, dists })
+    Ok(LiveIsoCheck { info, dists, casper })
+}
+
+/// Test-LiveIso equivalent (no mount needed).
+///
+/// STRICT: requires casper layout, because every caller of this one acts on
+/// casper's file layout. Use `live_iso_shape` to merely ask the question.
+pub fn check_live_iso(path: &str) -> Result<LiveIsoCheck, String> {
+    let check = live_iso_shape(path)?;
+    if !check.casper {
+        return Err(
+            "Not a casper/Ubuntu-family live image (no casper\\filesystem.squashfs).".to_string(),
+        );
+    }
+    Ok(check)
 }
 
 #[cfg(test)]
