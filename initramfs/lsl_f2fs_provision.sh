@@ -413,11 +413,25 @@ lsl_wait_for_boot_disk() {
             case "$(basename "$_lsl_d")" in
                 loop*|ram*|dm-*|sr*|fd*|zram*|md*) continue ;;
             esac
-            # The disk exists. Nudge its table, then wait for a partition node.
-            partprobe "$_lsl_d" 2>/dev/null || true
-            blockdev --rereadpt "$_lsl_d" 2>/dev/null || true
+            # The disk exists. Nudge its table, then wait for a
+            # partition node. A node that has not appeared yet is
+            # the NORMAL case - the kernel registers the disk before
+            # its partitions (the race the comment block above
+            # measures; measured 50ms apart under virtio, far wider
+            # on real USB) - and a disk with no partition table
+            # never gets one. That case must fall through to the
+            # next poll, NEVER exit: this hook is sourced into
+            # casper's shell, and an exit here is PID 1 quitting -
+            # the kernel panic "Attempted to kill init". The `if`
+            # form is mandatory: `[ -b ] && return 0 || exit 0`
+            # is left-associative, so its || fires exactly when
+            # the node is absent - the case the loop exists to
+            # wait for. Reproduced in QEMU: a blank virtio disk
+            # panicked the boot at this line.
             for _lsl_p in "${_lsl_d}"?* "${_lsl_d}"p?*; do
-                [ -b "$_lsl_p" ] && return 0 2>/dev/null || exit 0
+                if [ -b "$_lsl_p" ]; then
+                    return 0
+                fi
             done
         done
         _lsl_n=$((_lsl_n + 1))

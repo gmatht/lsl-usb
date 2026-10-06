@@ -120,6 +120,39 @@ Four open proposals closed. `FINDINGS-COMPRESSION.md`, `TODO.md` and
 
 ### Fixed
 
+- **First boot of an F2FS stick panicked with "Attempted to kill
+  init".** `lsl_wait_for_boot_disk` — the function that exists
+  because the kernel registers a disk node *before* its partition
+  nodes (the USB enumeration race) — ended its poll loop with
+  `[ -b "$_lsl_p" ] && return 0 2>/dev/null || exit 0`. Shell
+  `&&`/`||` are left-associative, so that is
+  `( [ -b ] && return 0 ) || exit 0`: the `exit 0` fires exactly
+  when the partition node is **absent** — the case the loop exists
+  to wait for, and the permanent state of a disk with no partition
+  table. The hook is sourced into casper's shell, which is PID 1,
+  so that exit was the kernel panic. The park guard added earlier
+  cannot catch it: the guard is armed (read-layout) *after* this
+  wait runs. The loop now uses the `if` form — a missing node
+  falls through to the next poll — matching the safe idiom the rest
+  of the hook already uses.
+  - **Reproduced deterministically in QEMU, no ISO needed**
+    (`tests/qemu-panic-repro.sh`): a minimal initramfs built from
+    the Ubuntu archive (kernel, the f2fs module **plus its real
+    dependency closure** — `kernel/lib/lz4/lz4_compress.ko` and
+    `lz4hc_compress.ko`, which a full `depmod` over the packages
+    resolves and a hand-picked module list does not) sources the
+    hook exactly as casper's `ORDER` does, against a blank virtio
+    disk. The buggy hook panicked at 1.1 s; the fixed hook waits
+    out its 60 polls, refuses safely ("could not identify the boot
+    medium by content") and the boot continues.
+  - **Two regression tests** in `tests/f2fs-provision-hook.tests.sh`:
+    a static ban on any `&& return … || exit` one-liner (mirroring
+    the scrub suite's check), and a behavioural test (part 1d) that
+    drives `lsl_wait_for_boot_disk` at `mknod`'d block nodes — one
+    partitionless (the panic shape) followed by one with a partition
+    node — and asserts the sourcing shell survives.
+  - Full reasoning: `rust9x/lslsetup/WHYFAIL18.md`.
+
 - **The USB-bus safety check had never run, on any machine.** Two independent
   bugs, stacked, each hiding the other:
   1. **`STORAGE_PROPERTY_QUERY` was 8 bytes instead of 12** — the struct omitted

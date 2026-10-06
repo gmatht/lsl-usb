@@ -44,6 +44,27 @@ else
     ok "opt-out gate uses the safe if-form, not && ||"
 fi
 
+# And the same trap anywhere else: no one-liner may combine
+# `&& return` with `|| exit 0`, because that form's exit fires
+# exactly when the left side is FALSE. In lsl_wait_for_boot_disk
+# that was the "Attempted to kill init" panic: a disk node whose
+# partition node has not appeared yet (the USB enumeration race
+# the wait loop exists to handle - and the permanent state of a
+# disk with no partition table) made the left side false, the
+# exit ran inside casper's sourced shell - PID 1 - and the kernel
+# panicked. Reproduced in QEMU against a blank virtio disk; the
+# park guard cannot help because it is armed (read-layout) AFTER
+# the wait runs. Comments are stripped first so this prose cannot
+# trip its own check. NB: do not write this as `&& return [^|]*
+# || exit` - the character class cannot cross the `|` in
+# `2>/dev/null`, so it silently matches nothing.
+prov_code="$(sed 's/#.*$//' "$HOOK")"
+if printf '%s\n' "$prov_code" | grep -nE '&&[[:space:]]*return.*\|[[:space:]]*exit' | grep -q .; then
+    bad "the hook has a '&& return ... || exit' one-liner; when the left side is false it EXITS the sourcing shell"
+else
+    ok "no '&& return ... || exit' one-liner (the left-associativity trap)"
+fi
+
 # The cmdline is the only channel: lsl-usb.env is on the medium we repartition
 # and is read in userspace, so the size cannot come from there.
 if grep -q 'lsl_f2fs_provision=' "$HOOK"; then
@@ -464,6 +485,68 @@ for mode in disarm refuse; do
 done
 
 rm -rf "$prefix"
+
+echo
+echo "== part 1d: the boot-disk wait must WAIT, not exit (needs root) =="
+
+# lsl_wait_for_boot_disk polls because the kernel can register
+# a disk node before its partition nodes - the USB enumeration
+# race, measured 50ms apart under virtio and far wider on real
+# hardware - and a disk with no partition table never gets them.
+# The old `[ -b "$_lsl_p" ] && return 0 || exit 0` answered
+# that EXPECTED case with `exit 0`: left-associativity makes it
+# `( [ -b ] && return 0 ) || exit 0`, so the exit fires exactly
+# when the node is ABSENT - the case the loop exists to wait
+# for. The exit runs in the shell that SOURCED the hook: casper's
+# shell, PID 1 - the kernel panic "Attempted to kill init",
+# reproduced in QEMU against a blank virtio disk. The park guard
+# cannot catch it: the guard is armed (read-layout) AFTER this
+# wait runs.
+#
+# The test drives the wait at mknod'd block nodes: one with NO
+# partition nodes (the panic shape) followed by one WITH a
+# partition node (so the wait can return). An unbacked
+# block-device node passes the hook's `[ -b ]` test - the test
+# is on the node type, not a live driver - and the names sit
+# outside the hook's loop/ram/dm/sr/fd/zram/md skip list. With
+# the old code the shell dies on the first node; with the fix it
+# falls through to the second node's partition and returns.
+if [ "$(id -u)" -ne 0 ]; then
+    skip "mknod needs root - the wait race is untested here"
+else
+    rm -f /dev/lslwaitA /dev/lslwaitB /dev/lslwaitB1
+    mknod /dev/lslwaitA b 7 100
+    mknod /dev/lslwaitB b 7 101
+    mknod /dev/lslwaitB1 b 7 102
+    # The wait function is defined BELOW the opt-out gates, so the
+    # prefix trick used for the park helpers cannot reach it;
+    # extract the function definition instead.
+    waitdir="$(mktemp -d)"
+    sed -n '/^lsl_wait_for_boot_disk()/,/^}/p' "$HOOK" > "$waitdir/waitfn.sh"
+    [ -s "$waitdir/waitfn.sh" ] || bad "could not extract lsl_wait_for_boot_disk"
+    cat > "$waitdir/case.sh" <<'EOF'
+#!/bin/sh
+echo "WAIT_MARKER_BEFORE"
+. "$1"
+LSL_DISKS="/dev/lslwaitA /dev/lslwaitB" lsl_wait_for_boot_disk
+echo "WAIT_MARKER_AFTER"
+EOF
+    chmod +x "$waitdir/case.sh" 2>/dev/null || true
+    if out="$(sh "$waitdir/case.sh" "$waitdir/waitfn.sh" 2>/dev/null)"; then
+        case "$out" in
+            *WAIT_MARKER_BEFORE*WAIT_MARKER_AFTER*)
+                ok "a partitionless disk is skipped, not fatal - the sourcing shell survives" ;;
+            *WAIT_MARKER_BEFORE*)
+                bad "the wait EXITED the sourcing shell on a partitionless disk - that is the 'Attempted to kill init' panic" ;;
+            *)
+                bad "the wait produced no output" ;;
+        esac
+    else
+        bad "the wait terminated the shell with a non-zero status"
+    fi
+    rm -f /dev/lslwaitA /dev/lslwaitB /dev/lslwaitB1
+    rm -rf "$waitdir"
+fi
 
 echo
 echo "== part 2: geometry against a real loopback image (needs root) =="
