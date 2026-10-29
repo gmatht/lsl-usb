@@ -2233,6 +2233,7 @@ pub fn install_ramclone_initrd(vol_letter: &str, bundle_dir: &str) -> Result<(),
         INITRAMFS_F2FS_SCRUB,
     )?;
     let compressed = make_ramclone_initrd_with(&data, Some(&f2fs))?;
+    sys::create_dir_all(&format!("{}:\\casper", vol_letter));
     let dest = format!("{}:\\casper\\initrd.ramclone.gz", vol_letter);
     std::fs::write(&dest, &compressed).map_err(|e| format!("write ramclone initrd: {}", e))?;
     out::info(&format!(
@@ -2316,6 +2317,7 @@ pub fn install_hddmirror_initrd(vol_letter: &str, bundle_dir: &str) -> Result<()
     // copy still wins when a future bundle ships one.
     let f2fs = hook_bytes(&f2fs_hook, INITRAMFS_F2FS_SCRUB)?;
     let compressed = make_hddmirror_initrd_with(&casper, &live, Some(&f2fs))?;
+    sys::create_dir_all(&format!("{}:\\casper", vol_letter));
     let dest = format!("{}:\\casper\\initrd.hddmirror.gz", vol_letter);
     std::fs::write(&dest, &compressed).map_err(|e| format!("write hddmirror initrd: {}", e))?;
     out::info(&format!(
@@ -2417,6 +2419,7 @@ pub fn install_f2fs_initrd(
     // warning - the user picked f2fs and must be told now, not at first boot.
     let tools = stage_f2fs_tools(vol_letter, bundle_dir, iso, arch)?;
     let compressed = make_f2fs_initrd_with(&provision, &scrub, &tools)?;
+    sys::create_dir_all(&format!("{}:\\casper", vol_letter));
     let dest = format!("{}:\\casper\\initrd.f2fs.gz", vol_letter);
     std::fs::write(&dest, &compressed).map_err(|e| format!("write f2fs initrd: {}", e))?;
     out::info(&format!(
