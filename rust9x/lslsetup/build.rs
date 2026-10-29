@@ -64,7 +64,25 @@ fn main() {
     // in an environment without it, still has to succeed, so a failure here is
     // NOT a build error - src/version.rs treats the empty value as "unknown" and
     // omits the stamp line rather than printing a placeholder.
+    //
+    // WHY THE RERUN TRIGGERS: this block used to run only when build.rs itself
+    // was rebuilt, so a commit touching only src/*.rs left LSL_GIT_REV at
+    // whatever HEAD was when build.rs last re-ran. Measured 2026-10-30: a stick
+    // written that day carried "Rev: e114257" while actually holding the ORDER
+    // from a later commit - the embedded initrd was current, the stamp was not.
+    // lsl-diag.sh reads that stamp to answer "which build is failing?", so a
+    // stale revision makes the one diagnostic tool lie. Watch HEAD, packed-refs
+    // and refs/heads/*; that covers commit, checkout, branch and rebase without
+    // hashing the object store. A missing path is harmless - cargo ignores it.
     {
+        let git_dir = Path::new(&manifest).join("..").join("..").join(".git");
+        println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+        println!("cargo:rerun-if-changed={}", git_dir.join("packed-refs").display());
+        if let Ok(rd) = fs::read_dir(git_dir.join("refs").join("heads")) {
+            for e in rd.flatten() {
+                println!("cargo:rerun-if-changed={}", e.path().display());
+            }
+        }
         let rev = Command::new("git")
             .args(["rev-parse", "--short", "HEAD"])
             .current_dir(&manifest)
