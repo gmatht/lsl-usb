@@ -121,6 +121,17 @@ if grep -q 'zz_lsl_f2fs_provision' "$rust" && grep -q 'zz_lsl_f2fs_scrub' "$rust
     else
         bad "Rust ORDER has an unguarded dot-source at line $unguarded"
     fi
+    # The live-boot ORDER ships in the SAME hddmirror archive and was missed by
+    # the WHYFAIL19 fix: it kept a bare `. <hook>`. Guarded now, checked the
+    # same way. A single hook, so exactly one guarded source must exist and no
+    # bare one may.
+    live_src="$(grep -c 'if \[ -e /scripts/live-premount/00lsl_liveboot_mirror \]' "$rust")"
+    live_bare="$(grep -n '\. /scripts/live-premount/' "$rust" | grep -v 'if \[ -e ' | head -1 | cut -d: -f1)"
+    if [ "$live_src" = "1" ] && [ -z "$live_bare" ]; then
+        ok "live-premount ORDER source is existence-guarded (no bare dot-source)"
+    else
+        bad "live-premount ORDER: guarded=$live_src bare_line=${live_bare:-none}"
+    fi
 else
     bad "Rust CASPER_PREMOUNT_ORDER does not source both f2fs hooks"
 fi

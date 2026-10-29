@@ -1518,6 +1518,26 @@ mod secondary_initrd_order_tests {
             }
         }
         assert_eq!(sourced, 4, "expected the 4 hook sources: {}", order);
+
+        // The live-boot ORDER ships in the SAME hddmirror archive and had the
+        // same bug: WHYFAIL19 guarded only the casper ORDER, leaving this one
+        // bare. Its single hook is present on a normal hddmirror boot, so the
+        // bug is invisible until a member goes missing (base-squashfs-only
+        // stick, dropped cpio member, renamed path) - and then it is the same
+        // PID 1 death. Check it with the same rule, no exemptions.
+        let live = String::from_utf8_lossy(LIVE_PREMOUNT_ORDER);
+        let mut live_sourced = 0;
+        for line in live.lines() {
+            if line.contains(". /scripts/") {
+                live_sourced += 1;
+                assert!(
+                    line.starts_with("if [ -e "),
+                    "live-premount ORDER has an unguarded dot-source: {}",
+                    line
+                );
+            }
+        }
+        assert_eq!(live_sourced, 1, "expected the live-premount hook source: {}", live);
     }
 
     #[test]
@@ -2173,6 +2193,14 @@ if [ -e /scripts/casper-premount/zz_lsl_f2fs_scrub ]; then . /scripts/casper-pre
 
 /// ORDER body for scripts/live-premount (Debian live-boot). Same idea:
 /// preserve the base's own live-premount scripts, then source the hook.
+///
+/// The hook line is existence-guarded for the same reason as
+/// `CASPER_PREMOUNT_ORDER`: WHYFAIL19's fix guarded only the casper ORDER and
+/// left this one bare, so a boot whose live-premount member is absent (a
+/// base-squashfs-only stick, a dropped cpio member, a changed hook path)
+/// still hits `. <absent-file>` under `set -e` - fatal to PID 1, and
+/// `2>/dev/null || true` does not save it. One ORDER, one rule: every source
+/// line is `if [ -e ... ]; then . ...; fi`.
 const LIVE_PREMOUNT_ORDER: &[u8] =
     b"for f in /scripts/live-premount/*; do\n\
 case \"$f\" in\n\
@@ -2180,7 +2208,7 @@ case \"$f\" in\n\
 esac\n\
 [ -x \"$f\" ] && \"$f\" \"$@\" 2>/dev/null || true\n\
 done\n\
-. /scripts/live-premount/00lsl_liveboot_mirror \"$@\" 2>/dev/null || true\n";
+if [ -e /scripts/live-premount/00lsl_liveboot_mirror ]; then . /scripts/live-premount/00lsl_liveboot_mirror \"$@\" 2>/dev/null || true; fi\n";
 
 /// Create a gzip-compressed cpio initrd containing the ramclone hook for
 /// casper-premount. The hook is placed at scripts/casper-premount/ together
