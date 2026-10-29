@@ -1499,6 +1499,28 @@ mod secondary_initrd_order_tests {
     }
 
     #[test]
+    fn order_dot_sources_are_existence_guarded() {
+        // WHYFAIL19: every secondary initrd packs only two of the four hooks
+        // but carries this whole ORDER. A bare `. <absent-file>` under
+        // casper's `set -e` kills PID 1 (kernel panic) despite
+        // `2>/dev/null || true`, so every sourced line must be wrapped in
+        // `if [ -e ... ]; then ...; fi` (bisected via mid3/mid4/mid5).
+        let order = String::from_utf8_lossy(CASPER_PREMOUNT_ORDER);
+        let mut sourced = 0;
+        for line in order.lines() {
+            if line.contains(". /scripts/") {
+                sourced += 1;
+                assert!(
+                    line.starts_with("if [ -e "),
+                    "unconditional dot-source kills PID 1 when the member is absent: {}",
+                    line
+                );
+            }
+        }
+        assert_eq!(sourced, 4, "expected the 4 hook sources: {}", order);
+    }
+
+    #[test]
     fn f2fs_initrd_carries_both_hooks_and_the_tools() {
         let out = make_f2fs_initrd_with(
             b"# provision\n",
@@ -2129,6 +2151,14 @@ pub fn repack_initrd(initrd_path: &str, hooks: &[(String, Vec<u8>, u32)]) -> Res
 /// persistence partition and zz_lsl_f2fs_scrub then scrubs it, so provision
 /// must be sourced first. Reversed, the scrub would find no partition and no-op
 /// on exactly the boot that needed it.
+///
+/// Every hook line is guarded by `if [ -e ... ]`: this ONE order ships in
+/// every secondary initrd, but each initrd packs only TWO of the four hooks,
+/// so a bare `. /scripts/...` would source an absent file. Under casper's
+/// `set -e` a failed `.` is fatal to PID 1 (POSIX: a non-interactive shell
+/// exits on a failed dot-command) and `2>/dev/null || true` does NOT save it
+/// -- that is the kernel panic bisected in WHYFAIL19 (mid3/mid4/mid5). A false
+/// `[ -e ]` as an `if` condition never triggers `set -e`.
 const CASPER_PREMOUNT_ORDER: &[u8] =
     b"for f in /scripts/casper-premount/*; do\n\
 case \"$f\" in\n\
@@ -2136,10 +2166,10 @@ case \"$f\" in\n\
 esac\n\
 [ -x \"$f\" ] && \"$f\" \"$@\" 2>/dev/null || true\n\
 done\n\
-. /scripts/casper-premount/zz_lsl_hdd_mirror \"$@\" 2>/dev/null || true\n\
-. /scripts/casper-premount/9990-live-ramclone \"$@\" 2>/dev/null || true\n\
-. /scripts/casper-premount/zz_lsl_f2fs_provision \"$@\" 2>/dev/null || true\n\
-. /scripts/casper-premount/zz_lsl_f2fs_scrub \"$@\" 2>/dev/null || true\n";
+if [ -e /scripts/casper-premount/zz_lsl_hdd_mirror ]; then . /scripts/casper-premount/zz_lsl_hdd_mirror \"$@\" 2>/dev/null || true; fi\n\
+if [ -e /scripts/casper-premount/9990-live-ramclone ]; then . /scripts/casper-premount/9990-live-ramclone \"$@\" 2>/dev/null || true; fi\n\
+if [ -e /scripts/casper-premount/zz_lsl_f2fs_provision ]; then . /scripts/casper-premount/zz_lsl_f2fs_provision \"$@\" 2>/dev/null || true; fi\n\
+if [ -e /scripts/casper-premount/zz_lsl_f2fs_scrub ]; then . /scripts/casper-premount/zz_lsl_f2fs_scrub \"$@\" 2>/dev/null || true; fi\n";
 
 /// ORDER body for scripts/live-premount (Debian live-boot). Same idea:
 /// preserve the base's own live-premount scripts, then source the hook.

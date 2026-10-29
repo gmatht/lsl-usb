@@ -96,18 +96,30 @@ done
 
 # Parity with the Rust ORDER: base scripts first, provision before scrub.
 # NB: CASPER_PREMOUNT_ORDER is a Rust BYTE STRING, so its quotes are escaped
-# (\" ) in the source. Match on the hook name alone and take the first `. `
-# line that mentions it.
+# (\" ) in the source. WHYFAIL19: every hook line is wrapped in
+# `if [ -e ... ]; then . ...; fi` (a bare `. <absent-file>` kills PID 1 under
+# casper's set -e), so match the hook name plus the sourced path, not a
+# leading `. `.
 rust="$REPO_ROOT/rust9x/lslsetup/src/lslfiles.rs"
 if grep -q 'zz_lsl_f2fs_provision' "$rust" && grep -q 'zz_lsl_f2fs_scrub' "$rust"; then
     r_loop="$(grep -n 'for f in /scripts/casper-premount/\*' "$rust" | head -1 | cut -d: -f1)"
-    r_prov="$(grep -n '^\. /scripts/casper-premount/zz_lsl_f2fs_provision' "$rust" | head -1 | cut -d: -f1)"
-    r_scrub="$(grep -n '^\. /scripts/casper-premount/zz_lsl_f2fs_scrub' "$rust" | head -1 | cut -d: -f1)"
+    r_prov="$(grep -n '\. /scripts/casper-premount/zz_lsl_f2fs_provision' "$rust" | head -1 | cut -d: -f1)"
+    r_scrub="$(grep -n '\. /scripts/casper-premount/zz_lsl_f2fs_scrub' "$rust" | head -1 | cut -d: -f1)"
     if [ -n "$r_loop" ] && [ -n "$r_prov" ] && [ -n "$r_scrub" ] \
         && [ "$r_loop" -lt "$r_prov" ] && [ "$r_prov" -lt "$r_scrub" ]; then
         ok "Rust ORDER agrees: base scripts ($r_loop) < provision ($r_prov) < scrub ($r_scrub)"
     else
         bad "Rust ORDER order is loop@$r_loop prov@$r_prov scrub@$r_scrub"
+    fi
+    # Every sourced line must be existence-guarded (WHYFAIL19): a bare
+    # `. <absent-file>` under casper's set -e panics PID 1 even with
+    # `2>/dev/null || true`, and each secondary initrd packs only 2 of the 4
+    # hooks this ORDER names.
+    unguarded="$(grep -n '\. /scripts/casper-premount/' "$rust" | grep -v 'if \[ -e ' | head -1 | cut -d: -f1)"
+    if [ -z "$unguarded" ]; then
+        ok "Rust ORDER sources are all existence-guarded (no bare dot-source)"
+    else
+        bad "Rust ORDER has an unguarded dot-source at line $unguarded"
     fi
 else
     bad "Rust CASPER_PREMOUNT_ORDER does not source both f2fs hooks"
