@@ -23,16 +23,25 @@ from lslsetup and stores it in a Cloudflare D1 SQLite database.
    wrangler d1 execute lsl-usb-reports --remote --file=./schema.sql
    ```
 
-4. Deploy:
+4. Create the partition-layout KV namespace (F2FS safety net):
+   ```bash
+   wrangler kv namespace create lsl-usb-layouts
+   ```
+   Copy the printed `id` into `wrangler.toml` under `[[kv_namespaces]]`
+   (binding `PARTITION_KV`). Without it the `/kv` routes answer 500 and
+   Past Layouts shows nothing - `/report` keeps working regardless.
+
+5. Deploy:
    ```bash
    wrangler deploy
    ```
    Note the worker URL (e.g. `https://lsl-usb-reports.YOUR_SUBDOMAIN.workers.dev`).
 
-5. Update `src/telemetry.rs` in the lslsetup repo:
+6. Update `src/telemetry.rs` in the lslsetup repo:
    ```rust
    const WORKER_URL: &str = "https://lsl-usb-reports.YOUR_SUBDOMAIN.workers.dev/report";
    ```
+   (`KV_URL` in the same file already points at `/kv` on that host.)
 
 ## Querying reports
 
@@ -49,6 +58,9 @@ curl "https://lsl-usb-reports.YOUR_SUBDOMAIN.workers.dev/reports?limit=50&offset
 - `POST /report` — accepts JSON from lslsetup, validates `X-Lsl-Token`, inserts into D1
 - `GET /reports` — lists reports (no auth; this is public crowd-sourced data)
 - `GET /health` — health check
+- `PUT /kv` — partition-layout value write (needs `X-Lsl-Token` + `X-Key`
+  headers, body = value bytes <=1 KB, keys expire after 180 days)
+- `GET /kv?key=<key>` — partition-layout value read (public, raw bytes)
 
 The token (`lsl-usb-v1`) is hard-coded in both the worker and the binary. It
 is not secret-grade security, but it stops drive-by spam.

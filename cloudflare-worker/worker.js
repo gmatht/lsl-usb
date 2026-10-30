@@ -6,6 +6,13 @@
 //   2. Copy the database_id into wrangler.toml
 //   3. wrangler d1 execute lsl-usb-reports --local --file=./schema.sql
 //   4. wrangler deploy
+//
+// Partition-layout records (F2FS safety net) use a Cloudflare KV namespace
+// instead: the client speaks raw key->value PUT/GET, which is exactly KV.
+//   5. wrangler kv namespace create lsl-usb-layouts
+//   6. Copy the printed `id` into wrangler.toml under [[kv_namespaces]]
+//      (binding PARTITION_KV). The preview id is for `wrangler dev`;
+//      production uses `id`.
 
 const TOKEN = "lsl-usb-v1";  // Hard-coded simple token; not secret-grade,
                                // but enough to stop drive-by spam.
@@ -21,8 +28,8 @@ export default {
         status: 204,
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, X-Lsl-Token",
+          "Access-Control-Allow-Methods": "POST, GET, PUT, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, X-Lsl-Token, X-Key",
         },
       });
     }
@@ -33,6 +40,16 @@ export default {
 
     if (path === "/reports" && request.method === "GET") {
       return handleList(request, env);
+    }
+
+    // Partition-layout KeyVal store (F2FS safety net). The client PUTs one
+    // small value per key and GETs it back by ?key=. See the KV section below.
+    if (path === "/kv" && request.method === "PUT") {
+      return handleKvPut(request, env);
+    }
+
+    if (path === "/kv" && request.method === "GET") {
+      return handleKvGet(request, env);
     }
 
     if (path === "/health") {
@@ -165,6 +182,105 @@ async function handleList(request, env) {
     return jsonResponse({ error: "Database error: " + e.message }, 500);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Partition-layout KeyVal store (F2FS safety net).
+// ---------------------------------------------------------------------------
+// The client (partitionbackup.rs) PUTs one small JSON value per key:
+//
+//   PUT /kv with headers X-Lsl-Token + X-Key, body = the value bytes
+//   GET /kv?key=<key> returns the raw value bytes (200) or 404 + JSON error.
+//
+// Keys are path-shaped: <mobo_serial>/<run>/<disk_serial>-<size>/<stage>.
+// Values are the concise layout JSON (<=300 chars by construction). The
+// 1 KB value cap below is headroom, not a target: the client must stay
+// small because every value is fetched back verbatim for display.
+//
+// Trust model: same as /report. Writes need the token (stops drive-by
+// spam); reads are public crowd-sourced data like /reports. This is not
+// a secret store: keys carry board serials, so anyone can read them.
+//
+// Retention: KV entries expire after 180 days (EXPIRES_IN). A layout is a
+// recovery aid for a stick that exists NOW, not an archive: stale keys
+// self-clean instead of accumulating forever.
+const KV_VALUE_MAX = 1024;
+const KV_KEY_MAX = 512;
+const KV_EXPIRES_IN = 180 * 24 * 3600;
+
+function kvStore(env) {
+  return env.PARTITION_KV || null;
+}
+
+// Client key hygiene: opaque path-shaped tokens, so reject anything that
+// is not that shape rather than trying to sanitize it into shape.
+function kvKeyValid(key) {
+  if (typeof key !== 'string' || key.length === 0 || key.length > KV_KEY_MAX) {
+    return false;
+  }
+  // Printable ASCII minus whitespace/control; no backslashes (clients use
+  // forward slashes). Keeps keys log-safe and URL-safe without encoding.
+  return /^[\x21-\x7E]+$/.test(key) && !key.includes("\\");
+}
+
+async function handleKvPut(request, env) {
+  const token = request.headers.get("X-Lsl-Token") || "";
+  if (token !== TOKEN) {
+    return jsonResponse({ error: "Invalid token" }, 403);
+  }
+  const key = request.headers.get("X-Key") || "";
+  if (!kvKeyValid(key)) {
+    return jsonResponse({ error: "Missing or invalid X-Key header" }, 400);
+  }
+  const store = kvStore(env);
+  if (!store) {
+    return jsonResponse({ error: "KeyVal store not configured" }, 500);
+  }
+  let value;
+  try {
+    value = await request.text();
+  } catch (e) {
+    return jsonResponse({ error: "Unreadable body" }, 400);
+  }
+  if (value.length > KV_VALUE_MAX) {
+    return jsonResponse({ error: "Value too large (max " + KV_VALUE_MAX + " chars)" }, 413);
+  }
+  try {
+    await store.put(key, value, { expirationTtl: KV_EXPIRES_IN });
+    return jsonResponse({ ok: true, key });
+  } catch (e) {
+    return jsonResponse({ error: "KeyVal error: " + e.message }, 500);
+  }
+}
+
+async function handleKvGet(request, env) {
+  const url = new URL(request.url);
+  const key = url.searchParams.get("key") || "";
+  if (!kvKeyValid(key)) {
+    return jsonResponse({ error: "Missing or invalid key parameter" }, 400);
+  }
+  const store = kvStore(env);
+  if (!store) {
+    return jsonResponse({ error: "KeyVal store not configured" }, 500);
+  }
+  try {
+    const value = await store.get(key);
+    if (value === null) {
+      return jsonResponse({ error: "Not found" }, 404);
+    }
+    // Raw value bytes, not JSON: the client reads the body verbatim (its
+    // concise layout JSON). text/plain so nothing tries to re-encode it.
+    return new Response(value, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  } catch (e) {
+    return jsonResponse({ error: "KeyVal error: " + e.message }, 500);
+  }
+}
+
 
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj, null, 2), {

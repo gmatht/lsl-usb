@@ -658,10 +658,11 @@ pub fn take_pre_record(vol_letter: &str) -> Result<(String, Vec<CaptureFailure>,
     Ok((format!("{key} -> {path}"), fails, rec))
 }
 
-/// Upload each disk's layout to the online KeyVal store.
+/// Upload each disk's layout to the online KeyVal store. Returns true when
+/// every key landed.
 ///
 /// Key format: `<mobo_serial>/<N>/<disk_serial>-<size>/<stage>` where N is the
-/// per-machine run counter (incremented on each F2FS install).  Size is
+/// per-machine run counter (incremented on each successful F2FS upload). Size is
 /// human-readable (`128G`, `32G`, …).
 ///
 /// Also uploads `<mobo_serial>/<N>//disks` — a JSON array listing each disk's
@@ -670,13 +671,20 @@ pub fn take_pre_record(vol_letter: &str) -> Result<(String, Vec<CaptureFailure>,
 ///
 /// Best-effort: a network failure is logged but never aborts the install.
 /// Opt-out: respects `telemetry::partition_upload_allowed()`.
-pub fn upload_to_keyval(rec: &BackupRecord) {
+///
+/// The per-machine run counter advances only on success, so a failed
+/// upload leaves no phantom run number behind for the Past Layouts
+/// button to trip over.
+pub fn upload_to_keyval(rec: &BackupRecord) -> bool {
     if !crate::telemetry::partition_upload_allowed() {
-        return;
+        return false;
     }
-    let run_n = crate::telemetry::increment_partition_run_count();
+    // Peek, don't increment: the number is part of every key, but it is
+    // only real once the puts succeed.
+    let run_n = crate::telemetry::partition_run_count() + 1;
     let mobo = motherboard_serial();
     let phase = rec.phase.as_str();
+    let mut ok = true;
 
     // Upload each disk's layout.
     for disk in &rec.disks {
@@ -684,35 +692,70 @@ pub fn upload_to_keyval(rec: &BackupRecord) {
         let sz = human_size(disk.size_sectors);
         let key = format!("{}/{}/{}-{}/{}", mobo, run_n, serial, sz, phase);
         let value = disk.concise_json();
-        put_kv(&key, &value);
+        ok &= put_kv(&key, &value);
     }
 
     // Upload the disks index for this run.
     let entries: Vec<String> = rec.disks.iter().map(|d| {
         let s = d.serial_number.as_deref().unwrap_or("NOSN");
-        format!("\"{}-{}\"", s, human_size(d.size_sectors))
+        format!("\"{}\"", kv_sanitize(&format!("{}-{}", s, human_size(d.size_sectors))))
     }).collect();
     let disks_key = format!("{}/{}/disks", mobo, run_n);
-    put_kv(&disks_key, &format!("[{}]", entries.join(",")));
+    ok &= put_kv(&disks_key, &format!("[{}]", entries.join(",")));
+
+    if ok {
+        crate::telemetry::increment_partition_run_count();
+    } else {
+        crate::sys::out::warn("Partition layout upload failed (offline?) - the local record on the stick is unaffected; Past Layouts will show nothing until an upload succeeds.");
+    }
+    ok
 }
 
-/// PUT a key-value pair to the KeyVal store. Best-effort, silent on failure.
-fn put_kv(key: &str, value: &str) {
+/// Make a KeyVal key segment server-safe: the worker accepts printable
+/// ASCII without whitespace or backslashes, and the key also travels in a
+/// URL query, so anything outside [A-Za-z0-9-_.] becomes `_`. Applied at
+/// both choke points (put_kv, get_kv), so upload and fetch always agree -
+/// including on re-sanitized index entries (idempotent). BIOS and disk
+/// serials really do contain spaces ("To be filled by O.E.M."), so an
+/// unsanitized key would 400 on every machine with a placeholder serial.
+pub fn kv_sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// PUT a key-value pair to the KeyVal store. Best-effort; returns true on
+/// HTTP 200. The key is sanitized here (see kv_sanitize), so a hostile or
+/// sloppy serial can never 400 the upload.
+fn put_kv(key: &str, value: &str) -> bool {
+    let key = kv_sanitize(key);
     let headers = format!(
         "X-Lsl-Token: {}\r\nX-Key: {}\r\n",
         crate::telemetry::WORKER_TOKEN, key
     );
-    let _ = crate::net::put(
-        crate::telemetry::KV_URL,
-        crate::net::user_agent(),
-        value.as_bytes(),
-        &headers,
-    );
+    matches!(
+        crate::net::put(
+            crate::telemetry::KV_URL,
+            crate::net::user_agent(),
+            value.as_bytes(),
+            &headers,
+        ),
+        Ok(res) if res.status == 200
+    )
 }
 
 /// GET a value from the KeyVal store. Returns None on any failure.
 fn get_kv(key: &str) -> Option<String> {
-    let url = format!("{}?key={}", crate::telemetry::KV_URL, key);
+    // Sanitized like put_kv: the fetch side rebuilds keys from registry and
+    // index strings that may contain spaces, and must address the same keys
+    // the upload wrote.
+    let url = format!("{}?key={}", crate::telemetry::KV_URL, kv_sanitize(key));
     match crate::net::get(&url, crate::net::user_agent()) {
         Ok(res) if res.status == 200 => {
             Some(String::from_utf8_lossy(&res.body).into_owned())
@@ -1572,5 +1615,19 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
         // Must NOT contain the bootable/label/index fields.
         assert!(!j.contains("bootable"));
         assert!(!j.contains("LSLUSB"));
+    }
+
+    #[test]
+    fn kv_sanitize_keeps_key_structure_but_removes_spaces() {
+        // Real BIOS placeholder serials contain spaces and dots; the
+        // worker rejects whitespace, so these must map to underscores.
+        assert_eq!(kv_sanitize("To be filled by O.E.M."), "To_be_filled_by_O.E.M.");
+        // Path separators survive (they structure the key); everything
+        // else outside the safe set maps the same way.
+        assert_eq!(kv_sanitize("ABC/1/WD-1234 56/pre"), "ABC/1/WD-1234_56/pre");
+        // Idempotent: re-sanitizing an index entry changes nothing, so
+        // fetch-side keys built from index strings match upload keys.
+        let once = kv_sanitize("a b/c");
+        assert_eq!(kv_sanitize(&once), once);
     }
 }
