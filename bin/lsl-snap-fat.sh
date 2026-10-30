@@ -246,7 +246,7 @@ cmd_ensure() {
         log "no $STICK_LIST - no snaps requested."
         return 0
     fi
-    local names n total i=0 failed=0
+    local names total i=0 failed=0
     mapfile -t names < <(read_list)
     total="${#names[@]}"
     [ "$total" -gt 0 ] || {

@@ -1155,7 +1155,7 @@ install_desktop_home_files() {
     # duplicate work. LSL_DESKTOP_USER is passed explicitly so config.sh does
     # not re-derive it from a possibly-stale context.
     log "Installing desktop user files for $user ($home)..."
-    LSL_DESKTOP_USER="$user" LSL_CONFIG_ROOT= LSL_CDROM="${STICK_DIR:-/cdrom}" \
+    LSL_DESKTOP_USER="$user" LSL_CONFIG_ROOT='' LSL_CDROM="${STICK_DIR:-/cdrom}" \
         bash "$cfg" --install-home-only >>"$LOG" 2>&1 \
         || log "WARNING: \$HOME installs exited non-zero (terminal pin may be missing); see $LOG."
     return 0
