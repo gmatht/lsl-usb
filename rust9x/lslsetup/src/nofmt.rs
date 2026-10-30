@@ -3012,7 +3012,7 @@ pub fn write_extra_iso_entries(
             let cfg_path = format!("{}EFI\\BOOT\\grub.cfg", root);
             let (existing, existed) = match std::fs::read_to_string(&cfg_path) {
                 Ok(s) => (s, true),
-                Err(_) => ("set timeout=5\n".to_string(), false),
+                Err(_) => ("set default=0\nset timeout=5\n".to_string(), false),
             };
             let (cfg, added) =
                 upsert_grub_entry(&existing, &title, &uefi_cfg_loopback_user(&title, iso_rel, &live_session_kernel_params(iso_name)));
@@ -3117,7 +3117,7 @@ fn write_efi_bootdir(
             // Fresh file: header + the file-less direct entry.
             std::fs::write(
                 &cfg_path,
-                format!("set timeout=5\n{}", entry),
+                format!("set default=0\nset timeout=5\n{}", entry),
             )
             .map_err(|e| format!("write grub.cfg: {}", e))?;
             out::info(&format!("Created grub.cfg entry '{}'.", title));
@@ -5303,8 +5303,8 @@ mod tests {
         assert!(b.contains("iso-scan/filename=/_ISO/debian.iso"));
         assert!(b.contains("loopback loop /_ISO/debian.iso"));
         // fresh file: header + direct entry.
-        let fresh = format!("set timeout=5\n{}", a);
-        let (g1, added1) = upsert_grub_entry("set timeout=5\n", "Mint (direct kernel)", &a);
+        let fresh = format!("set default=0\nset timeout=5\n{}", a);
+        let (g1, added1) = upsert_grub_entry("set default=0\nset timeout=5\n", "Mint (direct kernel)", &a);
         assert!(added1);
         assert_eq!(g1, fresh);
         assert_eq!(g1.matches("menuentry").count(), 1);
@@ -5983,7 +5983,7 @@ mod tests {
         let initrd_line = format!("{} /casper/initrd.ramclone.gz", init);
         let direct = uefi_cfg_direct("Mint (direct kernel)", kern, init);
         let ram = ramclone_grub_entry("Mint (Boot to RAM)", kern, &initrd_line, "");
-        let cfg = format!("set timeout=5\n{}{}", direct, ram);
+        let cfg = format!("set default=0\nset timeout=5\n{}{}", direct, ram);
         let direct_new = uefi_cfg_direct_user(
             "Mint (direct kernel)",
             kern,
@@ -6040,7 +6040,7 @@ mod tests {
         let g_ram = ramclone_grub_entry("Mint (Boot to RAM)", kern, &initrd_line, "");
         let g_ram_np =
             ramclone_grub_entry("Mint (Boot to RAM, no persistence)", kern, &initrd_line, " lsl_home=tmpfs");
-        let cfg = format!("set timeout=5\n{}{}{}", g_direct, g_ram, g_ram_np);
+        let cfg = format!("set default=0\nset timeout=5\n{}{}{}", g_direct, g_ram, g_ram_np);
         std::fs::write(format!("{}EFI\\BOOT\\grub.cfg", root), &cfg).unwrap();
 
         remove_ramclone_boot_entries(&root, "Mint (direct kernel)", true).unwrap();
