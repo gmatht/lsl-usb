@@ -1121,6 +1121,10 @@ fn run() {
         out::info("Skipping boot-critical hivex staging (--no-pkgs): a drive-letter-mapped boot may use a transient /home.");
     }
 
+    // Model BIOS prerequisite (e.g. Acer Aspire 5560 graphics/disk mode): shown
+    // here, before the stick write, because it is the one thing this run cannot fix.
+    hardware::print_notice();
+
     if preload_drivers {
         out::step("Preloading network drivers for this machine...");
         let report = hardware::install_driver_packages(&vol.letter, false);
@@ -1792,6 +1796,9 @@ fn gui_tail_in_dialog(
     } else {
         out::warn("Skipping boot-critical hivex staging (--no-pkgs): a drive-letter-mapped boot may use a transient /home.");
     }
+    // Model BIOS prerequisite: also printed to the console log of a GUI run, so
+    // the log carries what the hardware page showed.
+    hardware::print_notice();
     if g.drivers || opts.drivers {
         ui.set_stage_status(ST::Drivers as usize, &crate::locale::tr("preloading..."));
         ui.set_status(&crate::locale::tr("Preloading network drivers..."));

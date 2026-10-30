@@ -1974,6 +1974,7 @@ struct LayoutCtx<'a> {
     frame_wifi: &'a nwg::Frame,
     frame_install: &'a nwg::Frame,
     lbl_hw: &'a nwg::Label,
+    lbl_hw_note: &'a std::sync::OnceLock<nwg::Label>,
     lv_hw: &'a nwg::ListView,
     lbl_rec: &'a nwg::Label,
     lbl_rec_help: &'a nwg::Label,
@@ -2082,11 +2083,23 @@ fn relayout(c: &LayoutCtx, cw: i32, ch: i32) {
     c.pb_dl.set_position(bar_x0, bar_y);
     c.pb_dl.set_size(bar_w as u32, bar_h as u32);
 
-    // page 0 (hardware): the ListView scrolls natively, so it just fills
+    // page 0 (hardware): the ListView scrolls natively, so it just fills.
+    // A model BIOS warning, when present, owns the band under the header and
+    // the ListView starts below it - heights come from text_h so a long
+    // notice is never clipped at any window width.
     c.lbl_hw.set_position(10, 6);
     c.lbl_hw.set_size((fw - 20) as u32, 20);
-    c.lv_hw.set_position(10, 30);
-    c.lv_hw.set_size((fw - 20) as u32, (fh - 40).max(40) as u32);
+    let mut lv_top = 30;
+    if let Some(note) = c.lbl_hw_note.get() {
+        let text = note.text();
+        let h = text_h(&text, fw - 20);
+        note.set_text(&wrap_text(&text, (((fw - 28) / 9).max(10)) as usize));
+        note.set_position(10, 26);
+        note.set_size((fw - 20) as u32, h as u32);
+        lv_top = 26 + h + 4;
+    }
+    c.lv_hw.set_position(10, lv_top);
+    c.lv_hw.set_size((fw - 20) as u32, (fh - lv_top - 10).max(40) as u32);
 
     // ISO page's fixed header: recommendation + wrapped help text
     c.lbl_rec.set_position(10, 4);
@@ -3614,6 +3627,10 @@ pub fn run_gui(
     // page 0: hardware
     let mut frame_hw: nwg::Frame = Default::default();
     let mut lbl_hw: nwg::Label = Default::default();
+    // Model-specific BIOS warning under the hardware header (empty on almost
+    // every machine). OnceLock because the label is created during run_gui
+    // but positioned by relayout, which borrows it through LayoutCtx.
+    let lbl_hw_note: std::sync::OnceLock<nwg::Label> = std::sync::OnceLock::new();
     let mut lv_hw: nwg::ListView = Default::default();
 
     // page 1: ISO — scrollable item list (shared storage, single owner)
@@ -3737,6 +3754,25 @@ pub fn run_gui(
         .size((820, 20))
         .parent(&*frame_hw)
         .build(&mut lbl_hw);
+    // Hardware-page warning for models with a known BIOS prerequisite (see
+    // hardware::MODEL_NOTICES, e.g. the Acer Aspire 5560's graphics/disk
+    // mode). Built and shown ONLY when this machine has such a notice: the
+    // empty case keeps the page exactly as it was, with the ListView at the
+    // top (relayout does that layout).
+    let hw_notice = crate::hardware::hardware_notice();
+    if !hw_notice.is_empty() {
+        let mut note: Box<nwg::Label> = Box::default();
+        let _ = nwg::Label::builder()
+            .text(&hw_notice)
+            .position((10, 26))
+            .parent(&*frame_hw)
+            .build(&mut note);
+        note.set_font(Some(&font_bold));
+        // set() only fails if already initialised, which cannot happen: this
+        // runs once during construction. A failed set drops the Box, whose Drop
+        // destroys the window - so the label can never leak.
+        let _ = lbl_hw_note.set(*note);
+    }
     let _ = nwg::ListView::builder()
         .position((10, 30))
         .size((830, 560))
@@ -4754,6 +4790,7 @@ pub fn run_gui(
             frame_wifi: &*frame_wifi,
             frame_install: &*frame_install,
             lbl_hw: &lbl_hw,
+            lbl_hw_note: &lbl_hw_note,
             lv_hw: &lv_hw,
             lbl_rec: &lbl_rec,
             lbl_rec_help: &lbl_rec_help,
@@ -5166,6 +5203,7 @@ pub fn run_gui(
                         frame_wifi: &*frame_wifi_c,
                         frame_install: &*frame_install_c,
                         lbl_hw: &lbl_hw,
+                        lbl_hw_note: &lbl_hw_note,
                         lv_hw: &lv_hw,
                         lbl_rec: &lbl_rec,
                         lbl_rec_help: &lbl_rec_help,

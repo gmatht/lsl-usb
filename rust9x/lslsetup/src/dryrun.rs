@@ -248,6 +248,9 @@ pub fn show_dry_run_report(opts: &crate::cli::Opts) {
         out::warn("No network hardware detected (registry PnP unavailable?).");
     }
 
+    // ---- model BIOS prerequisite ----
+    hardware::print_notice();
+
     // ---- hardware rating ----
     out::step("Linux compatibility (linux-hardware.org LKDDb, one polite query per device)");
     let rate_devices = if opts.rate_hardware {
