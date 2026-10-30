@@ -1,57 +1,12 @@
-// Compiles the lsl-hw-cache snapshot (../../lsl-hw-cache/*.html) into a
-// compact per-device summary embedded in the binary, so common hardware is
-// rated instantly with no network request (the live linux-hardware.org path
-// has a 10s crawl-delay per device).
+// Embeds the lsl-hw-cache snapshot (../../lsl-hw-cache/*.html) as raw gzipped
+// pages in the binary, so common hardware rates instantly with no network
+// request and no sidecar files beside the exe (the live linux-hardware.org
+// path has a 10s crawl-delay per device).
 
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-
-fn find_between<'a>(s: &'a str, start: &str, end: &str) -> Option<&'a str> {
-    let i = s.find(start)? + start.len();
-    let rest = &s[i..];
-    let j = rest.find(end)?;
-    Some(&rest[..j])
-}
-
-/// Same heuristics as the runtime parser in src/hardware.rs.
-fn parse_page(html: &str) -> (String, String, String, Vec<String>) {
-    let mut name = String::new();
-    let mut ksup = String::new();
-    let mut src = String::new();
-    let mut third = Vec::new();
-
-    if let Some(n) = find_between(html, "<h2 class='top'>Device '", "'") {
-        name = n.to_string();
-    }
-    if let Some(k) = find_between(html, "supported by kernel versions <a", "</a>") {
-        let k = match k.find('>') {
-            Some(i) => &k[i + 1..],
-            None => k,
-        };
-        ksup = k.to_string();
-    }
-    if let Some(seg) = find_between(html, "&nbsp;-&nbsp;</td>", "</td><td>") {
-        src = seg.to_string();
-    } else if let Some(seg) = find_between(html, "<td>", "</td>") {
-        if seg.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-            src = seg.to_string();
-        }
-    }
-    let mut from = 0;
-    while let Some(rel) = html[from..].find("<a href=\"https://github.com/") {
-        let start = from + rel + "<a href=\"https://github.com/".len();
-        let rest = &html[start..];
-        if let Some(q) = rest.find('"') {
-            third.push(rest[..q].to_string());
-            from = start + q;
-        } else {
-            break;
-        }
-    }
-    (name, ksup, src, third)
-}
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -235,31 +190,6 @@ fn main() {
         );
     }
 
-    let cache_dir = Path::new(&manifest).join("..").join("..").join("lsl-hw-cache");
-    let mut entries: Vec<(String, String, String, String, Vec<String>)> = Vec::new();
-    if let Ok(rd) = fs::read_dir(&cache_dir) {
-        let mut files: Vec<_> = rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().map(|e| e == "html").unwrap_or(false))
-            .collect();
-        files.sort();
-        for p in files {
-            // lsl-lhw-<kind>-<vid>-<did>.html  ->  <kind>:<vid>-<did>
-            let stem = p.file_stem().unwrap().to_string_lossy().into_owned();
-            let id = stem
-                .strip_prefix("lsl-lhw-")
-                .unwrap_or(&stem)
-                .replacen('-', ":", 1);
-            if !id.contains(':') {
-                continue;
-            }
-            let Ok(html) = fs::read_to_string(&p) else { continue };
-            let (name, ksup, src, third) = parse_page(&html);
-            entries.push((id, name, ksup, src, third));
-        }
-    }
-
     // Optional vendored UEFI loaders embedded via OUT_DIR/uefi_embedded.rs:
     // (a) the SIGNED chain (assets/shimx64.efi.gz + grubx64.efi.gz +
     // mmx64.efi.gz - shim + Canonical-signed GRUB2; Secure Boot ON), the
@@ -416,29 +346,67 @@ fn main() {
         grldr_gz.len(),
         &hex[..16]
     );
-    // Compact + gzip the snapshot: the literal table above costs ~90 KB of
-    // .rdata (highly repetitive text: 9.5:1 with gzip). flate2's decoder is
-    // already linked (Packages.gz), so the marginal code cost is ~nil.
-    // Format per entry (one line): id \x1f name \x1f ksup \x1f src \x1f repo,repo
-    fn flat(s: &str) -> String {
-        s.replace('\x1f', " ").replace('\n', " ")
+    // ---- Embedded lsl-hw-cache snapshot (raw pages, one gzip blob) ---------
+    // The exe must rate hardware standalone. Copying just lslsetup.exe to a
+    // new machine leaves %LOCALAPPDATA% cold, the sidecar lsl-hw-cache\ behind,
+    // and any VID:DID outside the old summary unratable: every row showed U
+    // while its link (a pure URL template) still worked. So ALL pages ship
+    // inside the binary: 4.4 MB of HTML gzips to ~175 KB (boilerplate-heavy
+    // pages compress ~25:1; flate2 is already linked for Packages.gz).
+    //
+    // Framed, length-prefixed (NOT lines): <id>\n<len>\n<page bytes> repeated,
+    // ids sorted. A truncated blob fails loudly at runtime instead of rating
+    // from half a page. Parsed at runtime with parse_lhw_html - the SAME
+    // parser as the on-disk cache - so embedded and sidecar ratings can never
+    // drift apart. (The previous build-time summary table parsed with a
+    // DUPLICATE parser that dropped every src and mis-rated audio/USB/EHCI
+    // devices as U.)
+    let cache_dir = Path::new(&manifest).join("..").join("..").join("lsl-hw-cache");
+    println!("cargo:rerun-if-changed={}", cache_dir.display());
+    let mut framed: Vec<u8> = Vec::new();
+    let mut n_pages = 0usize;
+    if let Ok(rd) = fs::read_dir(&cache_dir) {
+        let mut files: Vec<_> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "html").unwrap_or(false))
+            .collect();
+        files.sort();
+        for p in files {
+            println!("cargo:rerun-if-changed={}", p.display());
+            // lsl-lhw-<kind>-<vid>-<did>.html  ->  <kind>:<vid>-<did>
+            let stem = p.file_stem().unwrap().to_string_lossy().into_owned();
+            let id = stem
+                .strip_prefix("lsl-lhw-")
+                .unwrap_or(&stem)
+                .replacen('-', ":", 1);
+            if !id.contains(':') {
+                continue;
+            }
+            let bytes =
+                fs::read(&p).unwrap_or_else(|e| panic!("read {}: {}", p.display(), e));
+            assert!(!bytes.is_empty(), "{} is empty", p.display());
+            assert!(
+                !id.bytes().any(|b| b == b'\n'),
+                "{}: device id contains a newline",
+                p.display()
+            );
+            framed.extend_from_slice(id.as_bytes());
+            framed.push(b'\n');
+            framed.extend_from_slice(bytes.len().to_string().as_bytes());
+            framed.push(b'\n');
+            framed.extend_from_slice(&bytes);
+            n_pages += 1;
+        }
     }
-    let mut plain = String::new();
-    for (id, name, ksup, src, third) in &entries {
-        plain.push_str(&flat(id));
-        plain.push('\x1f');
-        plain.push_str(&flat(name));
-        plain.push('\x1f');
-        plain.push_str(&flat(ksup));
-        plain.push('\x1f');
-        plain.push_str(&flat(src));
-        plain.push('\x1f');
-        plain.push_str(&third.iter().map(|t| flat(t)).collect::<Vec<_>>().join(","));
-        plain.push('\n');
-    }
+    assert!(
+        n_pages > 0,
+        "lsl-hw-cache snapshot is empty ({}): the exe would rate everything U",
+        cache_dir.display()
+    );
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
     use std::io::Write;
-    enc.write_all(plain.as_bytes()).unwrap();
+    enc.write_all(&framed).unwrap();
     let gz = enc.finish().unwrap();
     let dst = Path::new(&out_dir).join("hw_cache_embedded.rs");
     let mut code = String::new();
@@ -447,12 +415,15 @@ fn main() {
         "pub static COMPRESSED_HW_CACHE: &[u8] = &[{}];\n",
         gz.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
     ));
-    code.push_str(&format!("pub static HW_CACHE_ENTRIES: usize = {};\n", entries.len()));
+    code.push_str(&format!(
+        "pub static HW_CACHE_ENTRIES: usize = {};\n",
+        n_pages
+    ));
     fs::write(&dst, code).unwrap();
     println!(
-        "cargo:warning=embedded LKDDb cache summary: {} devices ({} -> {} bytes)",
-        entries.len(),
-        plain.len(),
+        "cargo:warning=embedded LKDDb cache: {} devices ({} -> {} bytes)",
+        n_pages,
+        framed.len(),
         gz.len()
     );
 }

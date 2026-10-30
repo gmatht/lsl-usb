@@ -98,6 +98,92 @@ fn enum_bus(root_path: &str, bus: &'static str, out: &mut Vec<Device>) {
     }
 }
 
+/// A model-specific prerequisite the user must fix in the firmware setup
+/// before the live USB will boot. `model` is the SMBIOS system product
+/// ("Aspire 5560"); `notice` is the operator-facing text.
+pub struct ModelNotice {
+    pub model: &'static str,
+    pub notice: &'static str,
+}
+
+/// Models with a known BIOS prerequisite that the live session cannot work
+/// around. Matched case-insensitively against the SMBIOS SystemProductName /
+/// BaseBoardProduct (see `machine_model`).
+pub const MODEL_NOTICES: &[ModelNotice] = &[ModelNotice {
+    // Acer Aspire 5560 (AMD A6/A8 "Llano" era laptop). The BIOS ships with the
+    // graphics switch set to Discrete and SATA in AHCI; Linux then has no
+    // working display (the Radeon HD 6520G is only driven with the switchable/
+    // integrated setting) and casper cannot see the internal disk. Both are
+    // BIOS-only settings - set them at the F2 setup screen before booting the
+    // stick, not from Windows.
+    model: "Aspire 5560",
+    notice: "Acer Aspire 5560: before booting, enter the BIOS setup (press F2 \
+             during POST) and set the graphics mode from Discrete to Switchable \
+             (integrated graphics), and change the hard disk mode from AHCI to \
+             IDE - otherwise the live session may not reach the desktop or see \
+             the internal disk.",
+}];
+
+/// The notice for this machine, if its model has one. Pure (unit-tested).
+pub fn model_notice_for(model: &str) -> Option<&'static ModelNotice> {
+    let m = model.to_lowercase();
+    MODEL_NOTICES.iter().find(|n| m.contains(&n.model.to_lowercase()))
+}
+
+/// This machine's model string from the SMBIOS registry data (SystemProductName,
+/// else BaseBoardProduct), or "" when unavailable (Win9x, stripped installs).
+/// Registry, not WMI: see `boot::boot_menu_key` for the same reasoning.
+pub fn machine_model() -> String {
+    const PATH: &str = "HARDWARE\\DESCRIPTION\\System\\BIOS";
+    let Some(k) = RegKey::open(hklm(), PATH) else {
+        return String::new();
+    };
+    for name in ["SystemProductName", "BaseBoardProduct"] {
+        if let Some(v) = k.value(name) {
+            let v = v.trim().trim_end_matches('\0').trim().to_string();
+            // Some boards report a placeholder instead of a model name.
+            if !v.is_empty()
+                && !v.eq_ignore_ascii_case("to be filled by o.e.m.")
+                && !v.eq_ignore_ascii_case("system product name")
+                && !v.eq_ignore_ascii_case("default string")
+            {
+                return v;
+            }
+        }
+    }
+    String::new()
+}
+
+/// The BIOS warning for this machine as display text: empty when the model has
+/// no known prerequisite, else a one-line "WARNING: ..." notice.
+pub fn hardware_notice() -> String {
+    match model_notice_for(&machine_model()) {
+        Some(n) => format!("WARNING: {}", n.notice),
+        None => String::new(),
+    }
+}
+
+/// Print this machine's BIOS notice, if it has one, to the console.
+///
+/// Console counterpart of the GUI hardware-page label. Nothing lslsetup can do
+/// fixes a firmware setting, so the user must see this BEFORE writing (or at
+/// least before rebooting): a scripted --no-gui / --dry-run run must not drop
+/// the one prerequisite the wizard would have shown. Prints nothing on machines
+/// without a notice.
+pub fn print_notice() {
+    let text = hardware_notice();
+    if text.is_empty() {
+        return;
+    }
+    let mut lines = text.lines();
+    if let Some(first) = lines.next() {
+        out::warn(first);
+    }
+    for l in lines {
+        out::info(l);
+    }
+}
+
 /// All PCI+USB devices. Primary source: SetupAPI (`SetupDiGetClassDevs` with
 /// the PCI/USB enumerators) — the proper PnP API, available since 95 OSR2/
 /// NT4, no WMI required, loaded dynamically so the static import surface
@@ -513,58 +599,77 @@ pub fn install_staged_packages(vol_letter: &str, skip_download: bool) -> Vec<Str
 // linux-hardware.org LKDDb rating (Get-LinuxCompatRating).
 // ---------------------------------------------------------------------------
 
-// Compiled-in summary of the lsl-hw-cache snapshot (see build.rs): common
-// hardware rates instantly, with no network request at all. The table is
-// gzip-compressed (~9.5:1 — highly repetitive text) and inflated once on
-// first lookup; flate2's decoder is already linked for Packages.gz.
+// Compiled-in copy of the lsl-hw-cache snapshot (see build.rs): the raw
+// device pages, gzipped as one blob and inflated once on first lookup, so
+// common hardware rates instantly with no network request and no sidecar
+// files beside the exe. flate2's decoder is already linked for Packages.gz.
+// Parsed at runtime with parse_lhw_html - the SAME parser as the on-disk
+// cache - so embedded and sidecar ratings can never drift apart.
 include!(concat!(env!("OUT_DIR"), "/hw_cache_embedded.rs"));
 
 struct HwCacheEntry {
     id: String,
-    name: String,
-    ksup: String,
-    src: String,
-    third: Vec<String>,
+    html: String,
 }
 
 static HW_CACHE: std::sync::OnceLock<Vec<HwCacheEntry>> = std::sync::OnceLock::new();
 
 fn hw_cache() -> &'static [HwCacheEntry] {
     HW_CACHE.get_or_init(|| {
-        let mut out = Vec::with_capacity(HW_CACHE_ENTRIES);
         let mut dec = flate2::read::GzDecoder::new(COMPRESSED_HW_CACHE);
-        let mut plain = String::new();
+        let mut raw: Vec<u8> = Vec::new();
         use std::io::Read;
-        if dec.read_to_string(&mut plain).is_err() {
+        if dec.read_to_end(&mut raw).is_err() {
             return Vec::new(); // build-verified; on failure callers fall through to disk/network
         }
-        for line in plain.lines() {
-            let mut f = line.split('\x1f');
-            let (Some(id), Some(name), Some(ksup), Some(src), Some(third)) =
-                (f.next(), f.next(), f.next(), f.next(), f.next())
-            else {
-                continue;
+        // Raw concatenated pages, each prefixed by its id and byte length:
+        //   <id>\n<len>\n<page bytes>
+        // Rejects a truncated blob instead of rating from half a page.
+        let mut out = Vec::with_capacity(HW_CACHE_ENTRIES);
+        let mut p = &raw[..];
+        while !p.is_empty() {
+            let nl = match p.iter().position(|&b| b == b'\n') {
+                Some(i) => i,
+                None => break,
+            };
+            let id = match std::str::from_utf8(&p[..nl]) {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            p = &p[nl + 1..];
+            let nl2 = match p.iter().position(|&b| b == b'\n') {
+                Some(i) => i,
+                None => break,
+            };
+            let len: usize = match std::str::from_utf8(&p[..nl2]).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => break,
+            };
+            p = &p[nl2 + 1..];
+            if p.len() < len {
+                break; // truncated entry: stop, keep nothing partial
+            }
+            let html = match std::str::from_utf8(&p[..len]) {
+                Ok(s) => s,
+                Err(_) => {
+                    p = &p[len..];
+                    continue; // non-UTF8 page: skip, keep parsing the rest
+                }
             };
             out.push(HwCacheEntry {
                 id: id.to_string(),
-                name: name.to_string(),
-                ksup: ksup.to_string(),
-                src: src.to_string(),
-                third: if third.is_empty() {
-                    Vec::new()
-                } else {
-                    third.split(',').map(|s| s.to_string()).collect()
-                },
+                html: html.to_string(),
             });
+            p = &p[len..];
         }
         out
     })
 }
 
-fn embedded_lookup(id: &str) -> Option<(&'static str, &'static str, &'static str, Vec<String>)> {
+fn embedded_lookup(id: &str) -> Option<String> {
     for e in hw_cache().iter() {
         if e.id == id {
-            return Some((e.name.as_str(), e.ksup.as_str(), e.src.as_str(), e.third.clone()));
+            return Some(e.html.clone());
         }
     }
     None
@@ -737,20 +842,11 @@ pub fn linux_compat_rating_cached(d: &Device, bundle_dir: &str, iso_kernel: (u32
         d.vendor.to_lowercase(),
         d.device.to_lowercase()
     );
-    // Compiled-in snapshot
-    if let Some((e_name, e_ksup, e_src, e_third)) = embedded_lookup(&id) {
-        let name = if e_name.is_empty() {
-            d.name.clone()
-        } else {
-            e_name.to_string()
-        };
-        return Some(rating_from_lkddb(
-            name,
-            e_ksup.to_string(),
-            e_src.to_string(),
-            e_third.iter().map(|t| t.to_string()).collect(),
-            iso_kernel,
-        ));
+    // Compiled-in snapshot (raw pages, same parser as the on-disk cache)
+    if let Some(html) = embedded_lookup(&id) {
+        let (name, ksup, src, third) = parse_lhw_html(&html);
+        let name = if name.is_empty() { d.name.clone() } else { name };
+        return Some(rating_from_lkddb(name, ksup, src, third, iso_kernel));
     }
     // On-disk caches (user + bundle)
     let user_cache = lhw_cache_file(&id);
@@ -791,20 +887,16 @@ pub fn linux_compat_rating(d: &Device, bundle_dir: &str, iso_kernel: (u32, u32))
             reason: format!("needs out-of-tree driver ({}) - staged to <USB>:\\drivers\\", t.pkg),
         };
     }
-    // Compiled-in snapshot FIRST (../..lsl-hw-cache → build.rs →
-    // EMBEDDED_HW_CACHE): common hardware rates instantly with no network
-    // request at all. Before this, the embedded summary was only consulted
-    // as a *fallback* after a live linux-hardware.org fetch — and that live
-    // fetch carries a 10-second robots crawl-delay per device, which is why
+    // Compiled-in snapshot FIRST (../..lsl-hw-cache → build.rs → raw pages):
+    // common hardware rates instantly with no network request at all. Before
+    // this, only a lossy summary was embedded — and a live linux-hardware.org
+    // fetch carried a 10-second robots crawl-delay per device, which is why
     // a fresh (deployed) machine crept through the rating. Devices in the
     // snapshot never touch the network now.
-    if let Some((e_name, e_ksup, e_src, e_third)) = embedded_lookup(&id) {
-        let name = if e_name.is_empty() {
-            d.name.clone()
-        } else {
-            e_name.to_string()
-        };
-        return rating_from_lkddb(name, e_ksup.to_string(), e_src.to_string(), e_third, iso_kernel);
+    if let Some(html) = embedded_lookup(&id) {
+        let (e_name, ksup, src, third) = parse_lhw_html(&html);
+        let name = if e_name.is_empty() { d.name.clone() } else { e_name };
+        return rating_from_lkddb(name, ksup, src, third, iso_kernel);
     }
     // Not in the snapshot: on-disk caches (user + bundle), then ONE polite
     // live fetch (10s crawl-delay). Unlisted devices alone pay that cost.
@@ -1011,7 +1103,7 @@ mod tests {
     #[test]
     fn embedded_cache_rates_known_hardware_without_network() {
         // pci:8086-3ea0 = Intel WhiskeyLake-U GT2 [UHD Graphics 620],
-        // "4.16 and newer", present in EMBEDDED_HW_CACHE.
+        // "4.16 and newer", present in the embedded lsl-hw-cache blob.
         let d = dev("pci", "8086", "3ea0");
         let r = linux_compat_rating(&d, "", (6, 8));
         assert_eq!(r.rating, 'A', "{}: {}", r.rating, r.reason);
@@ -1067,5 +1159,31 @@ mod tests {
     fn rating_parser_reports_missing_entry_as_u() {
         let r = rating_from_lkddb("x".into(), String::new(), String::new(), vec![], (6, 8));
         assert_eq!(r.rating, 'U', "{}: {}", r.rating, r.reason);
+    }
+
+    // The Aspire 5560 BIOS prerequisite. The notice must name BOTH BIOS
+    // changes and how to reach setup, because each one alone is useless: the
+    // wrong graphics mode has no display, the wrong disk mode has no disk.
+    #[test]
+    fn aspire_5560_notice_names_both_bios_changes_and_f2() {
+        let n = model_notice_for("Aspire 5560").expect("Aspire 5560 must have a notice");
+        assert_eq!(n.model, "Aspire 5560");
+        let t = n.notice.to_lowercase();
+        assert!(t.contains("switchable"), "graphics mode: {}", n.notice);
+        assert!(t.contains("integrated"), "integrated graphics: {}", n.notice);
+        assert!(t.contains("ide"), "disk mode: {}", n.notice);
+        assert!(t.contains("ahci"), "disk mode source: {}", n.notice);
+        assert!(t.contains("f2"), "how to enter setup: {}", n.notice);
+    }
+
+    #[test]
+    fn model_notice_matching_is_case_insensitive_and_model_specific() {
+        // SMBIOS reports the product name with varying case.
+        assert!(model_notice_for("acer aspire 5560").is_some());
+        // A different model must not inherit an Aspire 5560 warning.
+        assert!(model_notice_for("Aspire 5750").is_none());
+        assert!(model_notice_for("Aspire 556").is_none());
+        // Unknown machine (Win9x / stripped install): no notice, no panic.
+        assert!(model_notice_for("").is_none());
     }
 }
